@@ -1,0 +1,16 @@
+[package]
+name = "wotoha-voice"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait.workspace = true
+dashmap.workspace = true
+parking_lot = "0.12.5"
+serenity.workspace = true
+songbird.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wotoha-contracts = { path = "../wotoha-contracts" }
+wotoha-core = { path = "../wotoha-core" }

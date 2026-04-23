@@ -1,0 +1,24 @@
+[Unit]
+Description=Wotoha Discord Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wotoha
+Group=wotoha
+WorkingDirectory=/opt/wotoha
+EnvironmentFile=/etc/wotoha/wotoha.env
+ExecStart=/opt/wotoha/bin/wotoha-app
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/wotoha
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
