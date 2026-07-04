@@ -8,9 +8,9 @@ use std::{
 
 use serenity::{
     all::{
-        ButtonStyle, ChannelId, Colour, Command, CommandInteraction, CommandOptionType,
-        ComponentInteraction, Context, CreateActionRow, CreateButton, CreateCommand,
-        CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
+        ActivityData, ButtonStyle, ChannelId, Colour, Command, CommandInteraction,
+        CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateButton,
+        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
         CreateInteractionResponseMessage, EmojiId, Interaction, MessageFlags, ReactionType, Ready,
         VoiceServerUpdateEvent, VoiceState,
@@ -48,6 +48,15 @@ const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
 const EMBED_FIELD_LIMIT: usize = 1024;
 const EMBED_TITLE_LIMIT: usize = 180;
+const BUILD_VERSION: &str = match option_env!("WOTOHA_BUILD_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
+fn version_activity() -> ActivityData {
+    let version = BUILD_VERSION.strip_prefix('v').unwrap_or(BUILD_VERSION);
+    ActivityData::custom(format!("v{version}"))
+}
 
 pub fn recommended_cache_settings() -> CacheSettings {
     let mut settings = CacheSettings::default();
@@ -442,6 +451,7 @@ where
 {
     async fn ready(&self, ctx: Context, ready: Ready) {
         append_debug_log("discord: ready event received");
+        ctx.set_activity(Some(version_activity()));
         if self.startup.boot_tasks_done.swap(true, Ordering::AcqRel) {
             info!("Gateway ready received again; skipping boot-only tasks");
             return;
@@ -743,7 +753,10 @@ fn player_button(
 
 #[cfg(test)]
 mod tests {
-    use super::{EMBED_FIELD_LIMIT, queue_lines, truncate_embed_text};
+    use super::{
+        BUILD_VERSION, EMBED_FIELD_LIMIT, queue_lines, truncate_embed_text, version_activity,
+    };
+    use serenity::all::ActivityType;
     use wotoha_core::{GuildPlayerState, PreparedSource, TrackMetadata, TrackRequest};
 
     #[test]
@@ -764,6 +777,17 @@ mod tests {
         let preview = state.queue_preview(20);
         let lines = queue_lines(&preview);
         assert!(lines.len() <= EMBED_FIELD_LIMIT);
+    }
+
+    #[test]
+    fn version_activity_contains_build_version() {
+        let version = BUILD_VERSION.strip_prefix('v').unwrap_or(BUILD_VERSION);
+        let activity = version_activity();
+        assert_eq!(
+            activity.state.as_deref(),
+            Some(format!("v{version}").as_str())
+        );
+        assert_eq!(activity.kind, ActivityType::Custom);
     }
 
     fn track(title: String, index: usize) -> TrackRequest {
