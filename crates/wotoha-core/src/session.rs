@@ -2,21 +2,34 @@ use std::collections::VecDeque;
 
 use rand::seq::SliceRandom;
 
-use crate::model::TrackRequest;
+use crate::model::{TrackMetadata, TrackRequest};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrackPreview {
+    pub metadata: TrackMetadata,
+}
+
+impl From<&TrackRequest> for TrackPreview {
+    fn from(request: &TrackRequest) -> Self {
+        Self {
+            metadata: request.metadata.clone(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct QueuePreview {
-    current: Option<TrackRequest>,
-    upcoming: Vec<TrackRequest>,
+    current: Option<TrackPreview>,
+    upcoming: Vec<TrackPreview>,
     total_queued: usize,
 }
 
 impl QueuePreview {
-    pub fn current(&self) -> Option<&TrackRequest> {
+    pub fn current(&self) -> Option<&TrackPreview> {
         self.current.as_ref()
     }
 
-    pub fn upcoming(&self) -> &[TrackRequest] {
+    pub fn upcoming(&self) -> &[TrackPreview] {
         &self.upcoming
     }
 
@@ -47,28 +60,21 @@ impl GuildPlayerState {
         self.current.as_ref()
     }
 
-    pub fn current_cloned(&self) -> Option<TrackRequest> {
-        self.current.clone()
-    }
-
     pub fn queue(&self) -> &VecDeque<TrackRequest> {
         &self.queue
     }
 
-    pub fn queue_len(&self) -> usize {
-        self.queue.len()
-    }
-
     pub fn queue_preview(&self, limit: usize) -> QueuePreview {
         QueuePreview {
-            current: self.current.clone(),
-            upcoming: self.queue.iter().take(limit).cloned().collect(),
+            current: self.current.as_ref().map(TrackPreview::from),
+            upcoming: self
+                .queue
+                .iter()
+                .take(limit)
+                .map(TrackPreview::from)
+                .collect(),
             total_queued: self.queue.len(),
         }
-    }
-
-    pub fn is_looping(&self) -> bool {
-        self.looping
     }
 
     pub fn toggle_loop(&mut self) -> bool {

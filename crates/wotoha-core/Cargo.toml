@@ -7,4 +7,5 @@ edition = "2024"
 dotenvy.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 url.workspace = true

@@ -5,6 +5,5 @@ edition = "2024"
 
 [dependencies]
 async-trait.workspace = true
-serenity.workspace = true
-songbird.workspace = true
+tokio.workspace = true
 wotoha-core = { path = "../wotoha-core" }

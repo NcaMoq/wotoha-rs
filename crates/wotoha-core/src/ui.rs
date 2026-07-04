@@ -35,6 +35,9 @@ pub const MSG_NO_TRACK_PLAYING: &str = "再生中の曲がありません。";
 pub const MSG_NOTHING_TO_SHUFFLE: &str = "シャッフルできる曲がありません。";
 pub const MSG_SHUFFLED: &str = "プレイリストをシャッフルしました！";
 pub const MSG_QUEUE_EMPTY: &str = "プレイリストは空です。";
+pub const MSG_JOIN_ACTIVE_VOICE: &str = "再生中のボイスチャンネルに参加してください。";
+pub const MSG_PLAYING_IN_ANOTHER_VOICE: &str =
+    "別のボイスチャンネルで再生中です。同じ部屋から操作してください。";
 
 pub fn format_duration(duration: Option<Duration>) -> String {
     let Some(duration) = duration else {

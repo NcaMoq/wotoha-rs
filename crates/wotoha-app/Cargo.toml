@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-trait.workspace = true
 serenity.workspace = true
 songbird.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+wotoha-contracts = { path = "../wotoha-contracts" }
 wotoha-control = { path = "../wotoha-control" }
 wotoha-core = { path = "../wotoha-core" }
 wotoha-media = { path = "../wotoha-media" }
+wotoha-runtime = { path = "../wotoha-runtime" }
 wotoha-voice = { path = "../wotoha-voice" }

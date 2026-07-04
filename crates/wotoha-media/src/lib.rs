@@ -1,3 +1,4 @@
+mod html;
 mod provider;
 mod providers;
 mod resolver;

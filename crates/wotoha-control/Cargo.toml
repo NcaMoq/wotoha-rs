@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-serenity.workspace = true
-songbird.workspace = true
-tracing.workspace = true
+async-trait.workspace = true
 wotoha-contracts = { path = "../wotoha-contracts" }
 wotoha-core = { path = "../wotoha-core" }
+
+[dev-dependencies]
+tokio.workspace = true

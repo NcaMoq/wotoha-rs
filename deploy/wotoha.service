@@ -2,12 +2,14 @@
 Description=Wotoha Discord Bot
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=8
 
 [Service]
 Type=simple
 User=wotoha
 Group=wotoha
-WorkingDirectory=/opt/wotoha
+WorkingDirectory=/var/lib/wotoha
 EnvironmentFile=/etc/wotoha/wotoha.env
 ExecStart=/opt/wotoha/bin/wotoha-app
 Restart=always
@@ -15,10 +17,25 @@ RestartSec=2
 TimeoutStopSec=15
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/wotoha
-LimitNOFILE=1048576
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+StateDirectory=wotoha
+LogsDirectory=wotoha
+TasksMax=8192
+MemoryMax=8G
+LimitNOFILE=131072
 
 [Install]
 WantedBy=multi-user.target

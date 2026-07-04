@@ -1,6 +1,5 @@
 use async_trait::async_trait;
 use reqwest::Client;
-use songbird::input::Input;
 use wotoha_core::TrackRequest;
 
 use crate::ResolveError;
@@ -10,15 +9,23 @@ pub trait MediaProvider: Send + Sync {
     fn id(&self) -> &'static str;
     fn supports(&self, raw_url: &str) -> bool;
 
+    async fn warmup(&self, probe_client: &Client) -> Result<(), ResolveError> {
+        let _ = probe_client;
+        Ok(())
+    }
+
     async fn probe(
         &self,
         raw_url: &str,
         probe_client: &Client,
     ) -> Result<TrackRequest, ResolveError>;
 
-    fn open_input(
+    async fn refresh_playback(
         &self,
         request: &TrackRequest,
-        stream_client: &Client,
-    ) -> Result<Input, ResolveError>;
+        probe_client: &Client,
+    ) -> Result<Option<TrackRequest>, ResolveError> {
+        let _ = (request, probe_client);
+        Ok(None)
+    }
 }

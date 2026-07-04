@@ -1,3 +1,3 @@
-mod discord;
+mod service;
 
-pub use discord::{DiscordControlPlane, recommended_cache_settings};
+pub use service::{ComponentAction, ComponentOutcome, ControlService};
