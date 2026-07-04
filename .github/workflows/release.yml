@@ -19,7 +19,7 @@ jobs:
             --volume "$PWD:/work" \
             --workdir /work \
             ghcr.io/rust-cross/cargo-zigbuild:0.22.3 \
-            bash -lc 'apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo zigbuild --locked --release --bin wotoha-app --target x86_64-unknown-linux-musl'
+            bash -c 'apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo zigbuild --locked --release --bin wotoha-app --target x86_64-unknown-linux-musl'
       - name: Package
         shell: bash
         run: |
