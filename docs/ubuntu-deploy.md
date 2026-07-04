@@ -41,7 +41,7 @@ Ubuntu 側で次を実行します。
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates tar
+sudo apt install -y ca-certificates curl jq tar util-linux
 cd /tmp
 tar -xzf wotoha-ubuntu-x86_64-musl.tar.gz
 cd wotoha-ubuntu-x86_64-musl
@@ -112,7 +112,42 @@ sha256sum /opt/wotoha/bin/wotoha-app
 cat /tmp/wotoha-ubuntu-x86_64-musl/SHA256SUMS.txt
 ```
 
-## 7. 更新する
+## 7. 自動更新する
+
+インストーラーは `wotoha-update.timer` を有効化します。15分間隔（最大2分のランダム遅延付き）でGitHub Releasesを確認し、新しい正式リリースがあれば次の処理を行います。
+
+1. 配布アーカイブとSHA-256ファイルをダウンロード
+2. アーカイブとバイナリのSHA-256を検証
+3. バイナリを原子的に差し替え
+4. Botが実行中だった場合だけ再起動
+5. 起動に失敗した場合は直前のバイナリへロールバック
+
+状態とログは次のコマンドで確認できます。
+
+```bash
+systemctl status wotoha-update.timer --no-pager
+journalctl -u wotoha-update.service
+sudo systemctl start wotoha-update.service
+```
+
+既存の手動ビルドを初めて自動更新の管理下へ移す場合、現在の正式リリースを基準として記録し、意図しないダウングレードを防ぎます。すぐ正式リリースへ置き換える場合だけ次を実行してください。
+
+```bash
+sudo /opt/wotoha/bin/wotoha-update --force
+```
+
+更新元は `/etc/wotoha/wotoha-update.env` で設定します。GitHubリポジトリを移動した場合だけ変更してください。
+
+```dotenv
+WOTOHA_UPDATE_REPOSITORY=NcaMoq/wotoha-rs
+WOTOHA_UPDATE_GITHUB_TOKEN=github_pat_xxxxxxxxxxxx
+```
+
+Private Repositoryでは、対象リポジトリの `Contents: Read-only` 権限だけを持つfine-grained personal access tokenを設定してください。このファイルはrootだけが読めるモードで作成されます。Public Repositoryではトークンを空にできます。
+
+GitHubで `v` から始まるタグ（例: `v0.2.0`）をpushすると、ReleaseワークフローがUbuntu用配布物をビルドして公開します。自動更新はドラフトとプレリリースを対象にしません。
+
+### 手動で更新する
 
 Windows 側で新しい配布物を作成して再転送した後、Ubuntu 側で次を実行します。
 
@@ -132,10 +167,14 @@ sudo systemctl restart wotoha.service
 
 ```bash
 sudo systemctl disable --now wotoha.service
+sudo systemctl disable --now wotoha-update.timer
 sudo rm -f /etc/systemd/system/wotoha.service
+sudo rm -f /etc/systemd/system/wotoha-update.service
+sudo rm -f /etc/systemd/system/wotoha-update.timer
 sudo rm -rf /opt/wotoha
 sudo rm -rf /etc/wotoha
 sudo rm -rf /var/lib/wotoha
+sudo rm -rf /var/lib/wotoha-updater
 sudo rm -rf /var/log/wotoha
 sudo systemctl daemon-reload
 ```

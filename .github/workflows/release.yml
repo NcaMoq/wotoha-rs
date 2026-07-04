@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  ubuntu-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools cmake ninja-build
+      - name: Build
+        run: cargo build --locked --release --bin wotoha-app --target x86_64-unknown-linux-musl
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="dist/wotoha-ubuntu-x86_64-musl"
+          mkdir -p "$package/bin" "$package/deploy" "$package/docs"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-app "$package/bin/wotoha-app"
+          printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
+          install -m 0755 deploy/install-ubuntu.sh deploy/wotoha-update.sh "$package/"
+          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example "$package/deploy/"
+          install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
+          (cd "$package" && sha256sum bin/wotoha-app > SHA256SUMS.txt)
+          tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
+          (cd dist && sha256sum wotoha-ubuntu-x86_64-musl.tar.gz > wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/wotoha-ubuntu-x86_64-musl.tar.gz dist/wotoha-ubuntu-x86_64-musl.tar.gz.sha256 --verify-tag --generate-notes

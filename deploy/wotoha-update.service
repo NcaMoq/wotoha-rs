@@ -1,0 +1,13 @@
+[Unit]
+Description=Update Wotoha from the latest GitHub release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/wotoha/bin/wotoha-update
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+UMask=0022
+
