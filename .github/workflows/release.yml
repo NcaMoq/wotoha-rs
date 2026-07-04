@@ -16,7 +16,6 @@ jobs:
       - name: Build
         run: |
           docker run --rm \
-            --user "$(id -u):$(id -g)" \
             --volume "$PWD:/work" \
             --workdir /work \
             ghcr.io/rust-cross/cargo-zigbuild:0.22.3 \
