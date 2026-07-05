@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use dashmap::DashMap;
+use futures::future::join_all;
 use serenity::{
     all::{
         ActivityData, ButtonStyle, ChannelId, Colour, Command, CommandInteraction,
@@ -16,8 +18,10 @@ use serenity::{
         VoiceServerUpdateEvent, VoiceState,
     },
     async_trait,
+    builder::CreateMessage,
     cache::Settings as CacheSettings,
     client::{Client, EventHandler},
+    http::Http,
 };
 use songbird::{SerenityInit, Songbird};
 use tracing::{error, info};
@@ -48,6 +52,9 @@ const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
 const EMBED_FIELD_LIMIT: usize = 1024;
 const EMBED_TITLE_LIMIT: usize = 180;
+const UPDATE_NOTICE_TITLE: &str = "アップデートのお知らせ";
+const UPDATE_NOTICE_DESCRIPTION: &str =
+    "最新版へのアップデートのため、まもなく再起動します。再生中の音声は一時的に停止します。";
 const BUILD_VERSION: &str = match option_env!("WOTOHA_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -71,6 +78,7 @@ pub struct DiscordGateway<P: PlaybackService, R: VoiceGatewayRuntime> {
     control: ControlService<P>,
     runtime: R,
     startup: Arc<StartupState>,
+    notification_channels: Arc<DashMap<GuildKey, ChannelId>>,
 }
 
 #[derive(Default)]
@@ -84,6 +92,25 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             control,
             runtime,
             startup: Arc::default(),
+            notification_channels: Arc::default(),
+        }
+    }
+
+    pub async fn notify_restart(&self, http: &Http) {
+        let targets = self
+            .notification_channels
+            .iter()
+            .filter(|entry| self.control.has_current_track(*entry.key()))
+            .map(|entry| *entry.value())
+            .collect::<Vec<_>>();
+        let notifications = targets.into_iter().map(|channel_id| {
+            channel_id.send_message(http, CreateMessage::new().embed(update_restart_embed()))
+        });
+
+        for result in join_all(notifications).await {
+            if let Err(error) = result {
+                error!(error = %error, "failed to send update restart notification");
+            }
         }
     }
 
@@ -215,6 +242,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
 
         match self.control.play(guild_key, &source_url).await {
             Ok(outcome) => {
+                self.notification_channels
+                    .insert(guild_key, command.channel_id);
                 append_debug_log(format!(
                     "discord: control.play ok provider={} key={} title={} now_playing={}",
                     outcome.request.provider_id.as_ref(),
@@ -514,6 +543,9 @@ where
             }
             self.control
                 .update_bot_voice_channel(guild_key, new_channel);
+            if new_channel.is_none() {
+                self.notification_channels.remove(&guild_key);
+            }
             return;
         }
 
@@ -603,6 +635,13 @@ fn error_embed(message: &str) -> CreateEmbed {
 fn info_embed(message: &str) -> CreateEmbed {
     CreateEmbed::new()
         .description(message)
+        .color(Colour::new(COLOR_INFO))
+}
+
+fn update_restart_embed() -> CreateEmbed {
+    CreateEmbed::new()
+        .title(UPDATE_NOTICE_TITLE)
+        .description(UPDATE_NOTICE_DESCRIPTION)
         .color(Colour::new(COLOR_INFO))
 }
 

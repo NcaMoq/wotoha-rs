@@ -5,6 +5,7 @@ use std::{
     fs::OpenOptions,
     io::{self, Write},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use serenity::{all::GatewayIntents, async_trait, client::Client};
@@ -78,21 +79,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
     let handler = DiscordGateway::new(control, playback_runtime);
+    let shutdown_handler = handler.clone();
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_VOICE_STATES;
     let mut client = Client::builder(config.discord_token, intents)
         .cache_settings(recommended_cache_settings())
         .event_handler(handler)
         .register_songbird_with(songbird)
         .await?;
+    let http = client.http.clone();
+    let shard_manager = client.shard_manager.clone();
     append_debug_log("main: serenity client built");
     if let Err(error) = warmup_task.await {
         append_debug_log(format!("main: media provider warmup task failed: {error}"));
     }
 
     append_debug_log("main: starting client");
-    client.start().await?;
+    tokio::select! {
+        result = client.start() => result?,
+        result = shutdown_signal() => {
+            result?;
+            append_debug_log("main: shutdown signal received; notifying active sessions");
+            shutdown_handler.notify_restart(&http).await;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            shard_manager.shutdown_all().await;
+        }
+    }
     append_debug_log("main: client exited");
     Ok(())
+}
+
+async fn shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c().await
 }
 
 #[derive(Clone)]
