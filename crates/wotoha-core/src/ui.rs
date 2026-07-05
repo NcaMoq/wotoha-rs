@@ -13,6 +13,7 @@ pub const BUTTON_QUEUE: &str = "player_queue";
 pub const BUTTON_SKIP_LABEL: &str = "Skip";
 pub const BUTTON_LOOP_LABEL: &str = "Loop";
 pub const BUTTON_SHUFFLE_LABEL: &str = "Shuffle";
+pub const BUTTON_AUTOMIX_LABEL: &str = "AutoMix";
 pub const BUTTON_QUEUE_LABEL: &str = "List";
 
 pub const SKIP_EMOJI_NAME: &str = "skip";
