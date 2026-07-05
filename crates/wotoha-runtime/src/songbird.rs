@@ -223,6 +223,121 @@ impl SongbirdRuntime {
             .get(provider_id)
             .ok_or_else(|| SongbirdRuntimeError::MissingStreamClient(provider_id.to_owned()))
     }
+
+    async fn register_track(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        options: TrackStartOptions,
+        start_paused: bool,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, SongbirdRuntimeError> {
+        append_debug_log(format!(
+            "runtime: play_track start guild_id={} session_id={} playback_id={} provider={} key={} title={} paused={}",
+            guild_id.get(),
+            session_id,
+            playback_id.get(),
+            request.provider_id.as_ref(),
+            request.canonical_key.as_ref(),
+            request.metadata.title.as_ref(),
+            start_paused
+        ));
+        let Some(call_lock) = self.manager.get(to_guild_id(guild_id)) else {
+            append_debug_log("runtime: play_track missing call");
+            return Err(SongbirdRuntimeError::MissingCall);
+        };
+
+        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .map_err(make_playable_error)?;
+        let transition_events = events.clone();
+        let handle = {
+            let mut call = call_lock.lock().await;
+            append_debug_log(format!(
+                "runtime: play_track call state guild_id={} session_id={} playback_id={} current_channel={:?} current_connection={}",
+                guild_id.get(),
+                session_id,
+                playback_id.get(),
+                call.current_channel().map(|channel_id| channel_id.0.get()),
+                call.current_connection().is_some()
+            ));
+            let mut track = Track::new(input).volume(options.initial_gain);
+            if start_paused {
+                track = track.pause();
+            }
+            if let Some(delay) = options.transition_after {
+                track.events.add_event(
+                    EventData::new(
+                        Event::Delayed(delay),
+                        TrackTransitionNotifier {
+                            guild_id,
+                            session_id,
+                            playback_id,
+                            events: transition_events,
+                        },
+                    ),
+                    Duration::ZERO,
+                );
+            }
+            call.play(track)
+        };
+        let lifecycle = Arc::new(TrackLifecycle::default());
+        let playback_events = events.clone();
+        let error_events = events.clone();
+        handle
+            .add_event(
+                Event::Track(TrackEvent::End),
+                TrackEndNotifier {
+                    guild_id,
+                    session_id,
+                    playback_id,
+                    events,
+                    lifecycle: lifecycle.clone(),
+                },
+            )
+            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
+        handle
+            .add_event(
+                Event::Track(TrackEvent::Playable),
+                TrackPlayableLogger {
+                    guild_id,
+                    session_id,
+                    playback_id,
+                    title: request.metadata.title.to_string(),
+                    provider_id: request.provider_id.to_string(),
+                    canonical_key: request.canonical_key.to_string(),
+                    events: playback_events,
+                },
+            )
+            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
+        handle
+            .add_event(
+                Event::Track(TrackEvent::Error),
+                TrackErrorLogger {
+                    guild_id,
+                    session_id,
+                    playback_id,
+                    title: request.metadata.title.to_string(),
+                    provider_id: request.provider_id.to_string(),
+                    canonical_key: request.canonical_key.to_string(),
+                    events: error_events,
+                    lifecycle: lifecycle.clone(),
+                },
+            )
+            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
+        append_debug_log(format!(
+            "runtime: play_track handle registered guild_id={} session_id={} playback_id={} paused={}",
+            guild_id.get(),
+            session_id,
+            playback_id.get(),
+            start_paused
+        ));
+
+        Ok(Arc::new(SongbirdTrackHandle { handle, lifecycle }))
+    }
 }
 
 fn build_stream_client(provider_id: &'static str) -> Result<Client, SongbirdRuntimeError> {
@@ -287,104 +402,37 @@ impl VoiceRuntime for SongbirdRuntime {
         events: RuntimeEventSink,
         options: TrackStartOptions,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
-        append_debug_log(format!(
-            "runtime: play_track start guild_id={} session_id={} playback_id={} provider={} key={} title={}",
-            guild_id.get(),
+        self.register_track(
+            guild_id,
             session_id,
-            playback_id.get(),
-            request.provider_id.as_ref(),
-            request.canonical_key.as_ref(),
-            request.metadata.title.as_ref()
-        ));
-        let Some(call_lock) = self.manager.get(to_guild_id(guild_id)) else {
-            append_debug_log("runtime: play_track missing call");
-            return Err(SongbirdRuntimeError::MissingCall);
-        };
+            playback_id,
+            request,
+            events,
+            options,
+            false,
+        )
+        .await
+    }
 
-        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?
-            .make_playable_async(get_codec_registry(), get_probe())
-            .await
-            .map_err(make_playable_error)?;
-        let transition_events = events.clone();
-        let handle = {
-            let mut call = call_lock.lock().await;
-            append_debug_log(format!(
-                "runtime: play_track call state guild_id={} session_id={} playback_id={} current_channel={:?} current_connection={}",
-                guild_id.get(),
-                session_id,
-                playback_id.get(),
-                call.current_channel().map(|channel_id| channel_id.0.get()),
-                call.current_connection().is_some()
-            ));
-            let mut track = Track::new(input).volume(options.initial_gain);
-            if let Some(delay) = options.transition_after {
-                track.events.add_event(
-                    EventData::new(
-                        Event::Delayed(delay),
-                        TrackTransitionNotifier {
-                            guild_id,
-                            session_id,
-                            playback_id,
-                            events: transition_events,
-                        },
-                    ),
-                    Duration::ZERO,
-                );
-            }
-            call.play(track)
-        };
-        let lifecycle = Arc::new(TrackLifecycle::default());
-        let playback_events = events.clone();
-        let error_events = events.clone();
-        handle
-            .add_event(
-                Event::Track(TrackEvent::End),
-                TrackEndNotifier {
-                    guild_id,
-                    session_id,
-                    playback_id,
-                    events,
-                    lifecycle: lifecycle.clone(),
-                },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        handle
-            .add_event(
-                Event::Track(TrackEvent::Playable),
-                TrackPlayableLogger {
-                    guild_id,
-                    session_id,
-                    playback_id,
-                    title: request.metadata.title.to_string(),
-                    provider_id: request.provider_id.to_string(),
-                    canonical_key: request.canonical_key.to_string(),
-                    events: playback_events,
-                },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        handle
-            .add_event(
-                Event::Track(TrackEvent::Error),
-                TrackErrorLogger {
-                    guild_id,
-                    session_id,
-                    playback_id,
-                    title: request.metadata.title.to_string(),
-                    provider_id: request.provider_id.to_string(),
-                    canonical_key: request.canonical_key.to_string(),
-                    events: error_events,
-                    lifecycle: lifecycle.clone(),
-                },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        append_debug_log(format!(
-            "runtime: play_track handle registered guild_id={} session_id={} playback_id={}",
-            guild_id.get(),
+    async fn prepare_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        self.register_track(
+            guild_id,
             session_id,
-            playback_id.get()
-        ));
-
-        Ok(Arc::new(SongbirdTrackHandle { handle, lifecycle }))
+            playback_id,
+            request,
+            events,
+            options,
+            true,
+        )
+        .await
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -568,6 +616,14 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
 
     fn set_volume(&self, volume: f32) {
         let _ = self.handle.set_volume(volume);
+    }
+
+    fn pause(&self) {
+        let _ = self.handle.pause();
+    }
+
+    fn resume(&self) {
+        let _ = self.handle.play();
     }
 }
 

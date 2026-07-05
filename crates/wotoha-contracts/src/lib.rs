@@ -126,6 +126,10 @@ pub enum VoiceGatewayEvent {
 pub trait RuntimeTrackHandle: Send + Sync + 'static {
     fn stop(&self);
     fn set_volume(&self, volume: f32);
+
+    fn pause(&self) {}
+
+    fn resume(&self) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,6 +181,22 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
             .play_track(guild_id, session_id, playback_id, request, events)
             .await?;
         handle.set_volume(options.initial_gain);
+        Ok(handle)
+    }
+
+    async fn prepare_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        let handle = self
+            .play_track_with_options(guild_id, session_id, playback_id, request, events, options)
+            .await?;
+        handle.pause();
         Ok(handle)
     }
 
