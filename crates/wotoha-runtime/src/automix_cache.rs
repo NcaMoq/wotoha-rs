@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wotoha_core::{PreparedSource, TrackRequest, automix::TrackAnalysis};
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 2;
 const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -257,6 +257,7 @@ struct SerializableAnalysis {
     audible_end_micros: u64,
     bpm: Option<f32>,
     beat_confidence: f32,
+    first_beat_micros: Option<u64>,
 }
 
 impl From<&TrackAnalysis> for SerializableAnalysis {
@@ -267,6 +268,7 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             audible_end_micros: duration_to_micros(value.audible_end),
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
+            first_beat_micros: value.first_beat.map(duration_to_micros),
         }
     }
 }
@@ -281,6 +283,7 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             audible_end: Duration::from_micros(value.audible_end_micros),
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
+            first_beat: value.first_beat_micros.map(Duration::from_micros),
         };
         validate_analysis(&analysis)?;
         Ok(analysis)
@@ -309,6 +312,14 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     if !analysis.beat_confidence.is_finite() || !(0.0..=1.0).contains(&analysis.beat_confidence) {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "beat confidence must be between zero and one",
+        ));
+    }
+    if analysis
+        .first_beat
+        .is_some_and(|beat| beat > analysis.duration)
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "first beat must be within the track duration",
         ));
     }
     Ok(())
@@ -367,6 +378,7 @@ mod tests {
             audible_end: Duration::from_millis(179_200),
             bpm: Some(124.5),
             beat_confidence: 0.91,
+            first_beat: Some(Duration::from_millis(750)),
         }
     }
 
@@ -440,6 +452,7 @@ mod tests {
             audible_end: Duration::from_millis(800),
             bpm: Some(f32::NAN),
             beat_confidence: 2.0,
+            first_beat: None,
         };
 
         assert!(matches!(

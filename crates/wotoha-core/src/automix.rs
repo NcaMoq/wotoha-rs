@@ -15,6 +15,7 @@ pub struct TrackAnalysis {
     pub audible_end: Duration,
     pub bpm: Option<f32>,
     pub beat_confidence: f32,
+    pub first_beat: Option<Duration>,
 }
 
 impl TrackAnalysis {
@@ -25,6 +26,7 @@ impl TrackAnalysis {
             audible_end: duration,
             bpm: None,
             beat_confidence: 0.0,
+            first_beat: None,
         }
     }
 }
@@ -99,17 +101,46 @@ pub fn plan_transition(
     let duration = timing.fade_duration;
 
     let tempo_ratio = compatible_tempo_ratio(outgoing, incoming, config);
+    let beat_aligned = tempo_ratio.is_some();
+    let outgoing_start = if beat_aligned {
+        align_to_beat(
+            outgoing.audible_end.saturating_sub(duration),
+            outgoing.first_beat,
+            outgoing.bpm,
+        )
+    } else {
+        outgoing.audible_end.saturating_sub(duration)
+    };
     TransitionPlan {
         kind: if tempo_ratio.is_some() {
             TransitionKind::BeatMatched
         } else {
             TransitionKind::Crossfade
         },
-        outgoing_start: outgoing.audible_end.saturating_sub(duration),
-        incoming_start: incoming.audible_start,
+        outgoing_start,
+        incoming_start: if beat_aligned {
+            incoming.first_beat.unwrap_or(incoming.audible_start)
+        } else {
+            incoming.audible_start
+        },
         duration,
         incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
     }
+}
+
+fn align_to_beat(position: Duration, first_beat: Option<Duration>, bpm: Option<f32>) -> Duration {
+    let (Some(first), Some(bpm)) = (first_beat, bpm) else {
+        return position;
+    };
+    if bpm <= 0.0 || position <= first {
+        return first.min(position);
+    }
+    let interval = Duration::from_secs_f32(60.0 / bpm);
+    if interval.is_zero() {
+        return position;
+    }
+    let beats = position.saturating_sub(first).as_secs_f64() / interval.as_secs_f64();
+    first + interval.mul_f64(beats.floor())
 }
 
 fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> TransitionPlan {
@@ -162,6 +193,7 @@ mod tests {
             audible_end: Duration::from_secs(179),
             bpm: Some(bpm),
             beat_confidence: 0.9,
+            first_beat: Some(Duration::from_secs(1)),
         }
     }
 
