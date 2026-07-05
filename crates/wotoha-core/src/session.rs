@@ -88,6 +88,10 @@ impl GuildPlayerState {
         previous
     }
 
+    pub fn is_looping(&self) -> bool {
+        self.looping
+    }
+
     pub fn prepare_next_track(&mut self) -> Option<TrackRequest> {
         let next = if self.looping {
             self.current.clone()

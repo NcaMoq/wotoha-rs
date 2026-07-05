@@ -15,9 +15,9 @@ use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackService, RuntimeEventSink,
-    RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess, VoiceGatewayEvent,
-    VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackRestartSnapshot, PlaybackService,
+    RuntimeEventSink, RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess,
+    VoiceGatewayEvent, VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_control::ControlService;
 use wotoha_core::{
@@ -105,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             append_debug_log("main: shutdown signal received; notifying active sessions");
             shutdown_handler.notify_restart(&http).await;
             tokio::time::sleep(Duration::from_secs(3)).await;
+            shutdown_handler.persist_restart_state().await;
             shard_manager.shutdown_all().await;
         }
     }
@@ -244,6 +245,7 @@ impl ConfiguredTrackHandle {
     }
 }
 
+#[async_trait]
 impl RuntimeTrackHandle for ConfiguredTrackHandle {
     fn stop(&self) {
         self.inner.stop();
@@ -260,6 +262,14 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
 
     fn resume(&self) {
         self.inner.resume();
+    }
+
+    async fn position(&self) -> Option<Duration> {
+        self.inner.position().await
+    }
+
+    async fn seek(&self, position: Duration) -> bool {
+        self.inner.seek(position).await
     }
 }
 
@@ -429,6 +439,20 @@ where
 
     async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
         self.inner.toggle_automix(guild_id).await
+    }
+
+    async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
+        self.inner.restart_snapshot(guild_id).await
+    }
+
+    async fn restore_restart_snapshot(
+        &self,
+        guild_id: GuildKey,
+        snapshot: PlaybackRestartSnapshot,
+    ) -> bool {
+        self.inner
+            .restore_restart_snapshot(guild_id, snapshot)
+            .await
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) {
@@ -721,6 +745,7 @@ mod tests {
         volumes: Arc<Mutex<Vec<f32>>>,
     }
 
+    #[async_trait]
     impl RuntimeTrackHandle for MockTrackHandle {
         fn stop(&self) {
             self.stopped.fetch_add(1, Ordering::SeqCst);

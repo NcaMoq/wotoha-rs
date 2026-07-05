@@ -1,3 +1,4 @@
+pub mod audio_analysis;
 pub mod automix;
 pub mod config;
 pub mod debug;

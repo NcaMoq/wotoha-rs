@@ -128,6 +128,7 @@ pub enum VoiceGatewayEvent {
     ServerUpdate(VoiceGatewayServerUpdate),
 }
 
+#[async_trait]
 pub trait RuntimeTrackHandle: Send + Sync + 'static {
     fn stop(&self);
     fn set_volume(&self, volume: f32);
@@ -135,6 +136,23 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
     fn pause(&self) {}
 
     fn resume(&self) {}
+
+    async fn position(&self) -> Option<Duration> {
+        None
+    }
+
+    async fn seek(&self, _position: Duration) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaybackRestartSnapshot {
+    pub current_source_url: String,
+    pub queued_source_urls: Vec<String>,
+    pub position: Duration,
+    pub looping: bool,
+    pub automix_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -241,6 +259,16 @@ pub trait PlaybackService: Clone + Send + Sync + 'static {
     }
     async fn toggle_automix(&self, _guild_id: GuildKey) -> Option<bool> {
         None
+    }
+    async fn restart_snapshot(&self, _guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
+        None
+    }
+    async fn restore_restart_snapshot(
+        &self,
+        _guild_id: GuildKey,
+        _snapshot: PlaybackRestartSnapshot,
+    ) -> bool {
+        false
     }
     async fn disconnect_guild(&self, guild_id: GuildKey);
 
