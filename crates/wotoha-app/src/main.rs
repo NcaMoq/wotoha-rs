@@ -558,6 +558,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
     use wotoha_contracts::{
         ChannelKey, EnqueueOutcome, GuildKey, PlaybackService, RuntimeTrackHandle, UserKey,
@@ -565,7 +566,7 @@ mod tests {
     };
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
-        config::PlaybackConfig,
+        automix::AutoMixConfig, config::PlaybackConfig,
     };
 
     #[derive(Clone, Default)]
@@ -674,6 +675,12 @@ mod tests {
             default_volume: 0.25,
             max_queue_len,
             max_pending_enqueues,
+            automix: AutoMixConfig {
+                enabled: true,
+                crossfade: Duration::from_secs(8),
+                max_tempo_adjustment: 0.06,
+                min_beat_confidence: 0.7,
+            },
         }
     }
 

@@ -2,6 +2,8 @@ use std::{env, path::PathBuf};
 
 use thiserror::Error;
 
+use crate::automix::AutoMixConfig;
+
 const DEFAULT_LOG_DIR: &str = "target";
 const DEFAULT_LOG_FILE: &str = "wotoha-app.runtime.log";
 const DEFAULT_RUST_LOG: &str = "info,wotoha_debug=info";
@@ -9,6 +11,10 @@ const DEFAULT_LOG_ANSI: bool = false;
 const DEFAULT_PLAYBACK_VOLUME: f32 = 0.10;
 const DEFAULT_MAX_QUEUE_LEN: usize = 512;
 const DEFAULT_MAX_PENDING_ENQUEUES: usize = 64;
+const DEFAULT_AUTOMIX_ENABLED: bool = true;
+const DEFAULT_AUTOMIX_CROSSFADE_SECONDS: f32 = 8.0;
+const DEFAULT_AUTOMIX_MAX_TEMPO_ADJUSTMENT: f32 = 0.06;
+const DEFAULT_AUTOMIX_MIN_BEAT_CONFIDENCE: f32 = 0.70;
 const MAX_QUEUE_LEN_LIMIT: usize = 512;
 const MAX_PENDING_ENQUEUES_LIMIT: usize = 64;
 const MAX_PLAYBACK_VOLUME: f32 = 2.0;
@@ -39,6 +45,7 @@ pub struct PlaybackConfig {
     pub default_volume: f32,
     pub max_queue_len: usize,
     pub max_pending_enqueues: usize,
+    pub automix: AutoMixConfig,
 }
 
 impl BotConfig {
@@ -87,6 +94,29 @@ impl BotConfig {
             0.0,
             MAX_PLAYBACK_VOLUME,
         )?;
+        let automix_enabled =
+            read_optional_bool(&get, "WOTOHA_AUTOMIX_ENABLED", DEFAULT_AUTOMIX_ENABLED)?;
+        let automix_crossfade_seconds = read_optional_f32(
+            &get,
+            "WOTOHA_AUTOMIX_CROSSFADE_SECONDS",
+            DEFAULT_AUTOMIX_CROSSFADE_SECONDS,
+            0.0,
+            30.0,
+        )?;
+        let automix_max_tempo_adjustment = read_optional_f32(
+            &get,
+            "WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT",
+            DEFAULT_AUTOMIX_MAX_TEMPO_ADJUSTMENT,
+            0.0,
+            0.25,
+        )?;
+        let automix_min_beat_confidence = read_optional_f32(
+            &get,
+            "WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE",
+            DEFAULT_AUTOMIX_MIN_BEAT_CONFIDENCE,
+            0.0,
+            1.0,
+        )?;
 
         Ok(Self {
             discord_token,
@@ -100,6 +130,12 @@ impl BotConfig {
                 default_volume,
                 max_queue_len,
                 max_pending_enqueues,
+                automix: AutoMixConfig {
+                    enabled: automix_enabled,
+                    crossfade: std::time::Duration::from_secs_f32(automix_crossfade_seconds),
+                    max_tempo_adjustment: automix_max_tempo_adjustment,
+                    min_beat_confidence: automix_min_beat_confidence,
+                },
             },
         })
     }
@@ -285,6 +321,8 @@ mod tests {
         assert_eq!(config.playback.default_volume, 0.10);
         assert_eq!(config.playback.max_queue_len, 512);
         assert_eq!(config.playback.max_pending_enqueues, 64);
+        assert!(config.playback.automix.enabled);
+        assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 8.0);
     }
 
     #[test]
@@ -298,6 +336,10 @@ mod tests {
             ("WOTOHA_DEFAULT_VOLUME", "0.25"),
             ("WOTOHA_MAX_QUEUE_LEN", "256"),
             ("WOTOHA_MAX_PENDING_ENQUEUES", "32"),
+            ("WOTOHA_AUTOMIX_ENABLED", "false"),
+            ("WOTOHA_AUTOMIX_CROSSFADE_SECONDS", "12.5"),
+            ("WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT", "0.08"),
+            ("WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE", "0.80"),
         ])
         .unwrap();
 
@@ -312,6 +354,10 @@ mod tests {
         assert_eq!(config.playback.default_volume, 0.25);
         assert_eq!(config.playback.max_queue_len, 256);
         assert_eq!(config.playback.max_pending_enqueues, 32);
+        assert!(!config.playback.automix.enabled);
+        assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 12.5);
+        assert_eq!(config.playback.automix.max_tempo_adjustment, 0.08);
+        assert_eq!(config.playback.automix.min_beat_confidence, 0.80);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod automix;
 pub mod config;
 pub mod debug;
 pub mod model;
