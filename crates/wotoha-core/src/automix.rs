@@ -154,6 +154,66 @@ pub struct TransitionPlan {
     pub harmonic_compatibility: Option<f32>,
     /// Relative gain retained by the incoming track after the overlap.
     pub incoming_gain: f32,
+    pub tempo_envelope: Option<TempoEnvelope>,
+}
+
+/// Maps output time to source time while the incoming deck returns to native tempo.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TempoEnvelope {
+    pub initial_speed: f32,
+    pub hold: Duration,
+    pub ramp: Duration,
+}
+
+impl TempoEnvelope {
+    pub fn speed_at(self, output_elapsed: Duration) -> f32 {
+        if output_elapsed <= self.hold || self.ramp.is_zero() {
+            return self.initial_speed;
+        }
+        let ramp_elapsed = output_elapsed.saturating_sub(self.hold);
+        if ramp_elapsed >= self.ramp {
+            return 1.0;
+        }
+        let progress = ramp_elapsed.as_secs_f32() / self.ramp.as_secs_f32();
+        self.initial_speed + (1.0 - self.initial_speed) * progress
+    }
+
+    pub fn source_elapsed(self, output_elapsed: Duration) -> Duration {
+        let output = output_elapsed.as_secs_f64();
+        let hold = self.hold.as_secs_f64();
+        let ramp = self.ramp.as_secs_f64();
+        let initial = f64::from(self.initial_speed);
+        let source = if output <= hold {
+            output * initial
+        } else if ramp > 0.0 && output < hold + ramp {
+            let elapsed = output - hold;
+            hold * initial + initial * elapsed + 0.5 * (1.0 - initial) * elapsed * elapsed / ramp
+        } else {
+            hold * initial + ramp * (initial + 1.0) * 0.5 + (output - hold - ramp)
+        };
+        Duration::from_secs_f64(source.max(0.0))
+    }
+
+    pub fn output_elapsed(self, source_elapsed: Duration) -> Duration {
+        let target = source_elapsed.as_secs_f64();
+        let mut low = 0.0_f64;
+        let mut high = (target / f64::from(self.initial_speed).min(1.0).max(0.01))
+            + self.hold.as_secs_f64()
+            + self.ramp.as_secs_f64();
+        for _ in 0..64 {
+            let midpoint = (low + high) * 0.5;
+            if self
+                .source_elapsed(Duration::from_secs_f64(midpoint))
+                .as_secs_f64()
+                < target
+            {
+                low = midpoint;
+            } else {
+                high = midpoint;
+            }
+        }
+        Duration::from_secs_f64((low + high) * 0.5)
+    }
 }
 
 /// Playback-relative timing for preparing and starting an adaptive transition.
@@ -247,6 +307,13 @@ pub fn plan_transition(
         incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
         harmonic_compatibility,
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
+        tempo_envelope: tempo_ratio.and_then(|ratio| {
+            ((ratio - 1.0).abs() > 0.005).then_some(TempoEnvelope {
+                initial_speed: ratio,
+                hold: duration,
+                ramp: Duration::from_secs_f32(240.0 / outgoing.bpm.unwrap_or(120.0)),
+            })
+        }),
     }
 }
 
@@ -289,6 +356,7 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
         incoming_tempo_ratio: 1.0,
         harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
+        tempo_envelope: None,
     }
 }
 
@@ -483,6 +551,40 @@ mod tests {
         std::mem::swap(&mut outgoing, &mut incoming);
         let plan = plan_transition(&outgoing, &incoming, &config());
         assert_eq!(plan.incoming_gain, 1.0);
+    }
+
+    #[test]
+    fn tempo_envelope_holds_then_returns_to_native_speed() {
+        let envelope = TempoEnvelope {
+            initial_speed: 0.95,
+            hold: Duration::from_secs(8),
+            ramp: Duration::from_secs(2),
+        };
+        assert_eq!(envelope.speed_at(Duration::from_secs(4)), 0.95);
+        assert!((envelope.speed_at(Duration::from_secs(9)) - 0.975).abs() < 0.0001);
+        assert_eq!(envelope.speed_at(Duration::from_secs(11)), 1.0);
+        assert!(
+            (envelope
+                .source_elapsed(Duration::from_secs(10))
+                .as_secs_f32()
+                - 9.55)
+                .abs()
+                < 0.001
+        );
+    }
+
+    #[test]
+    fn tempo_envelope_time_mapping_round_trips() {
+        let envelope = TempoEnvelope {
+            initial_speed: 1.04,
+            hold: Duration::from_secs(8),
+            ramp: Duration::from_secs(2),
+        };
+        for output in [0.0, 4.0, 8.0, 9.0, 12.0, 60.0] {
+            let output = Duration::from_secs_f64(output);
+            let source = envelope.source_elapsed(output);
+            assert!(envelope.output_elapsed(source).abs_diff(output) < Duration::from_micros(2));
+        }
     }
 
     #[test]
