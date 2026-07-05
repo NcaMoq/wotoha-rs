@@ -923,7 +923,7 @@ where
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let prepared = {
+        let start_delay = {
             let _operation = session.operation.lock().await;
             if !self.session_is_current(guild_id, session_id) {
                 return;
@@ -937,29 +937,36 @@ where
             }
             playback.transition_due = Some(playback_id);
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
-            match playback.prepared_transition.take() {
-                Some(prepared) if prepared.origin_playback_id == playback_id => Some(prepared),
-                Some(stale) => {
-                    stale.incoming.handle.stop();
-                    None
-                }
-                None => None,
-            }
+            playback
+                .prepared_transition
+                .as_ref()
+                .filter(|prepared| prepared.origin_playback_id == playback_id)
+                .map(|prepared| prepared.start_delay)
         };
-        let Some(prepared) = prepared else {
+        let Some(start_delay) = start_delay else {
             return;
         };
-        if !prepared.start_delay.is_zero() {
-            tokio::time::sleep(prepared.start_delay).await;
+        if !start_delay.is_zero() {
+            tokio::time::sleep(start_delay).await;
         }
 
-        let (outgoing, previous_retiring) = {
-            let _operation = session.operation.lock().await;
+        let _operation = session.operation.lock().await;
+        let (prepared, outgoing, previous_retiring) = {
             let mut playback = session.playback.lock();
-            if !self.session_is_current(guild_id, session_id)
+            let invalid = !self.session_is_current(guild_id, session_id)
                 || playback.current_playback_id != Some(playback_id)
                 || !playback.automix_enabled
-                || playback.transition_due != Some(playback_id)
+                || playback.transition_due != Some(playback_id);
+            if invalid {
+                if let Some(stale) = playback.prepared_transition.take() {
+                    stale.incoming.handle.stop();
+                }
+                return;
+            }
+            let Some(prepared) = playback.prepared_transition.take() else {
+                return;
+            };
+            if prepared.origin_playback_id != playback_id
                 || playback.logical.peek_next_track() != Some(&prepared.next)
             {
                 prepared.incoming.handle.stop();
@@ -976,10 +983,10 @@ where
                 .retiring_handle
                 .replace((playback_id, outgoing.clone()));
             playback.logical.prepare_next_track();
-            playback.logical.replace_current(prepared.next);
+            playback.logical.replace_current(prepared.next.clone());
             playback.current_playback_id = Some(prepared.incoming.playback_id);
             playback.transition_due = None;
-            (outgoing, previous_retiring)
+            (prepared, outgoing, previous_retiring)
         };
         if let Some((_, handle)) = previous_retiring {
             handle.stop();
@@ -1009,6 +1016,7 @@ where
             }
         });
         session.playback.lock().fade_abort = Some(fade_task.abort_handle());
+        drop(_operation);
     }
 
     async fn play_request(

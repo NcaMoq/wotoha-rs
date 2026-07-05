@@ -302,8 +302,8 @@ impl SongbirdRuntime {
         let lifecycle = Arc::new(TrackLifecycle::default());
         let playback_events = events.clone();
         let error_events = events.clone();
-        handle
-            .add_event(
+        let listener_result: Result<(), songbird::tracks::ControlError> = (|| {
+            handle.add_event(
                 Event::Track(TrackEvent::End),
                 TrackEndNotifier {
                     guild_id,
@@ -312,10 +312,8 @@ impl SongbirdRuntime {
                     events,
                     lifecycle: lifecycle.clone(),
                 },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        handle
-            .add_event(
+            )?;
+            handle.add_event(
                 Event::Track(TrackEvent::Playable),
                 TrackPlayableLogger {
                     guild_id,
@@ -326,10 +324,8 @@ impl SongbirdRuntime {
                     canonical_key: request.canonical_key.to_string(),
                     events: playback_events,
                 },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        handle
-            .add_event(
+            )?;
+            handle.add_event(
                 Event::Track(TrackEvent::Error),
                 TrackErrorLogger {
                     guild_id,
@@ -341,8 +337,13 @@ impl SongbirdRuntime {
                     events: error_events,
                     lifecycle: lifecycle.clone(),
                 },
-            )
-            .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = listener_result {
+            let _ = handle.stop();
+            return Err(SongbirdRuntimeError::TrackEvent(error.to_string()));
+        }
         append_debug_log(format!(
             "runtime: play_track handle registered guild_id={} session_id={} playback_id={} paused={}",
             guild_id.get(),
