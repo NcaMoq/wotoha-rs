@@ -14,8 +14,8 @@ use serenity::{
         CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateButton,
         CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
-        CreateInteractionResponseMessage, EmojiId, Interaction, MessageFlags, ReactionType, Ready,
-        VoiceServerUpdateEvent, VoiceState,
+        CreateInteractionResponseMessage, EmojiId, Guild, Interaction, MessageFlags, ReactionType,
+        Ready, UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
     },
     async_trait,
     builder::CreateMessage,
@@ -61,9 +61,13 @@ const BUILD_VERSION: &str = match option_env!("WOTOHA_BUILD_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
-fn version_activity() -> ActivityData {
+fn version_activity(guild_count: usize) -> ActivityData {
     let version = BUILD_VERSION.strip_prefix('v').unwrap_or(BUILD_VERSION);
-    ActivityData::custom(format!("v{version}"))
+    ActivityData::custom(format!("v{version} | in {guild_count} servers"))
+}
+
+fn update_version_activity(ctx: &Context) {
+    ctx.set_activity(Some(version_activity(ctx.cache.guilds().len())));
 }
 
 pub fn recommended_cache_settings() -> CacheSettings {
@@ -579,7 +583,7 @@ where
 {
     async fn ready(&self, ctx: Context, ready: Ready) {
         append_debug_log("discord: ready event received");
-        ctx.set_activity(Some(version_activity()));
+        update_version_activity(&ctx);
         if self.startup.boot_tasks_done.swap(true, Ordering::AcqRel) {
             info!("Gateway ready received again; skipping boot-only tasks");
             return;
@@ -612,6 +616,19 @@ where
             }
             _ => {}
         }
+    }
+
+    async fn guild_create(&self, ctx: Context, _guild: Guild, _is_new: Option<bool>) {
+        update_version_activity(&ctx);
+    }
+
+    async fn guild_delete(
+        &self,
+        ctx: Context,
+        _incomplete: UnavailableGuild,
+        _full: Option<Guild>,
+    ) {
+        update_version_activity(&ctx);
     }
 
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
@@ -695,7 +712,8 @@ where
         }
     }
 
-    async fn cache_ready(&self, _ctx: Context, guilds: Vec<serenity::all::GuildId>) {
+    async fn cache_ready(&self, ctx: Context, guilds: Vec<serenity::all::GuildId>) {
+        update_version_activity(&ctx);
         append_debug_log(format!("discord: cache_ready guild_count={}", guilds.len()));
         info!(guild_count = guilds.len(), "Cache is ready");
     }
@@ -937,10 +955,10 @@ mod tests {
     #[test]
     fn version_activity_contains_build_version() {
         let version = BUILD_VERSION.strip_prefix('v').unwrap_or(BUILD_VERSION);
-        let activity = version_activity();
+        let activity = version_activity(42);
         assert_eq!(
             activity.state.as_deref(),
-            Some(format!("v{version}").as_str())
+            Some(format!("v{version} | in 42 servers").as_str())
         );
         assert_eq!(activity.kind, ActivityType::Custom);
     }
