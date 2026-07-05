@@ -13,7 +13,6 @@ pub const BUTTON_QUEUE: &str = "player_queue";
 pub const BUTTON_SKIP_LABEL: &str = "Skip";
 pub const BUTTON_LOOP_LABEL: &str = "Loop";
 pub const BUTTON_SHUFFLE_LABEL: &str = "Shuffle";
-pub const BUTTON_AUTOMIX_LABEL: &str = "AutoMix";
 pub const BUTTON_QUEUE_LABEL: &str = "List";
 
 pub const SKIP_EMOJI_NAME: &str = "skip";
@@ -30,6 +29,7 @@ pub const COLOR_INFO: u32 = 0x49B0E4;
 pub const COLOR_ERROR: u32 = 0xE74C3C;
 
 pub const LOOPING_NICKNAME: &str = "音葉 🔁";
+pub const AUTOMIX_NICKNAME: &str = "音葉 🎚️";
 
 pub const MSG_JOIN_VOICE_FIRST: &str = "ボイスチャンネルに参加してください。";
 pub const MSG_ALLOWED_URL_ONLY: &str = "許可されている HTTPS の音源URLのみ再生できます。";

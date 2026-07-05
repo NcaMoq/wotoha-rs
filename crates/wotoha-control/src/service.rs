@@ -22,6 +22,7 @@ pub enum ComponentAction {
 pub enum ComponentOutcome {
     Skip { was_looping: bool },
     Loop { enabled: bool },
+    LoopBlockedByAutoMix,
     Shuffle,
     NothingToShuffle,
     AutoMix { enabled: bool },
@@ -70,10 +71,16 @@ impl<P: PlaybackService> ControlService<P> {
                 Some(was_looping) => ComponentOutcome::Skip { was_looping },
                 None => ComponentOutcome::NoTrackPlaying,
             },
-            ComponentAction::Loop => match self.playback.toggle_loop(guild_id).await {
-                Some(enabled) => ComponentOutcome::Loop { enabled },
-                None => ComponentOutcome::NoTrackPlaying,
-            },
+            ComponentAction::Loop => {
+                if self.playback.automix_enabled(guild_id) {
+                    ComponentOutcome::LoopBlockedByAutoMix
+                } else {
+                    match self.playback.toggle_loop(guild_id).await {
+                        Some(enabled) => ComponentOutcome::Loop { enabled },
+                        None => ComponentOutcome::NoTrackPlaying,
+                    }
+                }
+            }
             ComponentAction::Shuffle => {
                 if self.playback.shuffle(guild_id).await {
                     ComponentOutcome::Shuffle
@@ -98,6 +105,10 @@ impl<P: PlaybackService> ControlService<P> {
 
     pub fn has_current_track(&self, guild_id: GuildKey) -> bool {
         self.playback.has_current_track(guild_id)
+    }
+
+    pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
+        self.playback.automix_enabled(guild_id)
     }
 
     pub async fn disconnect_guild(&self, guild_id: GuildKey) {
@@ -166,6 +177,7 @@ mod tests {
         access: Option<VoiceActionAccess>,
         skip: Option<bool>,
         loop_result: Option<bool>,
+        automix_enabled: bool,
         shuffle: bool,
         preview: Option<QueuePreview>,
         disconnected: usize,
@@ -221,6 +233,10 @@ mod tests {
 
         async fn shuffle(&self, _guild_id: GuildKey) -> bool {
             self.state.lock().expect("mock state").shuffle
+        }
+
+        fn automix_enabled(&self, _guild_id: GuildKey) -> bool {
+            self.state.lock().expect("mock state").automix_enabled
         }
 
         async fn disconnect_guild(&self, _guild_id: GuildKey) {
@@ -331,6 +347,23 @@ mod tests {
             .await;
 
         assert!(matches!(outcome, ComponentOutcome::NothingToShuffle));
+    }
+
+    #[tokio::test]
+    async fn component_blocks_loop_while_automix_is_enabled() {
+        let playback = MockPlayback::default();
+        {
+            let mut state = playback.state.lock().expect("mock state");
+            state.automix_enabled = true;
+            state.loop_result = Some(true);
+        }
+        let service = ControlService::new(playback);
+
+        let outcome = service
+            .handle_component(GUILD, Some(CHANNEL), ComponentAction::Loop)
+            .await;
+
+        assert!(matches!(outcome, ComponentOutcome::LoopBlockedByAutoMix));
     }
 
     fn track(source_url: &str) -> TrackRequest {
