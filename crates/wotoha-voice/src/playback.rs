@@ -1194,18 +1194,8 @@ where
             let tempo_is_supported = dsp_active
                 || (plan.incoming_tempo_ratio - 1.0).abs() <= MAX_UNSTRETCHED_TEMPO_DRIFT;
             if !plan.duration.is_zero() && tempo_is_supported {
-                let seek_succeeded = dsp_active
-                    || plan.incoming_start.is_zero()
-                    || incoming.handle.seek(plan.incoming_start).await;
-                if seek_succeeded {
-                    timing.fade_duration = plan.duration;
-                    transition_after = plan.outgoing_start;
-                } else {
-                    warn!(
-                        guild_id = guild_id.get(),
-                        "AutoMix incoming beat seek failed; using adaptive crossfade"
-                    );
-                }
+                timing.fade_duration = plan.duration;
+                transition_after = plan.outgoing_start;
             }
         }
         let start_delay = current_tempo.map_or_else(
@@ -1238,9 +1228,7 @@ where
                     start_delay,
                     incoming_analysis,
                     incoming_gain,
-                    source_start: dsp_active
-                        .then_some(options.source_start)
-                        .unwrap_or_default(),
+                    source_start: options.source_start,
                     tempo_envelope: dsp_active.then_some(options.tempo_envelope).flatten(),
                 }) {
                     previous.incoming.handle.stop();
@@ -2066,6 +2054,7 @@ mod tests {
         stopped: Mutex<Vec<PlaybackId>>,
         paused: Mutex<Vec<PlaybackId>>,
         resumed: Mutex<Vec<PlaybackId>>,
+        seeks: Mutex<Vec<(PlaybackId, Duration)>>,
         volumes: Mutex<Vec<(PlaybackId, f32)>>,
         disconnects: Mutex<Vec<GuildKey>>,
         play_notify: Notify,
@@ -2152,6 +2141,10 @@ mod tests {
             self.state.resumed.lock().clone()
         }
 
+        fn seeks(&self) -> Vec<(PlaybackId, Duration)> {
+            self.state.seeks.lock().clone()
+        }
+
         fn disconnects(&self) -> Vec<GuildKey> {
             self.state.disconnects.lock().clone()
         }
@@ -2178,6 +2171,11 @@ mod tests {
 
         fn resume(&self) {
             self.state.resumed.lock().push(self.playback_id);
+        }
+
+        async fn seek(&self, position: Duration) -> bool {
+            self.state.seeks.lock().push((self.playback_id, position));
+            false
         }
     }
 
@@ -3259,6 +3257,55 @@ mod tests {
         assert_eq!(attempts[0].source_start, Duration::from_millis(250));
         assert!(attempts[1].tempo_envelope.is_none());
         assert_eq!(attempts[1].source_start, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn automix_applies_beat_start_during_prepare_without_handle_seek() {
+        let guild_id = GuildKey::new(124);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let analysis = |first_beat| TrackAnalysis {
+            duration,
+            audible_start: Duration::ZERO,
+            audible_end: duration,
+            bpm: Some(120.0),
+            beat_confidence: 1.0,
+            first_beat: Some(first_beat),
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
+        };
+        runtime.analyze_with("first", analysis(Duration::ZERO));
+        runtime.analyze_with("second", analysis(Duration::from_millis(250)));
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(options.source_start, Duration::from_millis(250));
+        assert!(options.tempo_envelope.is_none());
+        assert!(runtime.seeks().is_empty());
     }
 
     #[tokio::test]

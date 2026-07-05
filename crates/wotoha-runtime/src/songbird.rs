@@ -44,7 +44,7 @@ use crate::{
     audio_decode::analyze_input_with_cancel,
     niconico_hls::NiconicoHlsRequest,
     ranged_http::RangedHttpRequest,
-    tempo_stretch::{StretchTimeline, build_stretched_input},
+    tempo_stretch::{StretchTimeline, build_stretched_input, build_trimmed_input},
     validated_hls::ValidatedHlsRequest,
 };
 
@@ -287,7 +287,11 @@ impl SongbirdRuntime {
                 .map_err(SongbirdRuntimeError::TempoStretch)?;
             (input, Some(timeline))
         } else {
-            (input, None)
+            (
+                build_trimmed_input(input, options.source_start)
+                    .map_err(SongbirdRuntimeError::TempoStretch)?,
+                None,
+            )
         };
         let transition_events = events.clone();
         let prefetch_events = events.clone();

@@ -362,8 +362,15 @@ mod tests {
         StatusCode,
         header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue},
     };
+    use songbird::input::{
+        Input, LiveInput,
+        codecs::{get_codec_registry, get_probe},
+    };
+    use symphonia::core::audio::SampleBuffer;
     use tokio::io::AsyncReadExt;
     use wotoha_core::PreparedRangeMode;
+
+    use crate::tempo_stretch::build_trimmed_input;
 
     #[test]
     fn validates_partial_content_start_offset() {
@@ -490,6 +497,54 @@ mod tests {
         assert_eq!(bytes, b"abcdefghij");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automix_trims_real_ranged_http_input_without_seeking() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const CHUNK_SIZE: u64 = 32 * 1024;
+        let wav = two_tone_wav(SAMPLE_RATE);
+        let url = spawn_query_range_body(wav.clone(), CHUNK_SIZE);
+        let input: Input = RangedHttpRequest::new_with_headers(
+            reqwest::Client::new(),
+            url,
+            HeaderMap::new(),
+            Some(wav.len() as u64),
+            CHUNK_SIZE,
+            PreparedRangeMode::QueryParam,
+        )
+        .into();
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .unwrap();
+        let Input::Live(LiveInput::Parsed(ref parsed), _) = playable else {
+            panic!("ranged WAV should parse");
+        };
+        assert!(!parsed.supports_backseek);
+
+        let trimmed = build_trimmed_input(playable, Duration::from_secs(1)).unwrap();
+        let playable = trimmed
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .unwrap();
+        let Input::Live(LiveInput::Parsed(mut parsed), _) = playable else {
+            panic!("trimmed PCM should parse");
+        };
+        let mut samples = Vec::new();
+        while samples.len() < SAMPLE_RATE as usize {
+            let packet = parsed.format.next_packet().unwrap();
+            let decoded = parsed.decoder.decode(&packet).unwrap();
+            let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+            buffer.copy_interleaved_ref(decoded);
+            samples.extend_from_slice(buffer.samples());
+        }
+        let crossings = samples
+            .windows(2)
+            .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
+            .count();
+        let frequency = crossings as f32 * SAMPLE_RATE as f32 / samples.len() as f32;
+        assert!((frequency - 440.0).abs() < 3.0, "frequency={frequency}");
+    }
+
     fn spawn_query_range_responses(responses: Vec<(&'static str, &'static [u8])>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/videoplayback", listener.local_addr().unwrap());
@@ -523,5 +578,73 @@ mod tests {
             }
         });
         url
+    }
+
+    fn spawn_query_range_body(body: Vec<u8>, chunk_size: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/videoplayback", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut offset = 0_u64;
+            while offset < body.len() as u64 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+                let mut request = Vec::new();
+                let mut read_buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut read_buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&read_buf[..read]),
+                    }
+                }
+                let end = (offset + chunk_size).min(body.len() as u64) - 1;
+                let request = String::from_utf8_lossy(&request);
+                assert!(request.contains(&format!("range={offset}-{end}")));
+                let chunk = &body[offset as usize..=end as usize];
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    chunk.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(chunk).unwrap();
+                offset = end + 1;
+            }
+        });
+        url
+    }
+
+    fn two_tone_wav(sample_rate: u32) -> Vec<u8> {
+        let sample = |frequency: f32, index: usize| {
+            (std::f32::consts::TAU * frequency * index as f32 / sample_rate as f32).sin() * 0.5
+        };
+        let samples = (0..sample_rate as usize * 3)
+            .map(|index| {
+                if index < sample_rate as usize {
+                    sample(220.0, index)
+                } else {
+                    sample(440.0, index - sample_rate as usize)
+                }
+            })
+            .collect::<Vec<_>>();
+        let data_len = samples.len() * size_of::<i16>();
+        let mut wav = Vec::with_capacity(44 + data_len);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * size_of::<i16>() as u32).to_le_bytes());
+        wav.extend_from_slice(&(size_of::<i16>() as u16).to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&((sample * i16::MAX as f32) as i16).to_le_bytes());
+        }
+        wav
     }
 }
