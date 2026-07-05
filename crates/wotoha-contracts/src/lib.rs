@@ -2,7 +2,7 @@ use std::{error::Error, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
-use wotoha_core::{QueuePreview, TrackRequest};
+use wotoha_core::{QueuePreview, TrackRequest, automix::TrackAnalysis};
 
 macro_rules! runtime_key {
     ($name:ident) => {
@@ -223,6 +223,10 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
             .await?;
         handle.pause();
         Ok(handle)
+    }
+
+    async fn analyze_track(&self, _request: &TrackRequest) -> Option<TrackAnalysis> {
+        None
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error>;

@@ -1,3 +1,4 @@
+mod audio_decode;
 mod automix_cache;
 mod discord;
 mod hls_security;

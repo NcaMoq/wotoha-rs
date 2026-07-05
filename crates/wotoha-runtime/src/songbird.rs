@@ -26,6 +26,7 @@ use songbird::{
     tracks::{PlayMode, Track, TrackHandle},
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, GuildKey, PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle,
@@ -33,13 +34,14 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
+    automix::TrackAnalysis,
     debug::append_debug_log,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
 };
 
 use crate::{
-    niconico_hls::NiconicoHlsRequest, ranged_http::RangedHttpRequest,
-    validated_hls::ValidatedHlsRequest,
+    AnalysisCache, AnalysisCacheKey, audio_decode::analyze_input, niconico_hls::NiconicoHlsRequest,
+    ranged_http::RangedHttpRequest, validated_hls::ValidatedHlsRequest,
 };
 
 const STREAM_PROVIDER_IDS: [&str; 7] = [
@@ -65,6 +67,8 @@ const STREAM_REDIRECT_LIMIT: usize = 5;
 pub struct SongbirdRuntime {
     manager: Arc<Songbird>,
     stream_clients: Arc<HashMap<&'static str, Client>>,
+    analysis_cache: Arc<AnalysisCache>,
+    analysis_limit: Arc<Semaphore>,
 }
 
 #[derive(Debug, Error)]
@@ -101,6 +105,16 @@ impl SongbirdRuntime {
         Ok(Self {
             manager,
             stream_clients: Arc::new(stream_clients),
+            analysis_cache: Arc::new(
+                AnalysisCache::new(
+                    std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| ".wotoha-analysis".into()),
+                    "pcm-onset-v1",
+                )
+                .expect("static analyzer version is valid"),
+            ),
+            analysis_limit: Arc::new(Semaphore::new(2)),
         })
     }
 
@@ -449,6 +463,33 @@ impl VoiceRuntime for SongbirdRuntime {
             true,
         )
         .await
+    }
+
+    async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+            return Some(analysis);
+        }
+        if !matches!(request.prepared, PreparedSource::Http { .. }) {
+            return None;
+        }
+        let _permit = self.analysis_limit.acquire().await.ok()?;
+        if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+            return Some(analysis);
+        }
+        let input = build_input(
+            self.stream_client(request.provider_id.as_ref()).ok()?,
+            request,
+        )
+        .ok()?
+        .make_playable_async(get_codec_registry(), get_probe())
+        .await
+        .ok()?;
+        let analysis = tokio::task::spawn_blocking(move || analyze_input(input))
+            .await
+            .ok()??;
+        let _ = self.analysis_cache.store(&key, &analysis);
+        Some(analysis)
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {

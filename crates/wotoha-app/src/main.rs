@@ -208,6 +208,13 @@ where
         )))
     }
 
+    async fn analyze_track(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<wotoha_core::automix::TrackAnalysis> {
+        self.inner.analyze_track(request).await
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
         self.inner.disconnect_guild(guild_id).await
     }

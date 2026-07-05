@@ -24,7 +24,9 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
-    automix::{AutoMixConfig, TransitionTiming, plan_transition_timing},
+    automix::{
+        AutoMixConfig, TrackAnalysis, TransitionTiming, plan_transition, plan_transition_timing,
+    },
     debug::append_debug_log,
 };
 
@@ -33,6 +35,7 @@ type SessionHandle<ME, RE> = Arc<GuildSession<ME, RE>>;
 
 const MAX_QUEUE_LEN: usize = 512;
 const MAX_PENDING_ENQUEUES: usize = 64;
+const BEAT_ALIGNMENT_LOOKAHEAD: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
 pub struct PlaybackCoordinator<M: MediaBackend, R: VoiceRuntime> {
@@ -74,6 +77,7 @@ where
     prefetch_generation: u64,
     transition_due: Option<PlaybackId>,
     prepared_transition: Option<PreparedTransition>,
+    current_analysis: Option<TrackAnalysis>,
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
@@ -94,6 +98,7 @@ struct PreparedTransition {
     incoming: StartedTrack,
     timing: TransitionTiming,
     start_delay: std::time::Duration,
+    incoming_analysis: Option<TrackAnalysis>,
 }
 
 #[derive(Default)]
@@ -156,6 +161,7 @@ where
             prefetch_generation: 0,
             transition_due: None,
             prepared_transition: None,
+            current_analysis: None,
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
@@ -804,6 +810,7 @@ where
                 }
                 playback.active_handle = None;
                 playback.current_playback_id = None;
+                playback.current_analysis = None;
                 let prepared = invalidate_prepared_transition(&mut playback);
                 (playback.logical.prepare_next_track(), prepared)
             };
@@ -871,7 +878,7 @@ where
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let (generation, next, timing, start_delay) = {
+        let (generation, next, timing, event_after, outgoing_analysis) = {
             let _operation = session.operation.lock().await;
             if !self.session_is_current(guild_id, session_id) {
                 return;
@@ -909,10 +916,16 @@ where
             };
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
             let generation = playback.prefetch_generation;
-            let start_delay = timing
+            let event_after = scheduled
                 .transition_after
-                .saturating_sub(scheduled.transition_after);
-            (generation, next, timing, start_delay)
+                .saturating_sub(BEAT_ALIGNMENT_LOOKAHEAD);
+            (
+                generation,
+                next,
+                timing,
+                event_after,
+                playback.current_analysis.clone(),
+            )
         };
 
         let prepared = match self.inner.media.prepare_playback(&next).await {
@@ -936,19 +949,19 @@ where
             }
         }
         let incoming_id = self.next_playback_id();
-        let incoming = match self
-            .inner
-            .runtime
-            .prepare_track_with_options(
+        let options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
+        let (incoming_result, incoming_analysis) = tokio::join!(
+            self.inner.runtime.prepare_track_with_options(
                 guild_id,
                 session_id,
                 incoming_id,
                 &prepared,
                 self.inner.events.clone(),
-                track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0),
-            )
-            .await
-        {
+                options,
+            ),
+            self.inner.runtime.analyze_track(&prepared),
+        );
+        let incoming = match incoming_result {
             Ok(handle) => StartedTrack {
                 playback_id: incoming_id,
                 handle,
@@ -958,6 +971,23 @@ where
                 return;
             }
         };
+        let mut timing = timing;
+        let mut incoming_start = std::time::Duration::ZERO;
+        let mut transition_after = timing.transition_after;
+        if let (Some(outgoing), Some(incoming_analysis)) =
+            (outgoing_analysis.as_ref(), incoming_analysis.as_ref())
+        {
+            let plan = plan_transition(outgoing, incoming_analysis, &self.inner.automix);
+            if !plan.duration.is_zero() {
+                timing.fade_duration = plan.duration;
+                transition_after = plan.outgoing_start;
+                incoming_start = plan.incoming_start;
+            }
+        }
+        if !incoming_start.is_zero() {
+            let _ = incoming.handle.seek(incoming_start).await;
+        }
+        let start_delay = transition_after.saturating_sub(event_after);
 
         let mut incoming = Some(incoming);
         {
@@ -976,6 +1006,7 @@ where
                     incoming: incoming.take().expect("prefetched track is available"),
                     timing,
                     start_delay,
+                    incoming_analysis,
                 }) {
                     previous.incoming.handle.stop();
                 }
@@ -1052,6 +1083,7 @@ where
             playback.logical.prepare_next_track();
             playback.logical.replace_current(prepared.next.clone());
             playback.current_playback_id = Some(prepared.incoming.playback_id);
+            playback.current_analysis = prepared.incoming_analysis.clone();
             playback.transition_due = None;
             (prepared, outgoing, previous_retiring)
         };
@@ -1165,6 +1197,24 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
+        let coordinator = self.clone();
+        let analysis_request = prepared.clone();
+        tokio::spawn(async move {
+            if let Some(analysis) = coordinator
+                .inner
+                .runtime
+                .analyze_track(&analysis_request)
+                .await
+                && let Some(session) = coordinator.get_session(guild_id)
+                && session.id == session_id
+            {
+                let mut playback = session.playback.lock();
+                if playback.current_playback_id == Some(playback_id) {
+                    playback.current_analysis = Some(analysis);
+                }
+            }
+        });
+
         Ok(StartedTrack {
             playback_id,
             handle,
@@ -1191,7 +1241,11 @@ fn track_start_options(
     TrackStartOptions {
         initial_gain,
         prefetch_after: timing.map(|timing| timing.prefetch_after),
-        transition_after: timing.map(|timing| timing.transition_after),
+        transition_after: timing.map(|timing| {
+            timing
+                .transition_after
+                .saturating_sub(BEAT_ALIGNMENT_LOOKAHEAD)
+        }),
     }
 }
 
@@ -2611,7 +2665,7 @@ mod tests {
             })
             .unwrap();
 
-        timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(2), async {
             while !runtime.stopped().contains(&first.playback_id) {
                 tokio::task::yield_now().await;
             }
