@@ -46,6 +46,40 @@ pub struct TransitionPlan {
     pub incoming_tempo_ratio: f32,
 }
 
+/// Playback-relative timing for preparing and starting an adaptive transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransitionTiming {
+    /// Start resolving the next track at this position in the outgoing track.
+    pub prefetch_after: Duration,
+    /// Start the overlap at this position in the outgoing track.
+    pub transition_after: Duration,
+    pub fade_duration: Duration,
+}
+
+/// Chooses a safe overlap from the actual lengths of both tracks.
+///
+/// At most half of either track is consumed by the fade. Prefetch starts one
+/// fade window before the overlap, saturating at the beginning for short tracks.
+pub fn plan_transition_timing(
+    outgoing_duration: Duration,
+    incoming_duration: Duration,
+    preferred_fade: Duration,
+) -> Option<TransitionTiming> {
+    let fade_duration = preferred_fade
+        .min(outgoing_duration / 2)
+        .min(incoming_duration / 2);
+    if fade_duration.is_zero() {
+        return None;
+    }
+
+    let transition_after = outgoing_duration.saturating_sub(fade_duration);
+    Some(TransitionTiming {
+        prefetch_after: transition_after.saturating_sub(fade_duration),
+        transition_after,
+        fade_duration,
+    })
+}
+
 pub fn plan_transition(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
@@ -57,13 +91,12 @@ pub fn plan_transition(
 
     let available_outgoing = outgoing.audible_end.saturating_sub(outgoing.audible_start);
     let available_incoming = incoming.audible_end.saturating_sub(incoming.audible_start);
-    let duration = config
-        .crossfade
-        .min(available_outgoing / 2)
-        .min(available_incoming / 2);
-    if duration.is_zero() {
+    let Some(timing) =
+        plan_transition_timing(available_outgoing, available_incoming, config.crossfade)
+    else {
         return gapless_plan(outgoing, incoming);
-    }
+    };
+    let duration = timing.fade_duration;
 
     let tempo_ratio = compatible_tempo_ratio(outgoing, incoming, config);
     TransitionPlan {
@@ -157,5 +190,53 @@ mod tests {
         assert_eq!(plan.kind, TransitionKind::Gapless);
         assert_eq!(plan.outgoing_start, outgoing.audible_end);
         assert_eq!(plan.incoming_start, incoming.audible_start);
+    }
+
+    #[test]
+    fn adaptive_timing_uses_preferred_fade_for_long_tracks() {
+        let timing = plan_transition_timing(
+            Duration::from_secs(180),
+            Duration::from_secs(240),
+            Duration::from_secs(8),
+        )
+        .unwrap();
+
+        assert_eq!(timing.fade_duration, Duration::from_secs(8));
+        assert_eq!(timing.transition_after, Duration::from_secs(172));
+        assert_eq!(timing.prefetch_after, Duration::from_secs(164));
+    }
+
+    #[test]
+    fn adaptive_timing_is_bounded_by_the_shorter_track() {
+        let timing = plan_transition_timing(
+            Duration::from_secs(12),
+            Duration::from_secs(6),
+            Duration::from_secs(8),
+        )
+        .unwrap();
+
+        assert_eq!(timing.fade_duration, Duration::from_secs(3));
+        assert_eq!(timing.transition_after, Duration::from_secs(9));
+        assert_eq!(timing.prefetch_after, Duration::from_secs(6));
+    }
+
+    #[test]
+    fn adaptive_timing_rejects_zero_length_boundaries() {
+        assert_eq!(
+            plan_transition_timing(
+                Duration::ZERO,
+                Duration::from_secs(60),
+                Duration::from_secs(8)
+            ),
+            None
+        );
+        assert_eq!(
+            plan_transition_timing(
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::ZERO
+            ),
+            None
+        );
     }
 }
