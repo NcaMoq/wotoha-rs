@@ -36,23 +36,19 @@ pub(crate) fn build_stretched_input(
         .codec_params()
         .sample_rate
         .ok_or_else(|| "tempo stretching requires a known sample rate".to_owned())?;
-    let channels = parsed
-        .decoder
-        .codec_params()
-        .channels
-        .map(|channels| channels.count())
-        .ok_or_else(|| "tempo stretching requires a known channel layout".to_owned())?;
-    if channels == 0 || channels > 2 {
-        return Err(format!(
-            "unsupported tempo-stretch channel count: {channels}"
-        ));
-    }
+    let channels = output_channel_count(
+        parsed
+            .decoder
+            .codec_params()
+            .channels
+            .map(|channels| channels.count()),
+    );
     let source_bpm = 120.0;
     let target_bpm = source_bpm * f64::from(envelope.initial_speed);
     let processor =
         TempoStretchProcessor::new(source_bpm, target_bpm, sample_rate, channels, envelope)
             .map_err(|error| error.to_string())?;
-    let source_skip_samples = duration_samples(source_start, sample_rate, channels);
+    let source_skip_frames = duration_frames(source_start, sample_rate);
 
     let cancelled = Arc::new(AtomicBool::new(false));
     let (reader, writer) = tokio::io::duplex(384 * 1024);
@@ -68,7 +64,8 @@ pub(crate) fn build_stretched_input(
             parsed,
             writer,
             processor,
-            source_skip_samples,
+            source_skip_frames,
+            channels,
             cancelled,
             runtime,
         ) {
@@ -99,17 +96,15 @@ pub(crate) fn build_trimmed_input(
         .codec_params()
         .sample_rate
         .ok_or_else(|| "source trimming requires a known sample rate".to_owned())?;
-    let channels = parsed
-        .decoder
-        .codec_params()
-        .channels
-        .map(|channels| channels.count())
-        .ok_or_else(|| "source trimming requires a known channel layout".to_owned())?;
-    if channels == 0 {
-        return Err("source trimming requires at least one channel".into());
-    }
+    let channels = output_channel_count(
+        parsed
+            .decoder
+            .codec_params()
+            .channels
+            .map(|channels| channels.count()),
+    );
 
-    let source_skip_samples = duration_samples(source_start, sample_rate, channels);
+    let source_skip_frames = duration_frames(source_start, sample_rate);
     let cancelled = Arc::new(AtomicBool::new(false));
     let (reader, writer) = tokio::io::duplex(384 * 1024);
     let source = AsyncReadOnlySource::new(CancelOnDropReader {
@@ -120,16 +115,28 @@ pub(crate) fn build_trimmed_input(
     let output: Input = RawAdapter::new(adapter, sample_rate, channels as u32).into();
     let runtime = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = decode_and_trim(parsed, writer, source_skip_samples, cancelled, runtime)
-        {
+        if let Err(error) = decode_and_trim(
+            parsed,
+            writer,
+            source_skip_frames,
+            channels,
+            cancelled,
+            runtime,
+        ) {
             tracing::warn!(%error, "AutoMix source-trim worker stopped");
         }
     });
     Ok(output)
 }
 
-fn duration_samples(duration: std::time::Duration, sample_rate: u32, channels: usize) -> usize {
-    (duration.as_secs_f64() * f64::from(sample_rate) * channels as f64) as usize
+fn output_channel_count(metadata_channels: Option<usize>) -> usize {
+    metadata_channels
+        .filter(|channels| (1..=2).contains(channels))
+        .unwrap_or(2)
+}
+
+fn duration_frames(duration: std::time::Duration, sample_rate: u32) -> usize {
+    (duration.as_secs_f64() * f64::from(sample_rate)) as usize
 }
 
 struct CancelOnDropReader<R> {
@@ -157,7 +164,8 @@ fn decode_and_stretch(
     mut parsed: songbird::input::Parsed,
     mut writer: tokio::io::DuplexStream,
     mut processor: TempoStretchProcessor,
-    mut source_skip_samples: usize,
+    mut source_skip_frames: usize,
+    output_channels: usize,
     cancelled: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), String> {
@@ -183,11 +191,18 @@ fn decode_and_stretch(
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(error) => return Err(error.to_string()),
         };
+        let input_channels = decoded.spec().channels.count();
+        if input_channels == 0 {
+            return Err("decoded audio has no channels".into());
+        }
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
-        let skip = source_skip_samples.min(buffer.samples().len());
-        source_skip_samples -= skip;
-        let input = &buffer.samples()[skip..];
+        let available_frames = buffer.samples().len() / input_channels;
+        let skip_frames = source_skip_frames.min(available_frames);
+        source_skip_frames -= skip_frames;
+        let source = &buffer.samples()[skip_frames * input_channels..];
+        let mut normalized = Vec::new();
+        let input = normalize_channels(source, input_channels, output_channels, &mut normalized)?;
         if input.is_empty() {
             continue;
         }
@@ -221,7 +236,8 @@ fn decode_and_stretch(
 fn decode_and_trim(
     mut parsed: songbird::input::Parsed,
     mut writer: tokio::io::DuplexStream,
-    mut source_skip_samples: usize,
+    mut source_skip_frames: usize,
+    output_channels: usize,
     cancelled: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), String> {
@@ -246,23 +262,57 @@ fn decode_and_trim(
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(error) => return Err(error.to_string()),
         };
+        let input_channels = decoded.spec().channels.count();
+        if input_channels == 0 {
+            return Err("decoded audio has no channels".into());
+        }
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
-        let skip = source_skip_samples.min(buffer.samples().len());
-        source_skip_samples -= skip;
-        if skip < buffer.samples().len() {
+        let available_frames = buffer.samples().len() / input_channels;
+        let skip_frames = source_skip_frames.min(available_frames);
+        source_skip_frames -= skip_frames;
+        let source = &buffer.samples()[skip_frames * input_channels..];
+        if !source.is_empty() {
+            let mut normalized = Vec::new();
+            let samples =
+                normalize_channels(source, input_channels, output_channels, &mut normalized)?;
             let mut discard = 0;
-            write_pcm(
-                &mut writer,
-                &buffer.samples()[skip..],
-                &mut discard,
-                &cancelled,
-                &runtime,
-            )?;
+            write_pcm(&mut writer, samples, &mut discard, &cancelled, &runtime)?;
         }
     }
     let _ = runtime.block_on(writer.shutdown());
     Ok(())
+}
+
+fn normalize_channels<'a>(
+    samples: &'a [f32],
+    input_channels: usize,
+    output_channels: usize,
+    output: &'a mut Vec<f32>,
+) -> Result<&'a [f32], String> {
+    if input_channels == 0 || output_channels == 0 || !samples.len().is_multiple_of(input_channels)
+    {
+        return Err("invalid decoded channel layout".into());
+    }
+    if input_channels == output_channels {
+        return Ok(samples);
+    }
+
+    output.clear();
+    output.reserve(samples.len() / input_channels * output_channels);
+    for frame in samples.chunks_exact(input_channels) {
+        match output_channels {
+            1 => output.push(frame.iter().copied().sum::<f32>() / input_channels as f32),
+            2 if input_channels == 1 => output.extend_from_slice(&[frame[0], frame[0]]),
+            2 => output.extend_from_slice(&frame[..2]),
+            _ => {
+                return Err(format!(
+                    "unsupported output channel count: {output_channels}"
+                ));
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn write_pcm(
@@ -338,10 +388,16 @@ mod tests {
     use std::time::Duration;
 
     use songbird::input::{
-        AudioStream,
+        AudioStream, Parsed,
         codecs::{get_codec_registry, get_probe},
     };
-    use symphonia::core::io::MediaSource;
+    use symphonia::core::{
+        audio::AudioBufferRef,
+        codecs::{CodecDescriptor, CodecParameters, Decoder, DecoderOptions, FinalizeResult},
+        errors::Result as SymphoniaResult,
+        formats::Packet,
+        io::MediaSource,
+    };
 
     use super::*;
 
@@ -483,6 +539,21 @@ mod tests {
         assert!(cancelled.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn missing_channel_metadata_defaults_to_stereo() {
+        assert_eq!(output_channel_count(None), 2);
+        assert_eq!(output_channel_count(Some(1)), 1);
+        assert_eq!(output_channel_count(Some(2)), 2);
+        assert_eq!(output_channel_count(Some(6)), 2);
+    }
+
+    #[test]
+    fn normalizes_mono_frames_to_stereo() {
+        let mut output = Vec::new();
+        let normalized = normalize_channels(&[0.25, -0.5], 1, 2, &mut output).unwrap();
+        assert_eq!(normalized, [0.25, 0.25, -0.5, -0.5]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn songbird_adapter_trims_and_streams_stretched_pcm() {
         const SAMPLE_RATE: u32 = 48_000;
@@ -530,6 +601,25 @@ mod tests {
         let trimmed = build_trimmed_input(playable, Duration::from_secs(1)).unwrap();
         let samples = decode_samples(trimmed, SAMPLE_RATE as usize).await;
         let frequency = estimate_frequency(&samples, SAMPLE_RATE);
+        assert!((frequency - 440.0).abs() < 3.0, "frequency={frequency}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trims_input_when_decoder_channel_metadata_is_missing() {
+        const SAMPLE_RATE: u32 = 48_000;
+        let playable = Input::from(two_tone_wav(SAMPLE_RATE))
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .unwrap();
+        let playable = without_channel_metadata(playable);
+
+        let trimmed = build_trimmed_input(playable, Duration::from_secs(1)).unwrap();
+        let samples = decode_samples(trimmed, SAMPLE_RATE as usize * 2).await;
+        let left = samples
+            .chunks_exact(2)
+            .map(|frame| frame[0])
+            .collect::<Vec<_>>();
+        let frequency = estimate_frequency(&left, SAMPLE_RATE);
         assert!((frequency - 440.0).abs() < 3.0, "frequency={frequency}");
     }
 
@@ -582,6 +672,73 @@ mod tests {
             samples.extend_from_slice(buffer.samples());
         }
         samples
+    }
+
+    fn without_channel_metadata(input: Input) -> Input {
+        let Input::Live(LiveInput::Parsed(parsed), composer) = input else {
+            panic!("input should be parsed");
+        };
+        let Parsed {
+            format,
+            decoder,
+            track_id,
+            meta,
+            supports_backseek,
+        } = parsed;
+        let decoder = Box::new(MissingChannelMetadataDecoder::new(decoder));
+        Input::Live(
+            LiveInput::Parsed(Parsed {
+                format,
+                decoder,
+                track_id,
+                meta,
+                supports_backseek,
+            }),
+            composer,
+        )
+    }
+
+    struct MissingChannelMetadataDecoder {
+        inner: Box<dyn Decoder>,
+        params: CodecParameters,
+    }
+
+    impl MissingChannelMetadataDecoder {
+        fn new(inner: Box<dyn Decoder>) -> Self {
+            let mut params = inner.codec_params().clone();
+            params.channels = None;
+            Self { inner, params }
+        }
+    }
+
+    impl Decoder for MissingChannelMetadataDecoder {
+        fn try_new(_params: &CodecParameters, _options: &DecoderOptions) -> SymphoniaResult<Self> {
+            unreachable!("test wrapper is created around an existing decoder")
+        }
+
+        fn supported_codecs() -> &'static [CodecDescriptor] {
+            &[]
+        }
+
+        fn reset(&mut self) {
+            self.inner.reset();
+        }
+
+        fn codec_params(&self) -> &CodecParameters {
+            &self.params
+        }
+
+        fn decode(&mut self, packet: &Packet) -> SymphoniaResult<AudioBufferRef<'_>> {
+            self.inner.decode(packet)
+        }
+
+        fn finalize(&mut self) -> FinalizeResult {
+            self.inner.finalize()
+        }
+
+        fn last_decoded(&self) -> AudioBufferRef<'_> {
+            self.inner.last_decoded()
+        }
     }
 
     fn sine(frequency: f32, sample_rate: u32, seconds: f32) -> Vec<f32> {
