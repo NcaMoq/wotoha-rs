@@ -328,8 +328,8 @@ where
         let _operation = session.operation.lock().await;
         let mut playback = session.playback.lock();
         if playback.automix_enabled {
+            playback.automix_enabled = false;
             playback.logical.disable_loop();
-            return Some(false);
         }
         Some(playback.logical.toggle_loop())
     }
@@ -1580,7 +1580,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automix_disables_loop_and_blocks_it_until_disabled() {
+    async fn loop_replaces_automix_and_automix_replaces_loop() {
         let playback = PlaybackCoordinator::new(MockMedia::default(), MockRuntime::default());
         playback
             .enqueue_impl(GuildKey::new(1), "track")
@@ -1590,9 +1590,8 @@ mod tests {
         assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
         assert_eq!(playback.toggle_automix(GuildKey::new(1)).await, Some(true));
         assert!(playback.automix_enabled(GuildKey::new(1)));
-        assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(false));
-        assert_eq!(playback.toggle_automix(GuildKey::new(1)).await, Some(false));
         assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
+        assert!(!playback.automix_enabled(GuildKey::new(1)));
     }
 
     #[test]

@@ -22,7 +22,6 @@ pub enum ComponentAction {
 pub enum ComponentOutcome {
     Skip { was_looping: bool },
     Loop { enabled: bool },
-    LoopBlockedByAutoMix,
     Shuffle,
     NothingToShuffle,
     AutoMix { enabled: bool },
@@ -71,16 +70,10 @@ impl<P: PlaybackService> ControlService<P> {
                 Some(was_looping) => ComponentOutcome::Skip { was_looping },
                 None => ComponentOutcome::NoTrackPlaying,
             },
-            ComponentAction::Loop => {
-                if self.playback.automix_enabled(guild_id) {
-                    ComponentOutcome::LoopBlockedByAutoMix
-                } else {
-                    match self.playback.toggle_loop(guild_id).await {
-                        Some(enabled) => ComponentOutcome::Loop { enabled },
-                        None => ComponentOutcome::NoTrackPlaying,
-                    }
-                }
-            }
+            ComponentAction::Loop => match self.playback.toggle_loop(guild_id).await {
+                Some(enabled) => ComponentOutcome::Loop { enabled },
+                None => ComponentOutcome::NoTrackPlaying,
+            },
             ComponentAction::Shuffle => {
                 if self.playback.shuffle(guild_id).await {
                     ComponentOutcome::Shuffle
@@ -350,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_blocks_loop_while_automix_is_enabled() {
+    async fn component_enters_loop_while_automix_is_enabled() {
         let playback = MockPlayback::default();
         {
             let mut state = playback.state.lock().expect("mock state");
@@ -363,7 +356,7 @@ mod tests {
             .handle_component(GUILD, Some(CHANNEL), ComponentAction::Loop)
             .await;
 
-        assert!(matches!(outcome, ComponentOutcome::LoopBlockedByAutoMix));
+        assert!(matches!(outcome, ComponentOutcome::Loop { enabled: true }));
     }
 
     fn track(source_url: &str) -> TrackRequest {

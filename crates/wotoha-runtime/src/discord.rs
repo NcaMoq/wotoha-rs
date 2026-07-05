@@ -405,9 +405,6 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
                 component.defer(&ctx.http).await?;
             }
-            ComponentOutcome::LoopBlockedByAutoMix => {
-                component.defer(&ctx.http).await?;
-            }
             ComponentOutcome::Shuffle => {
                 component
                     .create_response(
