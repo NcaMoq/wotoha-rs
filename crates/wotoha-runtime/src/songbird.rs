@@ -624,6 +624,7 @@ struct SongbirdTrackHandle {
     lifecycle: Arc<TrackLifecycle>,
 }
 
+#[async_trait]
 impl RuntimeTrackHandle for SongbirdTrackHandle {
     fn stop(&self) {
         self.lifecycle.request_stop();
@@ -640,6 +641,18 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
 
     fn resume(&self) {
         let _ = self.handle.play();
+    }
+
+    async fn position(&self) -> Option<Duration> {
+        self.handle
+            .get_info()
+            .await
+            .ok()
+            .map(|state| state.position)
+    }
+
+    async fn seek(&self, position: Duration) -> bool {
+        self.handle.seek_async(position).await.is_ok()
     }
 }
 

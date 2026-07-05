@@ -17,9 +17,10 @@ use tokio::sync::{
 };
 use tracing::{info, warn};
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRuntimeEvent,
-    PlaybackService, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
-    UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRestartSnapshot,
+    PlaybackRuntimeEvent, PlaybackService, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason,
+    TrackStartOptions, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime,
+    VoiceUpdateDecision,
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
@@ -455,6 +456,72 @@ where
     pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
         self.get_session(guild_id)
             .is_some_and(|session| session.playback.lock().automix_enabled)
+    }
+
+    pub async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
+        let session = self.get_session(guild_id)?;
+        let (handle, current_source_url, queued_source_urls, looping, automix_enabled) = {
+            let playback = session.playback.lock();
+            let current = playback.logical.current()?;
+            (
+                playback.active_handle.clone()?,
+                current.source_url.to_string(),
+                playback
+                    .logical
+                    .queue()
+                    .iter()
+                    .map(|track| track.source_url.to_string())
+                    .collect(),
+                playback.logical.is_looping(),
+                playback.automix_enabled,
+            )
+        };
+        Some(PlaybackRestartSnapshot {
+            current_source_url,
+            queued_source_urls,
+            position: tokio::time::timeout(std::time::Duration::from_secs(2), handle.position())
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
+            looping,
+            automix_enabled,
+        })
+    }
+
+    pub async fn restore_restart_snapshot(
+        &self,
+        guild_id: GuildKey,
+        snapshot: PlaybackRestartSnapshot,
+    ) -> bool {
+        if self
+            .enqueue_impl(guild_id, &snapshot.current_source_url)
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        let handle = self
+            .get_session(guild_id)
+            .and_then(|session| session.playback.lock().active_handle.clone());
+        if let Some(handle) = handle
+            && !snapshot.position.is_zero()
+        {
+            let _ = handle.seek(snapshot.position).await;
+        }
+        for source_url in snapshot.queued_source_urls {
+            let _ = self.enqueue_impl(guild_id, &source_url).await;
+        }
+        if let Some(session) = self.get_session(guild_id) {
+            let _operation = session.operation.lock().await;
+            let mut playback = session.playback.lock();
+            playback.automix_enabled = snapshot.automix_enabled;
+            playback.logical.disable_loop();
+            if snapshot.looping && !snapshot.automix_enabled {
+                playback.logical.toggle_loop();
+            }
+        }
+        true
     }
 
     pub async fn disconnect_guild(&self, guild_id: GuildKey) {
@@ -1192,6 +1259,18 @@ where
         Self::toggle_automix(self, guild_id).await
     }
 
+    async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
+        Self::restart_snapshot(self, guild_id).await
+    }
+
+    async fn restore_restart_snapshot(
+        &self,
+        guild_id: GuildKey,
+        snapshot: PlaybackRestartSnapshot,
+    ) -> bool {
+        Self::restore_restart_snapshot(self, guild_id, snapshot).await
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) {
         Self::disconnect_guild(self, guild_id).await;
     }
@@ -1705,6 +1784,7 @@ mod tests {
         state: Arc<MockRuntimeState>,
     }
 
+    #[async_trait]
     impl RuntimeTrackHandle for MockTrackHandle {
         fn stop(&self) {
             self.state.stopped.lock().push(self.playback_id);
@@ -2888,5 +2968,41 @@ mod tests {
         let preview = playback.queue_preview(guild_id, 8).unwrap();
         assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "first");
         assert_eq!(preview.upcoming()[0].metadata.title.as_ref(), "second");
+    }
+
+    #[tokio::test]
+    async fn restart_snapshot_restores_current_queue_and_loop_mode() {
+        let guild_id = GuildKey::new(20);
+        let source_media = MockMedia::default();
+        let source = PlaybackCoordinator::new(source_media.clone(), MockRuntime::default());
+        source_media.resolve_with("first", Ok(track_request("first")));
+        source_media.resolve_with("second", Ok(track_request("second")));
+        source.enqueue_impl(guild_id, "first").await.unwrap();
+        source.enqueue_impl(guild_id, "second").await.unwrap();
+        assert_eq!(source.toggle_loop(guild_id).await, Some(true));
+        let snapshot = source.restart_snapshot(guild_id).await.unwrap();
+
+        let restored_media = MockMedia::default();
+        restored_media.resolve_with(
+            &snapshot.current_source_url,
+            Ok(track_request("restored-first")),
+        );
+        restored_media.resolve_with(
+            &snapshot.queued_source_urls[0],
+            Ok(track_request("restored-second")),
+        );
+        let restored = PlaybackCoordinator::new(restored_media, MockRuntime::default());
+        assert!(restored.restore_restart_snapshot(guild_id, snapshot).await);
+
+        let preview = restored.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(
+            preview.current().unwrap().metadata.title.as_ref(),
+            "restored-first"
+        );
+        assert_eq!(
+            preview.upcoming()[0].metadata.title.as_ref(),
+            "restored-second"
+        );
+        assert_eq!(restored.toggle_loop(guild_id).await, Some(false));
     }
 }

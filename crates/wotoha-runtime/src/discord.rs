@@ -102,21 +102,6 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
     }
 
     pub async fn notify_restart(&self, http: &Http) {
-        let mut connections = self
-            .active_voice_channels
-            .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
-            .collect::<Vec<_>>();
-        connections.sort_unstable_by_key(|(guild_id, _)| guild_id.get());
-        if let Err(error) = self.reconnect_store.save(&connections) {
-            error!(error = %error, "failed to persist voice reconnect handoff");
-        } else {
-            info!(
-                connections = connections.len(),
-                "persisted voice reconnect handoff"
-            );
-        }
-
         let targets = self
             .notification_channels
             .iter()
@@ -134,6 +119,31 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         }
     }
 
+    pub async fn persist_restart_state(&self) {
+        let mut voice_connections = self
+            .active_voice_channels
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect::<Vec<_>>();
+        voice_connections.sort_unstable_by_key(|(guild_id, _)| guild_id.get());
+        let connections = join_all(voice_connections.into_iter().map(|(guild_id, channel_id)| {
+            let control = self.control.clone();
+            async move {
+                let playback = control.restart_snapshot(guild_id).await;
+                (guild_id, channel_id, playback)
+            }
+        }))
+        .await;
+        if let Err(error) = self.reconnect_store.save(&connections) {
+            error!(error = %error, "failed to persist voice reconnect handoff");
+        } else {
+            info!(
+                connections = connections.len(),
+                "persisted voice reconnect handoff"
+            );
+        }
+    }
+
     async fn restore_voice_connections(&self, ctx: &Context) {
         let connections = match self.reconnect_store.take() {
             Ok(connections) => connections,
@@ -143,7 +153,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             }
         };
 
-        for (guild_id, channel_id) in connections {
+        for (guild_id, channel_id, playback) in connections {
             match self.runtime.ensure_joined(guild_id, channel_id).await {
                 Ok(_) => {
                     self.active_voice_channels.insert(guild_id, channel_id);
@@ -154,6 +164,18 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                         channel_id,
                         self.guild_voice_snapshot(ctx, serenity_guild_id, bot_user_id),
                     );
+                    if let Some(snapshot) = playback {
+                        let restored = self
+                            .control
+                            .restore_restart_snapshot(guild_id, snapshot)
+                            .await;
+                        if !restored {
+                            error!(
+                                guild_id = guild_id.get(),
+                                "failed to restore playback after restart"
+                            );
+                        }
+                    }
                     if self.control.automix_enabled(guild_id) {
                         let _ = serenity_guild_id
                             .edit_nickname(&ctx.http, Some(AUTOMIX_NICKNAME))

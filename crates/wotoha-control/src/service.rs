@@ -1,6 +1,6 @@
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, PlaybackService, UserKey, VoiceActionAccess,
-    VoicePeerSnapshot, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, GuildKey, PlaybackRestartSnapshot, PlaybackService, UserKey,
+    VoiceActionAccess, VoicePeerSnapshot, VoiceUpdateDecision,
 };
 use wotoha_core::QueuePreview;
 
@@ -102,6 +102,20 @@ impl<P: PlaybackService> ControlService<P> {
 
     pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
         self.playback.automix_enabled(guild_id)
+    }
+
+    pub async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
+        self.playback.restart_snapshot(guild_id).await
+    }
+
+    pub async fn restore_restart_snapshot(
+        &self,
+        guild_id: GuildKey,
+        snapshot: PlaybackRestartSnapshot,
+    ) -> bool {
+        self.playback
+            .restore_restart_snapshot(guild_id, snapshot)
+            .await
     }
 
     pub async fn disconnect_guild(&self, guild_id: GuildKey) {
