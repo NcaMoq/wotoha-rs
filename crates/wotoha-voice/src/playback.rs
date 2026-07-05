@@ -2257,4 +2257,233 @@ mod tests {
         assert_eq!(runtime.played().len(), 1);
         assert!(runtime.stopped().is_empty());
     }
+
+    #[tokio::test]
+    async fn duplicate_automix_transition_and_retired_end_do_not_advance_twice() {
+        let guild_id = GuildKey::new(14);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(200)),
+        );
+        for key in ["first", "second", "third"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(
+                    key,
+                    Some(Duration::from_secs(1)),
+                )),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+
+        let first = runtime.played()[0].clone();
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        playback
+            .advance(
+                guild_id,
+                first.session_id,
+                first.playback_id,
+                TrackEndReason::Completed,
+            )
+            .await;
+
+        let played = runtime.played();
+        assert_eq!(played.len(), 2);
+        assert_eq!(played[0].key, "first");
+        assert_eq!(played[1].key, "second");
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
+        assert_eq!(preview.upcoming().len(), 1);
+        assert_eq!(preview.upcoming()[0].metadata.title.as_ref(), "third");
+    }
+
+    #[tokio::test]
+    async fn skip_during_automix_overlap_stops_both_tracks_and_advances_once() {
+        let guild_id = GuildKey::new(15);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(200)),
+        );
+        for key in ["first", "second", "third"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(
+                    key,
+                    Some(Duration::from_secs(1)),
+                )),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+
+        let first = runtime.played()[0].clone();
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        let second = runtime.played()[1].clone();
+
+        assert_eq!(playback.skip(guild_id).await, Some(false));
+        let stopped = runtime.stopped();
+        assert!(stopped.contains(&first.playback_id));
+        assert!(stopped.contains(&second.playback_id));
+
+        playback
+            .advance(
+                guild_id,
+                first.session_id,
+                first.playback_id,
+                TrackEndReason::Stopped,
+            )
+            .await;
+        playback
+            .advance(
+                guild_id,
+                second.session_id,
+                second.playback_id,
+                TrackEndReason::Stopped,
+            )
+            .await;
+        playback
+            .advance(
+                guild_id,
+                second.session_id,
+                second.playback_id,
+                TrackEndReason::Stopped,
+            )
+            .await;
+
+        let played = runtime.played();
+        assert_eq!(played.len(), 3);
+        assert_eq!(played[2].key, "third");
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "third");
+        assert_eq!(preview.total_queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn disconnect_during_automix_overlap_stops_both_tracks_and_ignores_stale_events() {
+        let guild_id = GuildKey::new(16);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(200)),
+        );
+        for key in ["first", "second", "third"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(
+                    key,
+                    Some(Duration::from_secs(1)),
+                )),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+
+        let first = runtime.played()[0].clone();
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        let second = runtime.played()[1].clone();
+
+        playback.disconnect_guild(guild_id).await;
+        let stopped = runtime.stopped();
+        assert!(stopped.contains(&first.playback_id));
+        assert!(stopped.contains(&second.playback_id));
+        assert_eq!(runtime.disconnects(), vec![guild_id]);
+        assert!(playback.queue_preview(guild_id, 8).is_none());
+
+        playback
+            .advance(
+                guild_id,
+                first.session_id,
+                first.playback_id,
+                TrackEndReason::Stopped,
+            )
+            .await;
+        playback
+            .advance(
+                guild_id,
+                second.session_id,
+                second.playback_id,
+                TrackEndReason::Stopped,
+            )
+            .await;
+
+        assert_eq!(runtime.played().len(), 2);
+        assert!(playback.queue_preview(guild_id, 8).is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_while_automix_prepare_is_blocked_prevents_incoming_track() {
+        let guild_id = GuildKey::new(17);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(200)),
+        );
+        media.resolve_with(
+            "first",
+            Ok(track_request_with_duration(
+                "first",
+                Some(Duration::from_secs(1)),
+            )),
+        );
+        media.resolve_with(
+            "second",
+            Ok(track_request_with_duration(
+                "second",
+                Some(Duration::from_secs(1)),
+            )),
+        );
+
+        playback.enqueue_impl(guild_id, "first").await.unwrap();
+        playback.enqueue_impl(guild_id, "second").await.unwrap();
+        let first = runtime.played()[0].clone();
+        let prepare_release = media.block_prepare("second");
+        let transition = {
+            let playback = playback.clone();
+            tokio::spawn(async move {
+                playback
+                    .transition(guild_id, first.session_id, first.playback_id)
+                    .await;
+            })
+        };
+        media.wait_for_prepare_count(2).await;
+
+        timeout(
+            Duration::from_millis(100),
+            playback.disconnect_guild(guild_id),
+        )
+        .await
+        .expect("disconnect should not wait for blocked AutoMix prepare");
+        prepare_release
+            .send(Ok(track_request_with_duration(
+                "second",
+                Some(Duration::from_secs(1)),
+            )))
+            .expect("prepare receiver dropped");
+        timeout(Duration::from_secs(1), transition)
+            .await
+            .expect("transition did not return")
+            .expect("transition task panicked");
+
+        assert_eq!(runtime.played().len(), 1);
+        assert!(runtime.stopped().contains(&first.playback_id));
+        assert_eq!(runtime.disconnects(), vec![guild_id]);
+        assert!(playback.queue_preview(guild_id, 8).is_none());
+    }
 }
