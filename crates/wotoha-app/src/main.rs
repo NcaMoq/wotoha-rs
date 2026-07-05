@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackService, RuntimeEventSink,
-    RuntimeTrackHandle, UserKey, VoiceActionAccess, VoiceGatewayEvent, VoiceGatewayRuntime,
-    VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess, VoiceGatewayEvent,
+    VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_control::ControlService;
 use wotoha_core::{
@@ -75,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playback_runtime =
         ConfiguredVoiceRuntime::new(playback_runtime, config.playback.default_volume);
     append_debug_log("main: playback runtime created");
-    let playback = PlaybackCoordinator::new(resolver, playback_runtime.clone());
+    let playback = PlaybackCoordinator::new_with_automix(
+        resolver,
+        playback_runtime.clone(),
+        config.playback.automix.clone(),
+    );
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
     let handler = DiscordGateway::new(control, playback_runtime);
@@ -163,6 +167,26 @@ where
         )))
     }
 
+    async fn play_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        mut options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        options.initial_gain = (self.default_volume * options.initial_gain).clamp(0.0, 2.0);
+        let handle = self
+            .inner
+            .play_track_with_options(guild_id, session_id, playback_id, request, events, options)
+            .await?;
+        Ok(Arc::new(ConfiguredTrackHandle::new(
+            handle,
+            self.default_volume,
+        )))
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
         self.inner.disconnect_guild(guild_id).await
     }
@@ -205,8 +229,9 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
         self.inner.stop();
     }
 
-    fn set_volume(&self, _volume: f32) {
-        self.inner.set_volume(self.default_volume);
+    fn set_volume(&self, volume: f32) {
+        self.inner
+            .set_volume((self.default_volume * volume).clamp(0.0, 2.0));
     }
 }
 
@@ -368,6 +393,10 @@ where
 
     async fn shuffle(&self, guild_id: GuildKey) -> bool {
         self.inner.shuffle(guild_id).await
+    }
+
+    async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
+        self.inner.toggle_automix(guild_id).await
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) {
@@ -558,6 +587,7 @@ mod tests {
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
     use wotoha_contracts::{
         ChannelKey, EnqueueOutcome, GuildKey, PlaybackService, RuntimeTrackHandle, UserKey,
@@ -565,7 +595,7 @@ mod tests {
     };
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
-        config::PlaybackConfig,
+        automix::AutoMixConfig, config::PlaybackConfig,
     };
 
     #[derive(Clone, Default)]
@@ -674,6 +704,12 @@ mod tests {
             default_volume: 0.25,
             max_queue_len,
             max_pending_enqueues,
+            automix: AutoMixConfig {
+                enabled: true,
+                crossfade: Duration::from_secs(8),
+                max_tempo_adjustment: 0.06,
+                min_beat_confidence: 0.7,
+            },
         }
     }
 
@@ -746,10 +782,10 @@ mod tests {
         });
         let handle = ConfiguredTrackHandle::new(inner, 0.25);
 
-        handle.set_volume(1.0);
+        handle.set_volume(0.4);
         handle.stop();
 
-        assert_eq!(*volumes.lock().unwrap(), vec![0.25]);
+        assert_eq!(*volumes.lock().unwrap(), vec![0.1]);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
     }
 }

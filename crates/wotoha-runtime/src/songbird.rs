@@ -18,19 +18,18 @@ use serenity::all::{ChannelId, GuildId};
 use songbird::{
     Songbird,
     error::JoinError,
-    events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
+    events::{Event, EventContext, EventData, EventHandler as VoiceEventHandler, TrackEvent},
     input::{
         HttpRequest, MakePlayableError,
         codecs::{get_codec_registry, get_probe},
     },
-    tracks::PlayMode,
-    tracks::TrackHandle,
+    tracks::{PlayMode, Track, TrackHandle},
 };
 use thiserror::Error;
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, GuildKey, PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle,
-    TrackEndReason, VoiceGatewayEvent, VoiceGatewayRuntime, VoiceRuntime,
+    TrackEndReason, TrackStartOptions, VoiceGatewayEvent, VoiceGatewayRuntime, VoiceRuntime,
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
@@ -268,6 +267,26 @@ impl VoiceRuntime for SongbirdRuntime {
         request: &TrackRequest,
         events: RuntimeEventSink,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        self.play_track_with_options(
+            guild_id,
+            session_id,
+            playback_id,
+            request,
+            events,
+            TrackStartOptions::default(),
+        )
+        .await
+    }
+
+    async fn play_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
         append_debug_log(format!(
             "runtime: play_track start guild_id={} session_id={} playback_id={} provider={} key={} title={}",
             guild_id.get(),
@@ -282,7 +301,11 @@ impl VoiceRuntime for SongbirdRuntime {
             return Err(SongbirdRuntimeError::MissingCall);
         };
 
-        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?;
+        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .map_err(make_playable_error)?;
+        let transition_events = events.clone();
         let handle = {
             let mut call = call_lock.lock().await;
             append_debug_log(format!(
@@ -293,7 +316,22 @@ impl VoiceRuntime for SongbirdRuntime {
                 call.current_channel().map(|channel_id| channel_id.0.get()),
                 call.current_connection().is_some()
             ));
-            call.play_input(input)
+            let mut track = Track::new(input).volume(options.initial_gain);
+            if let Some(delay) = options.transition_after {
+                track.events.add_event(
+                    EventData::new(
+                        Event::Delayed(delay),
+                        TrackTransitionNotifier {
+                            guild_id,
+                            session_id,
+                            playback_id,
+                            events: transition_events,
+                        },
+                    ),
+                    Duration::ZERO,
+                );
+            }
+            call.play(track)
         };
         let lifecycle = Arc::new(TrackLifecycle::default());
         let playback_events = events.clone();
@@ -569,6 +607,31 @@ struct TrackPlayableLogger {
     provider_id: String,
     canonical_key: String,
     events: RuntimeEventSink,
+}
+
+struct TrackTransitionNotifier {
+    guild_id: GuildKey,
+    session_id: u64,
+    playback_id: PlaybackId,
+    events: RuntimeEventSink,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for TrackTransitionNotifier {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        append_debug_log(format!(
+            "runtime: transition due guild_id={} session_id={} playback_id={}",
+            self.guild_id.get(),
+            self.session_id,
+            self.playback_id.get()
+        ));
+        let _ = self.events.send(PlaybackRuntimeEvent::TransitionDue {
+            guild_id: self.guild_id,
+            session_id: self.session_id,
+            playback_id: self.playback_id,
+        });
+        None
+    }
 }
 
 #[serenity::async_trait]

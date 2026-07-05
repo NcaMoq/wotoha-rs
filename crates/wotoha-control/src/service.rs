@@ -14,6 +14,7 @@ pub enum ComponentAction {
     Skip,
     Loop,
     Shuffle,
+    AutoMix,
     Queue { limit: usize },
 }
 
@@ -23,6 +24,7 @@ pub enum ComponentOutcome {
     Loop { enabled: bool },
     Shuffle,
     NothingToShuffle,
+    AutoMix { enabled: bool },
     QueuePreview(Box<QueuePreview>),
     QueueEmpty,
     NoTrackPlaying,
@@ -79,6 +81,10 @@ impl<P: PlaybackService> ControlService<P> {
                     ComponentOutcome::NothingToShuffle
                 }
             }
+            ComponentAction::AutoMix => match self.playback.toggle_automix(guild_id).await {
+                Some(enabled) => ComponentOutcome::AutoMix { enabled },
+                None => ComponentOutcome::NoTrackPlaying,
+            },
             ComponentAction::Queue { limit } => {
                 match self.playback.queue_preview(guild_id, limit) {
                     Some(preview) if preview.current().is_some() || preview.total_queued() > 0 => {
