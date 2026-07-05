@@ -22,7 +22,9 @@ use wotoha_contracts::{
     UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_core::{
-    GuildPlayerState, QueuePreview, TrackRequest, automix::AutoMixConfig, debug::append_debug_log,
+    GuildPlayerState, QueuePreview, TrackRequest,
+    automix::{AutoMixConfig, TransitionTiming, plan_transition_timing},
+    debug::append_debug_log,
 };
 
 type CompletionSender<ME, RE> = oneshot::Sender<Result<EnqueueOutcome, PlaybackError<ME, RE>>>;
@@ -68,6 +70,9 @@ where
     retiring_handle: Option<(PlaybackId, Arc<dyn RuntimeTrackHandle>)>,
     fade_abort: Option<tokio::task::AbortHandle>,
     automix_enabled: bool,
+    prefetch_generation: u64,
+    transition_due: Option<PlaybackId>,
+    prepared_transition: Option<PreparedTransition>,
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
@@ -80,6 +85,14 @@ where
 {
     outcome: Option<Result<TrackRequest, PlaybackError<ME, RE>>>,
     completion: Option<CompletionSender<ME, RE>>,
+}
+
+struct PreparedTransition {
+    origin_playback_id: PlaybackId,
+    next: TrackRequest,
+    incoming: StartedTrack,
+    timing: TransitionTiming,
+    start_delay: std::time::Duration,
 }
 
 #[derive(Default)]
@@ -139,6 +152,9 @@ where
             retiring_handle: None,
             fade_abort: None,
             automix_enabled: false,
+            prefetch_generation: 0,
+            transition_due: None,
+            prepared_transition: None,
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
@@ -191,7 +207,24 @@ where
                         guild_id,
                         session_id,
                         playback_id,
-                    } => playback.transition(guild_id, session_id, playback_id).await,
+                    } => {
+                        let playback = playback.clone();
+                        tokio::spawn(async move {
+                            playback.transition(guild_id, session_id, playback_id).await
+                        });
+                    }
+                    PlaybackRuntimeEvent::TransitionPrefetchDue {
+                        guild_id,
+                        session_id,
+                        playback_id,
+                    } => {
+                        let playback = playback.clone();
+                        tokio::spawn(async move {
+                            playback
+                                .prefetch_transition(guild_id, session_id, playback_id)
+                                .await
+                        });
+                    }
                     PlaybackRuntimeEvent::TrackEnded {
                         guild_id,
                         session_id,
@@ -326,25 +359,33 @@ where
     pub async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool> {
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
-        let mut playback = session.playback.lock();
-        if playback.automix_enabled {
-            playback.automix_enabled = false;
-            playback.logical.disable_loop();
+        let (enabled, prepared) = {
+            let mut playback = session.playback.lock();
+            if playback.automix_enabled {
+                playback.automix_enabled = false;
+                playback.logical.disable_loop();
+            }
+            let prepared = invalidate_prepared_transition(&mut playback);
+            (playback.logical.toggle_loop(), prepared)
+        };
+        if let Some(handle) = prepared {
+            handle.stop();
         }
-        Some(playback.logical.toggle_loop())
+        Some(enabled)
     }
 
     pub async fn skip(&self, guild_id: GuildKey) -> Option<bool> {
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
 
-        let (was_looping, handle, retiring, fade_abort) = {
+        let (was_looping, handle, retiring, fade_abort, prepared) = {
             let mut playback = session.playback.lock();
             let was_looping = playback.logical.disable_loop();
             let handle = playback.active_handle.take();
             let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
             let fade_abort = playback.fade_abort.take();
-            (was_looping, handle, retiring, fade_abort)
+            let prepared = invalidate_prepared_transition(&mut playback);
+            (was_looping, handle, retiring, fade_abort, prepared)
         };
 
         if let Some(abort) = fade_abort {
@@ -355,6 +396,9 @@ where
             handle.stop();
         }
         if let Some(handle) = retiring {
+            handle.stop();
+        }
+        if let Some(handle) = prepared {
             handle.stop();
         }
 
@@ -376,19 +420,36 @@ where
         };
 
         let _operation = session.operation.lock().await;
-        let mut playback = session.playback.lock();
-        playback.logical.shuffle()
+        let (shuffled, prepared) = {
+            let mut playback = session.playback.lock();
+            let shuffled = playback.logical.shuffle();
+            let prepared = shuffled
+                .then(|| invalidate_prepared_transition(&mut playback))
+                .flatten();
+            (shuffled, prepared)
+        };
+        if let Some(handle) = prepared {
+            handle.stop();
+        }
+        shuffled
     }
 
     pub async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
-        let mut playback = session.playback.lock();
-        playback.automix_enabled = !playback.automix_enabled;
-        if playback.automix_enabled {
-            playback.logical.disable_loop();
+        let (enabled, prepared) = {
+            let mut playback = session.playback.lock();
+            playback.automix_enabled = !playback.automix_enabled;
+            if playback.automix_enabled {
+                playback.logical.disable_loop();
+            }
+            let prepared = invalidate_prepared_transition(&mut playback);
+            (playback.automix_enabled, prepared)
+        };
+        if let Some(handle) = prepared {
+            handle.stop();
         }
-        Some(playback.automix_enabled)
+        Some(enabled)
     }
 
     pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
@@ -404,15 +465,16 @@ where
             .map(|(_, session)| session);
 
         if let Some(session) = session {
-            let (handle, retiring, fade_abort, pending) = {
+            let (handle, retiring, fade_abort, prepared, pending) = {
                 let mut playback = session.playback.lock();
                 playback.logical.clear();
                 let handle = playback.active_handle.take();
                 let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
                 let fade_abort = playback.fade_abort.take();
+                let prepared = invalidate_prepared_transition(&mut playback);
                 playback.current_playback_id = None;
                 let pending = drain_pending(&mut playback);
-                (handle, retiring, fade_abort, pending)
+                (handle, retiring, fade_abort, prepared, pending)
             };
             session.voice.lock().clear();
 
@@ -423,6 +485,9 @@ where
                 handle.stop();
             }
             if let Some(handle) = retiring {
+                handle.stop();
+            }
+            if let Some(handle) = prepared {
                 handle.stop();
             }
             complete_all(pending, || PlaybackError::SessionExpired);
@@ -633,6 +698,27 @@ where
             return;
         }
 
+        let failed_prefetch = {
+            let mut playback = session.playback.lock();
+            let matches_prefetch = playback
+                .prepared_transition
+                .as_ref()
+                .is_some_and(|prepared| prepared.incoming.playback_id == playback_id);
+            if matches_prefetch {
+                playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+                playback
+                    .prepared_transition
+                    .take()
+                    .map(|prepared| prepared.incoming.handle)
+            } else {
+                None
+            }
+        };
+        if let Some(handle) = failed_prefetch {
+            handle.stop();
+            return;
+        }
+
         info!(
             guild_id = guild_id.get(),
             session_id,
@@ -644,15 +730,19 @@ where
         let mut expected_playback_id = Some(playback_id);
 
         loop {
-            let next = {
+            let (next, prepared) = {
                 let mut playback = session.playback.lock();
                 if playback.current_playback_id != expected_playback_id {
                     return;
                 }
                 playback.active_handle = None;
                 playback.current_playback_id = None;
-                playback.logical.prepare_next_track()
+                let prepared = invalidate_prepared_transition(&mut playback);
+                (playback.logical.prepare_next_track(), prepared)
             };
+            if let Some(handle) = prepared {
+                handle.stop();
+            }
 
             let Some(next) = next else {
                 return;
@@ -705,80 +795,205 @@ where
             .await;
     }
 
-    async fn transition(&self, guild_id: GuildKey, session_id: u64, playback_id: PlaybackId) {
+    async fn prefetch_transition(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+    ) {
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let _operation = session.operation.lock().await;
-        if !self.session_is_current(guild_id, session_id) {
-            return;
-        }
-
-        let (next, fade_duration) = {
-            let playback = session.playback.lock();
+        let (generation, next, timing, start_delay) = {
+            let _operation = session.operation.lock().await;
+            if !self.session_is_current(guild_id, session_id) {
+                return;
+            }
+            let mut playback = session.playback.lock();
             if playback.current_playback_id != Some(playback_id) {
                 return;
             }
-            if !playback.automix_enabled {
+            if !playback.automix_enabled || playback.transition_due == Some(playback_id) {
                 return;
             }
-            let Some(current_duration) = playback
+            let Some(outgoing_duration) = playback
                 .logical
                 .current()
                 .and_then(|track| track.metadata.duration)
             else {
                 return;
             };
-            let Some(fade_duration) = automix_fade_duration(&self.inner.automix, current_duration)
-            else {
-                return;
-            };
             let Some(next) = playback.logical.peek_next_track().cloned() else {
                 return;
             };
-            if next
-                .metadata
-                .duration
-                .is_none_or(|duration| duration < fade_duration.saturating_mul(2))
+            let Some(incoming_duration) = next.metadata.duration else {
+                return;
+            };
+            let Some(timing) = plan_transition_timing(
+                outgoing_duration,
+                incoming_duration,
+                self.inner.automix.crossfade,
+            ) else {
+                return;
+            };
+            let Some(scheduled) = track_transition_timing(&self.inner.automix, outgoing_duration)
+            else {
+                return;
+            };
+            playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+            let generation = playback.prefetch_generation;
+            let start_delay = timing
+                .transition_after
+                .saturating_sub(scheduled.transition_after);
+            (generation, next, timing, start_delay)
+        };
+
+        let prepared = match self.inner.media.prepare_playback(&next).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(guild_id = guild_id.get(), error = %error, "AutoMix failed to prefetch next track");
+                return;
+            }
+        };
+        if !self.session_is_current(guild_id, session_id) {
+            return;
+        }
+        {
+            let playback = session.playback.lock();
+            if playback.current_playback_id != Some(playback_id)
+                || playback.prefetch_generation != generation
+                || playback.transition_due == Some(playback_id)
+                || !playback.automix_enabled
             {
                 return;
             }
-            (next, fade_duration)
-        };
-
-        let incoming = match self.play_request(guild_id, session_id, &next, 0.0).await {
-            Ok(handle) => handle,
+        }
+        let incoming_id = self.next_playback_id();
+        let incoming = match self
+            .inner
+            .runtime
+            .prepare_track_with_options(
+                guild_id,
+                session_id,
+                incoming_id,
+                &prepared,
+                self.inner.events.clone(),
+                track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0),
+            )
+            .await
+        {
+            Ok(handle) => StartedTrack {
+                playback_id: incoming_id,
+                handle,
+            },
             Err(error) => {
-                warn!(guild_id = guild_id.get(), error = %error, "AutoMix failed to start next track");
+                warn!(guild_id = guild_id.get(), error = %error, "AutoMix runtime prefetch failed");
                 return;
             }
         };
+
+        let mut incoming = Some(incoming);
+        {
+            let _operation = session.operation.lock().await;
+            let mut playback = session.playback.lock();
+            let valid = self.session_is_current(guild_id, session_id)
+                && playback.current_playback_id == Some(playback_id)
+                && playback.automix_enabled
+                && playback.prefetch_generation == generation
+                && playback.transition_due != Some(playback_id)
+                && playback.logical.peek_next_track() == Some(&next);
+            if valid {
+                if let Some(previous) = playback.prepared_transition.replace(PreparedTransition {
+                    origin_playback_id: playback_id,
+                    next,
+                    incoming: incoming.take().expect("prefetched track is available"),
+                    timing,
+                    start_delay,
+                }) {
+                    previous.incoming.handle.stop();
+                }
+            }
+        }
+        if let Some(incoming) = incoming {
+            incoming.handle.stop();
+        }
+    }
+
+    async fn transition(&self, guild_id: GuildKey, session_id: u64, playback_id: PlaybackId) {
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        let prepared = {
+            let _operation = session.operation.lock().await;
+            if !self.session_is_current(guild_id, session_id) {
+                return;
+            }
+            let mut playback = session.playback.lock();
+            if playback.current_playback_id != Some(playback_id)
+                || !playback.automix_enabled
+                || playback.transition_due == Some(playback_id)
+            {
+                return;
+            }
+            playback.transition_due = Some(playback_id);
+            playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+            match playback.prepared_transition.take() {
+                Some(prepared) if prepared.origin_playback_id == playback_id => Some(prepared),
+                Some(stale) => {
+                    stale.incoming.handle.stop();
+                    None
+                }
+                None => None,
+            }
+        };
+        let Some(prepared) = prepared else {
+            return;
+        };
+        if !prepared.start_delay.is_zero() {
+            tokio::time::sleep(prepared.start_delay).await;
+        }
 
         let (outgoing, previous_retiring) = {
+            let _operation = session.operation.lock().await;
             let mut playback = session.playback.lock();
-            if playback.current_playback_id != Some(playback_id) {
-                incoming.handle.stop();
+            if !self.session_is_current(guild_id, session_id)
+                || playback.current_playback_id != Some(playback_id)
+                || !playback.automix_enabled
+                || playback.transition_due != Some(playback_id)
+                || playback.logical.peek_next_track() != Some(&prepared.next)
+            {
+                prepared.incoming.handle.stop();
                 return;
             }
-            let Some(outgoing) = playback.active_handle.replace(incoming.handle.clone()) else {
-                incoming.handle.stop();
+            let Some(outgoing) = playback
+                .active_handle
+                .replace(prepared.incoming.handle.clone())
+            else {
+                prepared.incoming.handle.stop();
                 return;
             };
             let previous_retiring = playback
                 .retiring_handle
                 .replace((playback_id, outgoing.clone()));
             playback.logical.prepare_next_track();
-            playback.logical.replace_current(next);
-            playback.current_playback_id = Some(incoming.playback_id);
+            playback.logical.replace_current(prepared.next);
+            playback.current_playback_id = Some(prepared.incoming.playback_id);
+            playback.transition_due = None;
             (outgoing, previous_retiring)
         };
         if let Some((_, handle)) = previous_retiring {
             handle.stop();
         }
+        prepared.incoming.handle.resume();
 
         let coordinator = self.clone();
         let fade_task = tokio::spawn(async move {
-            run_linear_fade(outgoing.clone(), incoming.handle, fade_duration).await;
+            run_linear_fade(
+                outgoing.clone(),
+                prepared.incoming.handle,
+                prepared.timing.fade_duration,
+            )
+            .await;
             outgoing.stop();
             if let Some(session) = coordinator.get_session(guild_id)
                 && session.id == session_id
@@ -843,12 +1058,11 @@ where
                 playback_id,
                 &prepared,
                 self.inner.events.clone(),
-                TrackStartOptions {
+                track_start_options(
+                    &self.inner.automix,
+                    prepared.metadata.duration,
                     initial_gain,
-                    transition_after: prepared.metadata.duration.and_then(|duration| {
-                        automix_transition_after(&self.inner.automix, duration)
-                    }),
-                },
+                ),
             )
             .await
             .map_err(PlaybackError::Runtime)?;
@@ -883,22 +1097,27 @@ where
     }
 }
 
-fn automix_fade_duration(
+fn track_transition_timing(
     config: &AutoMixConfig,
     duration: std::time::Duration,
-) -> Option<std::time::Duration> {
+) -> Option<TransitionTiming> {
     if !config.enabled {
         return None;
     }
-    let fade = config.crossfade.min(duration / 2);
-    (!fade.is_zero()).then_some(fade)
+    plan_transition_timing(duration, duration, config.crossfade)
 }
 
-fn automix_transition_after(
+fn track_start_options(
     config: &AutoMixConfig,
-    duration: std::time::Duration,
-) -> Option<std::time::Duration> {
-    automix_fade_duration(config, duration).map(|fade| duration.saturating_sub(fade))
+    duration: Option<std::time::Duration>,
+    initial_gain: f32,
+) -> TrackStartOptions {
+    let timing = duration.and_then(|duration| track_transition_timing(config, duration));
+    TrackStartOptions {
+        initial_gain,
+        prefetch_after: timing.map(|timing| timing.prefetch_after),
+        transition_after: timing.map(|timing| timing.transition_after),
+    }
 }
 
 async fn run_linear_fade(
@@ -1156,6 +1375,21 @@ where
     }
 }
 
+fn invalidate_prepared_transition<ME, RE>(
+    playback: &mut PlaybackRuntime<ME, RE>,
+) -> Option<Arc<dyn RuntimeTrackHandle>>
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+    playback.transition_due = None;
+    playback
+        .prepared_transition
+        .take()
+        .map(|prepared| prepared.incoming.handle)
+}
+
 fn drain_pending<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>) -> Vec<CompletionSender<ME, RE>>
 where
     ME: std::error::Error + Send + Sync + 'static,
@@ -1397,6 +1631,8 @@ mod tests {
         played: Mutex<Vec<PlayedTrack>>,
         play_failures: Mutex<HashMap<String, TestRuntimeError>>,
         stopped: Mutex<Vec<PlaybackId>>,
+        paused: Mutex<Vec<PlaybackId>>,
+        resumed: Mutex<Vec<PlaybackId>>,
         volumes: Mutex<Vec<(PlaybackId, f32)>>,
         disconnects: Mutex<Vec<GuildKey>>,
         play_notify: Notify,
@@ -1443,6 +1679,14 @@ mod tests {
             self.state.volumes.lock().clone()
         }
 
+        fn paused(&self) -> Vec<PlaybackId> {
+            self.state.paused.lock().clone()
+        }
+
+        fn resumed(&self) -> Vec<PlaybackId> {
+            self.state.resumed.lock().clone()
+        }
+
         fn disconnects(&self) -> Vec<GuildKey> {
             self.state.disconnects.lock().clone()
         }
@@ -1460,6 +1704,14 @@ mod tests {
 
         fn set_volume(&self, volume: f32) {
             self.state.volumes.lock().push((self.playback_id, volume));
+        }
+
+        fn pause(&self) {
+            self.state.paused.lock().push(self.playback_id);
+        }
+
+        fn resume(&self) {
+            self.state.resumed.lock().push(self.playback_id);
         }
     }
 
@@ -2252,6 +2504,18 @@ mod tests {
         let first = runtime.played()[0].clone();
         first
             .events
+            .send(PlaybackRuntimeEvent::TransitionPrefetchDue {
+                guild_id,
+                session_id: first.session_id,
+                playback_id: first.playback_id,
+            })
+            .unwrap();
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].playback_id;
+        assert_eq!(runtime.paused(), vec![second]);
+        assert!(runtime.resumed().is_empty());
+        first
+            .events
             .send(PlaybackRuntimeEvent::TransitionDue {
                 guild_id,
                 session_id: first.session_id,
@@ -2259,7 +2523,6 @@ mod tests {
             })
             .unwrap();
 
-        runtime.wait_for_play_count(2).await;
         timeout(Duration::from_secs(1), async {
             while !runtime.stopped().contains(&first.playback_id) {
                 tokio::task::yield_now().await;
@@ -2268,7 +2531,7 @@ mod tests {
         .await
         .expect("crossfade did not finish");
 
-        let second = runtime.played()[1].playback_id;
+        assert_eq!(runtime.resumed(), vec![second]);
         let volumes = runtime.volumes();
         assert!(
             volumes
@@ -2316,7 +2579,7 @@ mod tests {
         let first = runtime.played()[0].clone();
         first
             .events
-            .send(PlaybackRuntimeEvent::TransitionDue {
+            .send(PlaybackRuntimeEvent::TransitionPrefetchDue {
                 guild_id,
                 session_id: first.session_id,
                 playback_id: first.playback_id,
@@ -2354,6 +2617,9 @@ mod tests {
         }
 
         let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
         playback
             .transition(guild_id, first.session_id, first.playback_id)
             .await;
@@ -2401,6 +2667,9 @@ mod tests {
         }
 
         let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
         playback
             .transition(guild_id, first.session_id, first.playback_id)
             .await;
@@ -2467,6 +2736,9 @@ mod tests {
 
         let first = runtime.played()[0].clone();
         playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        playback
             .transition(guild_id, first.session_id, first.playback_id)
             .await;
         let second = runtime.played()[1].clone();
@@ -2532,7 +2804,7 @@ mod tests {
             let playback = playback.clone();
             tokio::spawn(async move {
                 playback
-                    .transition(guild_id, first.session_id, first.playback_id)
+                    .prefetch_transition(guild_id, first.session_id, first.playback_id)
                     .await;
             })
         };
@@ -2559,5 +2831,54 @@ mod tests {
         assert!(runtime.stopped().contains(&first.playback_id));
         assert_eq!(runtime.disconnects(), vec![guild_id]);
         assert!(playback.queue_preview(guild_id, 8).is_none());
+    }
+
+    #[tokio::test]
+    async fn late_prefetch_is_discarded_after_transition_deadline() {
+        let guild_id = GuildKey::new(19);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(20)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(
+                    key,
+                    Some(Duration::from_secs(1)),
+                )),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        let first = runtime.played()[0].clone();
+        let prepare_release = media.block_prepare("second");
+        let prefetch = {
+            let playback = playback.clone();
+            tokio::spawn(async move {
+                playback
+                    .prefetch_transition(guild_id, first.session_id, first.playback_id)
+                    .await
+            })
+        };
+        media.wait_for_prepare_count(2).await;
+
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        prepare_release
+            .send(Ok(track_request_with_duration(
+                "second",
+                Some(Duration::from_secs(1)),
+            )))
+            .unwrap();
+        prefetch.await.unwrap();
+
+        assert_eq!(runtime.played().len(), 1);
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "first");
+        assert_eq!(preview.upcoming()[0].metadata.title.as_ref(), "second");
     }
 }

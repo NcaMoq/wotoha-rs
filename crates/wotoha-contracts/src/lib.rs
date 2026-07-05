@@ -88,6 +88,11 @@ pub enum PlaybackRuntimeEvent {
         session_id: u64,
         playback_id: PlaybackId,
     },
+    TransitionPrefetchDue {
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+    },
     TrackErrored {
         guild_id: GuildKey,
         session_id: u64,
@@ -135,6 +140,7 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackStartOptions {
     pub initial_gain: f32,
+    pub prefetch_after: Option<Duration>,
     pub transition_after: Option<Duration>,
 }
 
@@ -142,6 +148,7 @@ impl Default for TrackStartOptions {
     fn default() -> Self {
         Self {
             initial_gain: 1.0,
+            prefetch_after: None,
             transition_after: None,
         }
     }

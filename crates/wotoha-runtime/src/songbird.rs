@@ -254,6 +254,7 @@ impl SongbirdRuntime {
             .await
             .map_err(make_playable_error)?;
         let transition_events = events.clone();
+        let prefetch_events = events.clone();
         let handle = {
             let mut call = call_lock.lock().await;
             append_debug_log(format!(
@@ -277,6 +278,20 @@ impl SongbirdRuntime {
                             session_id,
                             playback_id,
                             events: transition_events,
+                        },
+                    ),
+                    Duration::ZERO,
+                );
+            }
+            if let Some(delay) = options.prefetch_after {
+                track.events.add_event(
+                    EventData::new(
+                        Event::Delayed(delay),
+                        TrackPrefetchNotifier {
+                            guild_id,
+                            session_id,
+                            playback_id,
+                            events: prefetch_events,
                         },
                     ),
                     Duration::ZERO,
@@ -670,6 +685,27 @@ struct TrackTransitionNotifier {
     session_id: u64,
     playback_id: PlaybackId,
     events: RuntimeEventSink,
+}
+
+struct TrackPrefetchNotifier {
+    guild_id: GuildKey,
+    session_id: u64,
+    playback_id: PlaybackId,
+    events: RuntimeEventSink,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for TrackPrefetchNotifier {
+    async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        let _ = self
+            .events
+            .send(PlaybackRuntimeEvent::TransitionPrefetchDue {
+                guild_id: self.guild_id,
+                session_id: self.session_id,
+                playback_id: self.playback_id,
+            });
+        None
+    }
 }
 
 #[serenity::async_trait]
