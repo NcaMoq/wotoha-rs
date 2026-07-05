@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    f32::consts::FRAC_PI_2,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -18,10 +19,12 @@ use tokio::sync::{
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRuntimeEvent,
-    PlaybackService, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, UserKey,
-    VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    PlaybackService, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
+    UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
-use wotoha_core::{GuildPlayerState, QueuePreview, TrackRequest, debug::append_debug_log};
+use wotoha_core::{
+    GuildPlayerState, QueuePreview, TrackRequest, automix::AutoMixConfig, debug::append_debug_log,
+};
 
 type CompletionSender<ME, RE> = oneshot::Sender<Result<EnqueueOutcome, PlaybackError<ME, RE>>>;
 type SessionHandle<ME, RE> = Arc<GuildSession<ME, RE>>;
@@ -41,6 +44,7 @@ struct PlaybackCoordinatorInner<M: MediaBackend, R: VoiceRuntime> {
     sessions: DashMap<GuildKey, SessionHandle<M::Error, R::Error>>,
     next_session_id: AtomicU64,
     next_playback_id: AtomicU64,
+    automix: AutoMixConfig,
 }
 
 struct GuildSession<ME, RE>
@@ -62,6 +66,7 @@ where
     logical: GuildPlayerState,
     active_handle: Option<Arc<dyn RuntimeTrackHandle>>,
     current_playback_id: Option<PlaybackId>,
+    retiring_handle: Option<(PlaybackId, Arc<dyn RuntimeTrackHandle>)>,
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
@@ -130,6 +135,7 @@ where
             logical: GuildPlayerState::default(),
             active_handle: None,
             current_playback_id: None,
+            retiring_handle: None,
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
@@ -143,6 +149,19 @@ where
     R: VoiceRuntime,
 {
     pub fn new(media: M, runtime: R) -> Self {
+        Self::new_with_automix(
+            media,
+            runtime,
+            AutoMixConfig {
+                enabled: false,
+                crossfade: std::time::Duration::ZERO,
+                max_tempo_adjustment: 0.0,
+                min_beat_confidence: 1.0,
+            },
+        )
+    }
+
+    pub fn new_with_automix(media: M, runtime: R, automix: AutoMixConfig) -> Self {
         let (events, receiver) = unbounded_channel();
         let playback = Self {
             inner: Arc::new(PlaybackCoordinatorInner {
@@ -152,6 +171,7 @@ where
                 sessions: DashMap::new(),
                 next_session_id: AtomicU64::new(1),
                 next_playback_id: AtomicU64::new(1),
+                automix,
             }),
         };
         playback.spawn_runtime_event_loop(receiver);
@@ -164,6 +184,11 @@ where
             while let Some(event) = receiver.recv().await {
                 match event {
                     PlaybackRuntimeEvent::TrackStarted { .. } => {}
+                    PlaybackRuntimeEvent::TransitionDue {
+                        guild_id,
+                        session_id,
+                        playback_id,
+                    } => playback.transition(guild_id, session_id, playback_id).await,
                     PlaybackRuntimeEvent::TrackEnded {
                         guild_id,
                         session_id,
@@ -304,14 +329,18 @@ where
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
 
-        let (was_looping, handle) = {
+        let (was_looping, handle, retiring) = {
             let mut playback = session.playback.lock();
             let was_looping = playback.logical.disable_loop();
             let handle = playback.active_handle.take();
-            (was_looping, handle)
+            let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
+            (was_looping, handle, retiring)
         };
 
         if let Some(handle) = handle {
+            handle.stop();
+        }
+        if let Some(handle) = retiring {
             handle.stop();
         }
 
@@ -345,17 +374,21 @@ where
             .map(|(_, session)| session);
 
         if let Some(session) = session {
-            let (handle, pending) = {
+            let (handle, retiring, pending) = {
                 let mut playback = session.playback.lock();
                 playback.logical.clear();
                 let handle = playback.active_handle.take();
+                let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
                 playback.current_playback_id = None;
                 let pending = drain_pending(&mut playback);
-                (handle, pending)
+                (handle, retiring, pending)
             };
             session.voice.lock().clear();
 
             if let Some(handle) = handle {
+                handle.stop();
+            }
+            if let Some(handle) = retiring {
                 handle.stop();
             }
             complete_all(pending, || PlaybackError::SessionExpired);
@@ -489,7 +522,7 @@ where
                 FlushAction::StartCurrent {
                     mut completion,
                     request,
-                } => match self.play_request(guild_id, session_id, &request).await {
+                } => match self.play_request(guild_id, session_id, &request, 1.0).await {
                     Ok(handle) => {
                         let mut playback = session.playback.lock();
                         playback.current_playback_id = Some(handle.playback_id);
@@ -591,7 +624,7 @@ where
                 return;
             };
 
-            match self.play_request(guild_id, session_id, &next).await {
+            match self.play_request(guild_id, session_id, &next, 1.0).await {
                 Ok(handle) => {
                     let mut playback = session.playback.lock();
                     playback.logical.replace_current(next);
@@ -638,11 +671,92 @@ where
             .await;
     }
 
+    async fn transition(&self, guild_id: GuildKey, session_id: u64, playback_id: PlaybackId) {
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        let _operation = session.operation.lock().await;
+        if !self.session_is_current(guild_id, session_id) {
+            return;
+        }
+
+        let (next, fade_duration) = {
+            let playback = session.playback.lock();
+            if playback.current_playback_id != Some(playback_id) {
+                return;
+            }
+            let Some(current_duration) = playback
+                .logical
+                .current()
+                .and_then(|track| track.metadata.duration)
+            else {
+                return;
+            };
+            let Some(fade_duration) = automix_fade_duration(&self.inner.automix, current_duration)
+            else {
+                return;
+            };
+            let Some(next) = playback.logical.peek_next_track().cloned() else {
+                return;
+            };
+            (next, fade_duration)
+        };
+
+        let incoming = match self.play_request(guild_id, session_id, &next, 0.0).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(guild_id = guild_id.get(), error = %error, "AutoMix failed to start next track");
+                return;
+            }
+        };
+
+        let (outgoing, previous_retiring) = {
+            let mut playback = session.playback.lock();
+            if playback.current_playback_id != Some(playback_id) {
+                incoming.handle.stop();
+                return;
+            }
+            let Some(outgoing) = playback.active_handle.replace(incoming.handle.clone()) else {
+                incoming.handle.stop();
+                return;
+            };
+            let previous_retiring = playback
+                .retiring_handle
+                .replace((playback_id, outgoing.clone()));
+            playback.logical.prepare_next_track();
+            playback.logical.replace_current(next);
+            playback.current_playback_id = Some(incoming.playback_id);
+            (outgoing, previous_retiring)
+        };
+        if let Some((_, handle)) = previous_retiring {
+            handle.stop();
+        }
+
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            run_equal_power_fade(outgoing.clone(), incoming.handle, fade_duration).await;
+            outgoing.stop();
+            if let Some(session) = coordinator.get_session(guild_id)
+                && session.id == session_id
+            {
+                let mut playback = session.playback.lock();
+                if playback
+                    .retiring_handle
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == playback_id)
+                {
+                    playback.retiring_handle = None;
+                }
+            }
+        });
+    }
+
     async fn play_request(
         &self,
         guild_id: GuildKey,
         session_id: u64,
         request: &TrackRequest,
+        initial_gain: f32,
     ) -> Result<StartedTrack, PlaybackError<M::Error, R::Error>> {
         if !self.session_is_current(guild_id, session_id) {
             return Err(PlaybackError::SessionExpired);
@@ -678,12 +792,18 @@ where
         let handle = self
             .inner
             .runtime
-            .play_track(
+            .play_track_with_options(
                 guild_id,
                 session_id,
                 playback_id,
                 &prepared,
                 self.inner.events.clone(),
+                TrackStartOptions {
+                    initial_gain,
+                    transition_after: prepared.metadata.duration.and_then(|duration| {
+                        automix_transition_after(&self.inner.automix, duration)
+                    }),
+                },
             )
             .await
             .map_err(PlaybackError::Runtime)?;
@@ -711,11 +831,43 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
-        handle.set_volume(1.0);
         Ok(StartedTrack {
             playback_id,
             handle,
         })
+    }
+}
+
+fn automix_fade_duration(
+    config: &AutoMixConfig,
+    duration: std::time::Duration,
+) -> Option<std::time::Duration> {
+    if !config.enabled {
+        return None;
+    }
+    let fade = config.crossfade.min(duration / 2);
+    (!fade.is_zero()).then_some(fade)
+}
+
+fn automix_transition_after(
+    config: &AutoMixConfig,
+    duration: std::time::Duration,
+) -> Option<std::time::Duration> {
+    automix_fade_duration(config, duration).map(|fade| duration.saturating_sub(fade))
+}
+
+async fn run_equal_power_fade(
+    outgoing: Arc<dyn RuntimeTrackHandle>,
+    incoming: Arc<dyn RuntimeTrackHandle>,
+    duration: std::time::Duration,
+) {
+    let steps = (duration.as_millis() / 50).clamp(1, 200) as u32;
+    let interval = duration / steps;
+    for step in 1..=steps {
+        tokio::time::sleep(interval).await;
+        let progress = step as f32 / steps as f32;
+        outgoing.set_volume((progress * FRAC_PI_2).cos());
+        incoming.set_volume((progress * FRAC_PI_2).sin());
     }
 }
 
@@ -1011,7 +1163,7 @@ mod tests {
         ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRuntimeEvent,
         RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, VoiceActionAccess, VoiceRuntime,
     };
-    use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
+    use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest, automix::AutoMixConfig};
 
     type TestPlayback = PlaybackCoordinator<MockMedia, MockRuntime>;
     type TestPlaybackError = PlaybackError<TestMediaError, TestRuntimeError>;
@@ -1234,6 +1386,10 @@ mod tests {
             self.state.stopped.lock().clone()
         }
 
+        fn volumes(&self) -> Vec<(PlaybackId, f32)> {
+            self.state.volumes.lock().clone()
+        }
+
         fn disconnects(&self) -> Vec<GuildKey> {
             self.state.disconnects.lock().clone()
         }
@@ -1297,6 +1453,10 @@ mod tests {
     }
 
     fn track_request(key: &str) -> TrackRequest {
+        track_request_with_duration(key, None)
+    }
+
+    fn track_request_with_duration(key: &str, duration: Option<Duration>) -> TrackRequest {
         let track_url = format!("https://example.invalid/{key}");
         TrackRequest::new(
             "test",
@@ -1310,8 +1470,17 @@ mod tests {
                 None,
                 None,
             ),
-            TrackMetadata::new(key, "tester", track_url, None, None),
+            TrackMetadata::new(key, "tester", track_url, None, duration),
         )
+    }
+
+    fn automix_config(crossfade: Duration) -> AutoMixConfig {
+        AutoMixConfig {
+            enabled: true,
+            crossfade,
+            max_tempo_adjustment: 0.06,
+            min_beat_confidence: 0.7,
+        }
     }
 
     fn spawn_enqueue(
@@ -1983,5 +2152,109 @@ mod tests {
             "pending-0"
         );
         assert_eq!(preview.total_queued(), MAX_PENDING_ENQUEUES - 1);
+    }
+
+    #[tokio::test]
+    async fn automix_crossfades_to_queued_track() {
+        let guild_id = GuildKey::new(12);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(20)),
+        );
+        media.resolve_with(
+            "first",
+            Ok(track_request_with_duration(
+                "first",
+                Some(Duration::from_secs(1)),
+            )),
+        );
+        media.resolve_with(
+            "second",
+            Ok(track_request_with_duration(
+                "second",
+                Some(Duration::from_secs(1)),
+            )),
+        );
+
+        playback.enqueue_impl(guild_id, "first").await.unwrap();
+        playback.enqueue_impl(guild_id, "second").await.unwrap();
+        let first = runtime.played()[0].clone();
+        first
+            .events
+            .send(PlaybackRuntimeEvent::TransitionDue {
+                guild_id,
+                session_id: first.session_id,
+                playback_id: first.playback_id,
+            })
+            .unwrap();
+
+        runtime.wait_for_play_count(2).await;
+        timeout(Duration::from_secs(1), async {
+            while !runtime.stopped().contains(&first.playback_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("crossfade did not finish");
+
+        let second = runtime.played()[1].playback_id;
+        let volumes = runtime.volumes();
+        assert!(
+            volumes
+                .iter()
+                .any(|(id, gain)| *id == first.playback_id && *gain < 0.01)
+        );
+        assert!(
+            volumes
+                .iter()
+                .any(|(id, gain)| *id == second && *gain > 0.99)
+        );
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
+        assert_eq!(preview.total_queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn automix_start_failure_preserves_current_and_queue() {
+        let guild_id = GuildKey::new(13);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(20)),
+        );
+        media.resolve_with(
+            "first",
+            Ok(track_request_with_duration(
+                "first",
+                Some(Duration::from_secs(1)),
+            )),
+        );
+        media.resolve_with("second", Ok(track_request("second")));
+        runtime.fail_play_for("second", TestRuntimeError::new("unplayable"));
+
+        playback.enqueue_impl(guild_id, "first").await.unwrap();
+        playback.enqueue_impl(guild_id, "second").await.unwrap();
+        let first = runtime.played()[0].clone();
+        first
+            .events
+            .send(PlaybackRuntimeEvent::TransitionDue {
+                guild_id,
+                session_id: first.session_id,
+                playback_id: first.playback_id,
+            })
+            .unwrap();
+        media.wait_for_prepare_count(2).await;
+        tokio::task::yield_now().await;
+
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "first");
+        assert_eq!(preview.upcoming()[0].metadata.title.as_ref(), "second");
+        assert_eq!(runtime.played().len(), 1);
+        assert!(runtime.stopped().is_empty());
     }
 }

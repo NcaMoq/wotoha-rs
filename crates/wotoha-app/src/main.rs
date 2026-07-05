@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackService, RuntimeEventSink,
-    RuntimeTrackHandle, UserKey, VoiceActionAccess, VoiceGatewayEvent, VoiceGatewayRuntime,
-    VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess, VoiceGatewayEvent,
+    VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_control::ControlService;
 use wotoha_core::{
@@ -75,7 +75,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playback_runtime =
         ConfiguredVoiceRuntime::new(playback_runtime, config.playback.default_volume);
     append_debug_log("main: playback runtime created");
-    let playback = PlaybackCoordinator::new(resolver, playback_runtime.clone());
+    let playback = PlaybackCoordinator::new_with_automix(
+        resolver,
+        playback_runtime.clone(),
+        config.playback.automix.clone(),
+    );
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
     let handler = DiscordGateway::new(control, playback_runtime);
@@ -156,6 +160,26 @@ where
         let handle = self
             .inner
             .play_track(guild_id, session_id, playback_id, request, events)
+            .await?;
+        Ok(Arc::new(ConfiguredTrackHandle::new(
+            handle,
+            self.default_volume,
+        )))
+    }
+
+    async fn play_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        mut options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        options.initial_gain = (self.default_volume * options.initial_gain).clamp(0.0, 2.0);
+        let handle = self
+            .inner
+            .play_track_with_options(guild_id, session_id, playback_id, request, events, options)
             .await?;
         Ok(Arc::new(ConfiguredTrackHandle::new(
             handle,

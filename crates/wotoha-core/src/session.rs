@@ -99,6 +99,14 @@ impl GuildPlayerState {
         next
     }
 
+    pub fn peek_next_track(&self) -> Option<&TrackRequest> {
+        if self.looping {
+            self.current.as_ref()
+        } else {
+            self.queue.front()
+        }
+    }
+
     pub fn replace_current(&mut self, track: TrackRequest) {
         self.current = Some(track);
     }

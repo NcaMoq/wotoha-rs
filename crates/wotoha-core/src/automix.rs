@@ -59,8 +59,8 @@ pub fn plan_transition(
     let available_incoming = incoming.audible_end.saturating_sub(incoming.audible_start);
     let duration = config
         .crossfade
-        .min(available_outgoing)
-        .min(available_incoming);
+        .min(available_outgoing / 2)
+        .min(available_incoming / 2);
     if duration.is_zero() {
         return gapless_plan(outgoing, incoming);
     }

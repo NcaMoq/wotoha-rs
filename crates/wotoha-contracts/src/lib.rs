@@ -1,4 +1,4 @@
-use std::{error::Error, sync::Arc};
+use std::{error::Error, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -83,6 +83,11 @@ pub enum PlaybackRuntimeEvent {
         playback_id: PlaybackId,
         reason: TrackEndReason,
     },
+    TransitionDue {
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+    },
     TrackErrored {
         guild_id: GuildKey,
         session_id: u64,
@@ -123,6 +128,21 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
     fn set_volume(&self, volume: f32);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackStartOptions {
+    pub initial_gain: f32,
+    pub transition_after: Option<Duration>,
+}
+
+impl Default for TrackStartOptions {
+    fn default() -> Self {
+        Self {
+            initial_gain: 1.0,
+            transition_after: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait MediaBackend: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
@@ -143,6 +163,22 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
         request: &TrackRequest,
         events: RuntimeEventSink,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error>;
+
+    async fn play_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        let handle = self
+            .play_track(guild_id, session_id, playback_id, request, events)
+            .await?;
+        handle.set_volume(options.initial_gain);
+        Ok(handle)
+    }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error>;
 }
