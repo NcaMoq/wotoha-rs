@@ -44,6 +44,9 @@ fn analyze_input_with_limit(
     let mut tonal_accumulated = 0_usize;
     let mut tonal_phase = 0_u64;
     let mut stream_rate = None;
+    let mut sum_squares = 0.0_f64;
+    let mut loudness_samples = 0_u64;
+    let mut sample_peak = 0.0_f32;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return None;
@@ -73,6 +76,12 @@ fn analyze_input_with_limit(
         stream_rate = Some(source_rate);
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
+        for sample in buffer.samples() {
+            let sample = *sample;
+            sum_squares += f64::from(sample) * f64::from(sample);
+            loudness_samples = loudness_samples.saturating_add(1);
+            sample_peak = sample_peak.max(sample.abs());
+        }
         for frame in buffer.samples().chunks(channels) {
             let sample = frame
                 .iter()
@@ -114,6 +123,12 @@ fn analyze_input_with_limit(
         .then(|| analyze_mono_pcm(&mono, ANALYSIS_RATE))
         .flatten()?;
     analysis.musical_key = estimate_musical_key(&tonal, TONAL_RATE);
+    if loudness_samples > 0 && sum_squares > f64::EPSILON {
+        analysis.rms_dbfs = Some((10.0 * (sum_squares / loudness_samples as f64).log10()) as f32);
+    }
+    if sample_peak > f32::EPSILON {
+        analysis.sample_peak_dbfs = Some(20.0 * sample_peak.log10());
+    }
     Some(analysis)
 }
 
@@ -186,6 +201,12 @@ mod tests {
         let key = analysis.musical_key.expect("key should be detected");
         assert_eq!(key.tonic, 0);
         assert_eq!(key.mode, wotoha_core::automix::KeyMode::Major);
+        let rms = analysis.rms_dbfs.expect("RMS level should be measured");
+        let peak = analysis
+            .sample_peak_dbfs
+            .expect("sample peak should be measured");
+        assert!(rms < peak);
+        assert!(peak <= 0.01);
     }
 
     fn click_track_wav() -> Vec<u8> {

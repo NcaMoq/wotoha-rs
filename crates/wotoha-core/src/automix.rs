@@ -19,6 +19,9 @@ pub struct TrackAnalysis {
     pub first_downbeat: Option<Duration>,
     pub downbeat_confidence: f32,
     pub musical_key: Option<MusicalKey>,
+    /// Unweighted full-band RMS level. This is dBFS, not LUFS.
+    pub rms_dbfs: Option<f32>,
+    pub sample_peak_dbfs: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +82,8 @@ impl TrackAnalysis {
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         }
     }
 
@@ -147,6 +152,8 @@ pub struct TransitionPlan {
     /// Playback speed applied to the incoming deck. `1.0` preserves its tempo.
     pub incoming_tempo_ratio: f32,
     pub harmonic_compatibility: Option<f32>,
+    /// Relative gain retained by the incoming track after the overlap.
+    pub incoming_gain: f32,
 }
 
 /// Playback-relative timing for preparing and starting an adaptive transition.
@@ -239,6 +246,7 @@ pub fn plan_transition(
         duration,
         incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
         harmonic_compatibility,
+        incoming_gain: recommended_incoming_gain(outgoing, incoming),
     }
 }
 
@@ -280,7 +288,23 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
         duration: Duration::ZERO,
         incoming_tempo_ratio: 1.0,
         harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
+        incoming_gain: recommended_incoming_gain(outgoing, incoming),
     }
+}
+
+fn recommended_incoming_gain(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> f32 {
+    let Some(outgoing_level) = outgoing.rms_dbfs else {
+        return 1.0;
+    };
+    let Some(incoming_level) = incoming.rms_dbfs else {
+        return 1.0;
+    };
+    let level_gain = 10.0_f32.powf((outgoing_level - incoming_level) / 20.0);
+    let peak_gain = incoming
+        .sample_peak_dbfs
+        .map(|peak| 10.0_f32.powf((-1.0 - peak) / 20.0))
+        .unwrap_or(1.0);
+    level_gain.min(peak_gain).clamp(0.5, 1.0)
 }
 
 pub fn harmonic_compatibility(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Option<f32> {
@@ -362,6 +386,8 @@ mod tests {
             first_downbeat: Some(Duration::from_secs(1)),
             downbeat_confidence: 0.9,
             musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         }
     }
 
@@ -442,6 +468,21 @@ mod tests {
         );
         assert_eq!(plan.harmonic_compatibility, Some(0.2));
         assert_eq!(plan.duration, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn attenuates_a_louder_incoming_track_without_boosting() {
+        let mut outgoing = analyzed(120.0);
+        outgoing.rms_dbfs = Some(-18.0);
+        let mut incoming = analyzed(120.0);
+        incoming.rms_dbfs = Some(-12.0);
+        incoming.sample_peak_dbfs = Some(-0.5);
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        assert!((plan.incoming_gain - 0.501).abs() < 0.01);
+
+        std::mem::swap(&mut outgoing, &mut incoming);
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        assert_eq!(plan.incoming_gain, 1.0);
     }
 
     #[test]

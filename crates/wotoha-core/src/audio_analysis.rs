@@ -49,6 +49,8 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         });
     };
     let onset_peak = onset.iter().copied().fold(0.0_f32, f32::max);
@@ -68,6 +70,8 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         });
     }
     let (downbeat_offset, downbeat_confidence) =
@@ -84,6 +88,8 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         first_downbeat: Some(duration(first_downbeat_block * block, sample_rate)),
         downbeat_confidence,
         musical_key: None,
+        rms_dbfs: None,
+        sample_peak_dbfs: None,
     })
 }
 

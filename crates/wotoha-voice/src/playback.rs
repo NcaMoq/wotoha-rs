@@ -90,6 +90,7 @@ where
     transition_due: Option<PlaybackId>,
     prepared_transition: Option<PreparedTransition>,
     current_analysis: Option<TrackAnalysis>,
+    current_gain: f32,
     analysis_by_key: HashMap<String, TrackAnalysis>,
     analysis_in_flight: HashSet<String>,
     analysis_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
@@ -114,6 +115,7 @@ struct PreparedTransition {
     timing: TransitionTiming,
     start_delay: std::time::Duration,
     incoming_analysis: Option<TrackAnalysis>,
+    incoming_gain: f32,
 }
 
 #[derive(Default)]
@@ -177,6 +179,7 @@ where
             transition_due: None,
             prepared_transition: None,
             current_analysis: None,
+            current_gain: 1.0,
             analysis_by_key: HashMap::new(),
             analysis_in_flight: HashSet::new(),
             analysis_tasks: HashMap::new(),
@@ -852,6 +855,7 @@ where
                             let mut playback = session.playback.lock();
                             playback.current_playback_id = Some(handle.playback_id);
                             playback.active_handle = Some(handle.handle);
+                            playback.current_gain = 1.0;
                         }
                         self.spawn_relevant_analyses(guild_id, session_id);
                         if let Some(completion) = completion.take() {
@@ -966,6 +970,7 @@ where
                 playback.active_handle = None;
                 playback.current_playback_id = None;
                 playback.current_analysis = None;
+                playback.current_gain = 1.0;
                 let prepared = invalidate_prepared_transition(&mut playback);
                 (playback.logical.prepare_next_track(), prepared)
             };
@@ -984,6 +989,7 @@ where
                         playback.logical.replace_current(next);
                         playback.current_playback_id = Some(handle.playback_id);
                         playback.active_handle = Some(handle.handle);
+                        playback.current_gain = 1.0;
                     }
                     self.spawn_relevant_analyses(guild_id, session_id);
                     return;
@@ -1150,10 +1156,12 @@ where
         };
         let mut timing = timing;
         let mut transition_after = timing.transition_after;
+        let mut incoming_gain = 1.0;
         if let (Some(outgoing), Some(incoming_analysis)) =
             (outgoing_analysis.as_ref(), incoming_analysis.as_ref())
         {
             let plan = plan_transition(outgoing, incoming_analysis, &self.inner.automix);
+            incoming_gain = plan.incoming_gain;
             let tempo_is_stable =
                 (plan.incoming_tempo_ratio - 1.0).abs() <= MAX_UNSTRETCHED_TEMPO_DRIFT;
             if !plan.duration.is_zero() && tempo_is_stable {
@@ -1190,6 +1198,7 @@ where
                     timing,
                     start_delay,
                     incoming_analysis,
+                    incoming_gain,
                 }) {
                     previous.incoming.handle.stop();
                 }
@@ -1232,7 +1241,7 @@ where
         }
 
         let _operation = session.operation.lock().await;
-        let (prepared, outgoing, previous_retiring) = {
+        let (prepared, outgoing, outgoing_gain, previous_retiring) = {
             let mut playback = session.playback.lock();
             let invalid = !self.session_is_current(guild_id, session_id)
                 || playback.current_playback_id != Some(playback_id)
@@ -1263,12 +1272,14 @@ where
             let previous_retiring = playback
                 .retiring_handle
                 .replace((playback_id, outgoing.clone()));
+            let outgoing_gain = playback.current_gain;
             playback.logical.prepare_next_track();
             playback.logical.replace_current(prepared.next.clone());
             playback.current_playback_id = Some(prepared.incoming.playback_id);
             playback.current_analysis = prepared.incoming_analysis.clone();
+            playback.current_gain = prepared.incoming_gain;
             playback.transition_due = None;
-            (prepared, outgoing, previous_retiring)
+            (prepared, outgoing, outgoing_gain, previous_retiring)
         };
         if let Some((_, handle)) = previous_retiring {
             handle.stop();
@@ -1282,6 +1293,8 @@ where
                 outgoing.clone(),
                 prepared.incoming.handle,
                 prepared.timing.fade_duration,
+                outgoing_gain,
+                prepared.incoming_gain,
             )
             .await;
             outgoing.stop();
@@ -1424,6 +1437,8 @@ async fn run_equal_power_fade(
     outgoing: Arc<dyn RuntimeTrackHandle>,
     incoming: Arc<dyn RuntimeTrackHandle>,
     duration: std::time::Duration,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
 ) {
     let steps = (duration.as_millis() / 50).clamp(1, 200) as u32;
     let interval = duration / steps;
@@ -1431,8 +1446,8 @@ async fn run_equal_power_fade(
         tokio::time::sleep(interval).await;
         let progress = step as f32 / steps as f32;
         let (outgoing_gain, incoming_gain) = equal_power_gains(progress);
-        outgoing.set_volume(outgoing_gain);
-        incoming.set_volume(incoming_gain);
+        outgoing.set_volume(outgoing_base_gain * outgoing_gain);
+        incoming.set_volume(incoming_base_gain * incoming_gain);
     }
 }
 
@@ -2957,6 +2972,8 @@ mod tests {
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
             musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         };
         runtime.analyze_with("first", analysis.clone());
         runtime.analyze_with("second", analysis);

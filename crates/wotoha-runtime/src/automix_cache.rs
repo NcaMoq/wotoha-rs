@@ -14,7 +14,7 @@ use wotoha_core::{
     automix::{KeyMode, MusicalKey, TrackAnalysis},
 };
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 4;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 5;
 const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -264,6 +264,8 @@ struct SerializableAnalysis {
     first_downbeat_micros: Option<u64>,
     downbeat_confidence: f32,
     musical_key: Option<SerializableMusicalKey>,
+    rms_dbfs: Option<f32>,
+    sample_peak_dbfs: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -289,6 +291,8 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
                 minor: key.mode == KeyMode::Minor,
                 confidence: key.confidence,
             }),
+            rms_dbfs: value.rms_dbfs,
+            sample_peak_dbfs: value.sample_peak_dbfs,
         }
     }
 }
@@ -315,6 +319,8 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
                 },
                 confidence: key.confidence,
             }),
+            rms_dbfs: value.rms_dbfs,
+            sample_peak_dbfs: value.sample_peak_dbfs,
         };
         validate_analysis(&analysis)?;
         Ok(analysis)
@@ -373,6 +379,15 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     }) {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "musical key must have a valid tonic and confidence",
+        ));
+    }
+    if analysis.rms_dbfs.is_some_and(|value| !value.is_finite())
+        || analysis
+            .sample_peak_dbfs
+            .is_some_and(|value| !value.is_finite())
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "level measurements must be finite",
         ));
     }
     Ok(())
@@ -439,6 +454,8 @@ mod tests {
                 mode: KeyMode::Minor,
                 confidence: 0.81,
             }),
+            rms_dbfs: Some(-14.2),
+            sample_peak_dbfs: Some(-1.0),
         }
     }
 
@@ -516,6 +533,8 @@ mod tests {
             first_downbeat: None,
             downbeat_confidence: 2.0,
             musical_key: None,
+            rms_dbfs: Some(f32::NAN),
+            sample_peak_dbfs: None,
         };
 
         assert!(matches!(
