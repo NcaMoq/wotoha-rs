@@ -16,6 +16,40 @@ pub struct TrackAnalysis {
     pub bpm: Option<f32>,
     pub beat_confidence: f32,
     pub first_beat: Option<Duration>,
+    pub first_downbeat: Option<Duration>,
+    pub downbeat_confidence: f32,
+}
+
+/// A lightweight 4/4 beat grid inferred from tempo and onset accents.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BeatGrid {
+    pub first_downbeat: Duration,
+    pub beat_interval: Duration,
+    pub beats_per_bar: u8,
+    pub downbeat_confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum PhraseLength {
+    FourBars,
+    EightBars,
+    SixteenBars,
+}
+
+impl PhraseLength {
+    pub const fn bars(self) -> u32 {
+        match self {
+            Self::FourBars => 4,
+            Self::EightBars => 8,
+            Self::SixteenBars => 16,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhraseCue {
+    pub position: Duration,
+    pub length: PhraseLength,
 }
 
 impl TrackAnalysis {
@@ -27,7 +61,57 @@ impl TrackAnalysis {
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
         }
+    }
+
+    pub fn beat_grid(&self) -> Option<BeatGrid> {
+        let first_downbeat = self.first_downbeat?;
+        let bpm = self.bpm?;
+        if bpm <= 0.0 || !bpm.is_finite() || self.beat_confidence <= 0.0 {
+            return None;
+        }
+        let beat_interval = Duration::from_secs_f32(60.0 / bpm);
+        (!beat_interval.is_zero()).then_some(BeatGrid {
+            first_downbeat,
+            beat_interval,
+            beats_per_bar: 4,
+            downbeat_confidence: self.downbeat_confidence,
+        })
+    }
+
+    /// Returns inferred 4/8/16-bar boundaries inside the audible region.
+    pub fn phrase_cues(&self) -> Vec<PhraseCue> {
+        let Some(grid) = self.beat_grid() else {
+            return Vec::new();
+        };
+        if grid.downbeat_confidence < 0.25 {
+            return Vec::new();
+        }
+        let mut cues = Vec::new();
+        for length in [
+            PhraseLength::FourBars,
+            PhraseLength::EightBars,
+            PhraseLength::SixteenBars,
+        ] {
+            let phrase = grid
+                .beat_interval
+                .mul_f64((grid.beats_per_bar as u32 * length.bars()) as f64);
+            if phrase.is_zero() {
+                continue;
+            }
+            let mut position = grid.first_downbeat;
+            while position < self.audible_start {
+                position += phrase;
+            }
+            while position <= self.audible_end {
+                cues.push(PhraseCue { position, length });
+                position += phrase;
+            }
+        }
+        cues.sort_by_key(|cue| cue.position);
+        cues
     }
 }
 
@@ -102,12 +186,17 @@ pub fn plan_transition(
 
     let tempo_ratio = compatible_tempo_ratio(outgoing, incoming, config);
     let beat_aligned = tempo_ratio.is_some();
+    let phrase_start = beat_aligned
+        .then(|| {
+            let target = outgoing.audible_end.saturating_sub(duration);
+            (incoming.downbeat_confidence >= 0.25 && incoming.first_downbeat.is_some())
+                .then(|| align_to_phrase(outgoing, target, duration))
+                .flatten()
+        })
+        .flatten();
     let outgoing_start = if beat_aligned {
-        align_to_beat(
-            outgoing.audible_end.saturating_sub(duration),
-            outgoing.first_beat,
-            outgoing.bpm,
-        )
+        let target = outgoing.audible_end.saturating_sub(duration);
+        phrase_start.unwrap_or_else(|| align_to_beat(target, outgoing.first_beat, outgoing.bpm))
     } else {
         outgoing.audible_end.saturating_sub(duration)
     };
@@ -118,7 +207,9 @@ pub fn plan_transition(
             TransitionKind::Crossfade
         },
         outgoing_start,
-        incoming_start: if beat_aligned {
+        incoming_start: if phrase_start.is_some() {
+            incoming.first_downbeat.unwrap_or(incoming.audible_start)
+        } else if beat_aligned {
             incoming.first_beat.unwrap_or(incoming.audible_start)
         } else {
             incoming.audible_start
@@ -126,6 +217,21 @@ pub fn plan_transition(
         duration,
         incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
     }
+}
+
+fn align_to_phrase(
+    analysis: &TrackAnalysis,
+    target: Duration,
+    search_window: Duration,
+) -> Option<Duration> {
+    let earliest = target.saturating_sub(search_window);
+    analysis
+        .phrase_cues()
+        .into_iter()
+        .filter(|cue| cue.position >= earliest && cue.position <= target)
+        // Prefer the strongest (longest) phrase boundary, then the latest one.
+        .max_by_key(|cue| (cue.length, cue.position))
+        .map(|cue| cue.position)
 }
 
 fn align_to_beat(position: Duration, first_beat: Option<Duration>, bpm: Option<f32>) -> Duration {
@@ -194,7 +300,41 @@ mod tests {
             bpm: Some(bpm),
             beat_confidence: 0.9,
             first_beat: Some(Duration::from_secs(1)),
+            first_downbeat: Some(Duration::from_secs(1)),
+            downbeat_confidence: 0.9,
         }
+    }
+
+    #[test]
+    fn exposes_four_four_grid_and_hierarchical_phrase_cues() {
+        let analysis = analyzed(120.0);
+        let grid = analysis.beat_grid().unwrap();
+        assert_eq!(grid.first_downbeat, Duration::from_secs(1));
+        assert_eq!(grid.beat_interval, Duration::from_millis(500));
+        assert_eq!(grid.beats_per_bar, 4);
+        assert_eq!(grid.downbeat_confidence, 0.9);
+
+        let cues = analysis.phrase_cues();
+        assert!(cues.contains(&PhraseCue {
+            position: Duration::from_secs(9),
+            length: PhraseLength::FourBars,
+        }));
+        assert!(cues.contains(&PhraseCue {
+            position: Duration::from_secs(17),
+            length: PhraseLength::EightBars,
+        }));
+        assert!(cues.contains(&PhraseCue {
+            position: Duration::from_secs(33),
+            length: PhraseLength::SixteenBars,
+        }));
+    }
+
+    #[test]
+    fn beatmatch_prefers_phrase_boundary_near_the_fade_target() {
+        let plan = plan_transition(&analyzed(120.0), &analyzed(120.0), &config());
+        // Fade target is 171s. The inferred 4-bar boundary at 169s is the
+        // strongest boundary within the eight-second look-behind window.
+        assert_eq!(plan.outgoing_start, Duration::from_secs(169));
     }
 
     #[test]

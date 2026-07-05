@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -40,8 +40,9 @@ use wotoha_core::{
 };
 
 use crate::{
-    AnalysisCache, AnalysisCacheKey, audio_decode::analyze_input, niconico_hls::NiconicoHlsRequest,
-    ranged_http::RangedHttpRequest, validated_hls::ValidatedHlsRequest,
+    AnalysisCache, AnalysisCacheKey, audio_decode::analyze_input_with_cancel,
+    niconico_hls::NiconicoHlsRequest, ranged_http::RangedHttpRequest,
+    validated_hls::ValidatedHlsRequest,
 };
 
 const STREAM_PROVIDER_IDS: [&str; 7] = [
@@ -62,6 +63,15 @@ const STREAM_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const STREAM_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
+const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct CancelAnalysisOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelAnalysisOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 pub struct SongbirdRuntime {
@@ -110,7 +120,7 @@ impl SongbirdRuntime {
                     std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| ".wotoha-analysis".into()),
-                    "pcm-onset-v1",
+                    "pcm-onset-v2",
                 )
                 .expect("static analyzer version is valid"),
             ),
@@ -473,21 +483,29 @@ impl VoiceRuntime for SongbirdRuntime {
         if !matches!(request.prepared, PreparedSource::Http { .. }) {
             return None;
         }
-        let _permit = self.analysis_limit.acquire().await.ok()?;
-        if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
-            return Some(analysis);
-        }
-        let input = build_input(
-            self.stream_client(request.provider_id.as_ref()).ok()?,
-            request,
-        )
-        .ok()?
-        .make_playable_async(get_codec_registry(), get_probe())
-        .await
-        .ok()?;
-        let analysis = tokio::task::spawn_blocking(move || analyze_input(input))
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelAnalysisOnDrop(cancelled.clone());
+        let analysis = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
+            let _permit = self.analysis_limit.acquire().await.ok()?;
+            if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+                return Some(analysis);
+            }
+            let input = build_input(
+                self.stream_client(request.provider_id.as_ref()).ok()?,
+                request,
+            )
+            .ok()?
+            .make_playable_async(get_codec_registry(), get_probe())
             .await
-            .ok()??;
+            .ok()?;
+            let worker_cancelled = cancelled.clone();
+            tokio::task::spawn_blocking(move || analyze_input_with_cancel(input, &worker_cancelled))
+                .await
+                .ok()?
+        })
+        .await
+        .ok()??;
+        drop(cancel_on_drop);
         let _ = self.analysis_cache.store(&key, &analysis);
         Some(analysis)
     }

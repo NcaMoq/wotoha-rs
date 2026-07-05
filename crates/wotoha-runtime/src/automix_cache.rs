@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wotoha_core::{PreparedSource, TrackRequest, automix::TrackAnalysis};
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 2;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 3;
 const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -258,6 +258,8 @@ struct SerializableAnalysis {
     bpm: Option<f32>,
     beat_confidence: f32,
     first_beat_micros: Option<u64>,
+    first_downbeat_micros: Option<u64>,
+    downbeat_confidence: f32,
 }
 
 impl From<&TrackAnalysis> for SerializableAnalysis {
@@ -269,6 +271,8 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat_micros: value.first_beat.map(duration_to_micros),
+            first_downbeat_micros: value.first_downbeat.map(duration_to_micros),
+            downbeat_confidence: value.downbeat_confidence,
         }
     }
 }
@@ -284,6 +288,8 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat: value.first_beat_micros.map(Duration::from_micros),
+            first_downbeat: value.first_downbeat_micros.map(Duration::from_micros),
+            downbeat_confidence: value.downbeat_confidence,
         };
         validate_analysis(&analysis)?;
         Ok(analysis)
@@ -314,12 +320,27 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
             "beat confidence must be between zero and one",
         ));
     }
+    if !analysis.downbeat_confidence.is_finite()
+        || !(0.0..=1.0).contains(&analysis.downbeat_confidence)
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "downbeat confidence must be between zero and one",
+        ));
+    }
     if analysis
         .first_beat
         .is_some_and(|beat| beat > analysis.duration)
     {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "first beat must be within the track duration",
+        ));
+    }
+    if analysis
+        .first_downbeat
+        .is_some_and(|downbeat| downbeat > analysis.duration)
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "first downbeat must be within the track duration",
         ));
     }
     Ok(())
@@ -379,6 +400,8 @@ mod tests {
             bpm: Some(124.5),
             beat_confidence: 0.91,
             first_beat: Some(Duration::from_millis(750)),
+            first_downbeat: Some(Duration::from_millis(750)),
+            downbeat_confidence: 0.72,
         }
     }
 
@@ -453,6 +476,8 @@ mod tests {
             bpm: Some(f32::NAN),
             beat_confidence: 2.0,
             first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 2.0,
         };
 
         assert!(matches!(

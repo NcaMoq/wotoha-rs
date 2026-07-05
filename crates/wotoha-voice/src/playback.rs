@@ -92,6 +92,7 @@ where
     current_analysis: Option<TrackAnalysis>,
     analysis_by_key: HashMap<String, TrackAnalysis>,
     analysis_in_flight: HashSet<String>,
+    analysis_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
@@ -178,6 +179,7 @@ where
             current_analysis: None,
             analysis_by_key: HashMap::new(),
             analysis_in_flight: HashSet::new(),
+            analysis_tasks: HashMap::new(),
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
@@ -314,34 +316,45 @@ where
         }
 
         let coordinator = self.clone();
-        tokio::spawn(async move {
+        let task_key = analysis_key.clone();
+        let (start_tx, start_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_rx.await.is_err() {
+                return;
+            }
             let analysis = coordinator.inner.runtime.analyze_track(&request).await;
             if let Some(session) = coordinator.get_session(guild_id)
                 && session.id == session_id
             {
                 let mut playback = session.playback.lock();
-                playback.analysis_in_flight.remove(&analysis_key);
+                playback.analysis_in_flight.remove(&task_key);
+                playback.analysis_tasks.remove(&task_key);
                 let request_is_current = playback
                     .logical
                     .current()
-                    .is_some_and(|current| track_analysis_key(current) == analysis_key);
+                    .is_some_and(|current| track_analysis_key(current) == task_key);
                 let request_is_next = playback
                     .logical
                     .peek_next_track()
-                    .is_some_and(|next| track_analysis_key(next) == analysis_key);
+                    .is_some_and(|next| track_analysis_key(next) == task_key);
                 if playback.automix_enabled
                     && (request_is_current || request_is_next)
                     && let Some(analysis) = analysis
                 {
-                    playback
-                        .analysis_by_key
-                        .insert(analysis_key, analysis.clone());
+                    playback.analysis_by_key.insert(task_key, analysis.clone());
                     if request_is_current {
                         playback.current_analysis = Some(analysis);
                     }
                 }
             }
         });
+        let mut playback = session.playback.lock();
+        if playback.automix_enabled && playback.analysis_in_flight.contains(&analysis_key) {
+            playback.analysis_tasks.insert(analysis_key, task);
+            let _ = start_tx.send(());
+        } else {
+            task.abort();
+        }
     }
 
     fn spawn_relevant_analyses(&self, guild_id: GuildKey, session_id: u64) {
@@ -367,6 +380,18 @@ where
                 .iter()
                 .map(track_analysis_key)
                 .collect::<HashSet<_>>();
+            let stale_tasks = playback
+                .analysis_tasks
+                .keys()
+                .filter(|key| !relevant_keys.contains(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in stale_tasks {
+                if let Some(task) = playback.analysis_tasks.remove(&key) {
+                    task.abort();
+                }
+                playback.analysis_in_flight.remove(&key);
+            }
             playback
                 .analysis_by_key
                 .retain(|key, _| relevant_keys.contains(key));
@@ -478,6 +503,7 @@ where
             let mut playback = session.playback.lock();
             if playback.automix_enabled {
                 playback.automix_enabled = false;
+                abort_analysis_tasks(&mut playback);
                 playback.logical.disable_loop();
             }
             let prepared = invalidate_prepared_transition(&mut playback);
@@ -560,6 +586,8 @@ where
             playback.automix_enabled = !playback.automix_enabled;
             if playback.automix_enabled {
                 playback.logical.disable_loop();
+            } else {
+                abort_analysis_tasks(&mut playback);
             }
             let prepared = invalidate_prepared_transition(&mut playback);
             (playback.automix_enabled, prepared)
@@ -634,11 +662,19 @@ where
         }
         if let Some(session) = self.get_session(guild_id) {
             let _operation = session.operation.lock().await;
-            let mut playback = session.playback.lock();
-            playback.automix_enabled = snapshot.automix_enabled;
-            playback.logical.disable_loop();
-            if snapshot.looping && !snapshot.automix_enabled {
-                playback.logical.toggle_loop();
+            {
+                let mut playback = session.playback.lock();
+                playback.automix_enabled = snapshot.automix_enabled;
+                if !snapshot.automix_enabled {
+                    abort_analysis_tasks(&mut playback);
+                }
+                playback.logical.disable_loop();
+                if snapshot.looping && !snapshot.automix_enabled {
+                    playback.logical.toggle_loop();
+                }
+            }
+            if snapshot.automix_enabled {
+                self.spawn_relevant_analyses(guild_id, session.id);
             }
         }
         true
@@ -659,6 +695,7 @@ where
                 let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
                 let fade_abort = playback.fade_abort.take();
                 let prepared = invalidate_prepared_transition(&mut playback);
+                abort_analysis_tasks(&mut playback);
                 playback.current_playback_id = None;
                 let pending = drain_pending(&mut playback);
                 (handle, retiring, fade_abort, prepared, pending)
@@ -1241,7 +1278,7 @@ where
 
         let coordinator = self.clone();
         let fade_task = tokio::spawn(async move {
-            run_linear_fade(
+            run_equal_power_fade(
                 outgoing.clone(),
                 prepared.incoming.handle,
                 prepared.timing.fade_duration,
@@ -1378,7 +1415,12 @@ fn track_start_options(
     }
 }
 
-async fn run_linear_fade(
+fn equal_power_gains(progress: f32) -> (f32, f32) {
+    let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    (angle.cos(), angle.sin())
+}
+
+async fn run_equal_power_fade(
     outgoing: Arc<dyn RuntimeTrackHandle>,
     incoming: Arc<dyn RuntimeTrackHandle>,
     duration: std::time::Duration,
@@ -1388,8 +1430,9 @@ async fn run_linear_fade(
     for step in 1..=steps {
         tokio::time::sleep(interval).await;
         let progress = step as f32 / steps as f32;
-        outgoing.set_volume(1.0 - progress);
-        incoming.set_volume(progress);
+        let (outgoing_gain, incoming_gain) = equal_power_gains(progress);
+        outgoing.set_volume(outgoing_gain);
+        incoming.set_volume(incoming_gain);
     }
 }
 
@@ -1660,6 +1703,17 @@ where
         .map(|prepared| prepared.incoming.handle)
 }
 
+fn abort_analysis_tasks<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>)
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    for (_, task) in playback.analysis_tasks.drain() {
+        task.abort();
+    }
+    playback.analysis_in_flight.clear();
+}
+
 fn drain_pending<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>) -> Vec<CompletionSender<ME, RE>>
 where
     ME: std::error::Error + Send + Sync + 'static,
@@ -1699,7 +1753,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError};
+    use super::{
+        GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
+        equal_power_gains,
+    };
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::{
@@ -1728,6 +1785,16 @@ mod tests {
     type TestPlayback = PlaybackCoordinator<MockMedia, MockRuntime>;
     type TestPlaybackError = PlaybackError<TestMediaError, TestRuntimeError>;
     type EnqueueJoinHandle = JoinHandle<Result<EnqueueOutcome, TestPlaybackError>>;
+
+    #[test]
+    fn equal_power_fade_preserves_power_and_endpoints() {
+        assert_eq!(equal_power_gains(0.0), (1.0, 0.0));
+        let (outgoing, incoming) = equal_power_gains(0.5);
+        assert!((outgoing * outgoing + incoming * incoming - 1.0).abs() < 0.0001);
+        let (outgoing, incoming) = equal_power_gains(1.0);
+        assert!(outgoing.abs() < 0.0001);
+        assert_eq!(incoming, 1.0);
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestMediaError(Arc<str>);
@@ -1904,6 +1971,7 @@ mod tests {
         played: Mutex<Vec<PlayedTrack>>,
         play_failures: Mutex<HashMap<String, TestRuntimeError>>,
         analyses: Mutex<HashMap<String, TrackAnalysis>>,
+        analysis_blockers: Mutex<HashMap<String, oneshot::Receiver<()>>>,
         analysis_calls: Mutex<Vec<String>>,
         stopped: Mutex<Vec<PlaybackId>>,
         paused: Mutex<Vec<PlaybackId>>,
@@ -1935,6 +2003,15 @@ mod tests {
 
         fn analyze_with(&self, key: &str, analysis: TrackAnalysis) {
             self.state.analyses.lock().insert(key.to_owned(), analysis);
+        }
+
+        fn block_analysis(&self, key: &str) -> oneshot::Sender<()> {
+            let (sender, receiver) = oneshot::channel();
+            self.state
+                .analysis_blockers
+                .lock()
+                .insert(key.to_owned(), receiver);
+            sender
         }
 
         async fn wait_for_analysis_count(&self, expected: usize) {
@@ -2057,6 +2134,14 @@ mod tests {
                 .lock()
                 .push(request.canonical_key.to_string());
             self.state.analysis_notify.notify_waiters();
+            let blocker = self
+                .state
+                .analysis_blockers
+                .lock()
+                .remove(request.canonical_key.as_ref());
+            if let Some(blocker) = blocker {
+                let _ = blocker.await;
+            }
             self.state
                 .analyses
                 .lock()
@@ -2869,6 +2954,8 @@ mod tests {
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
+            first_downbeat: Some(Duration::ZERO),
+            downbeat_confidence: 1.0,
         };
         runtime.analyze_with("first", analysis.clone());
         runtime.analyze_with("second", analysis);
@@ -2911,6 +2998,33 @@ mod tests {
             calls.iter().filter(|key| key.as_str() == "second").count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn disabling_automix_cancels_in_flight_analysis() {
+        let guild_id = GuildKey::new(121);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let release = runtime.block_analysis("first");
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(20)),
+        );
+        media.resolve_with(
+            "first",
+            Ok(track_request_with_duration(
+                "first",
+                Some(Duration::from_secs(30)),
+            )),
+        );
+
+        playback.enqueue_impl(guild_id, "first").await.unwrap();
+        runtime.wait_for_analysis_count(1).await;
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(false));
+        tokio::task::yield_now().await;
+
+        assert!(release.send(()).is_err());
     }
 
     #[tokio::test]

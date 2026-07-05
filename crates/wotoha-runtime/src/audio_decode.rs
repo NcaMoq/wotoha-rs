@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use songbird::input::{Input, LiveInput};
 use symphonia::core::{audio::SampleBuffer, errors::Error};
 use wotoha_core::{audio_analysis::analyze_mono_pcm, automix::TrackAnalysis};
@@ -5,11 +7,27 @@ use wotoha_core::{audio_analysis::analyze_mono_pcm, automix::TrackAnalysis};
 const ANALYSIS_RATE: u32 = 1_000;
 const MAX_ANALYSIS_SECONDS: usize = 30 * 60;
 
+#[cfg(test)]
 pub(crate) fn analyze_input(input: Input) -> Option<TrackAnalysis> {
-    analyze_input_with_limit(input, ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS)
+    analyze_input_with_cancel(input, &AtomicBool::new(false))
 }
 
-fn analyze_input_with_limit(input: Input, max_samples: usize) -> Option<TrackAnalysis> {
+pub(crate) fn analyze_input_with_cancel(
+    input: Input,
+    cancelled: &AtomicBool,
+) -> Option<TrackAnalysis> {
+    analyze_input_with_limit(
+        input,
+        ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS,
+        cancelled,
+    )
+}
+
+fn analyze_input_with_limit(
+    input: Input,
+    max_samples: usize,
+    cancelled: &AtomicBool,
+) -> Option<TrackAnalysis> {
     let Input::Live(LiveInput::Parsed(mut parsed), _) = input else {
         return None;
     };
@@ -19,6 +37,9 @@ fn analyze_input_with_limit(input: Input, max_samples: usize) -> Option<TrackAna
     let mut phase = 0_u64;
     let mut stream_rate = None;
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
         let packet = match parsed.format.next_packet() {
             Ok(packet) => packet,
             Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -114,7 +135,22 @@ mod tests {
             .await
             .expect("generated WAV should be playable");
 
-        assert!(analyze_input_with_limit(playable, ANALYSIS_RATE as usize).is_none());
+        assert!(
+            analyze_input_with_limit(playable, ANALYSIS_RATE as usize, &AtomicBool::new(false))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_stops_before_decode() {
+        let input = Input::from(click_track_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+        let cancelled = AtomicBool::new(true);
+
+        assert!(analyze_input_with_cancel(playable, &cancelled).is_none());
     }
 
     fn click_track_wav() -> Vec<u8> {
