@@ -38,12 +38,45 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         .windows(2)
         .map(|pair| (pair[1].sqrt() - pair[0].sqrt()).max(0.0))
         .collect::<Vec<_>>();
-    let (bpm, confidence, _) = estimate_tempo(&onset)?;
+    let Some((bpm, confidence, beat_lag)) = estimate_tempo(&onset) else {
+        return Some(TrackAnalysis {
+            duration: duration(samples.len(), sample_rate),
+            audible_start: duration(first, sample_rate),
+            audible_end: duration(last.saturating_add(1), sample_rate),
+            bpm: None,
+            beat_confidence: 0.0,
+            first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
+        });
+    };
     let onset_peak = onset.iter().copied().fold(0.0_f32, f32::max);
     let first_beat_block = onset
         .iter()
         .position(|value| *value >= onset_peak * 0.5)
-        .map(|index| index + 1)?;
+        .map(|index| index + 1)
+        .unwrap_or_default();
+    if first_beat_block == 0 {
+        return Some(TrackAnalysis {
+            duration: duration(samples.len(), sample_rate),
+            audible_start: duration(first, sample_rate),
+            audible_end: duration(last.saturating_add(1), sample_rate),
+            bpm: None,
+            beat_confidence: 0.0,
+            first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
+        });
+    }
+    let (downbeat_offset, downbeat_confidence) =
+        estimate_downbeat_phase(&onset, first_beat_block - 1, beat_lag);
+    let first_downbeat_block = first_beat_block + downbeat_offset * beat_lag;
 
     Some(TrackAnalysis {
         duration: duration(samples.len(), sample_rate),
@@ -52,7 +85,49 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         bpm: Some(bpm),
         beat_confidence: confidence,
         first_beat: Some(duration(first_beat_block * block, sample_rate)),
+        first_downbeat: Some(duration(first_downbeat_block * block, sample_rate)),
+        downbeat_confidence,
+        musical_key: None,
+        rms_dbfs: None,
+        sample_peak_dbfs: None,
     })
+}
+
+fn estimate_downbeat_phase(onset: &[f32], first_beat: usize, beat_lag: usize) -> (usize, f32) {
+    if beat_lag == 0 {
+        return (0, 0.0);
+    }
+    let mut sums = [0.0_f32; 4];
+    let mut counts = [0_u32; 4];
+    let mut beat = 0_usize;
+    let mut position = first_beat;
+    while position < onset.len() {
+        let from = position.saturating_sub(1);
+        let to = (position + 2).min(onset.len());
+        sums[beat % 4] += onset[from..to].iter().copied().fold(0.0_f32, f32::max);
+        counts[beat % 4] += 1;
+        beat += 1;
+        position = position.saturating_add(beat_lag);
+    }
+    let means = std::array::from_fn::<_, 4, _>(|phase| {
+        (counts[phase] > 0)
+            .then(|| sums[phase] / counts[phase] as f32)
+            .unwrap_or_default()
+    });
+    let mut ranked = means.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let (phase, best) = ranked[0];
+    let second = ranked[1].1;
+    let confidence = if best > f32::EPSILON && beat >= 8 {
+        ((best - second) / best).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    if confidence < 0.05 {
+        (0, confidence)
+    } else {
+        (phase, confidence)
+    }
 }
 
 fn estimate_tempo(onset: &[f32]) -> Option<(f32, f32, usize)> {
@@ -109,6 +184,7 @@ mod tests {
         assert!(analysis.beat_confidence > 0.7);
         assert_eq!(analysis.audible_start, Duration::from_secs(1));
         assert_eq!(analysis.first_beat, Some(Duration::from_secs(1)));
+        assert_eq!(analysis.first_downbeat, Some(Duration::from_secs(1)));
     }
 
     #[test]
@@ -116,5 +192,23 @@ mod tests {
         let analysis = analyze_mono_pcm(&vec![0.0; 1_000], 1_000).unwrap();
         assert_eq!(analysis.bpm, None);
         assert_eq!(analysis.beat_confidence, 0.0);
+        assert_eq!(analysis.first_downbeat, None);
+    }
+
+    #[test]
+    fn detects_downbeat_phase_from_four_beat_accents() {
+        let sample_rate = 1_000;
+        let mut samples = vec![0.0; 18_000];
+        for (beat_index, beat) in (1_000..17_000).step_by(500).enumerate() {
+            let level = if beat_index % 4 == 2 { 1.0 } else { 0.55 };
+            for sample in &mut samples[beat..beat + 20] {
+                *sample = level;
+            }
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        assert_eq!(analysis.first_beat, Some(Duration::from_secs(1)));
+        assert_eq!(analysis.first_downbeat, Some(Duration::from_secs(2)));
+        assert!(analysis.downbeat_confidence > 0.35);
     }
 }

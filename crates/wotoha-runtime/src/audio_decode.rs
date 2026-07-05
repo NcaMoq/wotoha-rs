@@ -1,0 +1,277 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use songbird::input::{Input, LiveInput};
+use symphonia::core::{audio::SampleBuffer, errors::Error};
+use wotoha_core::{
+    audio_analysis::analyze_mono_pcm, automix::TrackAnalysis, key_analysis::estimate_musical_key,
+};
+
+const ANALYSIS_RATE: u32 = 1_000;
+const TONAL_RATE: u32 = 11_025;
+const MAX_ANALYSIS_SECONDS: usize = 30 * 60;
+const MAX_TONAL_SECONDS: usize = 6 * 60;
+
+#[cfg(test)]
+pub(crate) fn analyze_input(input: Input) -> Option<TrackAnalysis> {
+    analyze_input_with_cancel(input, &AtomicBool::new(false))
+}
+
+pub(crate) fn analyze_input_with_cancel(
+    input: Input,
+    cancelled: &AtomicBool,
+) -> Option<TrackAnalysis> {
+    analyze_input_with_limit(
+        input,
+        ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS,
+        cancelled,
+    )
+}
+
+fn analyze_input_with_limit(
+    input: Input,
+    max_samples: usize,
+    cancelled: &AtomicBool,
+) -> Option<TrackAnalysis> {
+    let Input::Live(LiveInput::Parsed(mut parsed), _) = input else {
+        return None;
+    };
+    let mut mono = Vec::with_capacity(ANALYSIS_RATE as usize * 180);
+    let mut accumulator = 0.0_f32;
+    let mut accumulated = 0_usize;
+    let mut phase = 0_u64;
+    let mut tonal = Vec::with_capacity(TONAL_RATE as usize * 180);
+    let mut tonal_accumulator = 0.0_f32;
+    let mut tonal_accumulated = 0_usize;
+    let mut tonal_phase = 0_u64;
+    let mut stream_rate = None;
+    let mut sum_squares = 0.0_f64;
+    let mut loudness_samples = 0_u64;
+    let mut sample_peak = 0.0_f32;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let packet = match parsed.format.next_packet() {
+            Ok(packet) => packet,
+            Err(Error::IoError(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(_) => break,
+        };
+        if packet.track_id() != parsed.track_id {
+            continue;
+        }
+        let decoded = match parsed.decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(_) => continue,
+        };
+        let source_rate = decoded.spec().rate;
+        let channels = decoded.spec().channels.count();
+        if channels == 0 || source_rate < ANALYSIS_RATE {
+            continue;
+        }
+        if stream_rate.is_some_and(|rate| rate != source_rate) {
+            return None;
+        }
+        stream_rate = Some(source_rate);
+        let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        buffer.copy_interleaved_ref(decoded);
+        for sample in buffer.samples() {
+            let sample = *sample;
+            sum_squares += f64::from(sample) * f64::from(sample);
+            loudness_samples = loudness_samples.saturating_add(1);
+            sample_peak = sample_peak.max(sample.abs());
+        }
+        for frame in buffer.samples().chunks(channels) {
+            let sample = frame
+                .iter()
+                .copied()
+                .max_by(|left, right| left.abs().total_cmp(&right.abs()))
+                .unwrap_or_default();
+            accumulator += sample;
+            accumulated += 1;
+            phase += ANALYSIS_RATE as u64;
+            if phase >= source_rate as u64 {
+                phase -= source_rate as u64;
+                mono.push(accumulator / accumulated as f32);
+                accumulator = 0.0;
+                accumulated = 0;
+                if mono.len() > max_samples {
+                    break;
+                }
+            }
+            if source_rate >= TONAL_RATE && tonal.len() < TONAL_RATE as usize * MAX_TONAL_SECONDS {
+                tonal_accumulator += sample;
+                tonal_accumulated += 1;
+                tonal_phase += TONAL_RATE as u64;
+                if tonal_phase >= source_rate as u64 {
+                    tonal_phase -= source_rate as u64;
+                    tonal.push(tonal_accumulator / tonal_accumulated as f32);
+                    tonal_accumulator = 0.0;
+                    tonal_accumulated = 0;
+                }
+            }
+        }
+        if mono.len() > max_samples {
+            break;
+        }
+    }
+    if mono.len() > max_samples {
+        return None;
+    }
+    let mut analysis = (!mono.is_empty())
+        .then(|| analyze_mono_pcm(&mono, ANALYSIS_RATE))
+        .flatten()?;
+    analysis.musical_key = estimate_musical_key(&tonal, TONAL_RATE);
+    if loudness_samples > 0 && sum_squares > f64::EPSILON {
+        analysis.rms_dbfs = Some((10.0 * (sum_squares / loudness_samples as f64).log10()) as f32);
+    }
+    if sample_peak > f32::EPSILON {
+        analysis.sample_peak_dbfs = Some(20.0 * sample_peak.log10());
+    }
+    Some(analysis)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use songbird::input::codecs::{get_codec_registry, get_probe};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn decodes_wav_and_detects_click_track_tempo() {
+        let input = Input::from(click_track_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        let analysis = analyze_input(playable).expect("WAV should produce an analysis");
+
+        assert!(analysis.duration.abs_diff(Duration::from_secs(12)) < Duration::from_millis(1));
+        assert!((analysis.bpm.expect("tempo should be detected") - 120.0).abs() < 1.0);
+        assert!(analysis.beat_confidence > 0.7);
+        assert!(analysis.audible_start.abs_diff(Duration::from_secs(1)) < Duration::from_millis(5));
+        assert!(
+            analysis
+                .first_beat
+                .expect("first beat should be detected")
+                .abs_diff(Duration::from_secs(1))
+                < Duration::from_millis(15)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_audio_longer_than_the_analysis_limit() {
+        let input = Input::from(click_track_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        assert!(
+            analyze_input_with_limit(playable, ANALYSIS_RATE as usize, &AtomicBool::new(false))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_analysis_stops_before_decode() {
+        let input = Input::from(click_track_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+        let cancelled = AtomicBool::new(true);
+
+        assert!(analyze_input_with_cancel(playable, &cancelled).is_none());
+    }
+
+    #[tokio::test]
+    async fn decodes_wav_and_detects_musical_key() {
+        let input = Input::from(c_major_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        let analysis = analyze_input(playable).expect("WAV should produce an analysis");
+        let key = analysis.musical_key.expect("key should be detected");
+        assert_eq!(key.tonic, 0);
+        assert_eq!(key.mode, wotoha_core::automix::KeyMode::Major);
+        let rms = analysis.rms_dbfs.expect("RMS level should be measured");
+        let peak = analysis
+            .sample_peak_dbfs
+            .expect("sample peak should be measured");
+        assert!(rms < peak);
+        assert!(peak <= 0.01);
+    }
+
+    fn click_track_wav() -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 44_100;
+        const SECONDS: usize = 12;
+        const CLICK_SAMPLES: usize = SAMPLE_RATE as usize / 50;
+
+        let sample_count = SAMPLE_RATE as usize * SECONDS;
+        let data_len = sample_count * size_of::<i16>();
+        let mut wav = Vec::with_capacity(44 + data_len);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * size_of::<i16>() as u32).to_le_bytes());
+        wav.extend_from_slice(&(size_of::<i16>() as u16).to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+
+        for index in 0..sample_count {
+            let after_lead_in = index.saturating_sub(SAMPLE_RATE as usize);
+            let is_click = index >= SAMPLE_RATE as usize
+                && after_lead_in % (SAMPLE_RATE as usize / 2) < CLICK_SAMPLES
+                && index < SAMPLE_RATE as usize * 11;
+            let sample = if is_click { i16::MAX } else { 0 };
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn c_major_wav() -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 44_100;
+        const SECONDS: usize = 8;
+        let samples = (0..SAMPLE_RATE as usize * SECONDS)
+            .map(|index| {
+                let time = index as f32 / SAMPLE_RATE as f32;
+                let value = [261.63_f32, 329.63, 392.0]
+                    .into_iter()
+                    .map(|frequency| (std::f32::consts::TAU * frequency * time).sin())
+                    .sum::<f32>()
+                    / 3.0;
+                (value * i16::MAX as f32 * 0.8) as i16
+            })
+            .collect::<Vec<_>>();
+        let data_len = samples.len() * size_of::<i16>();
+        let mut wav = Vec::with_capacity(44 + data_len);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * size_of::<i16>() as u32).to_le_bytes());
+        wav.extend_from_slice(&(size_of::<i16>() as u16).to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+}

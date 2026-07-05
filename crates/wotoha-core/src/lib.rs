@@ -2,6 +2,7 @@ pub mod audio_analysis;
 pub mod automix;
 pub mod config;
 pub mod debug;
+pub mod key_analysis;
 pub mod model;
 pub mod session;
 pub mod ui;

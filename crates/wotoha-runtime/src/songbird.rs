@@ -3,7 +3,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -26,6 +26,7 @@ use songbird::{
     tracks::{PlayMode, Track, TrackHandle},
 };
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, GuildKey, PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle,
@@ -33,12 +34,17 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
+    automix::TrackAnalysis,
     debug::append_debug_log,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
 };
 
 use crate::{
-    niconico_hls::NiconicoHlsRequest, ranged_http::RangedHttpRequest,
+    AnalysisCache, AnalysisCacheKey,
+    audio_decode::analyze_input_with_cancel,
+    niconico_hls::NiconicoHlsRequest,
+    ranged_http::RangedHttpRequest,
+    tempo_stretch::{StretchTimeline, build_stretched_input},
     validated_hls::ValidatedHlsRequest,
 };
 
@@ -60,11 +66,22 @@ const STREAM_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const STREAM_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
+const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
+
+struct CancelAnalysisOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelAnalysisOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 #[derive(Clone)]
 pub struct SongbirdRuntime {
     manager: Arc<Songbird>,
     stream_clients: Arc<HashMap<&'static str, Client>>,
+    analysis_cache: Arc<AnalysisCache>,
+    analysis_limit: Arc<Semaphore>,
 }
 
 #[derive(Debug, Error)]
@@ -83,6 +100,8 @@ pub enum SongbirdRuntimeError {
     TrackEvent(String),
     #[error("resolved source is not playable: {0}")]
     MakePlayable(String),
+    #[error("failed to initialize tempo-matched playback: {0}")]
+    TempoStretch(String),
     #[error("failed to remove voice call: {0}")]
     Disconnect(String),
     #[error("missing stream HTTP client for provider: {0}")]
@@ -101,6 +120,16 @@ impl SongbirdRuntime {
         Ok(Self {
             manager,
             stream_clients: Arc::new(stream_clients),
+            analysis_cache: Arc::new(
+                AnalysisCache::new(
+                    std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| ".wotoha-analysis".into()),
+                    "pcm-onset-chroma-level-v4",
+                )
+                .expect("static analyzer version is valid"),
+            ),
+            analysis_limit: Arc::new(Semaphore::new(2)),
         })
     }
 
@@ -253,6 +282,13 @@ impl SongbirdRuntime {
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .map_err(make_playable_error)?;
+        let (input, stretch_timeline) = if let Some(envelope) = options.tempo_envelope {
+            let (input, timeline) = build_stretched_input(input, options.source_start, envelope)
+                .map_err(SongbirdRuntimeError::TempoStretch)?;
+            (input, Some(timeline))
+        } else {
+            (input, None)
+        };
         let transition_events = events.clone();
         let prefetch_events = events.clone();
         let handle = {
@@ -269,7 +305,10 @@ impl SongbirdRuntime {
             if start_paused {
                 track = track.pause();
             }
-            if let Some(delay) = options.transition_after {
+            if let Some(delay) = options
+                .transition_after
+                .map(|delay| stretched_event_delay(delay, stretch_timeline))
+            {
                 track.events.add_event(
                     EventData::new(
                         Event::Delayed(delay),
@@ -283,7 +322,10 @@ impl SongbirdRuntime {
                     Duration::ZERO,
                 );
             }
-            if let Some(delay) = options.prefetch_after {
+            if let Some(delay) = options
+                .prefetch_after
+                .map(|delay| stretched_event_delay(delay, stretch_timeline))
+            {
                 track.events.add_event(
                     EventData::new(
                         Event::Delayed(delay),
@@ -352,7 +394,11 @@ impl SongbirdRuntime {
             start_paused
         ));
 
-        Ok(Arc::new(SongbirdTrackHandle { handle, lifecycle }))
+        Ok(Arc::new(SongbirdTrackHandle {
+            handle,
+            lifecycle,
+            stretch_timeline,
+        }))
     }
 }
 
@@ -449,6 +495,41 @@ impl VoiceRuntime for SongbirdRuntime {
             true,
         )
         .await
+    }
+
+    async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+            return Some(analysis);
+        }
+        if !matches!(request.prepared, PreparedSource::Http { .. }) {
+            return None;
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelAnalysisOnDrop(cancelled.clone());
+        let analysis = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
+            let _permit = self.analysis_limit.acquire().await.ok()?;
+            if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+                return Some(analysis);
+            }
+            let input = build_input(
+                self.stream_client(request.provider_id.as_ref()).ok()?,
+                request,
+            )
+            .ok()?
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .ok()?;
+            let worker_cancelled = cancelled.clone();
+            tokio::task::spawn_blocking(move || analyze_input_with_cancel(input, &worker_cancelled))
+                .await
+                .ok()?
+        })
+        .await
+        .ok()??;
+        drop(cancel_on_drop);
+        let _ = self.analysis_cache.store(&key, &analysis);
+        Some(analysis)
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -622,6 +703,7 @@ impl TrackLifecycle {
 struct SongbirdTrackHandle {
     handle: TrackHandle,
     lifecycle: Arc<TrackLifecycle>,
+    stretch_timeline: Option<StretchTimeline>,
 }
 
 #[async_trait]
@@ -644,16 +726,24 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
     }
 
     async fn position(&self) -> Option<Duration> {
-        self.handle
-            .get_info()
-            .await
-            .ok()
-            .map(|state| state.position)
+        self.handle.get_info().await.ok().map(|state| {
+            self.stretch_timeline.map_or(state.position, |timeline| {
+                timeline.source_start + timeline.envelope.source_elapsed(state.position)
+            })
+        })
     }
 
     async fn seek(&self, position: Duration) -> bool {
-        self.handle.seek_async(position).await.is_ok()
+        self.stretch_timeline.is_none() && self.handle.seek_async(position).await.is_ok()
     }
+}
+
+fn stretched_event_delay(source_position: Duration, timeline: Option<StretchTimeline>) -> Duration {
+    timeline.map_or(source_position, |timeline| {
+        timeline
+            .envelope
+            .output_elapsed(source_position.saturating_sub(timeline.source_start))
+    })
 }
 
 struct TrackEndNotifier {
