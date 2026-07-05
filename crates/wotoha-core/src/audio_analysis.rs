@@ -38,12 +38,38 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         .windows(2)
         .map(|pair| (pair[1].sqrt() - pair[0].sqrt()).max(0.0))
         .collect::<Vec<_>>();
-    let (bpm, confidence, beat_lag) = estimate_tempo(&onset)?;
+    let Some((bpm, confidence, beat_lag)) = estimate_tempo(&onset) else {
+        return Some(TrackAnalysis {
+            duration: duration(samples.len(), sample_rate),
+            audible_start: duration(first, sample_rate),
+            audible_end: duration(last.saturating_add(1), sample_rate),
+            bpm: None,
+            beat_confidence: 0.0,
+            first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+        });
+    };
     let onset_peak = onset.iter().copied().fold(0.0_f32, f32::max);
     let first_beat_block = onset
         .iter()
         .position(|value| *value >= onset_peak * 0.5)
-        .map(|index| index + 1)?;
+        .map(|index| index + 1)
+        .unwrap_or_default();
+    if first_beat_block == 0 {
+        return Some(TrackAnalysis {
+            duration: duration(samples.len(), sample_rate),
+            audible_start: duration(first, sample_rate),
+            audible_end: duration(last.saturating_add(1), sample_rate),
+            bpm: None,
+            beat_confidence: 0.0,
+            first_beat: None,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+        });
+    }
     let (downbeat_offset, downbeat_confidence) =
         estimate_downbeat_phase(&onset, first_beat_block - 1, beat_lag);
     let first_downbeat_block = first_beat_block + downbeat_offset * beat_lag;
@@ -57,6 +83,7 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         first_beat: Some(duration(first_beat_block * block, sample_rate)),
         first_downbeat: Some(duration(first_downbeat_block * block, sample_rate)),
         downbeat_confidence,
+        musical_key: None,
     })
 }
 

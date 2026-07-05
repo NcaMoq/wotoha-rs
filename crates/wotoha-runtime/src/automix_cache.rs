@@ -9,9 +9,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wotoha_core::{PreparedSource, TrackRequest, automix::TrackAnalysis};
+use wotoha_core::{
+    PreparedSource, TrackRequest,
+    automix::{KeyMode, MusicalKey, TrackAnalysis},
+};
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 3;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 4;
 const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -260,6 +263,14 @@ struct SerializableAnalysis {
     first_beat_micros: Option<u64>,
     first_downbeat_micros: Option<u64>,
     downbeat_confidence: f32,
+    musical_key: Option<SerializableMusicalKey>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SerializableMusicalKey {
+    tonic: u8,
+    minor: bool,
+    confidence: f32,
 }
 
 impl From<&TrackAnalysis> for SerializableAnalysis {
@@ -273,6 +284,11 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             first_beat_micros: value.first_beat.map(duration_to_micros),
             first_downbeat_micros: value.first_downbeat.map(duration_to_micros),
             downbeat_confidence: value.downbeat_confidence,
+            musical_key: value.musical_key.map(|key| SerializableMusicalKey {
+                tonic: key.tonic,
+                minor: key.mode == KeyMode::Minor,
+                confidence: key.confidence,
+            }),
         }
     }
 }
@@ -290,6 +306,15 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             first_beat: value.first_beat_micros.map(Duration::from_micros),
             first_downbeat: value.first_downbeat_micros.map(Duration::from_micros),
             downbeat_confidence: value.downbeat_confidence,
+            musical_key: value.musical_key.map(|key| MusicalKey {
+                tonic: key.tonic,
+                mode: if key.minor {
+                    KeyMode::Minor
+                } else {
+                    KeyMode::Major
+                },
+                confidence: key.confidence,
+            }),
         };
         validate_analysis(&analysis)?;
         Ok(analysis)
@@ -341,6 +366,13 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "first downbeat must be within the track duration",
+        ));
+    }
+    if analysis.musical_key.is_some_and(|key| {
+        key.tonic >= 12 || !key.confidence.is_finite() || !(0.0..=1.0).contains(&key.confidence)
+    }) {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "musical key must have a valid tonic and confidence",
         ));
     }
     Ok(())
@@ -402,6 +434,11 @@ mod tests {
             first_beat: Some(Duration::from_millis(750)),
             first_downbeat: Some(Duration::from_millis(750)),
             downbeat_confidence: 0.72,
+            musical_key: Some(MusicalKey {
+                tonic: 9,
+                mode: KeyMode::Minor,
+                confidence: 0.81,
+            }),
         }
     }
 
@@ -478,6 +515,7 @@ mod tests {
             first_beat: None,
             first_downbeat: None,
             downbeat_confidence: 2.0,
+            musical_key: None,
         };
 
         assert!(matches!(

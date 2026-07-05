@@ -2956,6 +2956,7 @@ mod tests {
             first_beat: Some(Duration::ZERO),
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
+            musical_key: None,
         };
         runtime.analyze_with("first", analysis.clone());
         runtime.analyze_with("second", analysis);

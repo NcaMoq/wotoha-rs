@@ -120,7 +120,7 @@ impl SongbirdRuntime {
                     std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| ".wotoha-analysis".into()),
-                    "pcm-onset-v2",
+                    "pcm-onset-chroma-v3",
                 )
                 .expect("static analyzer version is valid"),
             ),

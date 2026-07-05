@@ -18,6 +18,21 @@ pub struct TrackAnalysis {
     pub first_beat: Option<Duration>,
     pub first_downbeat: Option<Duration>,
     pub downbeat_confidence: f32,
+    pub musical_key: Option<MusicalKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyMode {
+    Major,
+    Minor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MusicalKey {
+    /// Pitch class where C=0, C#=1, ... B=11.
+    pub tonic: u8,
+    pub mode: KeyMode,
+    pub confidence: f32,
 }
 
 /// A lightweight 4/4 beat grid inferred from tempo and onset accents.
@@ -63,6 +78,7 @@ impl TrackAnalysis {
             first_beat: None,
             first_downbeat: None,
             downbeat_confidence: 0.0,
+            musical_key: None,
         }
     }
 
@@ -130,6 +146,7 @@ pub struct TransitionPlan {
     pub duration: Duration,
     /// Playback speed applied to the incoming deck. `1.0` preserves its tempo.
     pub incoming_tempo_ratio: f32,
+    pub harmonic_compatibility: Option<f32>,
 }
 
 /// Playback-relative timing for preparing and starting an adaptive transition.
@@ -182,7 +199,12 @@ pub fn plan_transition(
     else {
         return gapless_plan(outgoing, incoming);
     };
-    let duration = timing.fade_duration;
+    let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
+    let duration = if harmonic_compatibility.is_some_and(|score| score < 0.5) {
+        timing.fade_duration.min(Duration::from_secs(4))
+    } else {
+        timing.fade_duration
+    };
 
     let tempo_ratio = compatible_tempo_ratio(outgoing, incoming, config);
     let beat_aligned = tempo_ratio.is_some();
@@ -216,6 +238,7 @@ pub fn plan_transition(
         },
         duration,
         incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
+        harmonic_compatibility,
     }
 }
 
@@ -256,7 +279,43 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
         incoming_start: incoming.audible_start,
         duration: Duration::ZERO,
         incoming_tempo_ratio: 1.0,
+        harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
     }
+}
+
+pub fn harmonic_compatibility(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Option<f32> {
+    let outgoing = outgoing.musical_key?;
+    let incoming = incoming.musical_key?;
+    if outgoing.confidence < 0.5
+        || incoming.confidence < 0.5
+        || outgoing.tonic >= 12
+        || incoming.tonic >= 12
+    {
+        return None;
+    }
+    let score = if outgoing.tonic == incoming.tonic && outgoing.mode == incoming.mode {
+        1.0
+    } else if matches!(
+        (outgoing.mode, incoming.mode),
+        (KeyMode::Major, KeyMode::Minor)
+    ) && incoming.tonic == (outgoing.tonic + 9) % 12
+        || matches!(
+            (outgoing.mode, incoming.mode),
+            (KeyMode::Minor, KeyMode::Major)
+        ) && outgoing.tonic == (incoming.tonic + 9) % 12
+    {
+        0.95
+    } else if outgoing.mode == incoming.mode
+        && (incoming.tonic == (outgoing.tonic + 7) % 12
+            || outgoing.tonic == (incoming.tonic + 7) % 12)
+    {
+        0.85
+    } else if outgoing.tonic == incoming.tonic {
+        0.65
+    } else {
+        0.2
+    };
+    Some(score)
 }
 
 fn compatible_tempo_ratio(
@@ -302,7 +361,18 @@ mod tests {
             first_beat: Some(Duration::from_secs(1)),
             first_downbeat: Some(Duration::from_secs(1)),
             downbeat_confidence: 0.9,
+            musical_key: None,
         }
+    }
+
+    fn keyed(tonic: u8, mode: KeyMode) -> TrackAnalysis {
+        let mut analysis = analyzed(120.0);
+        analysis.musical_key = Some(MusicalKey {
+            tonic,
+            mode,
+            confidence: 0.9,
+        });
+        analysis
     }
 
     #[test]
@@ -350,6 +420,28 @@ mod tests {
         let plan = plan_transition(&analyzed(90.0), &analyzed(140.0), &config());
         assert_eq!(plan.kind, TransitionKind::Crossfade);
         assert_eq!(plan.incoming_tempo_ratio, 1.0);
+    }
+
+    #[test]
+    fn recognizes_relative_keys_as_harmonically_compatible() {
+        let plan = plan_transition(
+            &keyed(0, KeyMode::Major),
+            &keyed(9, KeyMode::Minor),
+            &config(),
+        );
+        assert_eq!(plan.harmonic_compatibility, Some(0.95));
+        assert_eq!(plan.duration, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn shortens_overlap_for_confident_incompatible_keys() {
+        let plan = plan_transition(
+            &keyed(0, KeyMode::Major),
+            &keyed(6, KeyMode::Major),
+            &config(),
+        );
+        assert_eq!(plan.harmonic_compatibility, Some(0.2));
+        assert_eq!(plan.duration, Duration::from_secs(4));
     }
 
     #[test]

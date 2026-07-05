@@ -2,10 +2,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use songbird::input::{Input, LiveInput};
 use symphonia::core::{audio::SampleBuffer, errors::Error};
-use wotoha_core::{audio_analysis::analyze_mono_pcm, automix::TrackAnalysis};
+use wotoha_core::{
+    audio_analysis::analyze_mono_pcm, automix::TrackAnalysis, key_analysis::estimate_musical_key,
+};
 
 const ANALYSIS_RATE: u32 = 1_000;
+const TONAL_RATE: u32 = 11_025;
 const MAX_ANALYSIS_SECONDS: usize = 30 * 60;
+const MAX_TONAL_SECONDS: usize = 6 * 60;
 
 #[cfg(test)]
 pub(crate) fn analyze_input(input: Input) -> Option<TrackAnalysis> {
@@ -35,6 +39,10 @@ fn analyze_input_with_limit(
     let mut accumulator = 0.0_f32;
     let mut accumulated = 0_usize;
     let mut phase = 0_u64;
+    let mut tonal = Vec::with_capacity(TONAL_RATE as usize * 180);
+    let mut tonal_accumulator = 0.0_f32;
+    let mut tonal_accumulated = 0_usize;
+    let mut tonal_phase = 0_u64;
     let mut stream_rate = None;
     loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -83,6 +91,17 @@ fn analyze_input_with_limit(
                     break;
                 }
             }
+            if source_rate >= TONAL_RATE && tonal.len() < TONAL_RATE as usize * MAX_TONAL_SECONDS {
+                tonal_accumulator += sample;
+                tonal_accumulated += 1;
+                tonal_phase += TONAL_RATE as u64;
+                if tonal_phase >= source_rate as u64 {
+                    tonal_phase -= source_rate as u64;
+                    tonal.push(tonal_accumulator / tonal_accumulated as f32);
+                    tonal_accumulator = 0.0;
+                    tonal_accumulated = 0;
+                }
+            }
         }
         if mono.len() > max_samples {
             break;
@@ -91,9 +110,11 @@ fn analyze_input_with_limit(
     if mono.len() > max_samples {
         return None;
     }
-    (!mono.is_empty())
+    let mut analysis = (!mono.is_empty())
         .then(|| analyze_mono_pcm(&mono, ANALYSIS_RATE))
-        .flatten()
+        .flatten()?;
+    analysis.musical_key = estimate_musical_key(&tonal, TONAL_RATE);
+    Some(analysis)
 }
 
 #[cfg(test)]
@@ -153,6 +174,20 @@ mod tests {
         assert!(analyze_input_with_cancel(playable, &cancelled).is_none());
     }
 
+    #[tokio::test]
+    async fn decodes_wav_and_detects_musical_key() {
+        let input = Input::from(c_major_wav());
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        let analysis = analyze_input(playable).expect("WAV should produce an analysis");
+        let key = analysis.musical_key.expect("key should be detected");
+        assert_eq!(key.tonic, 0);
+        assert_eq!(key.mode, wotoha_core::automix::KeyMode::Major);
+    }
+
     fn click_track_wav() -> Vec<u8> {
         const SAMPLE_RATE: u32 = 44_100;
         const SECONDS: usize = 12;
@@ -180,6 +215,40 @@ mod tests {
                 && after_lead_in % (SAMPLE_RATE as usize / 2) < CLICK_SAMPLES
                 && index < SAMPLE_RATE as usize * 11;
             let sample = if is_click { i16::MAX } else { 0 };
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        wav
+    }
+
+    fn c_major_wav() -> Vec<u8> {
+        const SAMPLE_RATE: u32 = 44_100;
+        const SECONDS: usize = 8;
+        let samples = (0..SAMPLE_RATE as usize * SECONDS)
+            .map(|index| {
+                let time = index as f32 / SAMPLE_RATE as f32;
+                let value = [261.63_f32, 329.63, 392.0]
+                    .into_iter()
+                    .map(|frequency| (std::f32::consts::TAU * frequency * time).sin())
+                    .sum::<f32>()
+                    / 3.0;
+                (value * i16::MAX as f32 * 0.8) as i16
+            })
+            .collect::<Vec<_>>();
+        let data_len = samples.len() * size_of::<i16>();
+        let mut wav = Vec::with_capacity(44 + data_len);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        wav.extend_from_slice(&(SAMPLE_RATE * size_of::<i16>() as u32).to_le_bytes());
+        wav.extend_from_slice(&(size_of::<i16>() as u16).to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for sample in samples {
             wav.extend_from_slice(&sample.to_le_bytes());
         }
         wav
