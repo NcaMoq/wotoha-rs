@@ -711,7 +711,7 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
-        handle.set_volume(0.10);
+        handle.set_volume(1.0);
         Ok(StartedTrack {
             playback_id,
             handle,

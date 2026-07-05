@@ -205,8 +205,9 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
         self.inner.stop();
     }
 
-    fn set_volume(&self, _volume: f32) {
-        self.inner.set_volume(self.default_volume);
+    fn set_volume(&self, volume: f32) {
+        self.inner
+            .set_volume((self.default_volume * volume).clamp(0.0, 2.0));
     }
 }
 
@@ -753,10 +754,10 @@ mod tests {
         });
         let handle = ConfiguredTrackHandle::new(inner, 0.25);
 
-        handle.set_volume(1.0);
+        handle.set_volume(0.4);
         handle.stop();
 
-        assert_eq!(*volumes.lock().unwrap(), vec![0.25]);
+        assert_eq!(*volumes.lock().unwrap(), vec![0.1]);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
     }
 }
