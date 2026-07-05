@@ -327,6 +327,10 @@ where
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
         let mut playback = session.playback.lock();
+        if playback.automix_enabled {
+            playback.automix_enabled = false;
+            playback.logical.disable_loop();
+        }
         Some(playback.logical.toggle_loop())
     }
 
@@ -381,7 +385,15 @@ where
         let _operation = session.operation.lock().await;
         let mut playback = session.playback.lock();
         playback.automix_enabled = !playback.automix_enabled;
+        if playback.automix_enabled {
+            playback.logical.disable_loop();
+        }
         Some(playback.automix_enabled)
+    }
+
+    pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
+        self.get_session(guild_id)
+            .is_some_and(|session| session.playback.lock().automix_enabled)
     }
 
     pub async fn disconnect_guild(&self, guild_id: GuildKey) {
@@ -943,6 +955,10 @@ where
 
     async fn shuffle(&self, guild_id: GuildKey) -> bool {
         Self::shuffle(self, guild_id).await
+    }
+
+    fn automix_enabled(&self, guild_id: GuildKey) -> bool {
+        Self::automix_enabled(self, guild_id)
     }
 
     async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
@@ -1561,6 +1577,21 @@ mod tests {
             .get_session(guild_id)
             .map(|session| session.playback.lock().pending_enqueues.len())
             .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn loop_replaces_automix_and_automix_replaces_loop() {
+        let playback = PlaybackCoordinator::new(MockMedia::default(), MockRuntime::default());
+        playback
+            .enqueue_impl(GuildKey::new(1), "track")
+            .await
+            .expect("track should start");
+
+        assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
+        assert_eq!(playback.toggle_automix(GuildKey::new(1)).await, Some(true));
+        assert!(playback.automix_enabled(GuildKey::new(1)));
+        assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
+        assert!(!playback.automix_enabled(GuildKey::new(1)));
     }
 
     #[test]
@@ -2271,7 +2302,13 @@ mod tests {
                 Some(Duration::from_secs(1)),
             )),
         );
-        media.resolve_with("second", Ok(track_request("second")));
+        media.resolve_with(
+            "second",
+            Ok(track_request_with_duration(
+                "second",
+                Some(Duration::from_secs(1)),
+            )),
+        );
         runtime.fail_play_for("second", TestRuntimeError::new("unplayable"));
 
         playback.enqueue_impl(guild_id, "first").await.unwrap();

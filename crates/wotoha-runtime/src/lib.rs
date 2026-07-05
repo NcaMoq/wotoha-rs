@@ -3,6 +3,7 @@ mod discord;
 mod hls_security;
 mod niconico_hls;
 mod ranged_http;
+mod reconnect;
 mod songbird;
 mod validated_hls;
 

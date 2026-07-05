@@ -35,18 +35,19 @@ use wotoha_core::{
     QueuePreview, TrackMetadata,
     debug::append_debug_log,
     ui::{
-        self, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP, BUTTON_LOOP_LABEL, BUTTON_QUEUE,
-        BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, BUTTON_SKIP, BUTTON_SKIP_LABEL,
-        COLOR_ERROR, COLOR_INFO, LOOP_EMOJI_ID, LOOP_EMOJI_NAME, LOOPING_NICKNAME,
-        MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING,
-        MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED,
-        PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME, PLAY_COMMAND_URL_OPTION, QUEUE_EMOJI_ID,
-        QUEUE_EMOJI_NAME, SHUFFLE_EMOJI_ID, SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
+        self, AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, AUTOMIX_NICKNAME, BUTTON_AUTOMIX, BUTTON_LOOP,
+        BUTTON_LOOP_LABEL, BUTTON_QUEUE, BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL,
+        BUTTON_SKIP, BUTTON_SKIP_LABEL, COLOR_ERROR, COLOR_INFO, LOOP_EMOJI_ID, LOOP_EMOJI_NAME,
+        LOOPING_NICKNAME, MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST,
+        MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE,
+        MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME,
+        PLAY_COMMAND_URL_OPTION, QUEUE_EMOJI_ID, QUEUE_EMOJI_NAME, SHUFFLE_EMOJI_ID,
+        SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
     },
     url::summarize_url_for_logs,
 };
 
-use crate::SongbirdRuntime;
+use crate::{SongbirdRuntime, reconnect::ReconnectStore};
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
@@ -79,6 +80,8 @@ pub struct DiscordGateway<P: PlaybackService, R: VoiceGatewayRuntime> {
     runtime: R,
     startup: Arc<StartupState>,
     notification_channels: Arc<DashMap<GuildKey, ChannelId>>,
+    active_voice_channels: Arc<DashMap<GuildKey, ChannelKey>>,
+    reconnect_store: ReconnectStore,
 }
 
 #[derive(Default)]
@@ -93,10 +96,27 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             runtime,
             startup: Arc::default(),
             notification_channels: Arc::default(),
+            active_voice_channels: Arc::default(),
+            reconnect_store: ReconnectStore::from_env(),
         }
     }
 
     pub async fn notify_restart(&self, http: &Http) {
+        let mut connections = self
+            .active_voice_channels
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect::<Vec<_>>();
+        connections.sort_unstable_by_key(|(guild_id, _)| guild_id.get());
+        if let Err(error) = self.reconnect_store.save(&connections) {
+            error!(error = %error, "failed to persist voice reconnect handoff");
+        } else {
+            info!(
+                connections = connections.len(),
+                "persisted voice reconnect handoff"
+            );
+        }
+
         let targets = self
             .notification_channels
             .iter()
@@ -110,6 +130,49 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         for result in join_all(notifications).await {
             if let Err(error) = result {
                 error!(error = %error, "failed to send update restart notification");
+            }
+        }
+    }
+
+    async fn restore_voice_connections(&self, ctx: &Context) {
+        let connections = match self.reconnect_store.take() {
+            Ok(connections) => connections,
+            Err(error) => {
+                error!(error = %error, "failed to consume voice reconnect handoff");
+                return;
+            }
+        };
+
+        for (guild_id, channel_id) in connections {
+            match self.runtime.ensure_joined(guild_id, channel_id).await {
+                Ok(_) => {
+                    self.active_voice_channels.insert(guild_id, channel_id);
+                    let serenity_guild_id = serenity::all::GuildId::new(guild_id.get());
+                    let bot_user_id = UserKey::new(ctx.cache.current_user().id.get());
+                    self.control.bootstrap_voice_state(
+                        guild_id,
+                        channel_id,
+                        self.guild_voice_snapshot(ctx, serenity_guild_id, bot_user_id),
+                    );
+                    if self.control.automix_enabled(guild_id) {
+                        let _ = serenity_guild_id
+                            .edit_nickname(&ctx.http, Some(AUTOMIX_NICKNAME))
+                            .await;
+                    }
+                    info!(
+                        guild_id = guild_id.get(),
+                        channel_id = channel_id.get(),
+                        "restored voice connection after restart"
+                    );
+                }
+                Err(error) => {
+                    error!(
+                        guild_id = guild_id.get(),
+                        channel_id = channel_id.get(),
+                        error = %error,
+                        "failed to restore voice connection after restart"
+                    );
+                }
             }
         }
     }
@@ -232,6 +295,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 return Ok(());
             }
         };
+        self.active_voice_channels
+            .insert(guild_key, user_channel_key);
 
         let bot_user_id = UserKey::new(ctx.cache.current_user().id.get());
         self.control.bootstrap_voice_state(
@@ -259,6 +324,11 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     now_playing = outcome.now_playing,
                     "play command resolved successfully"
                 );
+                if self.control.automix_enabled(guild_key) {
+                    let _ = guild_id
+                        .edit_nickname(&ctx.http, Some(AUTOMIX_NICKNAME))
+                        .await;
+                }
                 let response = CreateInteractionResponseFollowup::new()
                     .embed(track_embed(
                         &outcome.request.metadata,
@@ -278,6 +348,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     "play command failed"
                 );
                 if joined_now && !self.control.has_current_track(guild_key) {
+                    self.active_voice_channels.remove(&guild_key);
                     self.control.disconnect_guild(guild_key).await;
                 }
                 command
@@ -359,21 +430,9 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     .await?;
             }
             ComponentOutcome::AutoMix { enabled } => {
-                let message = if enabled {
-                    "AutoMixを有効にしました。"
-                } else {
-                    "AutoMixを無効にしました。"
-                };
-                component
-                    .create_response(
-                        &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(info_embed(message)),
-                        ),
-                    )
-                    .await?;
+                let nickname = enabled.then_some(AUTOMIX_NICKNAME);
+                let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
+                component.defer(&ctx.http).await?;
             }
             ComponentOutcome::QueuePreview(preview) => {
                 component
@@ -506,6 +565,8 @@ where
 
         info!(guild_count = ready.guilds.len(), "Bot is ready");
 
+        self.restore_voice_connections(&ctx).await;
+
         if let Err(error) = ensure_global_commands(&ctx).await {
             error!(error = %error, "failed to synchronize slash commands");
         }
@@ -561,8 +622,15 @@ where
             }
             self.control
                 .update_bot_voice_channel(guild_key, new_channel);
-            if new_channel.is_none() {
-                self.notification_channels.remove(&guild_key);
+            match new_channel {
+                Some(channel_id) => {
+                    self.active_voice_channels.insert(guild_key, channel_id);
+                }
+                None => {
+                    self.active_voice_channels.remove(&guild_key);
+                    self.notification_channels.remove(&guild_key);
+                    let _ = guild_id.edit_nickname(&ctx.http, None).await;
+                }
             }
             return;
         }
@@ -578,6 +646,7 @@ where
             return;
         }
 
+        self.active_voice_channels.remove(&guild_key);
         self.control.disconnect_guild(guild_key).await;
         let _ = guild_id.edit_nickname(&ctx.http, None).await;
     }
@@ -781,10 +850,13 @@ fn player_action_row() -> CreateActionRow {
             SHUFFLE_EMOJI_NAME,
             SHUFFLE_EMOJI_ID,
         ),
-        CreateButton::new(BUTTON_AUTOMIX)
-            .label(BUTTON_AUTOMIX_LABEL)
-            .style(ButtonStyle::Secondary)
-            .emoji(ReactionType::Unicode("🎚️".to_owned())),
+        player_button(
+            BUTTON_AUTOMIX,
+            "",
+            ButtonStyle::Secondary,
+            AUTOMIX_EMOJI_NAME,
+            AUTOMIX_EMOJI_ID,
+        ),
         player_button(
             BUTTON_QUEUE,
             BUTTON_QUEUE_LABEL,

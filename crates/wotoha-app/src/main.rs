@@ -395,6 +395,10 @@ where
         self.inner.shuffle(guild_id).await
     }
 
+    fn automix_enabled(&self, guild_id: GuildKey) -> bool {
+        self.inner.automix_enabled(guild_id)
+    }
+
     async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
         self.inner.toggle_automix(guild_id).await
     }

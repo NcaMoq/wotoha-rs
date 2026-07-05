@@ -385,7 +385,8 @@ mod tests {
         cache.store(&key, &analysis()).unwrap();
         assert_eq!(cache.load(&key).unwrap(), Some(analysis()));
 
-        let filename = cache.path_for(&key).file_name().unwrap().to_string_lossy();
+        let cache_path = cache.path_for(&key);
+        let filename = cache_path.file_name().unwrap().to_string_lossy();
         assert_eq!(filename.len(), 69);
         assert!(!filename.contains("soundcloud"));
         assert!(!filename.contains("unsafe"));
