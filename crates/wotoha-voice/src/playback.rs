@@ -25,7 +25,8 @@ use wotoha_contracts::{
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
-        AutoMixConfig, TrackAnalysis, TransitionTiming, plan_transition, plan_transition_timing,
+        AutoMixConfig, TempoEnvelope, TrackAnalysis, TransitionTiming, plan_transition,
+        plan_transition_timing,
     },
     debug::append_debug_log,
 };
@@ -36,6 +37,8 @@ type SessionHandle<ME, RE> = Arc<GuildSession<ME, RE>>;
 const MAX_QUEUE_LEN: usize = 512;
 const MAX_PENDING_ENQUEUES: usize = 64;
 const BEAT_ALIGNMENT_LOOKAHEAD: std::time::Duration = std::time::Duration::from_secs(60);
+const TRANSITION_PREPARE_LEAD: std::time::Duration = std::time::Duration::from_secs(15);
+const MIN_TRANSITION_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const MAX_UNSTRETCHED_TEMPO_DRIFT: f32 = 0.005;
 
 fn track_analysis_key(request: &TrackRequest) -> String {
@@ -91,6 +94,7 @@ where
     prepared_transition: Option<PreparedTransition>,
     current_analysis: Option<TrackAnalysis>,
     current_gain: f32,
+    current_tempo: Option<(std::time::Duration, TempoEnvelope)>,
     analysis_by_key: HashMap<String, TrackAnalysis>,
     analysis_in_flight: HashSet<String>,
     analysis_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
@@ -116,6 +120,8 @@ struct PreparedTransition {
     start_delay: std::time::Duration,
     incoming_analysis: Option<TrackAnalysis>,
     incoming_gain: f32,
+    source_start: std::time::Duration,
+    tempo_envelope: Option<TempoEnvelope>,
 }
 
 #[derive(Default)]
@@ -180,6 +186,7 @@ where
             prepared_transition: None,
             current_analysis: None,
             current_gain: 1.0,
+            current_tempo: None,
             analysis_by_key: HashMap::new(),
             analysis_in_flight: HashSet::new(),
             analysis_tasks: HashMap::new(),
@@ -971,6 +978,7 @@ where
                 playback.current_playback_id = None;
                 playback.current_analysis = None;
                 playback.current_gain = 1.0;
+                playback.current_tempo = None;
                 let prepared = invalidate_prepared_transition(&mut playback);
                 (playback.logical.prepare_next_track(), prepared)
             };
@@ -1042,7 +1050,7 @@ where
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let (generation, next, timing, event_after) = {
+        let (generation, next, timing, event_after, current_tempo) = {
             let _operation = session.operation.lock().await;
             if !self.session_is_current(guild_id, session_id) {
                 return;
@@ -1080,10 +1088,14 @@ where
             };
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
             let generation = playback.prefetch_generation;
-            let event_after = scheduled
-                .transition_after
-                .saturating_sub(BEAT_ALIGNMENT_LOOKAHEAD);
-            (generation, next, timing, event_after)
+            let event_after = transition_event_after(scheduled);
+            (
+                generation,
+                next,
+                timing,
+                event_after,
+                playback.current_tempo,
+            )
         };
 
         let prepared = match self.inner.media.prepare_playback(&next).await {
@@ -1196,7 +1208,16 @@ where
                 }
             }
         }
-        let start_delay = transition_after.saturating_sub(event_after);
+        let start_delay = current_tempo.map_or_else(
+            || transition_after.saturating_sub(event_after),
+            |(source_start, envelope)| {
+                envelope
+                    .output_elapsed(transition_after.saturating_sub(source_start))
+                    .saturating_sub(
+                        envelope.output_elapsed(event_after.saturating_sub(source_start)),
+                    )
+            },
+        );
 
         let mut incoming = Some(incoming);
         {
@@ -1217,6 +1238,10 @@ where
                     start_delay,
                     incoming_analysis,
                     incoming_gain,
+                    source_start: dsp_active
+                        .then_some(options.source_start)
+                        .unwrap_or_default(),
+                    tempo_envelope: dsp_active.then_some(options.tempo_envelope).flatten(),
                 }) {
                     previous.incoming.handle.stop();
                 }
@@ -1296,6 +1321,9 @@ where
             playback.current_playback_id = Some(prepared.incoming.playback_id);
             playback.current_analysis = prepared.incoming_analysis.clone();
             playback.current_gain = prepared.incoming_gain;
+            playback.current_tempo = prepared
+                .tempo_envelope
+                .map(|envelope| (prepared.source_start, envelope));
             playback.transition_due = None;
             (prepared, outgoing, outgoing_gain, previous_retiring)
         };
@@ -1435,16 +1463,25 @@ fn track_start_options(
     initial_gain: f32,
 ) -> TrackStartOptions {
     let timing = duration.and_then(|duration| track_transition_timing(config, duration));
+    let transition_after = timing.map(transition_event_after);
     TrackStartOptions {
         initial_gain,
-        prefetch_after: timing.map(|timing| timing.prefetch_after),
-        transition_after: timing.map(|timing| {
-            timing
-                .transition_after
-                .saturating_sub(BEAT_ALIGNMENT_LOOKAHEAD)
-        }),
+        prefetch_after: transition_after
+            .map(|transition_after| transition_after.saturating_sub(TRANSITION_PREPARE_LEAD)),
+        transition_after,
         source_start: std::time::Duration::ZERO,
         tempo_envelope: None,
+    }
+}
+
+fn transition_event_after(timing: TransitionTiming) -> std::time::Duration {
+    let early = timing
+        .transition_after
+        .saturating_sub(BEAT_ALIGNMENT_LOOKAHEAD);
+    if early.is_zero() {
+        timing.transition_after.min(MIN_TRANSITION_ARM_DELAY)
+    } else {
+        early
     }
 }
 
@@ -1790,7 +1827,7 @@ where
 mod tests {
     use super::{
         GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
-        equal_power_gains,
+        equal_power_gains, track_start_options,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -1830,6 +1867,22 @@ mod tests {
         let (outgoing, incoming) = equal_power_gains(1.0);
         assert!(outgoing.abs() < 0.0001);
         assert_eq!(incoming, 1.0);
+    }
+
+    #[test]
+    fn transition_prefetch_is_always_armed_before_transition() {
+        let config = automix_config(Duration::from_secs(8));
+        for duration in [
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+            Duration::from_secs(180),
+        ] {
+            let options = track_start_options(&config, Some(duration), 1.0);
+            assert!(options.prefetch_after < options.transition_after);
+        }
+        let long = track_start_options(&config, Some(Duration::from_secs(180)), 1.0);
+        assert_eq!(long.prefetch_after, Some(Duration::from_secs(97)));
+        assert_eq!(long.transition_after, Some(Duration::from_secs(112)));
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3149,6 +3202,63 @@ mod tests {
             .1;
         let envelope = options.tempo_envelope.expect("tempo envelope");
         assert!((envelope.initial_speed - 120.0 / 124.0).abs() < 0.0001);
+    }
+
+    #[tokio::test]
+    async fn automix_retries_without_tempo_dsp_when_stretched_prepare_fails() {
+        let guild_id = GuildKey::new(123);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let analysis = |bpm, first_beat| TrackAnalysis {
+            duration,
+            audible_start: Duration::ZERO,
+            audible_end: duration,
+            bpm: Some(bpm),
+            beat_confidence: 1.0,
+            first_beat: Some(first_beat),
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
+        };
+        runtime.analyze_with("first", analysis(120.0, Duration::ZERO));
+        runtime.analyze_with("second", analysis(124.0, Duration::from_millis(250)));
+        runtime.fail_play_for("second", TestRuntimeError::new("DSP unavailable"));
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+        first
+            .events
+            .send(PlaybackRuntimeEvent::TransitionPrefetchDue {
+                guild_id,
+                session_id: first.session_id,
+                playback_id: first.playback_id,
+            })
+            .unwrap();
+        runtime.wait_for_play_count(2).await;
+
+        let attempts = runtime
+            .start_options()
+            .into_iter()
+            .filter(|(key, _)| key == "second")
+            .map(|(_, options)| options)
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2);
+        assert!(attempts[0].tempo_envelope.is_some());
+        assert_eq!(attempts[0].source_start, Duration::from_millis(250));
+        assert!(attempts[1].tempo_envelope.is_none());
+        assert_eq!(attempts[1].source_start, Duration::ZERO);
     }
 
     #[tokio::test]

@@ -313,6 +313,99 @@ mod tests {
         assert!(output.len() > input.len());
     }
 
+    #[test]
+    fn tempo_ramp_produces_less_extension_than_a_constant_slowdown() {
+        const SAMPLE_RATE: u32 = 48_000;
+        let input = sine(220.0, SAMPLE_RATE, 8.0);
+        let process = |envelope| {
+            let mut processor =
+                TempoStretchProcessor::new(120.0, 108.0, SAMPLE_RATE, 1, envelope).unwrap();
+            let mut output = Vec::with_capacity(input.len() * 2);
+            for chunk in input.chunks(960) {
+                processor.process_into(chunk, &mut output).unwrap();
+            }
+            processor.flush_into(&mut output).unwrap();
+            output
+        };
+        let constant = process(TempoEnvelope {
+            initial_speed: 0.9,
+            hold: Duration::from_secs(20),
+            ramp: Duration::ZERO,
+        });
+        let ramped = process(TempoEnvelope {
+            initial_speed: 0.9,
+            hold: Duration::from_millis(250),
+            ramp: Duration::from_millis(750),
+        });
+
+        assert!(ramped.len() > input.len());
+        assert!(
+            ramped.len() + SAMPLE_RATE as usize / 4 < constant.len(),
+            "ramped={}, constant={}",
+            ramped.len(),
+            constant.len()
+        );
+    }
+
+    #[test]
+    fn stretches_stereo_without_collapsing_channels_or_pitch() {
+        const SAMPLE_RATE: u32 = 48_000;
+        let envelope = TempoEnvelope {
+            initial_speed: 0.96,
+            hold: Duration::from_secs(20),
+            ramp: Duration::ZERO,
+        };
+        let mut processor = TempoStretchProcessor::new(125.0, 120.0, SAMPLE_RATE, 2, envelope)
+            .expect("valid stereo tempo configuration");
+        let latency = processor.latency_samples();
+        let left = sine(330.0, SAMPLE_RATE, 4.0);
+        let right = sine(660.0, SAMPLE_RATE, 4.0);
+        let mut input = Vec::with_capacity(left.len() * 2);
+        for (left, right) in left.into_iter().zip(right) {
+            input.extend_from_slice(&[left, right]);
+        }
+        let mut output = Vec::with_capacity(input.len() * 2);
+        for chunk in input.chunks(2_048) {
+            processor.process_into(chunk, &mut output).unwrap();
+        }
+        processor.flush_into(&mut output).unwrap();
+
+        assert!(output.len() > input.len());
+        let from = latency.min(output.len() / 4);
+        let from = from + from % 2;
+        let to = (from + SAMPLE_RATE as usize * 2 * 2).min(output.len());
+        let mut output_left = Vec::with_capacity((to - from) / 2);
+        let mut output_right = Vec::with_capacity((to - from) / 2);
+        for frame in output[from..to].chunks_exact(2) {
+            output_left.push(frame[0]);
+            output_right.push(frame[1]);
+        }
+        let left_frequency = spectral_peak_frequency(&output_left, SAMPLE_RATE, 300, 360);
+        let right_frequency = spectral_peak_frequency(&output_right, SAMPLE_RATE, 620, 700);
+        assert!(
+            (left_frequency - 330.0).abs() < 3.0,
+            "left_frequency={left_frequency}"
+        );
+        assert!(
+            (right_frequency - 660.0).abs() < 3.0,
+            "right_frequency={right_frequency}"
+        );
+    }
+
+    #[test]
+    fn dropping_pcm_reader_cancels_stretch_worker() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (reader, _writer) = tokio::io::duplex(64);
+        let reader = CancelOnDropReader {
+            inner: reader,
+            cancelled: cancelled.clone(),
+        };
+
+        assert!(!cancelled.load(Ordering::Relaxed));
+        drop(reader);
+        assert!(cancelled.load(Ordering::Relaxed));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn songbird_adapter_seeks_and_streams_stretched_pcm() {
         const SAMPLE_RATE: u32 = 48_000;
@@ -362,6 +455,33 @@ mod tests {
             .filter(|pair| pair[0] <= 0.0 && pair[1] > 0.0)
             .count();
         crossings as f32 * sample_rate as f32 / samples.len() as f32
+    }
+
+    fn spectral_peak_frequency(
+        samples: &[f32],
+        sample_rate: u32,
+        minimum: u32,
+        maximum: u32,
+    ) -> f32 {
+        let samples = &samples[..samples.len().min(sample_rate as usize)];
+        (minimum..=maximum)
+            .map(|frequency| {
+                let omega = std::f64::consts::TAU * frequency as f64 / sample_rate as f64;
+                let (real, imaginary) = samples.iter().enumerate().fold(
+                    (0.0_f64, 0.0_f64),
+                    |(real, imaginary), (index, sample)| {
+                        let phase = omega * index as f64;
+                        (
+                            real + f64::from(*sample) * phase.cos(),
+                            imaginary - f64::from(*sample) * phase.sin(),
+                        )
+                    },
+                );
+                (real * real + imaginary * imaginary, frequency as f32)
+            })
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .map(|(_, frequency)| frequency)
+            .unwrap_or_default()
     }
 
     fn sine_wav(frequency: f32, sample_rate: u32, seconds: f32) -> Vec<u8> {
