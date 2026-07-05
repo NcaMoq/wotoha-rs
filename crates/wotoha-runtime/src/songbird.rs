@@ -18,7 +18,7 @@ use serenity::all::{ChannelId, GuildId};
 use songbird::{
     Songbird,
     error::JoinError,
-    events::{Event, EventContext, EventHandler as VoiceEventHandler, TrackEvent},
+    events::{Event, EventContext, EventData, EventHandler as VoiceEventHandler, TrackEvent},
     input::{
         HttpRequest, MakePlayableError,
         codecs::{get_codec_registry, get_probe},
@@ -301,7 +301,11 @@ impl VoiceRuntime for SongbirdRuntime {
             return Err(SongbirdRuntimeError::MissingCall);
         };
 
-        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?;
+        let input = build_input(self.stream_client(request.provider_id.as_ref())?, request)?
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .map_err(make_playable_error)?;
+        let transition_events = events.clone();
         let handle = {
             let mut call = call_lock.lock().await;
             append_debug_log(format!(
@@ -312,12 +316,26 @@ impl VoiceRuntime for SongbirdRuntime {
                 call.current_channel().map(|channel_id| channel_id.0.get()),
                 call.current_connection().is_some()
             ));
-            call.play(Track::new(input).volume(options.initial_gain))
+            let mut track = Track::new(input).volume(options.initial_gain);
+            if let Some(delay) = options.transition_after {
+                track.events.add_event(
+                    EventData::new(
+                        Event::Delayed(delay),
+                        TrackTransitionNotifier {
+                            guild_id,
+                            session_id,
+                            playback_id,
+                            events: transition_events,
+                        },
+                    ),
+                    Duration::ZERO,
+                );
+            }
+            call.play(track)
         };
         let lifecycle = Arc::new(TrackLifecycle::default());
         let playback_events = events.clone();
         let error_events = events.clone();
-        let transition_events = events.clone();
         handle
             .add_event(
                 Event::Track(TrackEvent::End),
@@ -330,19 +348,6 @@ impl VoiceRuntime for SongbirdRuntime {
                 },
             )
             .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        if let Some(delay) = options.transition_after {
-            handle
-                .add_event(
-                    Event::Delayed(delay),
-                    TrackTransitionNotifier {
-                        guild_id,
-                        session_id,
-                        playback_id,
-                        events: transition_events,
-                    },
-                )
-                .map_err(|error| SongbirdRuntimeError::TrackEvent(error.to_string()))?;
-        }
         handle
             .add_event(
                 Event::Track(TrackEvent::Playable),

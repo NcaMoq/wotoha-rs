@@ -7,11 +7,13 @@ pub const PLAY_COMMAND_URL_OPTION: &str = "url";
 pub const BUTTON_SKIP: &str = "player_skip";
 pub const BUTTON_LOOP: &str = "player_loop";
 pub const BUTTON_SHUFFLE: &str = "player_shuffle";
+pub const BUTTON_AUTOMIX: &str = "player_automix";
 pub const BUTTON_QUEUE: &str = "player_queue";
 
 pub const BUTTON_SKIP_LABEL: &str = "Skip";
 pub const BUTTON_LOOP_LABEL: &str = "Loop";
 pub const BUTTON_SHUFFLE_LABEL: &str = "Shuffle";
+pub const BUTTON_AUTOMIX_LABEL: &str = "AutoMix";
 pub const BUTTON_QUEUE_LABEL: &str = "List";
 
 pub const SKIP_EMOJI_NAME: &str = "skip";

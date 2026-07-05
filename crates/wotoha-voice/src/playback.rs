@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    f32::consts::FRAC_PI_2,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -67,6 +66,8 @@ where
     active_handle: Option<Arc<dyn RuntimeTrackHandle>>,
     current_playback_id: Option<PlaybackId>,
     retiring_handle: Option<(PlaybackId, Arc<dyn RuntimeTrackHandle>)>,
+    fade_abort: Option<tokio::task::AbortHandle>,
+    automix_enabled: bool,
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
@@ -136,6 +137,8 @@ where
             active_handle: None,
             current_playback_id: None,
             retiring_handle: None,
+            fade_abort: None,
+            automix_enabled: false,
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
@@ -238,10 +241,12 @@ where
             .sessions
             .entry(guild_id)
             .or_insert_with(|| {
+                let mut playback = PlaybackRuntime::default();
+                playback.automix_enabled = self.inner.automix.enabled;
                 Arc::new(GuildSession {
                     id: self.inner.next_session_id.fetch_add(1, Ordering::Relaxed),
                     operation: AsyncMutex::new(()),
-                    playback: Mutex::new(PlaybackRuntime::default()),
+                    playback: Mutex::new(playback),
                     voice: Mutex::new(GuildVoiceIndex::default()),
                 })
             })
@@ -329,13 +334,18 @@ where
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
 
-        let (was_looping, handle, retiring) = {
+        let (was_looping, handle, retiring, fade_abort) = {
             let mut playback = session.playback.lock();
             let was_looping = playback.logical.disable_loop();
             let handle = playback.active_handle.take();
             let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
-            (was_looping, handle, retiring)
+            let fade_abort = playback.fade_abort.take();
+            (was_looping, handle, retiring, fade_abort)
         };
+
+        if let Some(abort) = fade_abort {
+            abort.abort();
+        }
 
         if let Some(handle) = handle {
             handle.stop();
@@ -366,6 +376,14 @@ where
         playback.logical.shuffle()
     }
 
+    pub async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
+        let session = self.get_session(guild_id)?;
+        let _operation = session.operation.lock().await;
+        let mut playback = session.playback.lock();
+        playback.automix_enabled = !playback.automix_enabled;
+        Some(playback.automix_enabled)
+    }
+
     pub async fn disconnect_guild(&self, guild_id: GuildKey) {
         let session = self
             .inner
@@ -374,17 +392,21 @@ where
             .map(|(_, session)| session);
 
         if let Some(session) = session {
-            let (handle, retiring, pending) = {
+            let (handle, retiring, fade_abort, pending) = {
                 let mut playback = session.playback.lock();
                 playback.logical.clear();
                 let handle = playback.active_handle.take();
                 let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
+                let fade_abort = playback.fade_abort.take();
                 playback.current_playback_id = None;
                 let pending = drain_pending(&mut playback);
-                (handle, retiring, pending)
+                (handle, retiring, fade_abort, pending)
             };
             session.voice.lock().clear();
 
+            if let Some(abort) = fade_abort {
+                abort.abort();
+            }
             if let Some(handle) = handle {
                 handle.stop();
             }
@@ -685,6 +707,9 @@ where
             if playback.current_playback_id != Some(playback_id) {
                 return;
             }
+            if !playback.automix_enabled {
+                return;
+            }
             let Some(current_duration) = playback
                 .logical
                 .current()
@@ -699,6 +724,13 @@ where
             let Some(next) = playback.logical.peek_next_track().cloned() else {
                 return;
             };
+            if next
+                .metadata
+                .duration
+                .is_none_or(|duration| duration < fade_duration.saturating_mul(2))
+            {
+                return;
+            }
             (next, fade_duration)
         };
 
@@ -733,8 +765,8 @@ where
         }
 
         let coordinator = self.clone();
-        tokio::spawn(async move {
-            run_equal_power_fade(outgoing.clone(), incoming.handle, fade_duration).await;
+        let fade_task = tokio::spawn(async move {
+            run_linear_fade(outgoing.clone(), incoming.handle, fade_duration).await;
             outgoing.stop();
             if let Some(session) = coordinator.get_session(guild_id)
                 && session.id == session_id
@@ -749,6 +781,7 @@ where
                 }
             }
         });
+        session.playback.lock().fade_abort = Some(fade_task.abort_handle());
     }
 
     async fn play_request(
@@ -856,7 +889,7 @@ fn automix_transition_after(
     automix_fade_duration(config, duration).map(|fade| duration.saturating_sub(fade))
 }
 
-async fn run_equal_power_fade(
+async fn run_linear_fade(
     outgoing: Arc<dyn RuntimeTrackHandle>,
     incoming: Arc<dyn RuntimeTrackHandle>,
     duration: std::time::Duration,
@@ -866,8 +899,8 @@ async fn run_equal_power_fade(
     for step in 1..=steps {
         tokio::time::sleep(interval).await;
         let progress = step as f32 / steps as f32;
-        outgoing.set_volume((progress * FRAC_PI_2).cos());
-        incoming.set_volume((progress * FRAC_PI_2).sin());
+        outgoing.set_volume(1.0 - progress);
+        incoming.set_volume(progress);
     }
 }
 
@@ -910,6 +943,10 @@ where
 
     async fn shuffle(&self, guild_id: GuildKey) -> bool {
         Self::shuffle(self, guild_id).await
+    }
+
+    async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
+        Self::toggle_automix(self, guild_id).await
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) {

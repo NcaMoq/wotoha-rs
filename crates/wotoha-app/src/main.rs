@@ -395,6 +395,10 @@ where
         self.inner.shuffle(guild_id).await
     }
 
+    async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
+        self.inner.toggle_automix(guild_id).await
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) {
         self.inner.disconnect_guild(guild_id).await;
     }

@@ -209,6 +209,9 @@ pub trait PlaybackService: Clone + Send + Sync + 'static {
     async fn skip(&self, guild_id: GuildKey) -> Option<bool>;
     fn has_current_track(&self, guild_id: GuildKey) -> bool;
     async fn shuffle(&self, guild_id: GuildKey) -> bool;
+    async fn toggle_automix(&self, _guild_id: GuildKey) -> Option<bool> {
+        None
+    }
     async fn disconnect_guild(&self, guild_id: GuildKey);
 
     fn bootstrap_voice_state(
