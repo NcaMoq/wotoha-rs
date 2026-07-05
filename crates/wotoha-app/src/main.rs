@@ -187,6 +187,26 @@ where
         )))
     }
 
+    async fn prepare_track_with_options(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        request: &TrackRequest,
+        events: RuntimeEventSink,
+        mut options: TrackStartOptions,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+        options.initial_gain = (self.default_volume * options.initial_gain).clamp(0.0, 2.0);
+        let handle = self
+            .inner
+            .prepare_track_with_options(guild_id, session_id, playback_id, request, events, options)
+            .await?;
+        Ok(Arc::new(ConfiguredTrackHandle::new(
+            handle,
+            self.default_volume,
+        )))
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
         self.inner.disconnect_guild(guild_id).await
     }
@@ -232,6 +252,14 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
     fn set_volume(&self, volume: f32) {
         self.inner
             .set_volume((self.default_volume * volume).clamp(0.0, 2.0));
+    }
+
+    fn pause(&self) {
+        self.inner.pause();
+    }
+
+    fn resume(&self) {
+        self.inner.resume();
     }
 }
 
