@@ -6,6 +6,7 @@ mod niconico_hls;
 mod ranged_http;
 mod reconnect;
 mod songbird;
+mod tempo_stretch;
 mod validated_hls;
 
 pub use automix_cache::{

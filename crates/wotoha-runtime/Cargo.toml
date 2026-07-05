@@ -23,6 +23,7 @@ sha2.workspace = true
 songbird.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
+timestretch.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

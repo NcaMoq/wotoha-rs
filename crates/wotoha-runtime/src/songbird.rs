@@ -40,8 +40,11 @@ use wotoha_core::{
 };
 
 use crate::{
-    AnalysisCache, AnalysisCacheKey, audio_decode::analyze_input_with_cancel,
-    niconico_hls::NiconicoHlsRequest, ranged_http::RangedHttpRequest,
+    AnalysisCache, AnalysisCacheKey,
+    audio_decode::analyze_input_with_cancel,
+    niconico_hls::NiconicoHlsRequest,
+    ranged_http::RangedHttpRequest,
+    tempo_stretch::{StretchTimeline, build_stretched_input},
     validated_hls::ValidatedHlsRequest,
 };
 
@@ -97,6 +100,8 @@ pub enum SongbirdRuntimeError {
     TrackEvent(String),
     #[error("resolved source is not playable: {0}")]
     MakePlayable(String),
+    #[error("failed to initialize tempo-matched playback: {0}")]
+    TempoStretch(String),
     #[error("failed to remove voice call: {0}")]
     Disconnect(String),
     #[error("missing stream HTTP client for provider: {0}")]
@@ -277,6 +282,13 @@ impl SongbirdRuntime {
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .map_err(make_playable_error)?;
+        let (input, stretch_timeline) = if let Some(envelope) = options.tempo_envelope {
+            let (input, timeline) = build_stretched_input(input, options.source_start, envelope)
+                .map_err(SongbirdRuntimeError::TempoStretch)?;
+            (input, Some(timeline))
+        } else {
+            (input, None)
+        };
         let transition_events = events.clone();
         let prefetch_events = events.clone();
         let handle = {
@@ -293,7 +305,10 @@ impl SongbirdRuntime {
             if start_paused {
                 track = track.pause();
             }
-            if let Some(delay) = options.transition_after {
+            if let Some(delay) = options
+                .transition_after
+                .map(|delay| stretched_event_delay(delay, stretch_timeline))
+            {
                 track.events.add_event(
                     EventData::new(
                         Event::Delayed(delay),
@@ -307,7 +322,10 @@ impl SongbirdRuntime {
                     Duration::ZERO,
                 );
             }
-            if let Some(delay) = options.prefetch_after {
+            if let Some(delay) = options
+                .prefetch_after
+                .map(|delay| stretched_event_delay(delay, stretch_timeline))
+            {
                 track.events.add_event(
                     EventData::new(
                         Event::Delayed(delay),
@@ -376,7 +394,11 @@ impl SongbirdRuntime {
             start_paused
         ));
 
-        Ok(Arc::new(SongbirdTrackHandle { handle, lifecycle }))
+        Ok(Arc::new(SongbirdTrackHandle {
+            handle,
+            lifecycle,
+            stretch_timeline,
+        }))
     }
 }
 
@@ -681,6 +703,7 @@ impl TrackLifecycle {
 struct SongbirdTrackHandle {
     handle: TrackHandle,
     lifecycle: Arc<TrackLifecycle>,
+    stretch_timeline: Option<StretchTimeline>,
 }
 
 #[async_trait]
@@ -703,16 +726,24 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
     }
 
     async fn position(&self) -> Option<Duration> {
-        self.handle
-            .get_info()
-            .await
-            .ok()
-            .map(|state| state.position)
+        self.handle.get_info().await.ok().map(|state| {
+            self.stretch_timeline.map_or(state.position, |timeline| {
+                timeline.source_start + timeline.envelope.source_elapsed(state.position)
+            })
+        })
     }
 
     async fn seek(&self, position: Duration) -> bool {
-        self.handle.seek_async(position).await.is_ok()
+        self.stretch_timeline.is_none() && self.handle.seek_async(position).await.is_ok()
     }
+}
+
+fn stretched_event_delay(source_position: Duration, timeline: Option<StretchTimeline>) -> Duration {
+    timeline.map_or(source_position, |timeline| {
+        timeline
+            .envelope
+            .output_elapsed(source_position.saturating_sub(timeline.source_start))
+    })
 }
 
 struct TrackEndNotifier {
