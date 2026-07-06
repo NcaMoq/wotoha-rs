@@ -25,8 +25,8 @@ use wotoha_contracts::{
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
-        AutoMixConfig, TEMPO_SYNC_DEADBAND, TempoEnvelope, TrackAnalysis, TransitionTiming,
-        plan_transition, plan_transition_timing,
+        AutoMixConfig, TempoEnvelope, TrackAnalysis, TransitionTiming, plan_transition,
+        plan_transition_timing,
     },
     debug::append_debug_log,
 };
@@ -1262,6 +1262,9 @@ where
                 incoming_start_ms = plan.incoming_start.as_millis(),
                 fade_ms = plan.duration.as_millis(),
                 tempo_ratio = plan.incoming_tempo_ratio,
+                tempo_end_ratio = plan
+                    .tempo_envelope
+                    .map_or(plan.incoming_tempo_ratio, |envelope| envelope.mix_end_speed),
                 "AutoMix transition planned"
             );
         }
@@ -1317,8 +1320,7 @@ where
             }
         };
         if let Some(plan) = plan {
-            let tempo_is_supported =
-                dsp_active || (plan.incoming_tempo_ratio - 1.0).abs() <= TEMPO_SYNC_DEADBAND;
+            let tempo_is_supported = dsp_active || plan.tempo_envelope.is_none();
             if !plan.duration.is_zero() && tempo_is_supported {
                 timing.fade_duration = plan.duration;
                 transition_after = plan.outgoing_start;
@@ -3245,6 +3247,7 @@ mod tests {
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
+            beat_markers: Vec::new(),
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
             musical_key: None,
@@ -3334,6 +3337,7 @@ mod tests {
             bpm: Some(bpm),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
+            beat_markers: Vec::new(),
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
             musical_key: None,
@@ -3394,6 +3398,7 @@ mod tests {
             bpm: Some(bpm),
             beat_confidence: 1.0,
             first_beat: Some(first_beat),
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -3451,6 +3456,7 @@ mod tests {
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(first_beat),
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -3500,6 +3506,7 @@ mod tests {
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,

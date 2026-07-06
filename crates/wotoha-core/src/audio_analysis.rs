@@ -48,6 +48,7 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -56,7 +57,11 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         });
     };
     let audible_start_block = first / block;
-    let first_beat_block = estimate_first_beat(&onset, beat_lag, audible_start_block)
+    let audible_end_block = last / block;
+    let beat_markers =
+        estimate_beat_markers(&onset, beat_lag, audible_start_block, audible_end_block);
+    let first_beat_block = beat_markers
+        .first()
         .map(|index| index + 1)
         .unwrap_or_default();
     if first_beat_block == 0 {
@@ -67,6 +72,7 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -86,6 +92,10 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         bpm: Some(bpm),
         beat_confidence: confidence,
         first_beat: Some(duration(first_beat_block * block, sample_rate)),
+        beat_markers: beat_markers
+            .into_iter()
+            .map(|index| duration((index + 1) * block, sample_rate))
+            .collect(),
         first_downbeat: Some(duration(first_downbeat_block * block, sample_rate)),
         downbeat_confidence,
         musical_key: None,
@@ -188,9 +198,14 @@ fn parabolic_peak_offset(left: f32, center: f32, right: f32) -> f32 {
     }
 }
 
-fn estimate_first_beat(onset: &[f32], beat_lag: f32, audible_start: usize) -> Option<usize> {
+fn estimate_beat_markers(
+    onset: &[f32],
+    beat_lag: f32,
+    audible_start: usize,
+    audible_end: usize,
+) -> Vec<usize> {
     if onset.is_empty() || beat_lag <= 1.0 || !beat_lag.is_finite() {
-        return None;
+        return Vec::new();
     }
     const PHASE_STEPS_PER_BLOCK: usize = 4;
     let phase_steps = (beat_lag * PHASE_STEPS_PER_BLOCK as f32).ceil() as usize;
@@ -207,36 +222,67 @@ fn estimate_first_beat(onset: &[f32], beat_lag: f32, audible_start: usize) -> Op
             }
             (score / count.max(1) as f32, phase)
         })
-        .max_by(|left, right| left.0.total_cmp(&right.0))?
-        .1;
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, phase)| phase);
+    let Some(phase) = phase else {
+        return Vec::new();
+    };
 
+    let peak = onset.iter().copied().fold(0.0_f32, f32::max);
+    let snap_threshold = peak * 0.1;
+    let search_radius = (beat_lag * 0.2).round().clamp(5.0, 20.0) as usize;
     let mut candidates = Vec::new();
     let mut position = phase;
-    while position + 5.0 < audible_start as f32 {
+    while position + (search_radius as f32) < audible_start as f32 {
         position += beat_lag;
     }
-    while position < onset.len() as f32 {
+    while position < onset.len() as f32 && position <= audible_end as f32 + search_radius as f32 {
         let center = position.round() as usize;
-        let from = center.saturating_sub(5);
-        let to = (center + 6).min(onset.len());
+        let from = center.saturating_sub(search_radius);
+        let to = center.saturating_add(search_radius + 1).min(onset.len());
         if from < to {
-            let (offset, strength) = onset[from..to]
+            let (offset, strength) = match onset[from..to]
                 .iter()
                 .copied()
                 .enumerate()
-                .max_by(|left, right| left.1.total_cmp(&right.1))?;
-            candidates.push((from + offset, strength));
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+            {
+                Some(candidate) => candidate,
+                None => {
+                    position += beat_lag;
+                    continue;
+                }
+            };
+            let detected = from + offset;
+            candidates.push((center, detected, strength));
+            if strength >= snap_threshold {
+                position = detected as f32 + beat_lag;
+                continue;
+            }
         }
         position += beat_lag;
     }
-    let peak = candidates
+    let Some(first) = candidates.iter().position(|(_, position, strength)| {
+        *position + 1 >= audible_start && *strength >= peak * 0.25
+    }) else {
+        return Vec::new();
+    };
+    candidates[first..]
         .iter()
-        .map(|(_, strength)| *strength)
-        .fold(0.0_f32, f32::max);
-    candidates
-        .into_iter()
-        .find(|(position, strength)| *position + 1 >= audible_start && *strength >= peak * 0.25)
-        .map(|(position, _)| position)
+        .map(|(predicted, detected, strength)| {
+            if *strength >= snap_threshold {
+                *detected
+            } else {
+                *predicted
+            }
+        })
+        .filter(|position| *position <= audible_end)
+        .fold(Vec::new(), |mut markers, position| {
+            if markers.last().is_none_or(|previous| *previous < position) {
+                markers.push(position);
+            }
+            markers
+        })
 }
 
 fn interpolated(values: &[f32], position: f32) -> f32 {
@@ -340,5 +386,40 @@ mod tests {
                 < Duration::from_millis(8),
             "{analysis:?}"
         );
+    }
+
+    #[test]
+    fn beat_markers_follow_gradual_tempo_drift() {
+        let sample_rate = 1_000;
+        let mut samples = vec![0.0; 62_000];
+        let mut beat = 1.0_f32;
+        let mut beats = Vec::new();
+        while beat < 61.0 {
+            beats.push(beat);
+            let progress = ((beat - 1.0) / 60.0).clamp(0.0, 1.0);
+            let bpm = 120.0 + 3.0 * progress;
+            beat += 60.0 / bpm;
+        }
+        for beat in &beats {
+            let position = (*beat * sample_rate as f32).round() as usize;
+            samples[position..position + 8].fill(1.0);
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        let expected_last = Duration::from_secs_f32(*beats.last().unwrap());
+        let detected_last = *analysis.beat_markers.last().unwrap();
+        assert!(
+            detected_last.abs_diff(expected_last) < Duration::from_millis(15),
+            "expected={expected_last:?} detected={detected_last:?} analysis={analysis:?}"
+        );
+        let trailing_intervals = analysis
+            .beat_markers
+            .windows(2)
+            .rev()
+            .take(8)
+            .map(|pair| pair[1].saturating_sub(pair[0]).as_secs_f32())
+            .collect::<Vec<_>>();
+        let local_bpm = 60.0 / (trailing_intervals.iter().sum::<f32>() / 8.0);
+        assert!(local_bpm > 122.0, "local_bpm={local_bpm}");
     }
 }

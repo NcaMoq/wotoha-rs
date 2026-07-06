@@ -15,6 +15,7 @@ pub(crate) struct TempoStretchProcessor {
     sample_rate: u32,
     channels: usize,
     emitted_samples: usize,
+    latency_samples: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -346,12 +347,14 @@ impl TempoStretchProcessor {
     ) -> Result<Self, StretchError> {
         let inner =
             StreamProcessor::try_from_tempo(source_bpm, target_bpm, sample_rate, channels as u32)?;
+        let latency_samples = inner.latency_samples();
         Ok(Self {
             inner,
             envelope,
             sample_rate,
             channels,
             emitted_samples: 0,
+            latency_samples,
         })
     }
 
@@ -361,7 +364,9 @@ impl TempoStretchProcessor {
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
         let output_elapsed = std::time::Duration::from_secs_f64(
-            self.emitted_samples as f64 / self.channels as f64 / self.sample_rate as f64,
+            audible_output_samples(self.emitted_samples, self.latency_samples) as f64
+                / self.channels as f64
+                / self.sample_rate as f64,
         );
         let speed = self.envelope.speed_at(output_elapsed);
         self.inner.set_stretch_ratio(1.0 / f64::from(speed))?;
@@ -379,8 +384,12 @@ impl TempoStretchProcessor {
     }
 
     pub(crate) fn latency_samples(&self) -> usize {
-        self.inner.latency_samples()
+        self.latency_samples
     }
+}
+
+fn audible_output_samples(emitted_samples: usize, latency_samples: usize) -> usize {
+    emitted_samples.saturating_sub(latency_samples)
 }
 
 #[cfg(test)]
@@ -402,13 +411,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tempo_timeline_starts_after_dsp_latency_is_discarded() {
+        assert_eq!(audible_output_samples(512, 1_024), 0);
+        assert_eq!(audible_output_samples(1_024, 1_024), 0);
+        assert_eq!(audible_output_samples(1_280, 1_024), 256);
+    }
+
+    #[test]
     fn stretches_tempo_while_preserving_tone_pitch() {
         const SAMPLE_RATE: u32 = 48_000;
-        let envelope = TempoEnvelope {
-            initial_speed: 120.0 / 124.0,
-            hold: Duration::from_secs(20),
-            ramp: Duration::ZERO,
-        };
+        let envelope = TempoEnvelope::new(
+            120.0 / 124.0,
+            120.0 / 124.0,
+            Duration::from_secs(20),
+            Duration::ZERO,
+        );
         let mut processor = TempoStretchProcessor::new(124.0, 120.0, SAMPLE_RATE, 1, envelope)
             .expect("valid tempo configuration");
         let latency = processor.latency_samples();
@@ -429,11 +446,12 @@ mod tests {
     #[test]
     fn follows_envelope_back_to_unity() {
         const SAMPLE_RATE: u32 = 48_000;
-        let envelope = TempoEnvelope {
-            initial_speed: 0.96,
-            hold: Duration::from_millis(500),
-            ramp: Duration::from_millis(500),
-        };
+        let envelope = TempoEnvelope::new(
+            0.96,
+            0.96,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
         let mut processor = TempoStretchProcessor::new(125.0, 120.0, SAMPLE_RATE, 1, envelope)
             .expect("valid tempo configuration");
         let input = sine(220.0, SAMPLE_RATE, 3.0);
@@ -460,16 +478,18 @@ mod tests {
             processor.flush_into(&mut output).unwrap();
             output
         };
-        let constant = process(TempoEnvelope {
-            initial_speed: 0.9,
-            hold: Duration::from_secs(20),
-            ramp: Duration::ZERO,
-        });
-        let ramped = process(TempoEnvelope {
-            initial_speed: 0.9,
-            hold: Duration::from_millis(250),
-            ramp: Duration::from_millis(750),
-        });
+        let constant = process(TempoEnvelope::new(
+            0.9,
+            0.9,
+            Duration::from_secs(20),
+            Duration::ZERO,
+        ));
+        let ramped = process(TempoEnvelope::new(
+            0.9,
+            0.9,
+            Duration::from_millis(250),
+            Duration::from_millis(750),
+        ));
 
         assert!(ramped.len() > input.len());
         assert!(
@@ -483,11 +503,7 @@ mod tests {
     #[test]
     fn stretches_stereo_without_collapsing_channels_or_pitch() {
         const SAMPLE_RATE: u32 = 48_000;
-        let envelope = TempoEnvelope {
-            initial_speed: 0.96,
-            hold: Duration::from_secs(20),
-            ramp: Duration::ZERO,
-        };
+        let envelope = TempoEnvelope::new(0.96, 0.96, Duration::from_secs(20), Duration::ZERO);
         let mut processor = TempoStretchProcessor::new(125.0, 120.0, SAMPLE_RATE, 2, envelope)
             .expect("valid stereo tempo configuration");
         let latency = processor.latency_samples();
@@ -562,11 +578,12 @@ mod tests {
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .unwrap();
-        let envelope = TempoEnvelope {
-            initial_speed: 120.0 / 124.0,
-            hold: Duration::from_secs(20),
-            ramp: Duration::ZERO,
-        };
+        let envelope = TempoEnvelope::new(
+            120.0 / 124.0,
+            120.0 / 124.0,
+            Duration::from_secs(20),
+            Duration::ZERO,
+        );
         let (stretched, timeline) =
             build_stretched_input(playable, Duration::from_secs(1), envelope).unwrap();
         assert_eq!(timeline.source_start, Duration::from_secs(1));
@@ -627,11 +644,7 @@ mod tests {
     async fn trims_unseekable_input_before_tempo_stretch() {
         const SAMPLE_RATE: u32 = 48_000;
         let playable = unseekable_playable(two_tone_wav(SAMPLE_RATE)).await;
-        let envelope = TempoEnvelope {
-            initial_speed: 1.0,
-            hold: Duration::from_secs(20),
-            ramp: Duration::ZERO,
-        };
+        let envelope = TempoEnvelope::new(1.0, 1.0, Duration::from_secs(20), Duration::ZERO);
         let (trimmed, timeline) =
             build_stretched_input(playable, Duration::from_secs(1), envelope).unwrap();
         assert_eq!(timeline.source_start, Duration::from_secs(1));

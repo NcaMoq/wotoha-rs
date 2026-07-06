@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 pub const TEMPO_SYNC_DEADBAND: f32 = 0.001;
+const MAX_TEMPO_SEGMENTS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoMixConfig {
@@ -18,6 +19,8 @@ pub struct TrackAnalysis {
     pub bpm: Option<f32>,
     pub beat_confidence: f32,
     pub first_beat: Option<Duration>,
+    /// Detected beat onsets used to follow local tempo changes during a transition.
+    pub beat_markers: Vec<Duration>,
     pub first_downbeat: Option<Duration>,
     pub downbeat_confidence: f32,
     pub musical_key: Option<MusicalKey>,
@@ -81,6 +84,7 @@ impl TrackAnalysis {
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
+            beat_markers: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -163,21 +167,72 @@ pub struct TransitionPlan {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TempoEnvelope {
     pub initial_speed: f32,
+    /// Target speed reached at the end of the overlap.
+    pub mix_end_speed: f32,
     pub hold: Duration,
     pub ramp: Duration,
+    phase_segments: [TempoSegment; MAX_TEMPO_SEGMENTS],
+    phase_segment_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TempoSegment {
+    output_end: Duration,
+    speed: f32,
+}
+
+impl TempoSegment {
+    const EMPTY: Self = Self {
+        output_end: Duration::ZERO,
+        speed: 1.0,
+    };
 }
 
 impl TempoEnvelope {
+    pub fn new(initial_speed: f32, mix_end_speed: f32, hold: Duration, ramp: Duration) -> Self {
+        Self {
+            initial_speed,
+            mix_end_speed,
+            hold,
+            ramp,
+            phase_segments: [TempoSegment::EMPTY; MAX_TEMPO_SEGMENTS],
+            phase_segment_count: 0,
+        }
+    }
+
+    fn with_phase_segments(mut self, segments: &[TempoSegment]) -> Self {
+        let count = segments.len().min(MAX_TEMPO_SEGMENTS);
+        self.phase_segments[..count].copy_from_slice(&segments[..count]);
+        self.phase_segment_count = count as u8;
+        self
+    }
+
     pub fn speed_at(self, output_elapsed: Duration) -> f32 {
-        if output_elapsed <= self.hold || self.ramp.is_zero() {
-            return self.initial_speed;
+        if output_elapsed <= self.hold {
+            for segment in &self.phase_segments[..usize::from(self.phase_segment_count)] {
+                if output_elapsed <= segment.output_end {
+                    return segment.speed;
+                }
+            }
+            if self.phase_segment_count > 0 {
+                return self.mix_end_speed;
+            }
+            if self.hold.is_zero() {
+                return self.mix_end_speed;
+            }
+            let progress = output_elapsed.as_secs_f32() / self.hold.as_secs_f32();
+            return self.initial_speed
+                + (self.mix_end_speed - self.initial_speed) * progress.clamp(0.0, 1.0);
+        }
+        if self.ramp.is_zero() {
+            return 1.0;
         }
         let ramp_elapsed = output_elapsed.saturating_sub(self.hold);
         if ramp_elapsed >= self.ramp {
             return 1.0;
         }
         let progress = ramp_elapsed.as_secs_f32() / self.ramp.as_secs_f32();
-        self.initial_speed + (1.0 - self.initial_speed) * progress
+        self.mix_end_speed + (1.0 - self.mix_end_speed) * progress
     }
 
     pub fn source_elapsed(self, output_elapsed: Duration) -> Duration {
@@ -185,15 +240,53 @@ impl TempoEnvelope {
         let hold = self.hold.as_secs_f64();
         let ramp = self.ramp.as_secs_f64();
         let initial = f64::from(self.initial_speed);
+        let mix_end = f64::from(self.mix_end_speed);
+        let hold_source = self.hold_source_elapsed();
         let source = if output <= hold {
-            output * initial
+            if self.phase_segment_count > 0 {
+                self.segmented_source_elapsed(output_elapsed).as_secs_f64()
+            } else if hold > 0.0 {
+                initial * output + 0.5 * (mix_end - initial) * output * output / hold
+            } else {
+                output * mix_end
+            }
         } else if ramp > 0.0 && output < hold + ramp {
             let elapsed = output - hold;
-            hold * initial + initial * elapsed + 0.5 * (1.0 - initial) * elapsed * elapsed / ramp
+            hold_source + mix_end * elapsed + 0.5 * (1.0 - mix_end) * elapsed * elapsed / ramp
         } else {
-            hold * initial + ramp * (initial + 1.0) * 0.5 + (output - hold - ramp)
+            hold_source + ramp * (mix_end + 1.0) * 0.5 + (output - hold - ramp)
         };
         Duration::from_secs_f64(source.max(0.0))
+    }
+
+    fn hold_source_elapsed(self) -> f64 {
+        if self.phase_segment_count > 0 {
+            self.segmented_source_elapsed(self.hold).as_secs_f64()
+        } else {
+            self.hold.as_secs_f64() * f64::from(self.initial_speed + self.mix_end_speed) * 0.5
+        }
+    }
+
+    fn segmented_source_elapsed(self, output_elapsed: Duration) -> Duration {
+        let target = output_elapsed.min(self.hold);
+        let mut source = 0.0_f64;
+        let mut previous_end = Duration::ZERO;
+        for segment in &self.phase_segments[..usize::from(self.phase_segment_count)] {
+            let segment_end = segment.output_end.min(target);
+            if segment_end > previous_end {
+                source += segment_end.saturating_sub(previous_end).as_secs_f64()
+                    * f64::from(segment.speed);
+            }
+            previous_end = segment.output_end;
+            if segment.output_end >= target {
+                return Duration::from_secs_f64(source);
+            }
+        }
+        if target > previous_end {
+            source +=
+                target.saturating_sub(previous_end).as_secs_f64() * f64::from(self.mix_end_speed);
+        }
+        Duration::from_secs_f64(source)
     }
 
     pub fn output_elapsed(self, source_elapsed: Duration) -> Duration {
@@ -275,8 +368,8 @@ pub fn plan_transition(
         timing.fade_duration
     };
 
-    let tempo_ratio = compatible_tempo_ratio(outgoing, incoming, config);
-    let beat_aligned = tempo_ratio.is_some();
+    let tempo_curve = compatible_tempo_curve(outgoing, incoming, config);
+    let beat_aligned = tempo_curve.is_some();
     let phrase_start = beat_aligned
         .then(|| {
             let target = outgoing.audible_end.saturating_sub(duration);
@@ -287,35 +380,80 @@ pub fn plan_transition(
         .flatten();
     let outgoing_start = if beat_aligned {
         let target = outgoing.audible_end.saturating_sub(duration);
-        phrase_start.unwrap_or_else(|| align_to_beat(target, outgoing.first_beat, outgoing.bpm))
+        phrase_start.unwrap_or_else(|| align_to_beat(target, outgoing))
     } else {
         outgoing.audible_end.saturating_sub(duration)
     };
+    let incoming_start = if phrase_start.is_some() {
+        snap_to_nearest_beat(
+            incoming,
+            incoming.first_downbeat.unwrap_or(incoming.audible_start),
+        )
+        .unwrap_or_else(|| {
+            incoming
+                .first_downbeat
+                .unwrap_or(incoming.audible_start)
+                .min(incoming.audible_end)
+        })
+    } else if beat_aligned {
+        incoming
+            .beat_markers
+            .first()
+            .copied()
+            .or(incoming.first_beat)
+            .unwrap_or(incoming.audible_start)
+    } else {
+        incoming.audible_start
+    };
+    let (tempo_start, tempo_end) = tempo_curve.unwrap_or((1.0, 1.0));
+    let phase_segments = tempo_curve
+        .and_then(|_| {
+            phase_follow_segments(
+                outgoing,
+                incoming,
+                outgoing_start,
+                incoming_start,
+                duration,
+                config.max_tempo_adjustment,
+            )
+        })
+        .unwrap_or_default();
+    let envelope_start = phase_segments
+        .first()
+        .map_or(tempo_start, |segment| segment.speed);
+    let envelope_end = phase_segments
+        .last()
+        .map_or(tempo_end, |segment| segment.speed);
+    let needs_tempo_dsp = phase_segments
+        .iter()
+        .any(|segment| (segment.speed - 1.0).abs() > TEMPO_SYNC_DEADBAND)
+        || (envelope_start - 1.0).abs() > TEMPO_SYNC_DEADBAND
+        || (envelope_end - 1.0).abs() > TEMPO_SYNC_DEADBAND
+        || (envelope_end - envelope_start).abs() > TEMPO_SYNC_DEADBAND;
+    let tempo_envelope = tempo_curve.and_then(|_| {
+        needs_tempo_dsp.then(|| {
+            TempoEnvelope::new(
+                envelope_start,
+                envelope_end,
+                duration,
+                Duration::from_secs_f32(240.0 / outgoing.bpm.unwrap_or(120.0)),
+            )
+            .with_phase_segments(&phase_segments)
+        })
+    });
     TransitionPlan {
-        kind: if tempo_ratio.is_some() {
+        kind: if tempo_curve.is_some() {
             TransitionKind::BeatMatched
         } else {
             TransitionKind::Crossfade
         },
         outgoing_start,
-        incoming_start: if phrase_start.is_some() {
-            incoming.first_downbeat.unwrap_or(incoming.audible_start)
-        } else if beat_aligned {
-            incoming.first_beat.unwrap_or(incoming.audible_start)
-        } else {
-            incoming.audible_start
-        },
+        incoming_start,
         duration,
-        incoming_tempo_ratio: tempo_ratio.unwrap_or(1.0),
+        incoming_tempo_ratio: envelope_start,
         harmonic_compatibility,
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
-        tempo_envelope: tempo_ratio.and_then(|ratio| {
-            ((ratio - 1.0).abs() > TEMPO_SYNC_DEADBAND).then_some(TempoEnvelope {
-                initial_speed: ratio,
-                hold: duration,
-                ramp: Duration::from_secs_f32(240.0 / outgoing.bpm.unwrap_or(120.0)),
-            })
-        }),
+        tempo_envelope,
     }
 }
 
@@ -331,10 +469,21 @@ fn align_to_phrase(
         .filter(|cue| cue.position >= earliest && cue.position <= target)
         // Prefer the strongest (longest) phrase boundary, then the latest one.
         .max_by_key(|cue| (cue.length, cue.position))
-        .map(|cue| cue.position)
+        .map(|cue| snap_to_nearest_beat(analysis, cue.position).unwrap_or(cue.position))
 }
 
-fn align_to_beat(position: Duration, first_beat: Option<Duration>, bpm: Option<f32>) -> Duration {
+fn align_to_beat(position: Duration, analysis: &TrackAnalysis) -> Duration {
+    if let Some(beat) = analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .take_while(|beat| *beat <= position)
+        .last()
+    {
+        return beat;
+    }
+    let first_beat = analysis.first_beat;
+    let bpm = analysis.bpm;
     let (Some(first), Some(bpm)) = (first_beat, bpm) else {
         return position;
     };
@@ -347,6 +496,14 @@ fn align_to_beat(position: Duration, first_beat: Option<Duration>, bpm: Option<f
     }
     let beats = position.saturating_sub(first).as_secs_f64() / interval.as_secs_f64();
     first + interval.mul_f64(beats.floor())
+}
+
+fn snap_to_nearest_beat(analysis: &TrackAnalysis, position: Duration) -> Option<Duration> {
+    analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .min_by_key(|beat| beat.abs_diff(position))
 }
 
 fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> TransitionPlan {
@@ -412,11 +569,11 @@ pub fn harmonic_compatibility(outgoing: &TrackAnalysis, incoming: &TrackAnalysis
     Some(score)
 }
 
-fn compatible_tempo_ratio(
+fn compatible_tempo_curve(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
     config: &AutoMixConfig,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     if outgoing.beat_confidence < config.min_beat_confidence
         || incoming.beat_confidence < config.min_beat_confidence
     {
@@ -429,7 +586,61 @@ fn compatible_tempo_ratio(
     }
 
     let ratio = outgoing_bpm / incoming_bpm;
-    ((ratio - 1.0).abs() <= config.max_tempo_adjustment).then_some(ratio)
+    (ratio.is_finite() && (ratio - 1.0).abs() <= config.max_tempo_adjustment)
+        .then_some((ratio, ratio))
+}
+
+fn phase_follow_segments(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    outgoing_start: Duration,
+    incoming_start: Duration,
+    duration: Duration,
+    max_tempo_adjustment: f32,
+) -> Option<Vec<TempoSegment>> {
+    const BEATS_PER_CORRECTION: usize = 4;
+    let outgoing_end = outgoing_start.saturating_add(duration);
+    let outgoing_beats = outgoing
+        .beat_markers
+        .iter()
+        .copied()
+        .filter(|beat| *beat >= outgoing_start && *beat <= outgoing_end)
+        .collect::<Vec<_>>();
+    let incoming_beats = incoming
+        .beat_markers
+        .iter()
+        .copied()
+        .filter(|beat| *beat >= incoming_start)
+        .take(outgoing_beats.len())
+        .collect::<Vec<_>>();
+    let paired = outgoing_beats.len().min(incoming_beats.len());
+    if paired < 5
+        || outgoing_beats[0].abs_diff(outgoing_start) > Duration::from_millis(30)
+        || incoming_beats[0].abs_diff(incoming_start) > Duration::from_millis(30)
+    {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    let mut index = 0;
+    while index + 1 < paired && segments.len() < MAX_TEMPO_SEGMENTS {
+        let end = (index + BEATS_PER_CORRECTION).min(paired - 1);
+        let output_delta = outgoing_beats[end].saturating_sub(outgoing_beats[index]);
+        let source_delta = incoming_beats[end].saturating_sub(incoming_beats[index]);
+        if output_delta.is_zero() || source_delta.is_zero() {
+            return None;
+        }
+        let speed = source_delta.as_secs_f32() / output_delta.as_secs_f32();
+        if !speed.is_finite() || (speed - 1.0).abs() > max_tempo_adjustment {
+            return None;
+        }
+        segments.push(TempoSegment {
+            output_end: outgoing_beats[end].saturating_sub(outgoing_start),
+            speed,
+        });
+        index = end;
+    }
+    (!segments.is_empty()).then_some(segments)
 }
 
 #[cfg(test)]
@@ -446,6 +657,13 @@ mod tests {
     }
 
     fn analyzed(bpm: f32) -> TrackAnalysis {
+        let interval = Duration::from_secs_f32(60.0 / bpm);
+        let mut beat_markers = Vec::new();
+        let mut beat = Duration::from_secs(1);
+        while beat <= Duration::from_secs(179) {
+            beat_markers.push(beat);
+            beat += interval;
+        }
         TrackAnalysis {
             duration: Duration::from_secs(180),
             audible_start: Duration::from_secs(1),
@@ -453,6 +671,7 @@ mod tests {
             bpm: Some(bpm),
             beat_confidence: 0.9,
             first_beat: Some(Duration::from_secs(1)),
+            beat_markers,
             first_downbeat: Some(Duration::from_secs(1)),
             downbeat_confidence: 0.9,
             musical_key: None,
@@ -567,11 +786,8 @@ mod tests {
 
     #[test]
     fn tempo_envelope_holds_then_returns_to_native_speed() {
-        let envelope = TempoEnvelope {
-            initial_speed: 0.95,
-            hold: Duration::from_secs(8),
-            ramp: Duration::from_secs(2),
-        };
+        let envelope =
+            TempoEnvelope::new(0.95, 0.95, Duration::from_secs(8), Duration::from_secs(2));
         assert_eq!(envelope.speed_at(Duration::from_secs(4)), 0.95);
         assert!((envelope.speed_at(Duration::from_secs(9)) - 0.975).abs() < 0.0001);
         assert_eq!(envelope.speed_at(Duration::from_secs(11)), 1.0);
@@ -587,15 +803,71 @@ mod tests {
 
     #[test]
     fn tempo_envelope_time_mapping_round_trips() {
-        let envelope = TempoEnvelope {
-            initial_speed: 1.04,
-            hold: Duration::from_secs(8),
-            ramp: Duration::from_secs(2),
-        };
+        let envelope =
+            TempoEnvelope::new(1.04, 1.04, Duration::from_secs(8), Duration::from_secs(2));
         for output in [0.0, 4.0, 8.0, 9.0, 12.0, 60.0] {
             let output = Duration::from_secs_f64(output);
             let source = envelope.source_elapsed(output);
             assert!(envelope.output_elapsed(source).abs_diff(output) < Duration::from_micros(2));
+        }
+    }
+
+    #[test]
+    fn tempo_envelope_follows_local_tempo_during_overlap() {
+        let envelope =
+            TempoEnvelope::new(0.98, 1.02, Duration::from_secs(8), Duration::from_secs(2));
+
+        assert!((envelope.speed_at(Duration::ZERO) - 0.98).abs() < 0.0001);
+        assert!((envelope.speed_at(Duration::from_secs(4)) - 1.0).abs() < 0.0001);
+        assert!((envelope.speed_at(Duration::from_secs(8)) - 1.02).abs() < 0.0001);
+    }
+
+    #[test]
+    fn transition_tracks_tempo_drift_across_the_overlap() {
+        let mut outgoing = analyzed(120.0);
+        outgoing
+            .beat_markers
+            .retain(|beat| *beat <= Duration::from_secs(170));
+        let mut beat = *outgoing.beat_markers.last().unwrap();
+        for index in 0..16 {
+            let bpm = if index < 8 { 120.0 } else { 123.0 };
+            beat += Duration::from_secs_f32(60.0 / bpm);
+            outgoing.beat_markers.push(beat);
+        }
+        let incoming = analyzed(120.0);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let envelope = plan.tempo_envelope.expect("tempo drift should be followed");
+
+        assert!((envelope.initial_speed - 1.0).abs() < 0.001);
+        assert!((envelope.mix_end_speed - (123.0 / 120.0)).abs() < 0.001);
+        assert!(envelope.speed_at(plan.duration) > envelope.speed_at(Duration::ZERO));
+
+        let outgoing_beats = outgoing
+            .beat_markers
+            .iter()
+            .copied()
+            .filter(|beat| *beat >= plan.outgoing_start)
+            .collect::<Vec<_>>();
+        let incoming_beats = incoming
+            .beat_markers
+            .iter()
+            .copied()
+            .filter(|beat| *beat >= plan.incoming_start)
+            .collect::<Vec<_>>();
+        for segment in &envelope.phase_segments[..usize::from(envelope.phase_segment_count)] {
+            let outgoing_beat = plan.outgoing_start + segment.output_end;
+            let index = outgoing_beats
+                .iter()
+                .position(|beat| beat.abs_diff(outgoing_beat) < Duration::from_millis(1))
+                .unwrap();
+            let expected_source = incoming_beats[index].saturating_sub(plan.incoming_start);
+            assert!(
+                envelope
+                    .source_elapsed(segment.output_end)
+                    .abs_diff(expected_source)
+                    < Duration::from_millis(1)
+            );
         }
     }
 
