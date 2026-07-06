@@ -25,8 +25,8 @@ use wotoha_contracts::{
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
-        AutoMixConfig, TempoEnvelope, TrackAnalysis, TransitionTiming, plan_transition,
-        plan_transition_timing,
+        AutoMixConfig, TEMPO_SYNC_DEADBAND, TempoEnvelope, TrackAnalysis, TransitionTiming,
+        plan_transition, plan_transition_timing,
     },
     debug::append_debug_log,
 };
@@ -39,7 +39,6 @@ const MAX_PENDING_ENQUEUES: usize = 64;
 const BEAT_ALIGNMENT_LOOKAHEAD: std::time::Duration = std::time::Duration::from_secs(60);
 const TRANSITION_PREPARE_LEAD: std::time::Duration = std::time::Duration::from_secs(15);
 const MIN_TRANSITION_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
-const MAX_UNSTRETCHED_TEMPO_DRIFT: f32 = 0.005;
 
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
@@ -89,6 +88,7 @@ where
     retiring_handle: Option<(PlaybackId, Arc<dyn RuntimeTrackHandle>)>,
     fade_abort: Option<tokio::task::AbortHandle>,
     automix_enabled: bool,
+    automix_rearm_in_progress: Option<PlaybackId>,
     prefetch_generation: u64,
     transition_due: Option<PlaybackId>,
     prepared_transition: Option<PreparedTransition>,
@@ -181,6 +181,7 @@ where
             retiring_handle: None,
             fade_abort: None,
             automix_enabled: false,
+            automix_rearm_in_progress: None,
             prefetch_generation: 0,
             transition_due: None,
             prepared_transition: None,
@@ -607,8 +608,114 @@ where
         }
         if enabled {
             self.spawn_relevant_analyses(guild_id, session.id);
+            self.spawn_current_automix_rearm(guild_id, session.id);
         }
         Some(enabled)
+    }
+
+    fn spawn_current_automix_rearm(&self, guild_id: GuildKey, session_id: u64) {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator
+                .rearm_current_automix(guild_id, session_id)
+                .await;
+        });
+    }
+
+    async fn rearm_current_automix(&self, guild_id: GuildKey, session_id: u64) {
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        let (playback_id, handle, scheduled) = {
+            let _operation = session.operation.lock().await;
+            if !self.session_is_current(guild_id, session_id) {
+                return;
+            }
+            let playback = session.playback.lock();
+            if !playback.automix_enabled || playback.automix_rearm_in_progress.is_some() {
+                return;
+            }
+            let (Some(playback_id), Some(handle), Some(duration)) = (
+                playback.current_playback_id,
+                playback.active_handle.clone(),
+                playback
+                    .logical
+                    .current()
+                    .and_then(|track| track.metadata.duration),
+            ) else {
+                return;
+            };
+            let Some(scheduled) = track_transition_timing(&self.inner.automix, duration) else {
+                return;
+            };
+            (playback_id, handle, scheduled)
+        };
+        let Some(position) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle.position())
+                .await
+                .ok()
+                .flatten()
+        else {
+            return;
+        };
+        let prefetch_after =
+            transition_event_after(scheduled).saturating_sub(TRANSITION_PREPARE_LEAD);
+        if position < prefetch_after || position >= scheduled.transition_after {
+            return;
+        }
+        {
+            let _operation = session.operation.lock().await;
+            let mut playback = session.playback.lock();
+            if playback.current_playback_id != Some(playback_id) || !playback.automix_enabled {
+                return;
+            }
+            if playback.transition_due == Some(playback_id)
+                && playback.prepared_transition.is_none()
+            {
+                playback.transition_due = None;
+            }
+            playback.automix_rearm_in_progress = Some(playback_id);
+        }
+
+        self.prefetch_transition(guild_id, session_id, playback_id)
+            .await;
+
+        let should_transition = {
+            let _operation = session.operation.lock().await;
+            let mut playback = session.playback.lock();
+            if playback.automix_rearm_in_progress == Some(playback_id) {
+                playback.automix_rearm_in_progress = None;
+            }
+            playback.current_playback_id == Some(playback_id)
+                && playback.automix_enabled
+                && playback
+                    .prepared_transition
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.origin_playback_id == playback_id)
+        };
+        if !should_transition {
+            return;
+        }
+        let still_before_transition =
+            tokio::time::timeout(std::time::Duration::from_secs(2), handle.position())
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|position| position < scheduled.transition_after);
+        if still_before_transition {
+            self.transition(guild_id, session_id, playback_id).await;
+        } else {
+            let stale = {
+                let _operation = session.operation.lock().await;
+                let mut playback = session.playback.lock();
+                (playback.current_playback_id == Some(playback_id))
+                    .then(|| invalidate_prepared_transition(&mut playback))
+                    .flatten()
+            };
+            if let Some(handle) = stale {
+                handle.stop();
+            }
+        }
     }
 
     pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
@@ -1139,6 +1246,25 @@ where
             .as_ref()
             .zip(incoming_analysis.as_ref())
             .map(|(outgoing, incoming)| plan_transition(outgoing, incoming, &self.inner.automix));
+        if let (Some(plan), Some(outgoing), Some(incoming)) = (
+            plan.as_ref(),
+            outgoing_analysis.as_ref(),
+            incoming_analysis.as_ref(),
+        ) {
+            info!(
+                guild_id = guild_id.get(),
+                transition_kind = ?plan.kind,
+                outgoing_bpm = ?outgoing.bpm,
+                incoming_bpm = ?incoming.bpm,
+                outgoing_beat_confidence = outgoing.beat_confidence,
+                incoming_beat_confidence = incoming.beat_confidence,
+                outgoing_start_ms = plan.outgoing_start.as_millis(),
+                incoming_start_ms = plan.incoming_start.as_millis(),
+                fade_ms = plan.duration.as_millis(),
+                tempo_ratio = plan.incoming_tempo_ratio,
+                "AutoMix transition planned"
+            );
+        }
         if let Some(plan) = &plan {
             incoming_gain = plan.incoming_gain;
             options.source_start = plan.incoming_start;
@@ -1191,13 +1317,14 @@ where
             }
         };
         if let Some(plan) = plan {
-            let tempo_is_supported = dsp_active
-                || (plan.incoming_tempo_ratio - 1.0).abs() <= MAX_UNSTRETCHED_TEMPO_DRIFT;
+            let tempo_is_supported =
+                dsp_active || (plan.incoming_tempo_ratio - 1.0).abs() <= TEMPO_SYNC_DEADBAND;
             if !plan.duration.is_zero() && tempo_is_supported {
                 timing.fade_duration = plan.duration;
                 transition_after = plan.outgoing_start;
             }
         }
+        timing.transition_after = transition_after;
         let start_delay = current_tempo.map_or_else(
             || transition_after.saturating_sub(event_after),
             |(source_start, envelope)| {
@@ -1244,7 +1371,7 @@ where
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let start_delay = {
+        let transition_state = {
             let _operation = session.operation.lock().await;
             if !self.session_is_current(guild_id, session_id) {
                 return;
@@ -1256,17 +1383,42 @@ where
             {
                 return;
             }
+            if playback.automix_rearm_in_progress == Some(playback_id)
+                && playback.prepared_transition.is_none()
+            {
+                return;
+            }
             playback.transition_due = Some(playback_id);
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
             playback
                 .prepared_transition
                 .as_ref()
                 .filter(|prepared| prepared.origin_playback_id == playback_id)
-                .map(|prepared| prepared.start_delay)
+                .and_then(|prepared| {
+                    playback.active_handle.clone().map(|handle| {
+                        (
+                            prepared.start_delay,
+                            prepared.timing.transition_after,
+                            handle,
+                            playback.current_tempo,
+                        )
+                    })
+                })
         };
-        let Some(start_delay) = start_delay else {
+        let Some((fallback_delay, transition_after, outgoing_handle, current_tempo)) =
+            transition_state
+        else {
             return;
         };
+        let start_delay = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            outgoing_handle.position(),
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|position| transition_remaining_delay(position, transition_after, current_tempo))
+        .unwrap_or(fallback_delay);
         if !start_delay.is_zero() {
             tokio::time::sleep(start_delay).await;
         }
@@ -1471,6 +1623,23 @@ fn transition_event_after(timing: TransitionTiming) -> std::time::Duration {
     } else {
         early
     }
+}
+
+fn transition_remaining_delay(
+    current_position: std::time::Duration,
+    transition_after: std::time::Duration,
+    current_tempo: Option<(std::time::Duration, TempoEnvelope)>,
+) -> std::time::Duration {
+    current_tempo.map_or_else(
+        || transition_after.saturating_sub(current_position),
+        |(source_start, envelope)| {
+            envelope
+                .output_elapsed(transition_after.saturating_sub(source_start))
+                .saturating_sub(
+                    envelope.output_elapsed(current_position.saturating_sub(source_start)),
+                )
+        },
+    )
 }
 
 fn equal_power_gains(progress: f32) -> (f32, f32) {
@@ -1757,6 +1926,7 @@ where
 {
     playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
     playback.transition_due = None;
+    playback.automix_rearm_in_progress = None;
     playback
         .prepared_transition
         .take()
@@ -2055,6 +2225,7 @@ mod tests {
         paused: Mutex<Vec<PlaybackId>>,
         resumed: Mutex<Vec<PlaybackId>>,
         seeks: Mutex<Vec<(PlaybackId, Duration)>>,
+        positions: Mutex<HashMap<PlaybackId, Duration>>,
         volumes: Mutex<Vec<(PlaybackId, f32)>>,
         disconnects: Mutex<Vec<GuildKey>>,
         play_notify: Notify,
@@ -2145,6 +2316,10 @@ mod tests {
             self.state.seeks.lock().clone()
         }
 
+        fn set_position(&self, playback_id: PlaybackId, position: Duration) {
+            self.state.positions.lock().insert(playback_id, position);
+        }
+
         fn disconnects(&self) -> Vec<GuildKey> {
             self.state.disconnects.lock().clone()
         }
@@ -2171,6 +2346,10 @@ mod tests {
 
         fn resume(&self) {
             self.state.resumed.lock().push(self.playback_id);
+        }
+
+        async fn position(&self) -> Option<Duration> {
+            self.state.positions.lock().get(&self.playback_id).copied()
         }
 
         async fn seek(&self, position: Duration) -> bool {
@@ -3306,6 +3485,55 @@ mod tests {
         assert_eq!(options.source_start, Duration::from_millis(250));
         assert!(options.tempo_envelope.is_none());
         assert!(runtime.seeks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabling_automix_mid_track_rearms_the_current_transition() {
+        let guild_id = GuildKey::new(125);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(1);
+        let analysis = TrackAnalysis {
+            duration,
+            audible_start: Duration::ZERO,
+            audible_end: duration,
+            bpm: Some(120.0),
+            beat_confidence: 1.0,
+            first_beat: Some(Duration::ZERO),
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
+        };
+        runtime.analyze_with("first", analysis.clone());
+        runtime.analyze_with("second", analysis);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(200)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        let first = runtime.played()[0].clone();
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(false));
+        runtime.set_position(first.playback_id, Duration::from_millis(600));
+
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(true));
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].clone();
+        timeout(Duration::from_secs(2), async {
+            while !runtime.resumed().contains(&second.playback_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("mid-track AutoMix transition did not start");
+
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
     }
 
     #[tokio::test]

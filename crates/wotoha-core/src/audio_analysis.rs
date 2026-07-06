@@ -4,6 +4,7 @@ use crate::automix::TrackAnalysis;
 
 const MIN_BPM: usize = 70;
 const MAX_BPM: usize = 180;
+const ONSET_BLOCKS_PER_SECOND: usize = 200;
 
 /// Lightweight mono PCM analysis used by AutoMix. Samples must be normalized to -1..=1.
 pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalysis> {
@@ -29,7 +30,8 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         .rposition(|sample| sample.abs() >= threshold)
         .unwrap_or(samples.len() - 1);
 
-    let block = (sample_rate as usize / 100).max(1);
+    let block = (sample_rate as usize / ONSET_BLOCKS_PER_SECOND).max(1);
+    let onset_rate = sample_rate as f32 / block as f32;
     let energy = samples
         .chunks(block)
         .map(|chunk| chunk.iter().map(|sample| sample * sample).sum::<f32>() / chunk.len() as f32)
@@ -38,7 +40,7 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
         .windows(2)
         .map(|pair| (pair[1].sqrt() - pair[0].sqrt()).max(0.0))
         .collect::<Vec<_>>();
-    let Some((bpm, confidence, beat_lag)) = estimate_tempo(&onset) else {
+    let Some((bpm, confidence, beat_lag)) = estimate_tempo(&onset, onset_rate) else {
         return Some(TrackAnalysis {
             duration: duration(samples.len(), sample_rate),
             audible_start: duration(first, sample_rate),
@@ -53,10 +55,8 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             sample_peak_dbfs: None,
         });
     };
-    let onset_peak = onset.iter().copied().fold(0.0_f32, f32::max);
-    let first_beat_block = onset
-        .iter()
-        .position(|value| *value >= onset_peak * 0.5)
+    let audible_start_block = first / block;
+    let first_beat_block = estimate_first_beat(&onset, beat_lag, audible_start_block)
         .map(|index| index + 1)
         .unwrap_or_default();
     if first_beat_block == 0 {
@@ -74,9 +74,10 @@ pub fn analyze_mono_pcm(samples: &[f32], sample_rate: u32) -> Option<TrackAnalys
             sample_peak_dbfs: None,
         });
     }
+    let beat_lag_blocks = beat_lag.round().max(1.0) as usize;
     let (downbeat_offset, downbeat_confidence) =
-        estimate_downbeat_phase(&onset, first_beat_block - 1, beat_lag);
-    let first_downbeat_block = first_beat_block + downbeat_offset * beat_lag;
+        estimate_downbeat_phase(&onset, first_beat_block - 1, beat_lag_blocks);
+    let first_downbeat_block = first_beat_block + downbeat_offset * beat_lag_blocks;
 
     Some(TrackAnalysis {
         duration: duration(samples.len(), sample_rate),
@@ -110,9 +111,11 @@ fn estimate_downbeat_phase(onset: &[f32], first_beat: usize, beat_lag: usize) ->
         position = position.saturating_add(beat_lag);
     }
     let means = std::array::from_fn::<_, 4, _>(|phase| {
-        (counts[phase] > 0)
-            .then(|| sums[phase] / counts[phase] as f32)
-            .unwrap_or_default()
+        if counts[phase] > 0 {
+            sums[phase] / counts[phase] as f32
+        } else {
+            0.0
+        }
     });
     let mut ranked = means.into_iter().enumerate().collect::<Vec<_>>();
     ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -130,36 +133,117 @@ fn estimate_downbeat_phase(onset: &[f32], first_beat: usize, beat_lag: usize) ->
     }
 }
 
-fn estimate_tempo(onset: &[f32]) -> Option<(f32, f32, usize)> {
-    if onset.len() < 100 {
+fn estimate_tempo(onset: &[f32], onset_rate: f32) -> Option<(f32, f32, f32)> {
+    if onset.len() < onset_rate as usize || onset_rate <= 0.0 {
         return None;
     }
     let energy = onset.iter().map(|value| value * value).sum::<f32>();
     if energy <= f32::EPSILON {
         return None;
     }
-    let mut best = (0.0_f32, 0_usize);
-    for bpm in MIN_BPM..=MAX_BPM {
-        let lag = (6000.0 / bpm as f32).round() as usize;
-        if lag >= onset.len() {
-            continue;
-        }
-        let score = onset
-            .iter()
-            .zip(onset.iter().skip(lag))
-            .map(|(left, right)| left * right)
-            .sum::<f32>();
-        if score > best.0 {
-            best = (score, lag);
-        }
-    }
-    (best.1 > 0).then(|| {
+    let minimum_lag = (onset_rate * 60.0 / MAX_BPM as f32).floor() as usize;
+    let maximum_lag = (onset_rate * 60.0 / MIN_BPM as f32).ceil() as usize;
+    let scores = (minimum_lag.max(1)..=maximum_lag.min(onset.len() - 1))
+        .map(|lag| (lag, autocorrelation(onset, lag)))
+        .collect::<Vec<_>>();
+    let best_index = scores
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.1.total_cmp(&right.1.1))?
+        .0;
+    let (best_lag, best_score) = scores[best_index];
+    let fractional_offset = if best_index > 0 && best_index + 1 < scores.len() {
+        parabolic_peak_offset(
+            scores[best_index - 1].1,
+            best_score,
+            scores[best_index + 1].1,
+        )
+    } else {
+        0.0
+    };
+    let refined_lag = best_lag as f32 + fractional_offset;
+    (refined_lag > 0.0).then(|| {
         (
-            6000.0 / best.1 as f32,
-            (best.0 / energy).clamp(0.0, 1.0),
-            best.1,
+            onset_rate * 60.0 / refined_lag,
+            (best_score / energy).clamp(0.0, 1.0),
+            refined_lag,
         )
     })
+}
+
+fn autocorrelation(onset: &[f32], lag: usize) -> f32 {
+    onset
+        .iter()
+        .zip(onset.iter().skip(lag))
+        .map(|(left, right)| left * right)
+        .sum()
+}
+
+fn parabolic_peak_offset(left: f32, center: f32, right: f32) -> f32 {
+    let denominator = left - 2.0 * center + right;
+    if denominator.abs() <= f32::EPSILON {
+        0.0
+    } else {
+        (0.5 * (left - right) / denominator).clamp(-0.5, 0.5)
+    }
+}
+
+fn estimate_first_beat(onset: &[f32], beat_lag: f32, audible_start: usize) -> Option<usize> {
+    if onset.is_empty() || beat_lag <= 1.0 || !beat_lag.is_finite() {
+        return None;
+    }
+    const PHASE_STEPS_PER_BLOCK: usize = 4;
+    let phase_steps = (beat_lag * PHASE_STEPS_PER_BLOCK as f32).ceil() as usize;
+    let phase = (0..phase_steps)
+        .map(|step| {
+            let phase = step as f32 / PHASE_STEPS_PER_BLOCK as f32;
+            let mut score = 0.0;
+            let mut count = 0_u32;
+            let mut position = phase;
+            while position < onset.len() as f32 {
+                score += interpolated(onset, position);
+                count += 1;
+                position += beat_lag;
+            }
+            (score / count.max(1) as f32, phase)
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))?
+        .1;
+
+    let mut candidates = Vec::new();
+    let mut position = phase;
+    while position + 5.0 < audible_start as f32 {
+        position += beat_lag;
+    }
+    while position < onset.len() as f32 {
+        let center = position.round() as usize;
+        let from = center.saturating_sub(5);
+        let to = (center + 6).min(onset.len());
+        if from < to {
+            let (offset, strength) = onset[from..to]
+                .iter()
+                .copied()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(&right.1))?;
+            candidates.push((from + offset, strength));
+        }
+        position += beat_lag;
+    }
+    let peak = candidates
+        .iter()
+        .map(|(_, strength)| *strength)
+        .fold(0.0_f32, f32::max);
+    candidates
+        .into_iter()
+        .find(|(position, strength)| *position + 1 >= audible_start && *strength >= peak * 0.25)
+        .map(|(position, _)| position)
+}
+
+fn interpolated(values: &[f32], position: f32) -> f32 {
+    let left = position.floor().max(0.0) as usize;
+    let right = (left + 1).min(values.len().saturating_sub(1));
+    let fraction = position - left as f32;
+    values[left] * (1.0 - fraction) + values[right] * fraction
 }
 
 fn duration(samples: usize, sample_rate: u32) -> Duration {
@@ -210,5 +294,51 @@ mod tests {
         assert_eq!(analysis.first_beat, Some(Duration::from_secs(1)));
         assert_eq!(analysis.first_downbeat, Some(Duration::from_secs(2)));
         assert!(analysis.downbeat_confidence > 0.35);
+    }
+
+    #[test]
+    fn estimates_fractional_tempo_without_accumulating_beat_drift() {
+        let sample_rate = 1_000;
+        let bpm = 123.0_f32;
+        let interval = 60.0 / bpm;
+        let mut samples = vec![0.0; 62_000];
+        let mut beat = 1.0_f32;
+        while beat < 61.0 {
+            let position = (beat * sample_rate as f32).round() as usize;
+            samples[position..position + 8].fill(1.0);
+            beat += interval;
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        assert!((analysis.bpm.unwrap() - bpm).abs() < 0.15, "{analysis:?}");
+        assert!(
+            analysis
+                .first_beat
+                .unwrap()
+                .abs_diff(Duration::from_secs(1))
+                < Duration::from_millis(8),
+            "{analysis:?}"
+        );
+    }
+
+    #[test]
+    fn locks_phase_to_the_repeating_kick_grid_instead_of_a_loud_pickup() {
+        let sample_rate = 1_000;
+        let mut samples = vec![0.0; 20_000];
+        samples[1_250..1_270].fill(1.0);
+        for beat in (2_000..19_000).step_by(500) {
+            samples[beat..beat + 12].fill(0.7);
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        assert!((analysis.bpm.unwrap() - 120.0).abs() < 0.2);
+        assert!(
+            analysis
+                .first_beat
+                .unwrap()
+                .abs_diff(Duration::from_secs(2))
+                < Duration::from_millis(8),
+            "{analysis:?}"
+        );
     }
 }

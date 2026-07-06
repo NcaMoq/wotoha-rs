@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+pub const TEMPO_SYNC_DEADBAND: f32 = 0.001;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoMixConfig {
     pub enabled: bool,
@@ -197,7 +199,7 @@ impl TempoEnvelope {
     pub fn output_elapsed(self, source_elapsed: Duration) -> Duration {
         let target = source_elapsed.as_secs_f64();
         let mut low = 0.0_f64;
-        let mut high = (target / f64::from(self.initial_speed).min(1.0).max(0.01))
+        let mut high = (target / f64::from(self.initial_speed).clamp(0.01, 1.0))
             + self.hold.as_secs_f64()
             + self.ramp.as_secs_f64();
         for _ in 0..64 {
@@ -308,7 +310,7 @@ pub fn plan_transition(
         harmonic_compatibility,
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
         tempo_envelope: tempo_ratio.and_then(|ratio| {
-            ((ratio - 1.0).abs() > 0.005).then_some(TempoEnvelope {
+            ((ratio - 1.0).abs() > TEMPO_SYNC_DEADBAND).then_some(TempoEnvelope {
                 initial_speed: ratio,
                 hold: duration,
                 ramp: Duration::from_secs_f32(240.0 / outgoing.bpm.unwrap_or(120.0)),
@@ -507,6 +509,16 @@ mod tests {
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert!((plan.incoming_tempo_ratio - 120.0 / 124.0).abs() < 0.0001);
         assert_eq!(plan.duration, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn corrects_small_tempo_differences_that_would_drift_during_the_mix() {
+        let plan = plan_transition(&analyzed(120.0), &analyzed(120.3), &config());
+        let envelope = plan
+            .tempo_envelope
+            .expect("small drift should be corrected");
+        assert!((envelope.initial_speed - 120.0 / 120.3).abs() < 0.0001);
+        assert_eq!(envelope.hold, plan.duration);
     }
 
     #[test]
