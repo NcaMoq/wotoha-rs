@@ -26,7 +26,8 @@ use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
         AutoMixConfig, EqTransition, EqTransitionRole, TempoEnvelope, TrackAnalysis,
-        TransitionKind, TransitionTiming, plan_guarded_transition, plan_transition_timing,
+        TransitionKind, TransitionTiming, explain_beatmatch_decision, plan_guarded_transition,
+        plan_transition_timing,
     },
     debug::append_debug_log,
 };
@@ -1290,6 +1291,12 @@ where
             info!(
                 guild_id = guild_id.get(),
                 transition_kind = ?plan.kind,
+                beatmatch_decision = ?explain_beatmatch_decision(
+                    outgoing,
+                    incoming,
+                    &self.inner.automix,
+                    guarded
+                ),
                 quality_guarded = guarded.rejected_quality.is_some(),
                 outgoing_bpm = ?outgoing.bpm,
                 incoming_bpm = ?incoming.bpm,

@@ -392,6 +392,21 @@ pub struct GuardedTransitionPlan {
     pub rejected_quality: Option<AutoMixQualityReport>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutoMixBeatMatchDecision {
+    Selected,
+    Disabled,
+    QualityGuarded,
+    NoTrustedIncomingBeatStart,
+    OutgoingTempoConfidenceTooLow,
+    IncomingTempoConfidenceTooLow,
+    MissingBpm,
+    InvalidBpm,
+    TempoDifferenceTooLarge,
+    VocalLimitConstrained,
+    NoSafeOverlap,
+}
+
 /// Maps output time to source time while the incoming deck returns to native tempo.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TempoEnvelope {
@@ -808,6 +823,53 @@ pub fn plan_guarded_transition(
         quality: fallback_quality,
         rejected_plan: Some(plan),
         rejected_quality: Some(quality),
+    }
+}
+
+pub fn explain_beatmatch_decision(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    guarded: &GuardedTransitionPlan,
+) -> AutoMixBeatMatchDecision {
+    if !config.enabled {
+        return AutoMixBeatMatchDecision::Disabled;
+    }
+    if guarded.plan.kind == TransitionKind::BeatMatched {
+        return AutoMixBeatMatchDecision::Selected;
+    }
+    if guarded
+        .rejected_plan
+        .as_ref()
+        .is_some_and(|plan| plan.kind == TransitionKind::BeatMatched)
+    {
+        return AutoMixBeatMatchDecision::QualityGuarded;
+    }
+    if safe_incoming_beat_start(incoming).is_none() {
+        return AutoMixBeatMatchDecision::NoTrustedIncomingBeatStart;
+    }
+    if !tempo_alignment_confident(outgoing, config.min_beat_confidence) {
+        return AutoMixBeatMatchDecision::OutgoingTempoConfidenceTooLow;
+    }
+    if !tempo_alignment_confident(incoming, config.min_beat_confidence) {
+        return AutoMixBeatMatchDecision::IncomingTempoConfidenceTooLow;
+    }
+
+    let (Some(outgoing_bpm), Some(incoming_bpm)) = (outgoing.bpm, incoming.bpm) else {
+        return AutoMixBeatMatchDecision::MissingBpm;
+    };
+    if outgoing_bpm <= 0.0 || incoming_bpm <= 0.0 {
+        return AutoMixBeatMatchDecision::InvalidBpm;
+    }
+    let ratio = outgoing_bpm / incoming_bpm;
+    if !ratio.is_finite() || (ratio - 1.0).abs() > config.max_tempo_adjustment {
+        return AutoMixBeatMatchDecision::TempoDifferenceTooLarge;
+    }
+
+    match guarded.plan.kind {
+        TransitionKind::Gapless => AutoMixBeatMatchDecision::NoSafeOverlap,
+        TransitionKind::Crossfade => AutoMixBeatMatchDecision::VocalLimitConstrained,
+        TransitionKind::BeatMatched => AutoMixBeatMatchDecision::Selected,
     }
 }
 
@@ -2961,8 +3023,13 @@ mod tests {
 
         let plan = plan_transition(&outgoing, &incoming, &config());
         let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let guarded = plan_guarded_transition(&outgoing, &incoming, &config());
 
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(
+            explain_beatmatch_decision(&outgoing, &incoming, &config(), &guarded),
+            AutoMixBeatMatchDecision::Selected
+        );
         assert!(
             report.max_beat_phase_error.unwrap() <= Duration::from_millis(1),
             "plan={plan:?} report={report:?}"
@@ -2978,8 +3045,13 @@ mod tests {
         incoming.beat_marker_confidences.fill(0.1);
 
         let plan = plan_transition(&outgoing, &incoming, &config());
+        let guarded = plan_guarded_transition(&outgoing, &incoming, &config());
 
         assert_eq!(plan.kind, TransitionKind::Crossfade);
+        assert_eq!(
+            explain_beatmatch_decision(&outgoing, &incoming, &config(), &guarded),
+            AutoMixBeatMatchDecision::OutgoingTempoConfidenceTooLow
+        );
     }
 
     #[test]
@@ -3296,6 +3368,10 @@ mod tests {
         assert_eq!(guarded.plan.incoming_tempo_ratio, 1.0);
         assert!(guarded.plan.tempo_envelope.is_none());
         assert!(!guarded.quality.has_blocking_issue(), "guarded={guarded:?}");
+        assert_eq!(
+            explain_beatmatch_decision(&outgoing, &incoming, &config(), &guarded),
+            AutoMixBeatMatchDecision::QualityGuarded
+        );
     }
 
     #[test]
@@ -3310,9 +3386,16 @@ mod tests {
 
     #[test]
     fn falls_back_to_crossfade_for_incompatible_tempos() {
-        let plan = plan_transition(&analyzed(90.0), &analyzed(140.0), &config());
+        let outgoing = analyzed(90.0);
+        let incoming = analyzed(140.0);
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let guarded = plan_guarded_transition(&outgoing, &incoming, &config());
         assert_eq!(plan.kind, TransitionKind::Crossfade);
         assert_eq!(plan.incoming_tempo_ratio, 1.0);
+        assert_eq!(
+            explain_beatmatch_decision(&outgoing, &incoming, &config(), &guarded),
+            AutoMixBeatMatchDecision::TempoDifferenceTooLarge
+        );
     }
 
     #[test]
