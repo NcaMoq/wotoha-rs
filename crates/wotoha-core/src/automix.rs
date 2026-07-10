@@ -14,6 +14,9 @@ const MAX_LOW_HANDOFF_GAIN: f32 = 1.15;
 const MAX_DUAL_VOCAL_RISK: f32 = 0.58;
 const ENERGY_SELECTION_EPSILON: f32 = 0.02;
 const MAX_ENERGY_START_CANDIDATES: usize = 96;
+const MIN_MARKER_BACKED_BEAT_CONFIDENCE: f32 = 0.45;
+const MIN_MARKER_BACKED_KICK_COVERAGE: f32 = 0.55;
+const MIN_MARKER_BACKED_KICK_MARKERS: usize = 8;
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
@@ -2612,8 +2615,8 @@ fn compatible_tempo_curve(
     incoming: &TrackAnalysis,
     config: &AutoMixConfig,
 ) -> Option<(f32, f32)> {
-    if outgoing.beat_confidence < config.min_beat_confidence
-        || incoming.beat_confidence < config.min_beat_confidence
+    if !tempo_alignment_confident(outgoing, config.min_beat_confidence)
+        || !tempo_alignment_confident(incoming, config.min_beat_confidence)
     {
         return None;
     }
@@ -2626,6 +2629,27 @@ fn compatible_tempo_curve(
     let ratio = outgoing_bpm / incoming_bpm;
     (ratio.is_finite() && (ratio - 1.0).abs() <= config.max_tempo_adjustment)
         .then_some((ratio, ratio))
+}
+
+fn tempo_alignment_confident(analysis: &TrackAnalysis, min_beat_confidence: f32) -> bool {
+    if analysis.beat_confidence >= min_beat_confidence {
+        return true;
+    }
+    if analysis.beat_confidence < MIN_MARKER_BACKED_BEAT_CONFIDENCE
+        || analysis.beat_markers.len() < MIN_MARKER_BACKED_KICK_MARKERS
+        || analysis.beat_marker_confidences.is_empty()
+    {
+        return false;
+    }
+
+    let trusted = analysis
+        .beat_marker_confidences
+        .iter()
+        .filter(|confidence| **confidence >= MIN_PHASE_MARKER_CONFIDENCE)
+        .count();
+    trusted >= MIN_MARKER_BACKED_KICK_MARKERS
+        && trusted as f32 / analysis.beat_marker_confidences.len() as f32
+            >= MIN_MARKER_BACKED_KICK_COVERAGE
 }
 
 fn phase_follow_segments(
@@ -2928,6 +2952,34 @@ mod tests {
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert!((plan.incoming_tempo_ratio - 120.0 / 124.0).abs() < 0.0001);
         assert_eq!(plan.duration, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn kick_marker_coverage_allows_beatmatch_below_global_confidence_threshold() {
+        let outgoing = marker_backed_low_confidence(126.0);
+        let incoming = marker_backed_low_confidence(126.0);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert!(
+            report.max_beat_phase_error.unwrap() <= Duration::from_millis(1),
+            "plan={plan:?} report={report:?}"
+        );
+        assert!(!report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn weak_kick_marker_coverage_still_falls_back_to_crossfade() {
+        let mut outgoing = marker_backed_low_confidence(126.0);
+        let mut incoming = marker_backed_low_confidence(126.0);
+        outgoing.beat_marker_confidences.fill(0.1);
+        incoming.beat_marker_confidences.fill(0.1);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+
+        assert_eq!(plan.kind, TransitionKind::Crossfade);
     }
 
     #[test]
@@ -3790,6 +3842,13 @@ mod tests {
             let to = (*end * rate as f32).ceil() as usize;
             analysis.vocal_activity[from..to.min(length)].fill(255);
         }
+    }
+
+    fn marker_backed_low_confidence(bpm: f32) -> TrackAnalysis {
+        let mut analysis = analyzed(bpm);
+        analysis.beat_confidence = 0.56;
+        analysis.beat_marker_confidences = vec![0.75; analysis.beat_markers.len()];
+        analysis
     }
 
     fn set_energy_ranges(analysis: &mut TrackAnalysis, base_dbfs: f32, ranges: &[(f32, f32, f32)]) {
