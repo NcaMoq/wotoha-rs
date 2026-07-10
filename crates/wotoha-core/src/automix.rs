@@ -12,6 +12,8 @@ const MAX_PHRASE_PHASE_ERROR: Duration = Duration::from_millis(150);
 const MIN_LOW_HANDOFF_GAIN: f32 = 0.85;
 const MAX_LOW_HANDOFF_GAIN: f32 = 1.15;
 const MAX_DUAL_VOCAL_RISK: f32 = 0.58;
+const ENERGY_SELECTION_EPSILON: f32 = 0.02;
+const MAX_ENERGY_START_CANDIDATES: usize = 96;
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
@@ -592,6 +594,7 @@ pub fn plan_transition(
         return gapless_plan(outgoing, incoming);
     };
     let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
+    let incoming_gain = recommended_incoming_gain(outgoing, incoming);
     let base_duration = if harmonic_compatibility.is_some_and(|score| score < 0.5) {
         timing.fade_duration.min(Duration::from_secs(4))
     } else {
@@ -660,8 +663,8 @@ pub fn plan_transition(
             align_to_matching_bar_phase(outgoing, incoming, incoming_start, target, phase_bias)
         })
         .flatten();
+    let target = outgoing.audible_end.saturating_sub(target_duration);
     let mut outgoing_start = if beat_aligned {
-        let target = outgoing.audible_end.saturating_sub(target_duration);
         if vocal_constrained {
             phrase_start
                 .or(bar_phase_start)
@@ -679,6 +682,20 @@ pub fn plan_transition(
     } else {
         outgoing.audible_end.saturating_sub(target_duration)
     };
+    outgoing_start = select_energy_balanced_start(
+        outgoing,
+        incoming,
+        incoming_start,
+        outgoing_start,
+        target,
+        target_duration,
+        beat_aligned,
+        phase_bias,
+        harmonic_compatibility,
+        incoming_gain,
+        tempo_curve,
+        config.max_tempo_adjustment,
+    );
     let mut duration = outgoing.audible_end.saturating_sub(outgoing_start);
     let (mut envelope_start, mut tempo_envelope) = build_tempo_envelope(
         outgoing,
@@ -760,7 +777,7 @@ pub fn plan_transition(
         duration,
         incoming_tempo_ratio: envelope_start,
         harmonic_compatibility,
-        incoming_gain: recommended_incoming_gain(outgoing, incoming),
+        incoming_gain,
         tempo_envelope,
     }
 }
@@ -1571,6 +1588,399 @@ fn transition_energy_report(
         min_ratio: (samples > 0).then_some(min_ratio),
         max_ratio: (samples > 0).then_some(max_ratio),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_energy_balanced_start(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+    default_start: Duration,
+    target: Duration,
+    search_window: Duration,
+    beat_aligned: bool,
+    phase_bias: BarPhaseBias,
+    harmonic_compatibility: Option<f32>,
+    incoming_gain: f32,
+    tempo_curve: Option<(f32, f32)>,
+    max_tempo_adjustment: f32,
+) -> Duration {
+    if !has_energy_profile(outgoing) || !has_energy_profile(incoming) {
+        return default_start;
+    }
+
+    let mut candidates = vec![default_start];
+    if beat_aligned {
+        if harmonic_compatibility.is_none_or(|score| score >= 0.5)
+            && incoming.downbeat_confidence >= 0.25
+            && incoming.first_downbeat.is_some()
+        {
+            candidates.extend(matching_phrase_phase_candidates(
+                outgoing,
+                incoming,
+                incoming_start,
+                target,
+                search_window,
+                PhraseLength::FourBars,
+                phase_bias,
+            ));
+        }
+        candidates.extend(matching_bar_phase_candidates(
+            outgoing,
+            incoming,
+            incoming_start,
+            target,
+            search_window,
+            phase_bias,
+        ));
+        candidates.extend(beat_start_candidates(
+            outgoing,
+            target,
+            search_window,
+            phase_bias,
+        ));
+    } else {
+        candidates.extend(energy_grid_start_candidates(
+            outgoing,
+            target,
+            search_window,
+            phase_bias,
+        ));
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+
+    let Some((mut best_start, mut best_score)) = transition_start_energy_score(
+        outgoing,
+        incoming,
+        incoming_start,
+        default_start,
+        beat_aligned,
+        harmonic_compatibility,
+        incoming_gain,
+        tempo_curve,
+        max_tempo_adjustment,
+    ) else {
+        return default_start;
+    };
+
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| *candidate != default_start)
+        .take(MAX_ENERGY_START_CANDIDATES)
+    {
+        let Some((candidate_start, candidate_score)) = transition_start_energy_score(
+            outgoing,
+            incoming,
+            incoming_start,
+            candidate,
+            beat_aligned,
+            harmonic_compatibility,
+            incoming_gain,
+            tempo_curve,
+            max_tempo_adjustment,
+        ) else {
+            continue;
+        };
+        if candidate_score + ENERGY_SELECTION_EPSILON < best_score {
+            best_start = candidate_start;
+            best_score = candidate_score;
+        }
+    }
+
+    best_start
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_start_energy_score(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+    outgoing_start: Duration,
+    beat_aligned: bool,
+    harmonic_compatibility: Option<f32>,
+    incoming_gain: f32,
+    tempo_curve: Option<(f32, f32)>,
+    max_tempo_adjustment: f32,
+) -> Option<(Duration, f32)> {
+    let duration = outgoing.audible_end.saturating_sub(outgoing_start);
+    if duration < MIN_AUDIBLE_MIX_OVERLAP {
+        return None;
+    }
+
+    let (incoming_tempo_ratio, tempo_envelope) = build_tempo_envelope(
+        outgoing,
+        incoming,
+        outgoing_start,
+        incoming_start,
+        duration,
+        tempo_curve,
+        max_tempo_adjustment,
+    );
+    let incoming_end = incoming_start.saturating_add(
+        tempo_envelope.map_or(duration, |envelope| envelope.source_elapsed(duration)),
+    );
+    if incoming_end
+        > incoming
+            .audible_end
+            .saturating_add(Duration::from_millis(20))
+    {
+        return None;
+    }
+    if vocal_overlap_limit(outgoing, incoming, incoming_start, duration, tempo_envelope) < duration
+    {
+        return None;
+    }
+
+    let plan = TransitionPlan {
+        kind: if beat_aligned {
+            TransitionKind::BeatMatched
+        } else {
+            TransitionKind::Crossfade
+        },
+        outgoing_start,
+        incoming_start,
+        duration,
+        incoming_tempo_ratio,
+        harmonic_compatibility,
+        incoming_gain,
+        tempo_envelope,
+    };
+    let quality = evaluate_transition_quality(outgoing, incoming, &plan);
+    if quality.has_blocking_issue() {
+        return None;
+    }
+    energy_balance_score(&quality).map(|score| (outgoing_start, score))
+}
+
+fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
+    if quality.energy_samples_checked == 0 {
+        return None;
+    }
+    let min_ratio = quality.min_mix_energy_ratio?.max(1.0e-6);
+    let max_ratio = quality.max_mix_energy_ratio?.max(1.0e-6);
+    if !min_ratio.is_finite() || !max_ratio.is_finite() {
+        return None;
+    }
+
+    let dip_penalty = (0.9 - min_ratio).max(0.0) * 4.0;
+    let buildup_penalty = (max_ratio - 1.15).max(0.0) * 2.0;
+    let movement_penalty = min_ratio.ln().abs() * 0.15 + max_ratio.ln().abs() * 0.05;
+    Some(dip_penalty + buildup_penalty + movement_penalty)
+}
+
+fn has_energy_profile(analysis: &TrackAnalysis) -> bool {
+    analysis.energy_profile_rate > 0 && !analysis.energy_profile.is_empty()
+}
+
+fn candidate_bounds(
+    target: Duration,
+    search_window: Duration,
+    bias: BarPhaseBias,
+) -> (Duration, Duration) {
+    match bias {
+        BarPhaseBias::AtOrBefore => (target.saturating_sub(search_window), target),
+        BarPhaseBias::AtOrAfter => (target, target.saturating_add(search_window)),
+    }
+}
+
+fn matching_phrase_phase_candidates(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+    target: Duration,
+    search_window: Duration,
+    length: PhraseLength,
+    bias: BarPhaseBias,
+) -> Vec<Duration> {
+    let Some(outgoing_grid) = outgoing.beat_grid() else {
+        return Vec::new();
+    };
+    let Some(incoming_grid) = incoming.beat_grid() else {
+        return Vec::new();
+    };
+    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+        return Vec::new();
+    }
+
+    let outgoing_phrase = phrase_interval(outgoing_grid, length);
+    let incoming_phrase = phrase_interval(incoming_grid, length);
+    if outgoing_phrase.is_zero() || incoming_phrase.is_zero() {
+        return Vec::new();
+    }
+    let Some(incoming_phase) = cycle_phase_fraction(
+        incoming_start,
+        incoming_grid.first_downbeat,
+        incoming_phrase,
+    ) else {
+        return Vec::new();
+    };
+    let (earliest, latest) = candidate_bounds(target, search_window, bias);
+    matching_cycle_phase_candidates(
+        outgoing_grid.first_downbeat,
+        outgoing_phrase,
+        incoming_phase,
+        earliest,
+        latest,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        valid_outgoing_start(outgoing, *candidate)
+            && has_trusted_marker_near(outgoing, *candidate, MAX_BEATMATCH_PHASE_ERROR)
+    })
+    .collect()
+}
+
+fn matching_bar_phase_candidates(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+    target: Duration,
+    search_window: Duration,
+    bias: BarPhaseBias,
+) -> Vec<Duration> {
+    let Some(outgoing_grid) = outgoing.beat_grid() else {
+        return Vec::new();
+    };
+    let Some(incoming_grid) = incoming.beat_grid() else {
+        return Vec::new();
+    };
+    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+        return Vec::new();
+    }
+
+    let Some(outgoing_bar) = bar_interval(outgoing_grid) else {
+        return Vec::new();
+    };
+    let Some(incoming_bar) = bar_interval(incoming_grid) else {
+        return Vec::new();
+    };
+    let Some(incoming_phase) =
+        cycle_phase_fraction(incoming_start, incoming_grid.first_downbeat, incoming_bar)
+    else {
+        return Vec::new();
+    };
+    let (earliest, latest) = candidate_bounds(target, search_window, bias);
+    matching_cycle_phase_candidates(
+        outgoing_grid.first_downbeat,
+        outgoing_bar,
+        incoming_phase,
+        earliest,
+        latest,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        valid_outgoing_start(outgoing, *candidate)
+            && has_trusted_marker_near(outgoing, *candidate, MAX_BEATMATCH_PHASE_ERROR)
+    })
+    .collect()
+}
+
+fn matching_cycle_phase_candidates(
+    first: Duration,
+    interval: Duration,
+    phase: f64,
+    earliest: Duration,
+    latest: Duration,
+) -> Vec<Duration> {
+    let interval_secs = interval.as_secs_f64();
+    let base = first.as_secs_f64() + interval_secs * phase;
+    let earliest_secs = earliest.as_secs_f64();
+    let latest_secs = latest.as_secs_f64();
+    if interval_secs <= 0.0
+        || !interval_secs.is_finite()
+        || !base.is_finite()
+        || earliest_secs > latest_secs
+    {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let mut cycle = ((earliest_secs - base) / interval_secs).ceil();
+    while candidates.len() < MAX_ENERGY_START_CANDIDATES {
+        let position = base + cycle * interval_secs;
+        if position > latest_secs + 1.0e-6 {
+            break;
+        }
+        if position >= earliest_secs - 1.0e-6 && position.is_finite() && position >= 0.0 {
+            candidates.push(Duration::from_secs_f64(position));
+        }
+        cycle += 1.0;
+    }
+    candidates
+}
+
+fn beat_start_candidates(
+    analysis: &TrackAnalysis,
+    target: Duration,
+    search_window: Duration,
+    bias: BarPhaseBias,
+) -> Vec<Duration> {
+    let (earliest, latest) = candidate_bounds(target, search_window, bias);
+    let mut candidates = analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, beat)| {
+            marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
+                && *beat >= earliest
+                && *beat <= latest
+        })
+        .map(|(_, beat)| beat)
+        .filter(|beat| valid_outgoing_start(analysis, *beat))
+        .collect::<Vec<_>>();
+
+    if let (Some(first), Some(bpm)) = (analysis.first_beat, analysis.bpm)
+        && bpm.is_finite()
+        && bpm > 0.0
+    {
+        let interval = Duration::from_secs_f32(60.0 / bpm);
+        if !interval.is_zero() {
+            let mut position = if earliest <= first {
+                first
+            } else {
+                align_to_global_beat_at_or_after(earliest, analysis)
+            };
+            while position <= latest && candidates.len() < MAX_ENERGY_START_CANDIDATES {
+                if valid_outgoing_start(analysis, position) {
+                    candidates.push(position);
+                }
+                position += interval;
+            }
+        }
+    }
+
+    candidates
+}
+
+fn energy_grid_start_candidates(
+    analysis: &TrackAnalysis,
+    target: Duration,
+    search_window: Duration,
+    bias: BarPhaseBias,
+) -> Vec<Duration> {
+    const STEP: Duration = Duration::from_millis(500);
+    let (earliest, latest) = candidate_bounds(target, search_window, bias);
+    let mut candidates = Vec::new();
+    let mut position = earliest;
+    while position <= latest && candidates.len() < MAX_ENERGY_START_CANDIDATES {
+        if valid_outgoing_start(analysis, position) {
+            candidates.push(position);
+        }
+        position += STEP;
+    }
+    if valid_outgoing_start(analysis, latest) {
+        candidates.push(latest);
+    }
+    candidates
+}
+
+fn valid_outgoing_start(analysis: &TrackAnalysis, candidate: Duration) -> bool {
+    candidate >= analysis.audible_start
+        && candidate <= analysis.audible_end
+        && analysis.audible_end.saturating_sub(candidate) >= MIN_AUDIBLE_MIX_OVERLAP
 }
 
 fn equal_power_mix_gains(progress: f32) -> (f32, f32) {
@@ -3187,6 +3597,50 @@ mod tests {
             report.min_mix_energy_ratio.unwrap() < 0.2,
             "report={report:?}"
         );
+    }
+
+    #[test]
+    fn energy_balancing_prefers_clean_phrase_boundary_over_default_dip() {
+        let mut config = config();
+        config.crossfade = Duration::from_secs(16);
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(168.0, 170.0, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(8.0, 10.0, -42.0)]);
+
+        let plan = plan_transition(&outgoing, &incoming, &config);
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.incoming_start, Duration::from_secs(1));
+        assert_eq!(plan.outgoing_start, Duration::from_secs(153));
+        assert!(
+            report.min_mix_energy_ratio.unwrap() > 0.6,
+            "plan={plan:?} report={report:?}"
+        );
+        assert!(!report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn energy_balancing_improves_crossfade_when_beatmatch_is_unavailable() {
+        let mut outgoing = analyzed(90.0);
+        let mut incoming = analyzed(140.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(175.0, 177.0, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(5.0, 7.0, -42.0)]);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::Crossfade);
+        assert!(
+            plan.outgoing_start < Duration::from_secs(171),
+            "plan={plan:?}"
+        );
+        assert!(
+            report.min_mix_energy_ratio.unwrap() > 0.6,
+            "plan={plan:?} report={report:?}"
+        );
+        assert!(!report.has_blocking_issue(), "report={report:?}");
     }
 
     #[test]
