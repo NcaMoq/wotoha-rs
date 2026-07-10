@@ -7,6 +7,7 @@ pub mod model;
 pub mod session;
 pub mod ui;
 pub mod url;
+pub mod vocal_analysis;
 
 pub use config::{BotConfig, ConfigError};
 pub use model::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};

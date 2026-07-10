@@ -9,6 +9,8 @@ use timestretch::{StreamProcessor, StretchError};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use wotoha_core::automix::TempoEnvelope;
 
+use crate::transition_dsp::{EqualizerControl, OutputTimeline, ThreeBandEqualizer};
+
 pub(crate) struct TempoStretchProcessor {
     inner: StreamProcessor,
     envelope: TempoEnvelope,
@@ -24,10 +26,20 @@ pub(crate) struct StretchTimeline {
     pub(crate) envelope: TempoEnvelope,
 }
 
+#[cfg(test)]
 pub(crate) fn build_stretched_input(
     input: Input,
     source_start: std::time::Duration,
     envelope: TempoEnvelope,
+) -> Result<(Input, StretchTimeline), String> {
+    build_stretched_input_with_equalizer(input, source_start, envelope, None)
+}
+
+pub(crate) fn build_stretched_input_with_equalizer(
+    input: Input,
+    source_start: std::time::Duration,
+    envelope: TempoEnvelope,
+    equalizer: Option<EqualizerControl>,
 ) -> Result<(Input, StretchTimeline), String> {
     let Input::Live(LiveInput::Parsed(parsed), _) = input else {
         return Err("tempo stretching requires a parsed input".into());
@@ -60,16 +72,17 @@ pub(crate) fn build_stretched_input(
     let adapter = AsyncAdapterStream::new(Box::new(source), 128 * 1024);
     let output: Input = RawAdapter::new(adapter, sample_rate, channels as u32).into();
     let runtime = tokio::runtime::Handle::current();
+    let worker = PcmWorker {
+        writer,
+        source_start,
+        source_skip_frames,
+        output_channels: channels,
+        cancelled,
+        runtime,
+        equalizer,
+    };
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = decode_and_stretch(
-            parsed,
-            writer,
-            processor,
-            source_skip_frames,
-            channels,
-            cancelled,
-            runtime,
-        ) {
+        if let Err(error) = decode_and_stretch(parsed, processor, worker) {
             tracing::warn!(%error, "AutoMix tempo-stretch worker stopped");
         }
     });
@@ -82,9 +95,18 @@ pub(crate) fn build_stretched_input(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn build_trimmed_input(
     input: Input,
     source_start: std::time::Duration,
+) -> Result<Input, String> {
+    build_trimmed_input_with_equalizer(input, source_start, None)
+}
+
+pub(crate) fn build_trimmed_input_with_equalizer(
+    input: Input,
+    source_start: std::time::Duration,
+    equalizer: Option<EqualizerControl>,
 ) -> Result<Input, String> {
     if source_start.is_zero() {
         return Ok(input);
@@ -115,15 +137,17 @@ pub(crate) fn build_trimmed_input(
     let adapter = AsyncAdapterStream::new(Box::new(source), 128 * 1024);
     let output: Input = RawAdapter::new(adapter, sample_rate, channels as u32).into();
     let runtime = tokio::runtime::Handle::current();
+    let worker = PcmWorker {
+        writer,
+        source_start,
+        source_skip_frames,
+        output_channels: channels,
+        cancelled,
+        runtime,
+        equalizer,
+    };
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = decode_and_trim(
-            parsed,
-            writer,
-            source_skip_frames,
-            channels,
-            cancelled,
-            runtime,
-        ) {
+        if let Err(error) = decode_and_trim(parsed, worker) {
             tracing::warn!(%error, "AutoMix source-trim worker stopped");
         }
     });
@@ -161,18 +185,32 @@ impl<R> Drop for CancelOnDropReader<R> {
     }
 }
 
-fn decode_and_stretch(
-    mut parsed: songbird::input::Parsed,
-    mut writer: tokio::io::DuplexStream,
-    mut processor: TempoStretchProcessor,
-    mut source_skip_frames: usize,
+struct PcmWorker {
+    writer: tokio::io::DuplexStream,
+    source_start: std::time::Duration,
+    source_skip_frames: usize,
     output_channels: usize,
     cancelled: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
+    equalizer: Option<EqualizerControl>,
+}
+
+fn decode_and_stretch(
+    mut parsed: songbird::input::Parsed,
+    mut processor: TempoStretchProcessor,
+    mut worker: PcmWorker,
 ) -> Result<(), String> {
     let mut discard_output = processor.latency_samples();
+    let mut equalizer = worker.equalizer.take().map(|control| {
+        StreamEqualizer::new(
+            control,
+            processor.sample_rate,
+            processor.channels,
+            OutputTimeline::stretched(worker.source_start, processor.envelope),
+        )
+    });
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if worker.cancelled.load(Ordering::Relaxed) {
             break;
         }
         let packet = match parsed.format.next_packet() {
@@ -199,11 +237,16 @@ fn decode_and_stretch(
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
         let available_frames = buffer.samples().len() / input_channels;
-        let skip_frames = source_skip_frames.min(available_frames);
-        source_skip_frames -= skip_frames;
+        let skip_frames = worker.source_skip_frames.min(available_frames);
+        worker.source_skip_frames -= skip_frames;
         let source = &buffer.samples()[skip_frames * input_channels..];
         let mut normalized = Vec::new();
-        let input = normalize_channels(source, input_channels, output_channels, &mut normalized)?;
+        let input = normalize_channels(
+            source,
+            input_channels,
+            worker.output_channels,
+            &mut normalized,
+        )?;
         if input.is_empty() {
             continue;
         }
@@ -211,39 +254,50 @@ fn decode_and_stretch(
         processor
             .process_into(input, &mut output)
             .map_err(|error| error.to_string())?;
-        write_pcm(
-            &mut writer,
-            &output,
+        write_pcm_with_equalizer(
+            &mut worker.writer,
+            &mut output,
             &mut discard_output,
-            &cancelled,
-            &runtime,
+            &worker.cancelled,
+            &worker.runtime,
+            equalizer.as_mut(),
         )?;
     }
     let mut output = Vec::with_capacity(processor.latency_samples() * 4);
     processor
         .flush_into(&mut output)
         .map_err(|error| error.to_string())?;
-    write_pcm(
-        &mut writer,
-        &output,
+    write_pcm_with_equalizer(
+        &mut worker.writer,
+        &mut output,
         &mut discard_output,
-        &cancelled,
-        &runtime,
+        &worker.cancelled,
+        &worker.runtime,
+        equalizer.as_mut(),
     )?;
-    let _ = runtime.block_on(writer.shutdown());
+    let _ = worker.runtime.block_on(worker.writer.shutdown());
     Ok(())
 }
 
 fn decode_and_trim(
     mut parsed: songbird::input::Parsed,
-    mut writer: tokio::io::DuplexStream,
-    mut source_skip_frames: usize,
-    output_channels: usize,
-    cancelled: Arc<AtomicBool>,
-    runtime: tokio::runtime::Handle,
+    mut worker: PcmWorker,
 ) -> Result<(), String> {
+    let sample_rate = parsed
+        .decoder
+        .codec_params()
+        .sample_rate
+        .ok_or_else(|| "source trimming requires a known sample rate".to_owned())?;
+    let mut equalizer = worker.equalizer.take().map(|control| {
+        StreamEqualizer::new(
+            control,
+            sample_rate,
+            worker.output_channels,
+            OutputTimeline::trimmed(worker.source_start),
+        )
+    });
     loop {
-        if cancelled.load(Ordering::Relaxed) {
+        if worker.cancelled.load(Ordering::Relaxed) {
             break;
         }
         let packet = match parsed.format.next_packet() {
@@ -270,18 +324,40 @@ fn decode_and_trim(
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
         let available_frames = buffer.samples().len() / input_channels;
-        let skip_frames = source_skip_frames.min(available_frames);
-        source_skip_frames -= skip_frames;
+        let skip_frames = worker.source_skip_frames.min(available_frames);
+        worker.source_skip_frames -= skip_frames;
         let source = &buffer.samples()[skip_frames * input_channels..];
         if !source.is_empty() {
             let mut normalized = Vec::new();
-            let samples =
-                normalize_channels(source, input_channels, output_channels, &mut normalized)?;
+            let samples = normalize_channels(
+                source,
+                input_channels,
+                worker.output_channels,
+                &mut normalized,
+            )?;
             let mut discard = 0;
-            write_pcm(&mut writer, samples, &mut discard, &cancelled, &runtime)?;
+            if let Some(equalizer) = equalizer.as_mut() {
+                let mut owned = samples.to_vec();
+                write_pcm_with_equalizer(
+                    &mut worker.writer,
+                    &mut owned,
+                    &mut discard,
+                    &worker.cancelled,
+                    &worker.runtime,
+                    Some(equalizer),
+                )?;
+            } else {
+                write_pcm(
+                    &mut worker.writer,
+                    samples,
+                    &mut discard,
+                    &worker.cancelled,
+                    &worker.runtime,
+                )?;
+            }
         }
     }
-    let _ = runtime.block_on(writer.shutdown());
+    let _ = worker.runtime.block_on(worker.writer.shutdown());
     Ok(())
 }
 
@@ -328,8 +404,68 @@ fn write_pcm(
     if skip == samples.len() || cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let mut bytes = Vec::with_capacity((samples.len() - skip) * size_of::<f32>());
-    for sample in &samples[skip..] {
+    let samples = &samples[skip..];
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    runtime
+        .block_on(writer.write_all(&bytes))
+        .map_err(|error| error.to_string())
+}
+
+struct StreamEqualizer {
+    processor: ThreeBandEqualizer,
+    timeline: OutputTimeline,
+    output_frames: u64,
+    channels: usize,
+}
+
+impl StreamEqualizer {
+    fn new(
+        control: EqualizerControl,
+        sample_rate: u32,
+        channels: usize,
+        timeline: OutputTimeline,
+    ) -> Self {
+        Self {
+            processor: ThreeBandEqualizer::new(control, sample_rate, channels),
+            timeline,
+            output_frames: 0,
+            channels,
+        }
+    }
+
+    fn process(&mut self, samples: &mut [f32]) {
+        if self.channels == 0 {
+            return;
+        }
+        self.processor
+            .process_interleaved(samples, self.output_frames, self.timeline);
+        self.output_frames += (samples.len() / self.channels) as u64;
+    }
+}
+
+fn write_pcm_with_equalizer(
+    writer: &mut tokio::io::DuplexStream,
+    samples: &mut [f32],
+    discard: &mut usize,
+    cancelled: &AtomicBool,
+    runtime: &tokio::runtime::Handle,
+    equalizer: Option<&mut StreamEqualizer>,
+) -> Result<(), String> {
+    let Some(equalizer) = equalizer else {
+        return write_pcm(writer, samples, discard, cancelled, runtime);
+    };
+    let skip = (*discard).min(samples.len());
+    *discard -= skip;
+    if skip == samples.len() || cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let samples = &mut samples[skip..];
+    equalizer.process(samples);
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+    for sample in samples {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     runtime

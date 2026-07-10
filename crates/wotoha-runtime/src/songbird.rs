@@ -34,7 +34,7 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
-    automix::TrackAnalysis,
+    automix::{AutoMixConfig, TrackAnalysis},
     debug::append_debug_log,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
 };
@@ -42,9 +42,13 @@ use wotoha_core::{
 use crate::{
     AnalysisCache, AnalysisCacheKey,
     audio_decode::analyze_input_with_cancel,
+    automix_preview::{AutoMixPreview, AutoMixPreviewError, render_automix_preview_inputs},
     niconico_hls::NiconicoHlsRequest,
     ranged_http::RangedHttpRequest,
-    tempo_stretch::{StretchTimeline, build_stretched_input, build_trimmed_input},
+    tempo_stretch::{
+        StretchTimeline, build_stretched_input_with_equalizer, build_trimmed_input_with_equalizer,
+    },
+    transition_dsp::{EqualizerControl, wrap_parsed_equalizer},
     validated_hls::ValidatedHlsRequest,
 };
 
@@ -82,6 +86,16 @@ pub struct SongbirdRuntime {
     stream_clients: Arc<HashMap<&'static str, Client>>,
     analysis_cache: Arc<AnalysisCache>,
     analysis_limit: Arc<Semaphore>,
+}
+
+struct RegisterTrackParams<'a> {
+    guild_id: GuildKey,
+    session_id: u64,
+    playback_id: PlaybackId,
+    request: &'a TrackRequest,
+    events: RuntimeEventSink,
+    options: TrackStartOptions,
+    start_paused: bool,
 }
 
 #[derive(Debug, Error)]
@@ -125,7 +139,7 @@ impl SongbirdRuntime {
                     std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| ".wotoha-analysis".into()),
-                    "pcm-onset-chroma-level-v6",
+                    "pcm-onset-chroma-level-v9",
                 )
                 .expect("static analyzer version is valid"),
             ),
@@ -241,6 +255,42 @@ impl SongbirdRuntime {
             .map_err(make_playable_error)
     }
 
+    pub async fn render_automix_preview(
+        &self,
+        outgoing: &TrackRequest,
+        incoming: &TrackRequest,
+        outgoing_analysis: &TrackAnalysis,
+        incoming_analysis: &TrackAnalysis,
+        config: &AutoMixConfig,
+    ) -> Result<AutoMixPreview, AutoMixPreviewError> {
+        let outgoing_input = build_input(
+            self.stream_client(outgoing.provider_id.as_ref())
+                .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?,
+            outgoing,
+        )
+        .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?
+        .make_playable_async(get_codec_registry(), get_probe())
+        .await
+        .map_err(|error| AutoMixPreviewError::MakePlayable(error.to_string()))?;
+        let incoming_input = build_input(
+            self.stream_client(incoming.provider_id.as_ref())
+                .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?,
+            incoming,
+        )
+        .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?
+        .make_playable_async(get_codec_registry(), get_probe())
+        .await
+        .map_err(|error| AutoMixPreviewError::MakePlayable(error.to_string()))?;
+
+        render_automix_preview_inputs(
+            outgoing_input,
+            incoming_input,
+            outgoing_analysis,
+            incoming_analysis,
+            config,
+        )
+    }
+
     pub fn paired() -> Result<(Self, Arc<Songbird>), SongbirdRuntimeError> {
         let songbird = Songbird::serenity();
         let runtime = Self::new(songbird.clone())?;
@@ -255,14 +305,17 @@ impl SongbirdRuntime {
 
     async fn register_track(
         &self,
-        guild_id: GuildKey,
-        session_id: u64,
-        playback_id: PlaybackId,
-        request: &TrackRequest,
-        events: RuntimeEventSink,
-        options: TrackStartOptions,
-        start_paused: bool,
+        params: RegisterTrackParams<'_>,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, SongbirdRuntimeError> {
+        let RegisterTrackParams {
+            guild_id,
+            session_id,
+            playback_id,
+            request,
+            events,
+            options,
+            start_paused,
+        } = params;
         append_debug_log(format!(
             "runtime: play_track start guild_id={} session_id={} playback_id={} provider={} key={} title={} paused={}",
             guild_id.get(),
@@ -282,13 +335,27 @@ impl SongbirdRuntime {
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .map_err(make_playable_error)?;
+        let equalizer =
+            EqualizerControl::new(options.equalizer_enabled, options.equalizer_transition);
+        let worker_equalizer = options.equalizer_enabled.then(|| equalizer.clone());
         let (input, stretch_timeline) = if let Some(envelope) = options.tempo_envelope {
-            let (input, timeline) = build_stretched_input(input, options.source_start, envelope)
-                .map_err(SongbirdRuntimeError::TempoStretch)?;
+            let (input, timeline) = build_stretched_input_with_equalizer(
+                input,
+                options.source_start,
+                envelope,
+                worker_equalizer,
+            )
+            .map_err(SongbirdRuntimeError::TempoStretch)?;
             (input, Some(timeline))
+        } else if options.source_start.is_zero() {
+            (
+                wrap_parsed_equalizer(input, equalizer.clone())
+                    .map_err(SongbirdRuntimeError::TempoStretch)?,
+                None,
+            )
         } else {
             (
-                build_trimmed_input(input, options.source_start)
+                build_trimmed_input_with_equalizer(input, options.source_start, worker_equalizer)
                     .map_err(SongbirdRuntimeError::TempoStretch)?,
                 None,
             )
@@ -401,7 +468,9 @@ impl SongbirdRuntime {
         Ok(Arc::new(SongbirdTrackHandle {
             handle,
             lifecycle,
+            source_start: options.source_start,
             stretch_timeline,
+            equalizer,
         }))
     }
 }
@@ -468,15 +537,15 @@ impl VoiceRuntime for SongbirdRuntime {
         events: RuntimeEventSink,
         options: TrackStartOptions,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
-        self.register_track(
+        self.register_track(RegisterTrackParams {
             guild_id,
             session_id,
             playback_id,
             request,
             events,
             options,
-            false,
-        )
+            start_paused: false,
+        })
         .await
     }
 
@@ -489,15 +558,15 @@ impl VoiceRuntime for SongbirdRuntime {
         events: RuntimeEventSink,
         options: TrackStartOptions,
     ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
-        self.register_track(
+        self.register_track(RegisterTrackParams {
             guild_id,
             session_id,
             playback_id,
             request,
             events,
             options,
-            true,
-        )
+            start_paused: true,
+        })
         .await
     }
 
@@ -707,7 +776,9 @@ impl TrackLifecycle {
 struct SongbirdTrackHandle {
     handle: TrackHandle,
     lifecycle: Arc<TrackLifecycle>,
+    source_start: Duration,
     stretch_timeline: Option<StretchTimeline>,
+    equalizer: EqualizerControl,
 }
 
 #[async_trait]
@@ -731,14 +802,28 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
 
     async fn position(&self) -> Option<Duration> {
         self.handle.get_info().await.ok().map(|state| {
-            self.stretch_timeline.map_or(state.position, |timeline| {
-                timeline.source_start + timeline.envelope.source_elapsed(state.position)
-            })
+            self.stretch_timeline
+                .map_or(self.source_start + state.position, |timeline| {
+                    timeline.source_start + timeline.envelope.source_elapsed(state.position)
+                })
         })
     }
 
     async fn seek(&self, position: Duration) -> bool {
-        self.stretch_timeline.is_none() && self.handle.seek_async(position).await.is_ok()
+        self.stretch_timeline.is_none()
+            && self.source_start.is_zero()
+            && self.handle.seek_async(position).await.is_ok()
+    }
+
+    fn schedule_equalizer_transition(
+        &self,
+        transition: wotoha_core::automix::EqTransition,
+    ) -> bool {
+        self.equalizer.schedule(transition)
+    }
+
+    fn cancel_equalizer_transition(&self, id: u64) {
+        self.equalizer.cancel(id);
     }
 }
 

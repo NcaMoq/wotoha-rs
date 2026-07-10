@@ -22,6 +22,7 @@ use wotoha_contracts::{
 use wotoha_control::ControlService;
 use wotoha_core::{
     BotConfig, QueuePreview, TrackRequest,
+    automix::EqTransition,
     config::PlaybackConfig,
     debug::{append_debug_log, sanitize_log_message},
 };
@@ -277,6 +278,14 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
 
     async fn seek(&self, position: Duration) -> bool {
         self.inner.seek(position).await
+    }
+
+    fn schedule_equalizer_transition(&self, transition: EqTransition) -> bool {
+        self.inner.schedule_equalizer_transition(transition)
+    }
+
+    fn cancel_equalizer_transition(&self, id: u64) {
+        self.inner.cancel_equalizer_transition(id);
     }
 }
 
@@ -658,7 +667,8 @@ mod tests {
     };
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
-        automix::AutoMixConfig, config::PlaybackConfig,
+        automix::{AutoMixConfig, EqTransition, EqTransitionRole},
+        config::PlaybackConfig,
     };
 
     #[derive(Clone, Default)]
@@ -750,6 +760,8 @@ mod tests {
     struct MockTrackHandle {
         stopped: Arc<AtomicUsize>,
         volumes: Arc<Mutex<Vec<f32>>>,
+        equalizer_transitions: Arc<Mutex<Vec<EqTransition>>>,
+        cancelled_equalizers: Arc<Mutex<Vec<u64>>>,
     }
 
     #[async_trait]
@@ -760,6 +772,15 @@ mod tests {
 
         fn set_volume(&self, volume: f32) {
             self.volumes.lock().unwrap().push(volume);
+        }
+
+        fn schedule_equalizer_transition(&self, transition: EqTransition) -> bool {
+            self.equalizer_transitions.lock().unwrap().push(transition);
+            true
+        }
+
+        fn cancel_equalizer_transition(&self, id: u64) {
+            self.cancelled_equalizers.lock().unwrap().push(id);
         }
     }
 
@@ -843,6 +864,8 @@ mod tests {
         let inner = Arc::new(MockTrackHandle {
             stopped: stopped.clone(),
             volumes: volumes.clone(),
+            equalizer_transitions: Arc::default(),
+            cancelled_equalizers: Arc::default(),
         });
         let handle = ConfiguredTrackHandle::new(inner, 0.25);
 
@@ -851,5 +874,30 @@ mod tests {
 
         assert_eq!(*volumes.lock().unwrap(), vec![0.1]);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn configured_track_handle_forwards_equalizer_control() {
+        let equalizer_transitions = Arc::new(Mutex::new(Vec::new()));
+        let cancelled_equalizers = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(MockTrackHandle {
+            stopped: Arc::default(),
+            volumes: Arc::default(),
+            equalizer_transitions: equalizer_transitions.clone(),
+            cancelled_equalizers: cancelled_equalizers.clone(),
+        });
+        let handle = ConfiguredTrackHandle::new(inner, 0.25);
+        let transition = EqTransition {
+            id: 7,
+            source_start: Duration::from_secs(30),
+            duration: Duration::from_secs(8),
+            role: EqTransitionRole::Outgoing,
+        };
+
+        assert!(handle.schedule_equalizer_transition(transition));
+        handle.cancel_equalizer_transition(transition.id);
+
+        assert_eq!(*equalizer_transitions.lock().unwrap(), vec![transition]);
+        assert_eq!(*cancelled_equalizers.lock().unwrap(), vec![transition.id]);
     }
 }

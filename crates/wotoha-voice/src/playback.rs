@@ -25,8 +25,8 @@ use wotoha_contracts::{
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
-        AutoMixConfig, TempoEnvelope, TrackAnalysis, TransitionTiming, plan_transition,
-        plan_transition_timing,
+        AutoMixConfig, EqTransition, EqTransitionRole, TempoEnvelope, TrackAnalysis,
+        TransitionKind, TransitionTiming, plan_guarded_transition, plan_transition_timing,
     },
     debug::append_debug_log,
 };
@@ -39,6 +39,7 @@ const MAX_PENDING_ENQUEUES: usize = 64;
 const BEAT_ALIGNMENT_LOOKAHEAD: std::time::Duration = std::time::Duration::from_secs(60);
 const TRANSITION_PREPARE_LEAD: std::time::Duration = std::time::Duration::from_secs(15);
 const MIN_TRANSITION_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const MIN_EQUALIZER_TRANSITION: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
@@ -122,6 +123,7 @@ struct PreparedTransition {
     incoming_gain: f32,
     source_start: std::time::Duration,
     tempo_envelope: Option<TempoEnvelope>,
+    outgoing_equalizer_transition: Option<EqTransition>,
 }
 
 #[derive(Default)]
@@ -425,8 +427,10 @@ where
             .sessions
             .entry(guild_id)
             .or_insert_with(|| {
-                let mut playback = PlaybackRuntime::default();
-                playback.automix_enabled = self.inner.automix.enabled;
+                let playback = PlaybackRuntime {
+                    automix_enabled: self.inner.automix.enabled,
+                    ..PlaybackRuntime::default()
+                };
                 Arc::new(GuildSession {
                     id: self.inner.next_session_id.fetch_add(1, Ordering::Relaxed),
                     operation: AsyncMutex::new(()),
@@ -635,7 +639,7 @@ where
             if !playback.automix_enabled || playback.automix_rearm_in_progress.is_some() {
                 return;
             }
-            let (Some(playback_id), Some(handle), Some(duration)) = (
+            let (Some(playback_id), Some(handle), Some(metadata_duration)) = (
                 playback.current_playback_id,
                 playback.active_handle.clone(),
                 playback
@@ -645,7 +649,14 @@ where
             ) else {
                 return;
             };
-            let Some(scheduled) = track_transition_timing(&self.inner.automix, duration) else {
+            let scheduling_duration = playback
+                .current_analysis
+                .as_ref()
+                .map(|analysis| analysis.audible_end.min(metadata_duration))
+                .filter(|duration| !duration.is_zero())
+                .unwrap_or(metadata_duration);
+            let Some(scheduled) = track_transition_timing(&self.inner.automix, scheduling_duration)
+            else {
                 return;
             };
             (playback_id, handle, scheduled)
@@ -660,7 +671,8 @@ where
         };
         let prefetch_after =
             transition_event_after(scheduled).saturating_sub(TRANSITION_PREPARE_LEAD);
-        if position < prefetch_after || position >= scheduled.transition_after {
+        let transition_window_end = scheduled.transition_after + scheduled.fade_duration;
+        if position < prefetch_after || position >= transition_window_end {
             return;
         }
         {
@@ -696,13 +708,13 @@ where
         if !should_transition {
             return;
         }
-        let still_before_transition =
+        let still_inside_transition_window =
             tokio::time::timeout(std::time::Duration::from_secs(2), handle.position())
                 .await
                 .ok()
                 .flatten()
-                .is_some_and(|position| position < scheduled.transition_after);
-        if still_before_transition {
+                .is_some_and(|position| position < transition_window_end);
+        if still_inside_transition_window {
             self.transition(guild_id, session_id, playback_id).await;
         } else {
             let stale = {
@@ -1241,23 +1253,54 @@ where
         let mut timing = timing;
         let mut transition_after = timing.transition_after;
         let mut incoming_gain = 1.0;
+        let mut outgoing_equalizer_transition = None;
         let mut options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
-        let plan = outgoing_analysis
+        let guarded_plan = outgoing_analysis
             .as_ref()
             .zip(incoming_analysis.as_ref())
-            .map(|(outgoing, incoming)| plan_transition(outgoing, incoming, &self.inner.automix));
-        if let (Some(plan), Some(outgoing), Some(incoming)) = (
-            plan.as_ref(),
+            .map(|(outgoing, incoming)| {
+                plan_guarded_transition(outgoing, incoming, &self.inner.automix)
+            });
+        if let (Some(guarded), Some(outgoing), Some(incoming)) = (
+            guarded_plan.as_ref(),
             outgoing_analysis.as_ref(),
             incoming_analysis.as_ref(),
         ) {
+            let plan = &guarded.plan;
+            let quality = &guarded.quality;
+            if let (Some(rejected_plan), Some(rejected_quality)) = (
+                guarded.rejected_plan.as_ref(),
+                guarded.rejected_quality.as_ref(),
+            ) {
+                warn!(
+                    guild_id = guild_id.get(),
+                    rejected_transition_kind = ?rejected_plan.kind,
+                    rejected_outgoing_start_ms = rejected_plan.outgoing_start.as_millis(),
+                    rejected_incoming_start_ms = rejected_plan.incoming_start.as_millis(),
+                    rejected_fade_ms = rejected_plan.duration.as_millis(),
+                    rejected_quality_issues = ?rejected_quality.issues,
+                    fallback_transition_kind = ?plan.kind,
+                    fallback_outgoing_start_ms = plan.outgoing_start.as_millis(),
+                    fallback_incoming_start_ms = plan.incoming_start.as_millis(),
+                    fallback_fade_ms = plan.duration.as_millis(),
+                    fallback_quality_issues = ?quality.issues,
+                    "AutoMix transition quality guard applied"
+                );
+            }
             info!(
                 guild_id = guild_id.get(),
                 transition_kind = ?plan.kind,
+                quality_guarded = guarded.rejected_quality.is_some(),
                 outgoing_bpm = ?outgoing.bpm,
                 incoming_bpm = ?incoming.bpm,
                 outgoing_beat_confidence = outgoing.beat_confidence,
                 incoming_beat_confidence = incoming.beat_confidence,
+                outgoing_kick_coverage = outgoing.trusted_kick_coverage(),
+                incoming_kick_coverage = incoming.trusted_kick_coverage(),
+                outgoing_outro_ms = outgoing.outro_start.map(|value| value.as_millis()),
+                outgoing_outro_confidence = outgoing.outro_confidence,
+                incoming_intro_ms = incoming.intro_end.map(|value| value.as_millis()),
+                incoming_intro_confidence = incoming.intro_confidence,
                 outgoing_start_ms = plan.outgoing_start.as_millis(),
                 incoming_start_ms = plan.incoming_start.as_millis(),
                 fade_ms = plan.duration.as_millis(),
@@ -1265,13 +1308,55 @@ where
                 tempo_end_ratio = plan
                     .tempo_envelope
                     .map_or(plan.incoming_tempo_ratio, |envelope| envelope.mix_end_speed),
+                quality_issues = ?quality.issues,
+                beat_pairs_checked = quality.beat_pairs_checked,
+                max_beat_phase_error_ms = quality
+                    .max_beat_phase_error
+                    .map(|value| value.as_millis()),
+                handoff_beat_phase_error_ms = quality
+                    .handoff_beat_phase_error
+                    .map(|value| value.as_millis()),
+                downbeat_pairs_checked = quality.downbeat_pairs_checked,
+                max_downbeat_phase_error_ms = quality
+                    .max_downbeat_phase_error
+                    .map(|value| value.as_millis()),
+                handoff_downbeat_phase_error_ms = quality
+                    .handoff_downbeat_phase_error
+                    .map(|value| value.as_millis()),
+                phrase_pairs_checked = quality.phrase_pairs_checked,
+                max_phrase_phase_error_ms = quality
+                    .max_phrase_phase_error
+                    .map(|value| value.as_millis()),
+                handoff_phrase_phase_error_ms = quality
+                    .handoff_phrase_phase_error
+                    .map(|value| value.as_millis()),
+                low_handoff_min = quality.low_handoff_min,
+                low_handoff_max = quality.low_handoff_max,
                 "AutoMix transition planned"
             );
         }
-        if let Some(plan) = &plan {
+        if let Some(guarded) = &guarded_plan {
+            let plan = &guarded.plan;
             incoming_gain = plan.incoming_gain;
             options.source_start = plan.incoming_start;
             options.tempo_envelope = plan.tempo_envelope;
+            if plan.kind != TransitionKind::Gapless && plan.duration >= MIN_EQUALIZER_TRANSITION {
+                let id = incoming_id.get();
+                outgoing_equalizer_transition = Some(EqTransition {
+                    id,
+                    source_start: plan.outgoing_start,
+                    duration: plan.duration,
+                    role: EqTransitionRole::Outgoing,
+                });
+                options.equalizer_transition = Some(EqTransition {
+                    id,
+                    source_start: plan.incoming_start,
+                    duration: plan.tempo_envelope.map_or(plan.duration, |envelope| {
+                        envelope.source_elapsed(plan.duration)
+                    }),
+                    role: EqTransitionRole::Incoming,
+                });
+            }
         }
         let dsp_requested = options.tempo_envelope.is_some();
         let mut incoming_result = self
@@ -1291,8 +1376,9 @@ where
                 guild_id = guild_id.get(),
                 "AutoMix tempo DSP unavailable; retrying adaptive crossfade"
             );
-            options.source_start = std::time::Duration::ZERO;
             options.tempo_envelope = None;
+            options.equalizer_transition = None;
+            outgoing_equalizer_transition = None;
             incoming_result = self
                 .inner
                 .runtime
@@ -1319,7 +1405,8 @@ where
                 return;
             }
         };
-        if let Some(plan) = plan {
+        if let Some(guarded) = guarded_plan {
+            let plan = guarded.plan;
             let tempo_is_supported = dsp_active || plan.tempo_envelope.is_none();
             if !plan.duration.is_zero() && tempo_is_supported {
                 timing.fade_duration = plan.duration;
@@ -1348,8 +1435,8 @@ where
                 && playback.prefetch_generation == generation
                 && playback.transition_due != Some(playback_id)
                 && playback.logical.peek_next_track() == Some(&next);
-            if valid {
-                if let Some(previous) = playback.prepared_transition.replace(PreparedTransition {
+            if valid
+                && let Some(previous) = playback.prepared_transition.replace(PreparedTransition {
                     origin_playback_id: playback_id,
                     next,
                     incoming: incoming.take().expect("prefetched track is available"),
@@ -1359,9 +1446,11 @@ where
                     incoming_gain,
                     source_start: options.source_start,
                     tempo_envelope: dsp_active.then_some(options.tempo_envelope).flatten(),
-                }) {
-                    previous.incoming.handle.stop();
-                }
+                    outgoing_equalizer_transition,
+                })
+            {
+                cancel_prepared_equalizer(&previous, playback.active_handle.as_ref());
+                previous.incoming.handle.stop();
             }
         }
         if let Some(incoming) = incoming {
@@ -1392,20 +1481,32 @@ where
             }
             playback.transition_due = Some(playback_id);
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
-            playback
+            let Some(handle) = playback.active_handle.clone() else {
+                return;
+            };
+            let current_tempo = playback.current_tempo;
+            let Some(prepared) = playback
                 .prepared_transition
-                .as_ref()
+                .as_mut()
                 .filter(|prepared| prepared.origin_playback_id == playback_id)
-                .and_then(|prepared| {
-                    playback.active_handle.clone().map(|handle| {
-                        (
-                            prepared.start_delay,
-                            prepared.timing.transition_after,
-                            handle,
-                            playback.current_tempo,
-                        )
-                    })
-                })
+            else {
+                return;
+            };
+            if let Some(transition) = prepared.outgoing_equalizer_transition
+                && !handle.schedule_equalizer_transition(transition)
+            {
+                prepared
+                    .incoming
+                    .handle
+                    .cancel_equalizer_transition(transition.id);
+                prepared.outgoing_equalizer_transition = None;
+            }
+            Some((
+                prepared.start_delay,
+                prepared.timing.transition_after,
+                handle,
+                current_tempo,
+            ))
         };
         let Some((fallback_delay, transition_after, outgoing_handle, current_tempo)) =
             transition_state
@@ -1434,6 +1535,7 @@ where
                 || playback.transition_due != Some(playback_id);
             if invalid {
                 if let Some(stale) = playback.prepared_transition.take() {
+                    cancel_prepared_equalizer(&stale, playback.active_handle.as_ref());
                     stale.incoming.handle.stop();
                 }
                 return;
@@ -1444,6 +1546,7 @@ where
             if prepared.origin_playback_id != playback_id
                 || playback.logical.peek_next_track() != Some(&prepared.next)
             {
+                cancel_prepared_equalizer(&prepared, playback.active_handle.as_ref());
                 prepared.incoming.handle.stop();
                 return;
             }
@@ -1451,6 +1554,7 @@ where
                 .active_handle
                 .replace(prepared.incoming.handle.clone())
             else {
+                cancel_prepared_equalizer(&prepared, None);
                 prepared.incoming.handle.stop();
                 return;
             };
@@ -1613,6 +1717,8 @@ fn track_start_options(
         transition_after,
         source_start: std::time::Duration::ZERO,
         tempo_envelope: None,
+        equalizer_enabled: config.enabled,
+        equalizer_transition: None,
     }
 }
 
@@ -1929,10 +2035,26 @@ where
     playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
     playback.transition_due = None;
     playback.automix_rearm_in_progress = None;
-    playback
-        .prepared_transition
-        .take()
-        .map(|prepared| prepared.incoming.handle)
+    playback.prepared_transition.take().map(|prepared| {
+        cancel_prepared_equalizer(&prepared, playback.active_handle.as_ref());
+        prepared.incoming.handle
+    })
+}
+
+fn cancel_prepared_equalizer(
+    prepared: &PreparedTransition,
+    outgoing: Option<&Arc<dyn RuntimeTrackHandle>>,
+) {
+    let Some(transition) = prepared.outgoing_equalizer_transition else {
+        return;
+    };
+    if let Some(outgoing) = outgoing {
+        outgoing.cancel_equalizer_transition(transition.id);
+    }
+    prepared
+        .incoming
+        .handle
+        .cancel_equalizer_transition(transition.id);
 }
 
 fn abort_analysis_tasks<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>)
@@ -2012,7 +2134,7 @@ mod tests {
     };
     use wotoha_core::{
         PreparedSource, TrackMetadata, TrackRequest,
-        automix::{AutoMixConfig, TrackAnalysis},
+        automix::{AutoMixConfig, EqTransition, EqTransitionRole, TrackAnalysis},
     };
 
     type TestPlayback = PlaybackCoordinator<MockMedia, MockRuntime>;
@@ -2043,6 +2165,8 @@ mod tests {
         let long = track_start_options(&config, Some(Duration::from_secs(180)), 1.0);
         assert_eq!(long.prefetch_after, Some(Duration::from_secs(97)));
         assert_eq!(long.transition_after, Some(Duration::from_secs(112)));
+        assert!(long.equalizer_enabled);
+        assert!(long.equalizer_transition.is_none());
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2228,6 +2352,8 @@ mod tests {
         resumed: Mutex<Vec<PlaybackId>>,
         seeks: Mutex<Vec<(PlaybackId, Duration)>>,
         positions: Mutex<HashMap<PlaybackId, Duration>>,
+        equalizer_schedules: Mutex<Vec<(PlaybackId, EqTransition)>>,
+        equalizer_cancellations: Mutex<Vec<(PlaybackId, u64)>>,
         volumes: Mutex<Vec<(PlaybackId, f32)>>,
         disconnects: Mutex<Vec<GuildKey>>,
         play_notify: Notify,
@@ -2322,6 +2448,14 @@ mod tests {
             self.state.positions.lock().insert(playback_id, position);
         }
 
+        fn equalizer_schedules(&self) -> Vec<(PlaybackId, EqTransition)> {
+            self.state.equalizer_schedules.lock().clone()
+        }
+
+        fn equalizer_cancellations(&self) -> Vec<(PlaybackId, u64)> {
+            self.state.equalizer_cancellations.lock().clone()
+        }
+
         fn disconnects(&self) -> Vec<GuildKey> {
             self.state.disconnects.lock().clone()
         }
@@ -2357,6 +2491,21 @@ mod tests {
         async fn seek(&self, position: Duration) -> bool {
             self.state.seeks.lock().push((self.playback_id, position));
             false
+        }
+
+        fn schedule_equalizer_transition(&self, transition: EqTransition) -> bool {
+            self.state
+                .equalizer_schedules
+                .lock()
+                .push((self.playback_id, transition));
+            true
+        }
+
+        fn cancel_equalizer_transition(&self, id: u64) {
+            self.state
+                .equalizer_cancellations
+                .lock()
+                .push((self.playback_id, id));
         }
     }
 
@@ -2471,6 +2620,32 @@ mod tests {
             crossfade,
             max_tempo_adjustment: 0.06,
             min_beat_confidence: 0.7,
+        }
+    }
+
+    fn beat_analysis(duration: Duration, bpm: f32) -> TrackAnalysis {
+        let bins = (duration.as_secs() as usize).saturating_mul(4);
+        TrackAnalysis {
+            duration,
+            audible_start: Duration::ZERO,
+            audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: vec![0; bins],
+            vocal_activity_confidences: vec![u8::MAX; bins],
+            vocal_activity_rate: 4,
+            bpm: Some(bpm),
+            beat_confidence: 1.0,
+            first_beat: Some(Duration::ZERO),
+            beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
+            first_downbeat: Some(Duration::ZERO),
+            downbeat_confidence: 1.0,
+            musical_key: None,
+            rms_dbfs: None,
+            sample_peak_dbfs: None,
         }
     }
 
@@ -3244,10 +3419,18 @@ mod tests {
             duration,
             audible_start: Duration::ZERO,
             audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
             musical_key: None,
@@ -3334,10 +3517,18 @@ mod tests {
             duration,
             audible_start: Duration::ZERO,
             audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(bpm),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: Some(Duration::ZERO),
             downbeat_confidence: 1.0,
             musical_key: None,
@@ -3382,7 +3573,220 @@ mod tests {
             .expect("second track options")
             .1;
         let envelope = options.tempo_envelope.expect("tempo envelope");
+        let equalizer = options
+            .equalizer_transition
+            .expect("incoming EQ transition");
         assert!((envelope.initial_speed - 120.0 / 124.0).abs() < 0.0001);
+        assert_eq!(equalizer.role, EqTransitionRole::Incoming);
+        assert_eq!(equalizer.duration, envelope.source_elapsed(envelope.hold));
+    }
+
+    #[tokio::test]
+    async fn automix_prefetch_guard_replaces_drifted_beatmatch_with_crossfade() {
+        let guild_id = GuildKey::new(129);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let mut incoming = beat_analysis(duration, 120.0);
+        incoming.first_beat = Some(Duration::from_millis(50));
+        incoming.beat_markers = {
+            let mut markers = Vec::new();
+            let mut marker = Duration::from_millis(250);
+            while marker <= duration {
+                markers.push(marker);
+                marker += Duration::from_millis(500);
+            }
+            markers
+        };
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        runtime.analyze_with("first", beat_analysis(duration, 120.0));
+        runtime.analyze_with("second", incoming);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(options.source_start, Duration::ZERO);
+        assert!(options.tempo_envelope.is_none());
+        assert_eq!(
+            options
+                .equalizer_transition
+                .expect("incoming EQ transition")
+                .source_start,
+            Duration::ZERO
+        );
+    }
+
+    #[tokio::test]
+    async fn automix_prefetch_uses_trusted_kick_marker_after_audible_boundary() {
+        let guild_id = GuildKey::new(130);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let mut incoming = beat_analysis(duration, 120.0);
+        incoming.audible_start = Duration::from_secs(1);
+        incoming.first_beat = Some(Duration::from_secs(1));
+        incoming.first_downbeat = Some(Duration::from_millis(1_050));
+        incoming.beat_markers = std::iter::once(Duration::from_millis(980))
+            .chain((0..60).map(|index| Duration::from_millis(1_050 + index * 500)))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        runtime.analyze_with("first", beat_analysis(duration, 120.0));
+        runtime.analyze_with("second", incoming);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(options.source_start, Duration::from_millis(1_050));
+        assert!(options.tempo_envelope.is_none());
+        assert_eq!(
+            options
+                .equalizer_transition
+                .expect("incoming EQ transition")
+                .source_start,
+            Duration::from_millis(1_050)
+        );
+    }
+
+    #[tokio::test]
+    async fn automix_prepares_incoming_eq_and_schedules_outgoing_before_transition() {
+        let guild_id = GuildKey::new(126);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        runtime.analyze_with("first", beat_analysis(duration, 120.0));
+        runtime.analyze_with("second", beat_analysis(duration, 120.0));
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let incoming = runtime.played()[1].clone();
+        let incoming_options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        let incoming_eq = incoming_options
+            .equalizer_transition
+            .expect("incoming EQ transition");
+        assert!(incoming_options.equalizer_enabled);
+        assert_eq!(incoming_eq.role, EqTransitionRole::Incoming);
+        assert_eq!(incoming_eq.id, incoming.playback_id.get());
+        assert!(runtime.equalizer_schedules().is_empty());
+
+        runtime.set_position(first.playback_id, duration);
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let schedules = runtime.equalizer_schedules();
+        assert_eq!(schedules.len(), 1);
+        let (scheduled_on, outgoing_eq) = schedules[0];
+        assert_eq!(scheduled_on, first.playback_id);
+        assert_eq!(outgoing_eq.role, EqTransitionRole::Outgoing);
+        assert_eq!(outgoing_eq.id, incoming_eq.id);
+        assert_eq!(outgoing_eq.duration, incoming_eq.duration);
+    }
+
+    #[tokio::test]
+    async fn disabling_automix_cancels_scheduled_eq_on_both_tracks() {
+        let guild_id = GuildKey::new(127);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        runtime.analyze_with("first", beat_analysis(duration, 120.0));
+        runtime.analyze_with("second", beat_analysis(duration, 120.0));
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        let incoming = runtime.played()[1].clone();
+        let transition = {
+            let playback = playback.clone();
+            let first = first.clone();
+            tokio::spawn(async move {
+                playback
+                    .transition(guild_id, first.session_id, first.playback_id)
+                    .await;
+            })
+        };
+        timeout(Duration::from_secs(2), async {
+            while runtime.equalizer_schedules().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("outgoing EQ was not scheduled");
+        let id = runtime.equalizer_schedules()[0].1.id;
+
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(false));
+
+        let cancellations = runtime.equalizer_cancellations();
+        assert!(cancellations.contains(&(first.playback_id, id)));
+        assert!(cancellations.contains(&(incoming.playback_id, id)));
+        transition.abort();
     }
 
     #[tokio::test]
@@ -3395,10 +3799,18 @@ mod tests {
             duration,
             audible_start: Duration::ZERO,
             audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(bpm),
             beat_confidence: 1.0,
             first_beat: Some(first_beat),
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -3406,7 +3818,7 @@ mod tests {
             sample_peak_dbfs: None,
         };
         runtime.analyze_with("first", analysis(120.0, Duration::ZERO));
-        runtime.analyze_with("second", analysis(124.0, Duration::from_millis(250)));
+        runtime.analyze_with("second", analysis(124.0, Duration::from_millis(50)));
         runtime.fail_play_for("second", TestRuntimeError::new("DSP unavailable"));
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
@@ -3438,9 +3850,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2);
         assert!(attempts[0].tempo_envelope.is_some());
-        assert_eq!(attempts[0].source_start, Duration::from_millis(250));
+        assert!(attempts[0].equalizer_transition.is_some());
+        assert_eq!(attempts[0].source_start, Duration::from_millis(50));
         assert!(attempts[1].tempo_envelope.is_none());
-        assert_eq!(attempts[1].source_start, Duration::ZERO);
+        assert!(attempts[1].equalizer_transition.is_none());
+        assert_eq!(attempts[1].source_start, Duration::from_millis(50));
     }
 
     #[tokio::test]
@@ -3453,10 +3867,18 @@ mod tests {
             duration,
             audible_start: Duration::ZERO,
             audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(first_beat),
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -3464,7 +3886,7 @@ mod tests {
             sample_peak_dbfs: None,
         };
         runtime.analyze_with("first", analysis(Duration::ZERO));
-        runtime.analyze_with("second", analysis(Duration::from_millis(250)));
+        runtime.analyze_with("second", analysis(Duration::from_millis(50)));
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
             runtime.clone(),
@@ -3488,7 +3910,7 @@ mod tests {
             .find(|(key, _)| key == "second")
             .expect("second track options")
             .1;
-        assert_eq!(options.source_start, Duration::from_millis(250));
+        assert_eq!(options.source_start, Duration::from_millis(50));
         assert!(options.tempo_envelope.is_none());
         assert!(runtime.seeks().is_empty());
     }
@@ -3503,10 +3925,18 @@ mod tests {
             duration,
             audible_start: Duration::ZERO,
             audible_end: duration,
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(120.0),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 0.0,
             musical_key: None,
@@ -3541,6 +3971,46 @@ mod tests {
 
         let preview = playback.queue_preview(guild_id, 8).unwrap();
         assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
+    }
+
+    #[tokio::test]
+    async fn enabling_automix_mid_track_uses_analyzed_audible_end_for_rearm() {
+        let guild_id = GuildKey::new(128);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let metadata_duration = Duration::from_secs(200);
+        let audible_end = Duration::from_secs(100);
+        let mut analysis = beat_analysis(metadata_duration, 120.0);
+        analysis.audible_end = audible_end;
+        runtime.analyze_with("first", analysis.clone());
+        runtime.analyze_with("second", analysis);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(key, Some(metadata_duration))),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        let first = runtime.played()[0].clone();
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(false));
+        runtime.set_position(first.playback_id, Duration::from_millis(91_900));
+
+        assert_eq!(playback.toggle_automix(guild_id).await, Some(true));
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].clone();
+        timeout(Duration::from_secs(2), async {
+            while !runtime.resumed().contains(&second.playback_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("analyzed audible end did not rearm the current AutoMix transition");
     }
 
     #[tokio::test]

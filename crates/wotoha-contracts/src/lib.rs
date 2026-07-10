@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use wotoha_core::{
     QueuePreview, TrackRequest,
-    automix::{TempoEnvelope, TrackAnalysis},
+    automix::{EqTransition, TempoEnvelope, TrackAnalysis},
 };
 
 macro_rules! runtime_key {
@@ -147,6 +147,13 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
     async fn seek(&self, _position: Duration) -> bool {
         false
     }
+
+    /// Schedules source-timeline EQ automation when supported by the runtime.
+    fn schedule_equalizer_transition(&self, _transition: EqTransition) -> bool {
+        false
+    }
+
+    fn cancel_equalizer_transition(&self, _id: u64) {}
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,6 +172,8 @@ pub struct TrackStartOptions {
     pub transition_after: Option<Duration>,
     pub source_start: Duration,
     pub tempo_envelope: Option<TempoEnvelope>,
+    pub equalizer_enabled: bool,
+    pub equalizer_transition: Option<EqTransition>,
 }
 
 impl Default for TrackStartOptions {
@@ -175,6 +184,8 @@ impl Default for TrackStartOptions {
             transition_after: None,
             source_start: Duration::ZERO,
             tempo_envelope: None,
+            equalizer_enabled: false,
+            equalizer_transition: None,
         }
     }
 }
@@ -306,4 +317,35 @@ pub trait PlaybackService: Clone + Send + Sync + 'static {
         guild_id: GuildKey,
         actor_channel: Option<ChannelKey>,
     ) -> VoiceActionAccess;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MinimalTrackHandle;
+
+    #[async_trait]
+    impl RuntimeTrackHandle for MinimalTrackHandle {
+        fn stop(&self) {}
+
+        fn set_volume(&self, _volume: f32) {}
+    }
+
+    #[test]
+    fn equalizer_contract_defaults_are_backwards_compatible() {
+        let options = TrackStartOptions::default();
+        assert!(!options.equalizer_enabled);
+        assert_eq!(options.equalizer_transition, None);
+
+        let handle = MinimalTrackHandle;
+        let transition = EqTransition {
+            id: 42,
+            source_start: Duration::from_secs(3),
+            duration: Duration::from_secs(4),
+            role: wotoha_core::automix::EqTransitionRole::Incoming,
+        };
+        assert!(!handle.schedule_equalizer_transition(transition));
+        handle.cancel_equalizer_transition(transition.id);
+    }
 }

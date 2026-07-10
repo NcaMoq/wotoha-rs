@@ -14,8 +14,8 @@ use wotoha_core::{
     automix::{KeyMode, MusicalKey, TrackAnalysis},
 };
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 5;
-const MAX_CACHE_FILE_BYTES: u64 = 64 * 1024;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 7;
+const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
@@ -258,11 +258,27 @@ struct SerializableAnalysis {
     duration_micros: u64,
     audible_start_micros: u64,
     audible_end_micros: u64,
+    #[serde(default)]
+    intro_end_micros: Option<u64>,
+    #[serde(default)]
+    intro_confidence: f32,
+    #[serde(default)]
+    outro_start_micros: Option<u64>,
+    #[serde(default)]
+    outro_confidence: f32,
+    #[serde(default)]
+    vocal_activity: Vec<u8>,
+    #[serde(default)]
+    vocal_activity_confidences: Vec<u8>,
+    #[serde(default)]
+    vocal_activity_rate: u8,
     bpm: Option<f32>,
     beat_confidence: f32,
     first_beat_micros: Option<u64>,
     #[serde(default)]
     beat_markers_micros: Vec<u64>,
+    #[serde(default)]
+    beat_marker_confidences: Vec<u8>,
     first_downbeat_micros: Option<u64>,
     downbeat_confidence: f32,
     musical_key: Option<SerializableMusicalKey>,
@@ -283,6 +299,13 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             duration_micros: duration_to_micros(value.duration),
             audible_start_micros: duration_to_micros(value.audible_start),
             audible_end_micros: duration_to_micros(value.audible_end),
+            intro_end_micros: value.intro_end.map(duration_to_micros),
+            intro_confidence: value.intro_confidence,
+            outro_start_micros: value.outro_start.map(duration_to_micros),
+            outro_confidence: value.outro_confidence,
+            vocal_activity: value.vocal_activity.clone(),
+            vocal_activity_confidences: value.vocal_activity_confidences.clone(),
+            vocal_activity_rate: value.vocal_activity_rate,
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat_micros: value.first_beat.map(duration_to_micros),
@@ -291,6 +314,11 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
                 .iter()
                 .copied()
                 .map(duration_to_micros)
+                .collect(),
+            beat_marker_confidences: value
+                .beat_marker_confidences
+                .iter()
+                .map(|confidence| (confidence.clamp(0.0, 1.0) * 255.0).round() as u8)
                 .collect(),
             first_downbeat_micros: value.first_downbeat.map(duration_to_micros),
             downbeat_confidence: value.downbeat_confidence,
@@ -313,6 +341,13 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             duration: Duration::from_micros(value.duration_micros),
             audible_start: Duration::from_micros(value.audible_start_micros),
             audible_end: Duration::from_micros(value.audible_end_micros),
+            intro_end: value.intro_end_micros.map(Duration::from_micros),
+            intro_confidence: value.intro_confidence,
+            outro_start: value.outro_start_micros.map(Duration::from_micros),
+            outro_confidence: value.outro_confidence,
+            vocal_activity: value.vocal_activity,
+            vocal_activity_confidences: value.vocal_activity_confidences,
+            vocal_activity_rate: value.vocal_activity_rate,
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat: value.first_beat_micros.map(Duration::from_micros),
@@ -320,6 +355,11 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
                 .beat_markers_micros
                 .into_iter()
                 .map(Duration::from_micros)
+                .collect(),
+            beat_marker_confidences: value
+                .beat_marker_confidences
+                .into_iter()
+                .map(|confidence| f32::from(confidence) / 255.0)
                 .collect(),
             first_downbeat: value.first_downbeat_micros.map(Duration::from_micros),
             downbeat_confidence: value.downbeat_confidence,
@@ -349,6 +389,50 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     if analysis.audible_start > analysis.audible_end || analysis.audible_end > analysis.duration {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "audible boundaries must be ordered within the track duration",
+        ));
+    }
+    if analysis.intro_end.is_some_and(|boundary| {
+        boundary < analysis.audible_start || boundary > analysis.audible_end
+    }) || analysis.outro_start.is_some_and(|boundary| {
+        boundary < analysis.audible_start || boundary > analysis.audible_end
+    }) || analysis
+        .intro_end
+        .zip(analysis.outro_start)
+        .is_some_and(|(intro, outro)| intro >= outro)
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "structure boundaries must be ordered within the audible region",
+        ));
+    }
+    if !analysis.intro_confidence.is_finite()
+        || !(0.0..=1.0).contains(&analysis.intro_confidence)
+        || !analysis.outro_confidence.is_finite()
+        || !(0.0..=1.0).contains(&analysis.outro_confidence)
+        || (analysis.intro_end.is_none() && analysis.intro_confidence != 0.0)
+        || (analysis.outro_start.is_none() && analysis.outro_confidence != 0.0)
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "structure confidences must match boundaries and be between zero and one",
+        ));
+    }
+    let expected_vocal_bins =
+        analysis.duration.as_secs_f64() * f64::from(analysis.vocal_activity_rate);
+    let minimum_vocal_bins = expected_vocal_bins.floor() as usize;
+    // The source-rate analyzer can emit one final partial bin, while the track
+    // duration is measured from the downsampled analysis stream. Allow one bin
+    // of rounding tolerance in that direction.
+    let maximum_vocal_bins = expected_vocal_bins.ceil() as usize + 1;
+    if (analysis.vocal_activity_rate == 0
+        && (!analysis.vocal_activity.is_empty() || !analysis.vocal_activity_confidences.is_empty()))
+        || (analysis.vocal_activity_rate > 0
+            && (analysis.vocal_activity_rate > 8
+                || analysis.vocal_activity.is_empty()
+                || analysis.vocal_activity.len() != analysis.vocal_activity_confidences.len()
+                || analysis.vocal_activity.len() < minimum_vocal_bins
+                || analysis.vocal_activity.len() > maximum_vocal_bins))
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "vocal activity profile must have a valid rate, length, and confidence shape",
         ));
     }
     if analysis
@@ -390,6 +474,17 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "beat markers must be ordered within the track duration",
+        ));
+    }
+    if !analysis.beat_marker_confidences.is_empty()
+        && (analysis.beat_marker_confidences.len() != analysis.beat_markers.len()
+            || analysis
+                .beat_marker_confidences
+                .iter()
+                .any(|confidence| !confidence.is_finite() || !(0.0..=1.0).contains(confidence)))
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "beat marker confidences must match markers and be between zero and one",
         ));
     }
     if analysis
@@ -466,14 +561,24 @@ mod tests {
     use super::*;
 
     fn analysis() -> TrackAnalysis {
+        let mut vocal_activity = vec![20; 180 * 4];
+        vocal_activity[12] = 200;
         TrackAnalysis {
             duration: Duration::from_secs(180),
             audible_start: Duration::from_millis(750),
             audible_end: Duration::from_millis(179_200),
+            intro_end: Some(Duration::from_secs(8)),
+            intro_confidence: 0.75,
+            outro_start: Some(Duration::from_secs(170)),
+            outro_confidence: 0.8,
+            vocal_activity,
+            vocal_activity_confidences: vec![230; 180 * 4],
+            vocal_activity_rate: 4,
             bpm: Some(124.5),
             beat_confidence: 0.91,
             first_beat: Some(Duration::from_millis(750)),
             beat_markers: vec![Duration::from_millis(750)],
+            beat_marker_confidences: vec![0.8],
             first_downbeat: Some(Duration::from_millis(750)),
             downbeat_confidence: 0.72,
             musical_key: Some(MusicalKey {
@@ -554,10 +659,18 @@ mod tests {
             duration: Duration::from_secs(1),
             audible_start: Duration::from_millis(900),
             audible_end: Duration::from_millis(800),
+            intro_end: None,
+            intro_confidence: 0.0,
+            outro_start: None,
+            outro_confidence: 0.0,
+            vocal_activity: Vec::new(),
+            vocal_activity_confidences: Vec::new(),
+            vocal_activity_rate: 0,
             bpm: Some(f32::NAN),
             beat_confidence: 2.0,
             first_beat: None,
             beat_markers: Vec::new(),
+            beat_marker_confidences: Vec::new(),
             first_downbeat: None,
             downbeat_confidence: 2.0,
             musical_key: None,
@@ -570,6 +683,81 @@ mod tests {
             Err(AnalysisCacheError::InvalidAnalysis(_))
         ));
         assert!(!cache.path_for(&key).exists());
+    }
+
+    #[test]
+    fn rejects_marker_confidence_length_mismatch() {
+        let directory = TestDirectory::new();
+        let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
+        let mut invalid = analysis();
+        invalid.beat_marker_confidences.push(0.5);
+
+        assert!(matches!(
+            cache.store(&key, &invalid),
+            Err(AnalysisCacheError::InvalidAnalysis(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_truncated_vocal_activity_profile() {
+        let directory = TestDirectory::new();
+        let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
+        let mut invalid = analysis();
+        invalid.vocal_activity.truncate(2);
+        invalid.vocal_activity_confidences.truncate(2);
+
+        assert!(matches!(
+            cache.store(&key, &invalid),
+            Err(AnalysisCacheError::InvalidAnalysis(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_analysis_without_new_analysis_fields_still_decodes() {
+        let mut value = serde_json::to_value(SerializableAnalysis::from(&analysis())).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "beat_marker_confidences",
+            "intro_end_micros",
+            "intro_confidence",
+            "outro_start_micros",
+            "outro_confidence",
+            "vocal_activity",
+            "vocal_activity_confidences",
+            "vocal_activity_rate",
+        ] {
+            object.remove(field);
+        }
+        let serialized: SerializableAnalysis = serde_json::from_value(value).unwrap();
+        let decoded = TrackAnalysis::try_from(serialized).unwrap();
+
+        assert!(decoded.beat_marker_confidences.is_empty());
+        assert_eq!(decoded.beat_markers, analysis().beat_markers);
+        assert_eq!(decoded.intro_end, None);
+        assert_eq!(decoded.outro_start, None);
+        assert_eq!(decoded.vocal_activity_rate, 0);
+    }
+
+    #[test]
+    fn stores_long_high_tempo_marker_analysis_with_confidences() {
+        let directory = TestDirectory::new();
+        let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "long", None, None).unwrap();
+        let mut long = analysis();
+        long.duration = Duration::from_secs(30 * 60);
+        long.audible_end = long.duration;
+        long.beat_markers = (0..5_400)
+            .map(|index| Duration::from_millis(index * 1_000 / 3))
+            .collect();
+        long.beat_marker_confidences = vec![1.0; long.beat_markers.len()];
+        long.vocal_activity = vec![0; 30 * 60 * 4];
+        long.vocal_activity_confidences = vec![255; 30 * 60 * 4];
+
+        cache.store(&key, &long).unwrap();
+        assert_eq!(cache.load(&key).unwrap(), Some(long));
+        assert!(cache.path_for(&key).metadata().unwrap().len() < MAX_CACHE_FILE_BYTES);
     }
 
     struct TestDirectory(PathBuf);
