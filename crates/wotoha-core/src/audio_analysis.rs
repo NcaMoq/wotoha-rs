@@ -11,6 +11,7 @@ const MIN_KICK_ENERGY_RATIO: f32 = 0.015;
 const MIN_KICK_MARKER_CONFIDENCE: f32 = 0.25;
 const MIN_KICK_FIRST_CONFIDENCE: f32 = 0.1;
 const STRUCTURE_BINS_PER_SECOND: u32 = 4;
+const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct EnergyStructure {
@@ -111,6 +112,8 @@ pub fn analyze_mono_pcm_with_low_band(
         duration(first, sample_rate),
         duration(last.saturating_add(1), sample_rate),
     );
+    let energy_profile = quantize_energy_profile(&structure_rms);
+    let energy_profile_rate = STRUCTURE_BINS_PER_SECOND as u8;
 
     let block = (sample_rate as usize / ONSET_BLOCKS_PER_SECOND).max(1);
     let onset_rate = sample_rate as f32 / block as f32;
@@ -159,6 +162,8 @@ pub fn analyze_mono_pcm_with_low_band(
             vocal_activity: Vec::new(),
             vocal_activity_confidences: Vec::new(),
             vocal_activity_rate: 0,
+            energy_profile: energy_profile.clone(),
+            energy_profile_rate,
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
@@ -199,6 +204,8 @@ pub fn analyze_mono_pcm_with_low_band(
             vocal_activity: Vec::new(),
             vocal_activity_confidences: Vec::new(),
             vocal_activity_rate: 0,
+            energy_profile: energy_profile.clone(),
+            energy_profile_rate,
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
@@ -227,6 +234,8 @@ pub fn analyze_mono_pcm_with_low_band(
         vocal_activity: Vec::new(),
         vocal_activity_confidences: Vec::new(),
         vocal_activity_rate: 0,
+        energy_profile,
+        energy_profile_rate,
         bpm: Some(bpm),
         beat_confidence: confidence,
         first_beat: Some(duration(first_beat_block * block, sample_rate)),
@@ -263,6 +272,24 @@ pub fn apply_energy_structure(analysis: &mut TrackAnalysis, rms: &[f32], bins_pe
     analysis.intro_confidence = structure.intro_confidence;
     analysis.outro_start = structure.outro_start;
     analysis.outro_confidence = structure.outro_confidence;
+    analysis.energy_profile = quantize_energy_profile(rms);
+    analysis.energy_profile_rate = bins_per_second.min(u32::from(u8::MAX)) as u8;
+}
+
+fn quantize_energy_profile(rms: &[f32]) -> Vec<u8> {
+    rms.iter()
+        .map(|value| {
+            let dbfs = if *value > f32::EPSILON {
+                20.0 * value.log10()
+            } else {
+                MIN_ENERGY_PROFILE_DBFS
+            };
+            (((dbfs.clamp(MIN_ENERGY_PROFILE_DBFS, 0.0) - MIN_ENERGY_PROFILE_DBFS)
+                / -MIN_ENERGY_PROFILE_DBFS)
+                * 255.0)
+                .round() as u8
+        })
+        .collect()
 }
 
 fn rms_envelope(samples: &[f32], sample_rate: u32, bins_per_second: u32) -> Vec<f32> {

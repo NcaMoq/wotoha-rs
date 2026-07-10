@@ -184,7 +184,7 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
         let plan = &guarded.plan;
         let quality = &guarded.quality;
         println!(
-            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}",
+            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
             outgoing.index,
             incoming.index,
             track_key(outgoing),
@@ -221,6 +221,9 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
             format_optional_f32(quality.low_handoff_max),
             quality.vocal_overlap_samples_checked,
             format_optional_f32(quality.max_dual_vocal_risk),
+            quality.energy_samples_checked,
+            format_optional_f32(quality.min_mix_energy_ratio),
+            format_optional_f32(quality.max_mix_energy_ratio),
         );
     }
 }

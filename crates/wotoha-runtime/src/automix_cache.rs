@@ -14,7 +14,7 @@ use wotoha_core::{
     automix::{KeyMode, MusicalKey, TrackAnalysis},
 };
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 7;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 8;
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -272,6 +272,10 @@ struct SerializableAnalysis {
     vocal_activity_confidences: Vec<u8>,
     #[serde(default)]
     vocal_activity_rate: u8,
+    #[serde(default)]
+    energy_profile: Vec<u8>,
+    #[serde(default)]
+    energy_profile_rate: u8,
     bpm: Option<f32>,
     beat_confidence: f32,
     first_beat_micros: Option<u64>,
@@ -306,6 +310,8 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             vocal_activity: value.vocal_activity.clone(),
             vocal_activity_confidences: value.vocal_activity_confidences.clone(),
             vocal_activity_rate: value.vocal_activity_rate,
+            energy_profile: value.energy_profile.clone(),
+            energy_profile_rate: value.energy_profile_rate,
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat_micros: value.first_beat.map(duration_to_micros),
@@ -348,6 +354,8 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             vocal_activity: value.vocal_activity,
             vocal_activity_confidences: value.vocal_activity_confidences,
             vocal_activity_rate: value.vocal_activity_rate,
+            energy_profile: value.energy_profile,
+            energy_profile_rate: value.energy_profile_rate,
             bpm: value.bpm,
             beat_confidence: value.beat_confidence,
             first_beat: value.first_beat_micros.map(Duration::from_micros),
@@ -433,6 +441,21 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
     {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "vocal activity profile must have a valid rate, length, and confidence shape",
+        ));
+    }
+    let expected_energy_bins =
+        analysis.duration.as_secs_f64() * f64::from(analysis.energy_profile_rate);
+    let minimum_energy_bins = expected_energy_bins.floor() as usize;
+    let maximum_energy_bins = expected_energy_bins.ceil() as usize + 1;
+    if (analysis.energy_profile_rate == 0 && !analysis.energy_profile.is_empty())
+        || (analysis.energy_profile_rate > 0
+            && (analysis.energy_profile_rate > 8
+                || analysis.energy_profile.is_empty()
+                || analysis.energy_profile.len() < minimum_energy_bins
+                || analysis.energy_profile.len() > maximum_energy_bins))
+    {
+        return Err(AnalysisCacheError::InvalidAnalysis(
+            "energy profile must have a valid rate and length",
         ));
     }
     if analysis
@@ -574,6 +597,8 @@ mod tests {
             vocal_activity,
             vocal_activity_confidences: vec![230; 180 * 4],
             vocal_activity_rate: 4,
+            energy_profile: vec![192; 180 * 4],
+            energy_profile_rate: 4,
             bpm: Some(124.5),
             beat_confidence: 0.91,
             first_beat: Some(Duration::from_millis(750)),
@@ -666,6 +691,8 @@ mod tests {
             vocal_activity: Vec::new(),
             vocal_activity_confidences: Vec::new(),
             vocal_activity_rate: 0,
+            energy_profile: Vec::new(),
+            energy_profile_rate: 0,
             bpm: Some(f32::NAN),
             beat_confidence: 2.0,
             first_beat: None,
@@ -727,6 +754,8 @@ mod tests {
             "vocal_activity",
             "vocal_activity_confidences",
             "vocal_activity_rate",
+            "energy_profile",
+            "energy_profile_rate",
         ] {
             object.remove(field);
         }
@@ -738,6 +767,7 @@ mod tests {
         assert_eq!(decoded.intro_end, None);
         assert_eq!(decoded.outro_start, None);
         assert_eq!(decoded.vocal_activity_rate, 0);
+        assert_eq!(decoded.energy_profile_rate, 0);
     }
 
     #[test]
@@ -754,6 +784,7 @@ mod tests {
         long.beat_marker_confidences = vec![1.0; long.beat_markers.len()];
         long.vocal_activity = vec![0; 30 * 60 * 4];
         long.vocal_activity_confidences = vec![255; 30 * 60 * 4];
+        long.energy_profile = vec![192; 30 * 60 * 4];
 
         cache.store(&key, &long).unwrap();
         assert_eq!(cache.load(&key).unwrap(), Some(long));

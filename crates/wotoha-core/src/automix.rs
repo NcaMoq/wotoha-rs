@@ -12,6 +12,7 @@ const MAX_PHRASE_PHASE_ERROR: Duration = Duration::from_millis(150);
 const MIN_LOW_HANDOFF_GAIN: f32 = 0.85;
 const MAX_LOW_HANDOFF_GAIN: f32 = 1.15;
 const MAX_DUAL_VOCAL_RISK: f32 = 0.58;
+const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,6 +37,9 @@ pub struct TrackAnalysis {
     /// Quantized confidence for each vocal activity sample.
     pub vocal_activity_confidences: Vec<u8>,
     pub vocal_activity_rate: u8,
+    /// Quantized full-band RMS profile used to score transition energy.
+    pub energy_profile: Vec<u8>,
+    pub energy_profile_rate: u8,
     pub bpm: Option<f32>,
     pub beat_confidence: f32,
     pub first_beat: Option<Duration>,
@@ -110,6 +114,8 @@ impl TrackAnalysis {
             vocal_activity: Vec::new(),
             vocal_activity_confidences: Vec::new(),
             vocal_activity_rate: 0,
+            energy_profile: Vec::new(),
+            energy_profile_rate: 0,
             bpm: None,
             beat_confidence: 0.0,
             first_beat: None,
@@ -294,6 +300,9 @@ pub struct AutoMixQualityReport {
     pub low_handoff_max: Option<f32>,
     pub vocal_overlap_samples_checked: usize,
     pub max_dual_vocal_risk: Option<f32>,
+    pub energy_samples_checked: usize,
+    pub min_mix_energy_ratio: Option<f32>,
+    pub max_mix_energy_ratio: Option<f32>,
 }
 
 impl AutoMixQualityReport {
@@ -799,6 +808,9 @@ pub fn evaluate_transition_quality(
     let mut handoff_phrase_phase_error = None;
     let mut vocal_overlap_samples_checked = 0;
     let mut max_dual_vocal_risk = None;
+    let mut energy_samples_checked = 0;
+    let mut min_mix_energy_ratio = None;
+    let mut max_mix_energy_ratio = None;
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
     if plan.kind != TransitionKind::Gapless {
@@ -847,6 +859,11 @@ pub fn evaluate_transition_quality(
         {
             issues.push(AutoMixQualityIssue::DualVocalOverlapTooHigh { max_risk });
         }
+
+        let energy = transition_energy_report(outgoing, incoming, plan);
+        energy_samples_checked = energy.samples;
+        min_mix_energy_ratio = energy.min_ratio;
+        max_mix_energy_ratio = energy.max_ratio;
     }
 
     if plan.kind == TransitionKind::BeatMatched {
@@ -917,6 +934,9 @@ pub fn evaluate_transition_quality(
         low_handoff_max,
         vocal_overlap_samples_checked,
         max_dual_vocal_risk,
+        energy_samples_checked,
+        min_mix_energy_ratio,
+        max_mix_energy_ratio,
     }
 }
 
@@ -1465,6 +1485,94 @@ fn dual_vocal_overlap_report(
     }
 }
 
+#[derive(Clone, Copy)]
+struct TransitionEnergyReport {
+    samples: usize,
+    min_ratio: Option<f32>,
+    max_ratio: Option<f32>,
+}
+
+fn transition_energy_report(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> TransitionEnergyReport {
+    const SAMPLES: u32 = 32;
+    if plan.kind == TransitionKind::Gapless || plan.duration.is_zero() {
+        return TransitionEnergyReport {
+            samples: 0,
+            min_ratio: None,
+            max_ratio: None,
+        };
+    }
+    let outgoing_reference = energy_at(outgoing, plan.outgoing_start);
+    let incoming_reference = energy_at(
+        incoming,
+        plan.incoming_start
+            .saturating_add(incoming_mix_source(plan)),
+    )
+    .map(|energy| energy * plan.incoming_gain);
+    let Some(reference) = outgoing_reference
+        .zip(incoming_reference)
+        .map(|(outgoing, incoming)| outgoing.max(incoming).max(1.0e-6))
+    else {
+        return TransitionEnergyReport {
+            samples: 0,
+            min_ratio: None,
+            max_ratio: None,
+        };
+    };
+
+    let mut samples = 0;
+    let mut min_ratio = f32::INFINITY;
+    let mut max_ratio = f32::NEG_INFINITY;
+    for index in 0..=SAMPLES {
+        let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
+        let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
+        let incoming_position = plan
+            .incoming_start
+            .saturating_add(incoming_source_elapsed(plan, elapsed));
+        let (Some(outgoing_energy), Some(incoming_energy)) = (
+            energy_at(outgoing, outgoing_position),
+            energy_at(incoming, incoming_position),
+        ) else {
+            continue;
+        };
+
+        let progress = elapsed.as_secs_f32() / plan.duration.as_secs_f32();
+        let (outgoing_mix_gain, incoming_mix_gain) = equal_power_mix_gains(progress);
+        let outgoing_eq = EqTransition {
+            id: 0,
+            source_start: plan.outgoing_start,
+            duration: plan.duration,
+            role: EqTransitionRole::Outgoing,
+        }
+        .gains_at(outgoing_position);
+        let incoming_eq = EqTransition {
+            id: 0,
+            source_start: plan.incoming_start,
+            duration: incoming_mix_source(plan),
+            role: EqTransitionRole::Incoming,
+        }
+        .gains_at(incoming_position);
+        let outgoing_level = outgoing_energy * outgoing_mix_gain * full_band_gain(outgoing_eq);
+        let incoming_level =
+            incoming_energy * incoming_mix_gain * plan.incoming_gain * full_band_gain(incoming_eq);
+        let combined = (outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level))
+            .sqrt()
+            / reference;
+        samples += 1;
+        min_ratio = min_ratio.min(combined);
+        max_ratio = max_ratio.max(combined);
+    }
+
+    TransitionEnergyReport {
+        samples,
+        min_ratio: (samples > 0).then_some(min_ratio),
+        max_ratio: (samples > 0).then_some(max_ratio),
+    }
+}
+
 fn equal_power_mix_gains(progress: f32) -> (f32, f32) {
     let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
     (angle.cos(), angle.sin())
@@ -1472,6 +1580,21 @@ fn equal_power_mix_gains(progress: f32) -> (f32, f32) {
 
 fn vocal_band_gain(gains: EqGains) -> f32 {
     (0.7 * gains.mid + 0.3 * gains.high).clamp(0.0, 1.0)
+}
+
+fn full_band_gain(gains: EqGains) -> f32 {
+    (0.35 * gains.low + 0.45 * gains.mid + 0.2 * gains.high).clamp(0.0, 1.0)
+}
+
+fn energy_at(analysis: &TrackAnalysis, position: Duration) -> Option<f32> {
+    if analysis.energy_profile_rate == 0 || analysis.energy_profile.is_empty() {
+        return None;
+    }
+    let index = (position.as_secs_f64() * f64::from(analysis.energy_profile_rate)).floor() as usize;
+    let value = analysis.energy_profile.get(index)?;
+    let dbfs =
+        MIN_ENERGY_PROFILE_DBFS + (f32::from(*value) / 255.0) * (0.0 - MIN_ENERGY_PROFILE_DBFS);
+    Some(dbfs_to_linear(dbfs))
 }
 
 fn incoming_mix_source(plan: &TransitionPlan) -> Duration {
@@ -2328,6 +2451,8 @@ mod tests {
             vocal_activity: vec![0; 180 * 4],
             vocal_activity_confidences: vec![255; 180 * 4],
             vocal_activity_rate: 4,
+            energy_profile: vec![192; 180 * 4],
+            energy_profile_rate: 4,
             bpm: Some(bpm),
             beat_confidence: 0.9,
             first_beat: Some(Duration::from_secs(1)),
@@ -2433,6 +2558,15 @@ mod tests {
         );
         assert!(
             report.low_handoff_min.unwrap() >= 0.99 && report.low_handoff_max.unwrap() <= 1.01,
+            "report={report:?}"
+        );
+        assert!(report.energy_samples_checked > 0, "report={report:?}");
+        assert!(
+            report.min_mix_energy_ratio.unwrap() >= 0.75,
+            "report={report:?}"
+        );
+        assert!(
+            report.max_mix_energy_ratio.unwrap() <= 1.05,
             "report={report:?}"
         );
     }
@@ -3030,6 +3164,32 @@ mod tests {
     }
 
     #[test]
+    fn transition_quality_reports_a_mid_mix_energy_dip() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(175.0, 177.0, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(5.0, 7.0, -42.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(report.energy_samples_checked > 0, "report={report:?}");
+        assert!(
+            report.min_mix_energy_ratio.unwrap() < 0.2,
+            "report={report:?}"
+        );
+    }
+
+    #[test]
     fn dual_vocal_quality_is_weighted_by_the_actual_fade_gain() {
         let mut outgoing = analyzed(120.0);
         outgoing.audible_end = Duration::from_secs(61);
@@ -3176,6 +3336,25 @@ mod tests {
             let to = (*end * rate as f32).ceil() as usize;
             analysis.vocal_activity[from..to.min(length)].fill(255);
         }
+    }
+
+    fn set_energy_ranges(analysis: &mut TrackAnalysis, base_dbfs: f32, ranges: &[(f32, f32, f32)]) {
+        let rate = 4_usize;
+        let length = (analysis.duration.as_secs_f32() * rate as f32).ceil() as usize;
+        analysis.energy_profile = vec![energy_code(base_dbfs); length];
+        analysis.energy_profile_rate = rate as u8;
+        for (start, end, dbfs) in ranges {
+            let from = (*start * rate as f32).floor() as usize;
+            let to = (*end * rate as f32).ceil() as usize;
+            analysis.energy_profile[from..to.min(length)].fill(energy_code(*dbfs));
+        }
+    }
+
+    fn energy_code(dbfs: f32) -> u8 {
+        (((dbfs.clamp(MIN_ENERGY_PROFILE_DBFS, 0.0) - MIN_ENERGY_PROFILE_DBFS)
+            / -MIN_ENERGY_PROFILE_DBFS)
+            * 255.0)
+            .round() as u8
     }
 
     #[test]

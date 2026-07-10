@@ -247,6 +247,8 @@ mod tests {
                 <= Duration::from_secs(1),
             "{analysis:?}"
         );
+        assert_eq!(analysis.energy_profile_rate, STRUCTURE_RATE as u8);
+        assert!(!analysis.energy_profile.is_empty(), "{analysis:?}");
     }
 
     #[tokio::test]

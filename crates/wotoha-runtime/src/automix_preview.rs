@@ -602,6 +602,8 @@ mod tests {
             vocal_activity: Vec::new(),
             vocal_activity_confidences: Vec::new(),
             vocal_activity_rate: 0,
+            energy_profile: Vec::new(),
+            energy_profile_rate: 0,
             bpm: Some(bpm),
             beat_confidence: 1.0,
             first_beat: Some(Duration::ZERO),
