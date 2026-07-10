@@ -1311,6 +1311,15 @@ where
                 outgoing_start_ms = plan.outgoing_start.as_millis(),
                 incoming_start_ms = plan.incoming_start.as_millis(),
                 fade_ms = plan.duration.as_millis(),
+                energy_selected = plan
+                    .energy_selection
+                    .is_some_and(|selection| selection.selected_start != selection.default_start),
+                energy_default_start_ms = plan
+                    .energy_selection
+                    .map(|selection| selection.default_start.as_millis()),
+                energy_candidates_checked = plan
+                    .energy_selection
+                    .map(|selection| selection.candidates_checked),
                 tempo_ratio = plan.incoming_tempo_ratio,
                 tempo_end_ratio = plan
                     .tempo_envelope

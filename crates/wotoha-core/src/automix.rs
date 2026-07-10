@@ -286,6 +286,14 @@ pub struct TransitionPlan {
     /// Relative gain retained by the incoming track after the overlap.
     pub incoming_gain: f32,
     pub tempo_envelope: Option<TempoEnvelope>,
+    pub energy_selection: Option<AutoMixEnergySelection>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoMixEnergySelection {
+    pub default_start: Duration,
+    pub selected_start: Duration,
+    pub candidates_checked: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -700,7 +708,7 @@ pub fn plan_transition(
     } else {
         outgoing.audible_end.saturating_sub(target_duration)
     };
-    outgoing_start = select_energy_balanced_start(
+    let (selected_start, mut energy_selection) = select_energy_balanced_start(
         outgoing,
         incoming,
         incoming_start,
@@ -714,6 +722,7 @@ pub fn plan_transition(
         tempo_curve,
         config.max_tempo_adjustment,
     );
+    outgoing_start = selected_start;
     let mut duration = outgoing.audible_end.saturating_sub(outgoing_start);
     let (mut envelope_start, mut tempo_envelope) = build_tempo_envelope(
         outgoing,
@@ -754,6 +763,7 @@ pub fn plan_transition(
         } else {
             target
         };
+        energy_selection = None;
         duration = outgoing.audible_end.saturating_sub(outgoing_start);
         (envelope_start, tempo_envelope) = build_tempo_envelope(
             outgoing,
@@ -782,6 +792,7 @@ pub fn plan_transition(
             return gapless_plan(outgoing, incoming);
         }
         outgoing_start = outgoing.audible_end.saturating_sub(native_vocal_limit);
+        energy_selection = None;
         duration = native_vocal_limit;
     }
     TransitionPlan {
@@ -797,6 +808,7 @@ pub fn plan_transition(
         harmonic_compatibility,
         incoming_gain,
         tempo_envelope,
+        energy_selection,
     }
 }
 
@@ -1669,9 +1681,9 @@ fn select_energy_balanced_start(
     incoming_gain: f32,
     tempo_curve: Option<(f32, f32)>,
     max_tempo_adjustment: f32,
-) -> Duration {
+) -> (Duration, Option<AutoMixEnergySelection>) {
     if !has_energy_profile(outgoing) || !has_energy_profile(incoming) {
-        return default_start;
+        return (default_start, None);
     }
 
     let mut candidates = vec![default_start];
@@ -1727,8 +1739,9 @@ fn select_energy_balanced_start(
         tempo_curve,
         max_tempo_adjustment,
     ) else {
-        return default_start;
+        return (default_start, None);
     };
+    let mut candidates_checked = 1;
 
     for candidate in candidates
         .into_iter()
@@ -1748,13 +1761,21 @@ fn select_energy_balanced_start(
         ) else {
             continue;
         };
+        candidates_checked += 1;
         if candidate_score + ENERGY_SELECTION_EPSILON < best_score {
             best_start = candidate_start;
             best_score = candidate_score;
         }
     }
 
-    best_start
+    (
+        best_start,
+        Some(AutoMixEnergySelection {
+            default_start,
+            selected_start: best_start,
+            candidates_checked,
+        }),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1811,6 +1832,7 @@ fn transition_start_energy_score(
         harmonic_compatibility,
         incoming_gain,
         tempo_envelope,
+        energy_selection: None,
     };
     let quality = evaluate_transition_quality(outgoing, incoming, &plan);
     if quality.has_blocking_issue() {
@@ -2548,6 +2570,7 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
         harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
         tempo_envelope: None,
+        energy_selection: None,
     }
 }
 
@@ -2594,6 +2617,7 @@ fn conservative_crossfade_plan(
         harmonic_compatibility,
         incoming_gain: recommended_incoming_gain(outgoing, incoming),
         tempo_envelope: None,
+        energy_selection: None,
     }
 }
 
@@ -3688,6 +3712,7 @@ mod tests {
             harmonic_compatibility: None,
             incoming_gain: 1.0,
             tempo_envelope: None,
+            energy_selection: None,
         };
 
         let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
@@ -3723,6 +3748,7 @@ mod tests {
             harmonic_compatibility: None,
             incoming_gain: 1.0,
             tempo_envelope: None,
+            energy_selection: None,
         };
 
         let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
@@ -3749,6 +3775,10 @@ mod tests {
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert_eq!(plan.incoming_start, Duration::from_secs(1));
         assert_eq!(plan.outgoing_start, Duration::from_secs(153));
+        let energy_selection = plan.energy_selection.expect("energy selection");
+        assert_eq!(energy_selection.default_start, Duration::from_secs(161));
+        assert_eq!(energy_selection.selected_start, plan.outgoing_start);
+        assert!(energy_selection.candidates_checked > 1);
         assert!(
             report.min_mix_energy_ratio.unwrap() > 0.6,
             "plan={plan:?} report={report:?}"
@@ -3771,6 +3801,10 @@ mod tests {
             plan.outgoing_start < Duration::from_secs(171),
             "plan={plan:?}"
         );
+        let energy_selection = plan.energy_selection.expect("energy selection");
+        assert_eq!(energy_selection.default_start, Duration::from_secs(171));
+        assert_eq!(energy_selection.selected_start, plan.outgoing_start);
+        assert!(energy_selection.candidates_checked > 1);
         assert!(
             report.min_mix_energy_ratio.unwrap() > 0.6,
             "plan={plan:?} report={report:?}"
@@ -3795,6 +3829,7 @@ mod tests {
             harmonic_compatibility: None,
             incoming_gain: 1.0,
             tempo_envelope: None,
+            energy_selection: None,
         };
 
         let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
