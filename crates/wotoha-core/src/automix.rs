@@ -873,7 +873,9 @@ pub fn explain_beatmatch_decision(
     if outgoing_bpm <= 0.0 || incoming_bpm <= 0.0 {
         return AutoMixBeatMatchDecision::InvalidBpm;
     }
-    let ratio = outgoing_bpm / incoming_bpm;
+    let Some(ratio) = closest_tempo_family_ratio(outgoing_bpm, incoming_bpm) else {
+        return AutoMixBeatMatchDecision::InvalidBpm;
+    };
     if !ratio.is_finite() || (ratio - 1.0).abs() > config.max_tempo_adjustment {
         return AutoMixBeatMatchDecision::TempoDifferenceTooLarge;
     }
@@ -1273,11 +1275,32 @@ fn handoff_cycle_phase_error(
     let incoming_handoff = plan
         .incoming_start
         .saturating_add(incoming_mix_source(plan));
+    let incoming_interval = closest_cycle_interval_family(outgoing_interval, incoming_interval)
+        .unwrap_or(incoming_interval);
     let outgoing_phase = cycle_phase_fraction(outgoing_handoff, outgoing_first, outgoing_interval)?;
     let incoming_phase = cycle_phase_fraction(incoming_handoff, incoming_first, incoming_interval)?;
     let delta = (outgoing_phase - incoming_phase).abs();
     let wrapped_delta = delta.min(1.0 - delta);
     Some(outgoing_interval.mul_f64(wrapped_delta))
+}
+
+fn closest_cycle_interval_family(
+    outgoing_interval: Duration,
+    incoming_interval: Duration,
+) -> Option<Duration> {
+    if outgoing_interval.is_zero() || incoming_interval.is_zero() {
+        return None;
+    }
+    let outgoing = outgoing_interval.as_secs_f64();
+    let incoming = incoming_interval.as_secs_f64();
+    if !outgoing.is_finite() || !incoming.is_finite() || outgoing <= 0.0 || incoming <= 0.0 {
+        return None;
+    }
+    [incoming, incoming * 2.0, incoming * 0.5]
+        .into_iter()
+        .filter(|candidate| candidate.is_finite() && *candidate > 0.0)
+        .min_by(|left, right| (left - outgoing).abs().total_cmp(&(right - outgoing).abs()))
+        .map(Duration::from_secs_f64)
 }
 
 fn phrase_phase_is_actionable(
@@ -2115,13 +2138,14 @@ fn build_tempo_envelope(
 ) -> (f32, Option<TempoEnvelope>) {
     let (tempo_start, tempo_end) = tempo_curve.unwrap_or((1.0, 1.0));
     let phase_segments = tempo_curve
-        .and_then(|_| {
+        .and_then(|(tempo_start, _)| {
             phase_follow_segments(
                 outgoing,
                 incoming,
                 outgoing_start,
                 incoming_start,
                 duration,
+                tempo_start,
                 max_tempo_adjustment,
             )
         })
@@ -2712,9 +2736,21 @@ fn compatible_tempo_curve(
         return None;
     }
 
-    let ratio = outgoing_bpm / incoming_bpm;
+    let ratio = closest_tempo_family_ratio(outgoing_bpm, incoming_bpm)?;
     (ratio.is_finite() && (ratio - 1.0).abs() <= config.max_tempo_adjustment)
         .then_some((ratio, ratio))
+}
+
+fn closest_tempo_family_ratio(outgoing_bpm: f32, incoming_bpm: f32) -> Option<f32> {
+    if outgoing_bpm <= 0.0 || incoming_bpm <= 0.0 {
+        return None;
+    }
+    let raw = outgoing_bpm / incoming_bpm;
+    [raw, raw * 2.0, raw * 0.5]
+        .iter()
+        .copied()
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .min_by(|left, right| (left - 1.0).abs().total_cmp(&(right - 1.0).abs()))
 }
 
 fn tempo_alignment_confident(analysis: &TrackAnalysis, min_beat_confidence: f32) -> bool {
@@ -2744,9 +2780,13 @@ fn phase_follow_segments(
     outgoing_start: Duration,
     incoming_start: Duration,
     duration: Duration,
+    global_speed: f32,
     max_tempo_adjustment: f32,
 ) -> Option<Vec<TempoSegment>> {
     const BEATS_PER_CORRECTION: usize = 4;
+    if !global_speed.is_finite() || global_speed <= 0.0 {
+        return None;
+    }
     let outgoing_end = outgoing_start.saturating_add(duration);
     let outgoing_beats = outgoing
         .beat_markers
@@ -2763,47 +2803,56 @@ fn phase_follow_segments(
         .enumerate()
         .filter(|(_, beat)| *beat >= incoming_start)
         .map(|(index, beat)| (beat, marker_confidence(incoming, index)))
-        .take(outgoing_beats.len())
         .collect::<Vec<_>>();
-    let paired = outgoing_beats.len().min(incoming_beats.len());
+    let paired_beats = pair_phase_follow_beats(
+        &outgoing_beats,
+        &incoming_beats,
+        outgoing_start,
+        incoming_start,
+        global_speed,
+        incoming,
+    );
+    let paired = paired_beats.len();
     if paired < 5
         || outgoing_beats[0].0.abs_diff(outgoing_start) > Duration::from_millis(30)
-        || incoming_beats[0].0.abs_diff(incoming_start) > Duration::from_millis(30)
+        || paired_beats[0].1.0.abs_diff(incoming_start) > Duration::from_millis(30)
     {
         return None;
     }
 
     let mut segments = Vec::new();
     let mut index = 0;
-    let global_speed = outgoing.bpm? / incoming.bpm?;
     let mut mapped_source = 0.0_f32;
     while index + 1 < paired && segments.len() < MAX_TEMPO_SEGMENTS {
         let end = (index + BEATS_PER_CORRECTION).min(paired - 1);
-        let output_delta = outgoing_beats[end]
+        let output_delta = paired_beats[end]
             .0
-            .saturating_sub(outgoing_beats[index].0);
-        let source_delta = incoming_beats[end]
             .0
-            .saturating_sub(incoming_beats[index].0);
+            .saturating_sub(paired_beats[index].0.0);
+        let source_delta = paired_beats[end]
+            .1
+            .0
+            .saturating_sub(paired_beats[index].1.0);
         if output_delta.is_zero() || source_delta.is_zero() {
             return None;
         }
-        let trusted = outgoing_beats[index..=end]
+        let trusted = paired_beats[index..=end]
             .iter()
-            .filter(|(_, confidence)| *confidence >= MIN_PHASE_MARKER_CONFIDENCE)
+            .filter(|((_, confidence), _)| *confidence >= MIN_PHASE_MARKER_CONFIDENCE)
             .count()
             >= 3
-            && incoming_beats[index..=end]
+            && paired_beats[index..=end]
                 .iter()
-                .filter(|(_, confidence)| *confidence >= MIN_PHASE_MARKER_CONFIDENCE)
+                .filter(|(_, (_, confidence))| *confidence >= MIN_PHASE_MARKER_CONFIDENCE)
                 .count()
                 >= 3;
         let trusted = trusted
-            && outgoing_beats[index].1 >= MIN_PHASE_MARKER_CONFIDENCE
-            && outgoing_beats[end].1 >= MIN_PHASE_MARKER_CONFIDENCE
-            && incoming_beats[index].1 >= MIN_PHASE_MARKER_CONFIDENCE
-            && incoming_beats[end].1 >= MIN_PHASE_MARKER_CONFIDENCE;
-        let desired_source = incoming_beats[end]
+            && paired_beats[index].0.1 >= MIN_PHASE_MARKER_CONFIDENCE
+            && paired_beats[end].0.1 >= MIN_PHASE_MARKER_CONFIDENCE
+            && paired_beats[index].1.1 >= MIN_PHASE_MARKER_CONFIDENCE
+            && paired_beats[end].1.1 >= MIN_PHASE_MARKER_CONFIDENCE;
+        let desired_source = paired_beats[end]
+            .1
             .0
             .saturating_sub(incoming_start)
             .as_secs_f32();
@@ -2817,13 +2866,49 @@ fn phase_follow_segments(
             global_speed
         };
         segments.push(TempoSegment {
-            output_end: outgoing_beats[end].0.saturating_sub(outgoing_start),
+            output_end: paired_beats[end].0.0.saturating_sub(outgoing_start),
             speed,
         });
         mapped_source += output_delta.as_secs_f32() * speed;
         index = end;
     }
     (!segments.is_empty()).then_some(segments)
+}
+
+fn pair_phase_follow_beats(
+    outgoing_beats: &[(Duration, f32)],
+    incoming_beats: &[(Duration, f32)],
+    outgoing_start: Duration,
+    incoming_start: Duration,
+    global_speed: f32,
+    incoming: &TrackAnalysis,
+) -> Vec<((Duration, f32), (Duration, f32))> {
+    let tolerance = marker_snap_tolerance(incoming).max(MAX_BEATMATCH_PHASE_ERROR);
+    let mut pairs = Vec::new();
+    let mut next_incoming_index = 0;
+
+    for outgoing in outgoing_beats {
+        let output_elapsed = outgoing.0.saturating_sub(outgoing_start);
+        let target_source = incoming_start.saturating_add(Duration::from_secs_f64(
+            output_elapsed.as_secs_f64() * f64::from(global_speed),
+        ));
+        let Some((offset, (_, incoming))) = incoming_beats
+            .iter()
+            .enumerate()
+            .skip(next_incoming_index)
+            .map(|(index, beat)| (index, (beat.0.abs_diff(target_source), beat)))
+            .min_by_key(|(_, (error, _))| *error)
+        else {
+            break;
+        };
+        if incoming.0.abs_diff(target_source) > tolerance {
+            continue;
+        }
+        pairs.push((*outgoing, *incoming));
+        next_incoming_index = offset + 1;
+    }
+
+    pairs
 }
 
 #[cfg(test)]
@@ -3038,6 +3123,18 @@ mod tests {
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert!((plan.incoming_tempo_ratio - 120.0 / 124.0).abs() < 0.0001);
         assert_eq!(plan.duration, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn beatmatch_accepts_double_time_bpm_family() {
+        let outgoing = analyzed(70.0);
+        let incoming = analyzed(140.0);
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert!((plan.incoming_tempo_ratio - 1.0).abs() < 0.0001);
+        assert!(report.is_ok(), "plan={plan:?} report={report:?}");
     }
 
     #[test]
@@ -3592,6 +3689,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_secs(8),
+            1.0,
             0.06,
         )
         .unwrap();
