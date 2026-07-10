@@ -1332,6 +1332,8 @@ where
                     .map(|value| value.as_millis()),
                 low_handoff_min = quality.low_handoff_min,
                 low_handoff_max = quality.low_handoff_max,
+                vocal_overlap_samples_checked = quality.vocal_overlap_samples_checked,
+                max_dual_vocal_risk = quality.max_dual_vocal_risk,
                 "AutoMix transition planned"
             );
         }

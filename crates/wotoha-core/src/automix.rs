@@ -11,6 +11,7 @@ const MAX_DOWNBEAT_PHASE_ERROR: Duration = Duration::from_millis(70);
 const MAX_PHRASE_PHASE_ERROR: Duration = Duration::from_millis(150);
 const MIN_LOW_HANDOFF_GAIN: f32 = 0.85;
 const MAX_LOW_HANDOFF_GAIN: f32 = 1.15;
+const MAX_DUAL_VOCAL_RISK: f32 = 0.58;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +292,8 @@ pub struct AutoMixQualityReport {
     pub handoff_phrase_phase_error: Option<Duration>,
     pub low_handoff_min: Option<f32>,
     pub low_handoff_max: Option<f32>,
+    pub vocal_overlap_samples_checked: usize,
+    pub max_dual_vocal_risk: Option<f32>,
 }
 
 impl AutoMixQualityReport {
@@ -343,6 +346,9 @@ pub enum AutoMixQualityIssue {
     LowHandoffBuildUp {
         max_gain: f32,
     },
+    DualVocalOverlapTooHigh {
+        max_risk: f32,
+    },
 }
 
 impl AutoMixQualityIssue {
@@ -359,6 +365,7 @@ impl AutoMixQualityIssue {
                 | Self::DownbeatHandoffPhaseDriftTooLarge { .. }
                 | Self::PhrasePhaseDriftTooLarge { .. }
                 | Self::PhraseHandoffPhaseDriftTooLarge { .. }
+                | Self::DualVocalOverlapTooHigh { .. }
         )
     }
 }
@@ -790,6 +797,8 @@ pub fn evaluate_transition_quality(
     let mut phrase_pairs_checked = 0;
     let mut max_phrase_phase_error = None;
     let mut handoff_phrase_phase_error = None;
+    let mut vocal_overlap_samples_checked = 0;
+    let mut max_dual_vocal_risk = None;
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
     if plan.kind != TransitionKind::Gapless {
@@ -828,6 +837,15 @@ pub fn evaluate_transition_quality(
             if max_gain > MAX_LOW_HANDOFF_GAIN {
                 issues.push(AutoMixQualityIssue::LowHandoffBuildUp { max_gain });
             }
+        }
+
+        let vocal_overlap = dual_vocal_overlap_report(outgoing, incoming, plan);
+        vocal_overlap_samples_checked = vocal_overlap.samples;
+        max_dual_vocal_risk = vocal_overlap.max_risk;
+        if let Some(max_risk) = max_dual_vocal_risk
+            && max_risk > MAX_DUAL_VOCAL_RISK
+        {
+            issues.push(AutoMixQualityIssue::DualVocalOverlapTooHigh { max_risk });
         }
     }
 
@@ -897,6 +915,8 @@ pub fn evaluate_transition_quality(
         handoff_phrase_phase_error,
         low_handoff_min,
         low_handoff_max,
+        vocal_overlap_samples_checked,
+        max_dual_vocal_risk,
     }
 }
 
@@ -1368,6 +1388,90 @@ fn low_handoff_range(plan: &TransitionPlan) -> (Option<f32>, Option<f32>) {
         max_gain = max_gain.max(gain);
     }
     (Some(min_gain), Some(max_gain))
+}
+
+#[derive(Clone, Copy)]
+struct DualVocalOverlapReport {
+    samples: usize,
+    max_risk: Option<f32>,
+}
+
+fn dual_vocal_overlap_report(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> DualVocalOverlapReport {
+    const SAMPLES: u32 = 32;
+    if plan.kind == TransitionKind::Gapless || plan.duration.is_zero() {
+        return DualVocalOverlapReport {
+            samples: 0,
+            max_risk: None,
+        };
+    }
+    if !summarize_vocals(outgoing).known || !summarize_vocals(incoming).known {
+        return DualVocalOverlapReport {
+            samples: 0,
+            max_risk: None,
+        };
+    }
+
+    let mut samples = 0;
+    let mut max_risk = None;
+    for index in 0..=SAMPLES {
+        let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
+        let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
+        let incoming_position = plan
+            .incoming_start
+            .saturating_add(incoming_source_elapsed(plan, elapsed));
+        if outgoing_position < outgoing.audible_start
+            || outgoing_position > outgoing.audible_end
+            || incoming_position < incoming.audible_start
+            || incoming_position > incoming.audible_end
+        {
+            continue;
+        }
+
+        let progress = elapsed.as_secs_f32() / plan.duration.as_secs_f32();
+        let (outgoing_mix_gain, incoming_mix_gain) = equal_power_mix_gains(progress);
+        let outgoing_eq = EqTransition {
+            id: 0,
+            source_start: plan.outgoing_start,
+            duration: plan.duration,
+            role: EqTransitionRole::Outgoing,
+        }
+        .gains_at(outgoing_position);
+        let incoming_eq = EqTransition {
+            id: 0,
+            source_start: plan.incoming_start,
+            duration: incoming_mix_source(plan),
+            role: EqTransitionRole::Incoming,
+        }
+        .gains_at(incoming_position);
+        let outgoing_risk = effective_vocal_risk(outgoing, outgoing_position)
+            * outgoing_mix_gain
+            * vocal_band_gain(outgoing_eq);
+        let incoming_risk = effective_vocal_risk(incoming, incoming_position)
+            * incoming_mix_gain
+            * plan.incoming_gain
+            * vocal_band_gain(incoming_eq);
+        let risk = outgoing_risk.min(incoming_risk);
+        samples += 1;
+        max_risk = Some(max_risk.map_or(risk, |current: f32| current.max(risk)));
+    }
+
+    DualVocalOverlapReport {
+        samples,
+        max_risk: (samples > 0).then_some(max_risk).flatten(),
+    }
+}
+
+fn equal_power_mix_gains(progress: f32) -> (f32, f32) {
+    let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    (angle.cos(), angle.sin())
+}
+
+fn vocal_band_gain(gains: EqGains) -> f32 {
+    (0.7 * gains.mid + 0.3 * gains.high).clamp(0.0, 1.0)
 }
 
 fn incoming_mix_source(plan: &TransitionPlan) -> Duration {
@@ -2880,7 +2984,84 @@ mod tests {
             quality.max_phrase_phase_error.unwrap() <= Duration::from_millis(1),
             "plan={plan:?} report={quality:?}"
         );
+        assert!(quality.vocal_overlap_samples_checked > 0);
+        assert!(
+            quality.max_dual_vocal_risk.unwrap() <= MAX_DUAL_VOCAL_RISK,
+            "plan={plan:?} report={quality:?}"
+        );
         assert!(!quality.has_blocking_issue(), "report={quality:?}");
+    }
+
+    #[test]
+    fn transition_quality_detects_dual_vocal_overlap() {
+        let mut outgoing = analyzed(120.0);
+        outgoing.audible_end = Duration::from_secs(61);
+        set_vocal_ranges(&mut outgoing, &[(53.0, 61.0)]);
+        let mut incoming = analyzed(120.0);
+        incoming.audible_end = Duration::from_secs(61);
+        set_vocal_ranges(&mut incoming, &[(1.0, 9.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(53),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(report.vocal_overlap_samples_checked > 0);
+        assert!(
+            report.max_dual_vocal_risk.unwrap() > MAX_DUAL_VOCAL_RISK,
+            "report={report:?}"
+        );
+        assert!(
+            report.issues.iter().any(|issue| matches!(
+                issue,
+                AutoMixQualityIssue::DualVocalOverlapTooHigh { max_risk }
+                    if *max_risk > MAX_DUAL_VOCAL_RISK
+            )),
+            "report={report:?}"
+        );
+        assert!(report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn dual_vocal_quality_is_weighted_by_the_actual_fade_gain() {
+        let mut outgoing = analyzed(120.0);
+        outgoing.audible_end = Duration::from_secs(61);
+        set_vocal_ranges(&mut outgoing, &[(53.0, 55.0)]);
+        let mut incoming = analyzed(120.0);
+        incoming.audible_end = Duration::from_secs(61);
+        set_vocal_ranges(&mut incoming, &[(1.0, 3.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(53),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(report.vocal_overlap_samples_checked > 0);
+        assert!(
+            report.max_dual_vocal_risk.unwrap() < MAX_DUAL_VOCAL_RISK,
+            "report={report:?}"
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AutoMixQualityIssue::DualVocalOverlapTooHigh { .. })),
+            "report={report:?}"
+        );
     }
 
     #[test]
