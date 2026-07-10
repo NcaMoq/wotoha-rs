@@ -1861,7 +1861,17 @@ fn transition_start_energy_score(
     if quality.has_blocking_issue() {
         return None;
     }
-    energy_balance_score(&quality).map(|score| (outgoing_start, score))
+    transition_start_score(&quality).map(|score| (outgoing_start, score))
+}
+
+fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
+    let energy_score = energy_balance_score(quality)?;
+    let vocal_penalty = quality
+        .max_dual_vocal_risk
+        .filter(|risk| risk.is_finite())
+        .map(|risk| (risk / MAX_DUAL_VOCAL_RISK).clamp(0.0, 1.0).powi(2) * 0.8)
+        .unwrap_or(0.0);
+    Some(energy_score + vocal_penalty)
 }
 
 fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
@@ -3911,6 +3921,45 @@ mod tests {
     }
 
     #[test]
+    fn start_selection_avoids_non_blocking_dual_vocal_risk() {
+        let mut config = config();
+        config.crossfade = Duration::from_secs(16);
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_soft_vocal_ranges(&mut outgoing, &[(165.0, 167.0)], 0.5);
+        set_soft_vocal_ranges(&mut incoming, &[(5.0, 7.0)], 0.5);
+
+        let default_plan = TransitionPlan {
+            kind: TransitionKind::BeatMatched,
+            outgoing_start: Duration::from_secs(161),
+            incoming_start: incoming.audible_start,
+            duration: outgoing
+                .audible_end
+                .saturating_sub(Duration::from_secs(161)),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: harmonic_compatibility(&outgoing, &incoming),
+            incoming_gain: recommended_incoming_gain(&outgoing, &incoming),
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let default_quality = evaluate_transition_quality(&outgoing, &incoming, &default_plan);
+
+        let plan = plan_transition(&outgoing, &incoming, &config);
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert!(
+            default_quality.max_dual_vocal_risk.unwrap() > quality.max_dual_vocal_risk.unwrap(),
+            "default={default_plan:?} default_quality={default_quality:?} plan={plan:?} quality={quality:?}"
+        );
+        assert!(
+            plan.outgoing_start < default_plan.outgoing_start,
+            "default={default_plan:?} plan={plan:?}"
+        );
+        assert!(!quality.has_blocking_issue(), "quality={quality:?}");
+    }
+
+    #[test]
     fn dual_vocal_quality_is_weighted_by_the_actual_fade_gain() {
         let mut outgoing = analyzed(120.0);
         outgoing.audible_end = Duration::from_secs(61);
@@ -4057,6 +4106,20 @@ mod tests {
             let from = (*start * rate as f32).floor() as usize;
             let to = (*end * rate as f32).ceil() as usize;
             analysis.vocal_activity[from..to.min(length)].fill(255);
+        }
+    }
+
+    fn set_soft_vocal_ranges(analysis: &mut TrackAnalysis, ranges: &[(f32, f32)], risk: f32) {
+        let rate = 4_usize;
+        let length = (analysis.duration.as_secs_f32() * rate as f32).ceil() as usize;
+        analysis.vocal_activity = vec![0; length];
+        analysis.vocal_activity_confidences = vec![255; length];
+        analysis.vocal_activity_rate = rate as u8;
+        let code = (risk.clamp(0.0, 1.0) * 255.0).round() as u8;
+        for (start, end) in ranges {
+            let from = (*start * rate as f32).floor() as usize;
+            let to = (*end * rate as f32).ceil() as usize;
+            analysis.vocal_activity[from..to.min(length)].fill(code);
         }
     }
 
