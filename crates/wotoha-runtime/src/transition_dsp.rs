@@ -171,6 +171,9 @@ impl ThreeBandEqualizer {
     }
 
     fn process_planar(&mut self, buffer: &mut AudioBuffer<f32>, packet_start: Duration) {
+        if self.channels == 0 || self.sample_rate == 0 {
+            return;
+        }
         let frames = buffer.frames();
         let low_alpha = low_pass_alpha(250.0, self.sample_rate);
         let high_alpha = low_pass_alpha(4_000.0, self.sample_rate);
@@ -247,13 +250,11 @@ struct EqualizerDecoder {
 impl EqualizerDecoder {
     fn new(inner: Box<dyn Decoder>, control: EqualizerControl) -> Result<Self, String> {
         let params = inner.codec_params().clone();
-        let sample_rate = params
-            .sample_rate
-            .ok_or("equalizer requires a known sample rate")?;
+        let sample_rate = params.sample_rate.unwrap_or(0);
         let channels = params
             .channels
-            .ok_or("equalizer requires known channels")?
-            .count();
+            .map(|channels| channels.count())
+            .unwrap_or(0);
         Ok(Self {
             inner,
             params,
@@ -321,6 +322,7 @@ impl Decoder for EqualizerDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use symphonia::core::audio::{Channels, SignalSpec};
     use wotoha_core::automix::{
         AutoMixConfig, EqTransitionRole, TrackAnalysis, TransitionKind, plan_transition,
     };
@@ -379,6 +381,26 @@ mod tests {
             timeline.source_position(Duration::from_secs(2)),
             Duration::from_secs(14)
         );
+    }
+
+    #[test]
+    fn equalizer_decoder_uses_decoded_spec_when_initial_channel_metadata_is_missing() {
+        let mut params = CodecParameters::new();
+        params.sample_rate = Some(48_000);
+        params.channels = None;
+        let mut output = AudioBuffer::new(128, SignalSpec::new(48_000, Channels::FRONT_LEFT));
+        output.render_silence(Some(128));
+
+        let mut decoder = EqualizerDecoder::new(
+            Box::new(BufferedDecoder { params, output }),
+            EqualizerControl::new(true, Some(outgoing(Duration::ZERO))),
+        )
+        .expect("channel metadata may be missing before the first decoded buffer");
+
+        let packet = Packet::new_from_slice(0, 0, 128, &[]);
+        let decoded = decoder.decode(&packet).unwrap();
+        assert!(decoded.frames() > 0);
+        assert_eq!(decoded.spec().channels.count(), 1);
     }
 
     #[test]
@@ -605,5 +627,38 @@ mod tests {
             return 0.0;
         }
         (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    struct BufferedDecoder {
+        params: CodecParameters,
+        output: AudioBuffer<f32>,
+    }
+
+    impl Decoder for BufferedDecoder {
+        fn try_new(_params: &CodecParameters, _options: &DecoderOptions) -> SymphoniaResult<Self> {
+            unreachable!("test decoder is constructed directly")
+        }
+
+        fn supported_codecs() -> &'static [CodecDescriptor] {
+            &[]
+        }
+
+        fn reset(&mut self) {}
+
+        fn codec_params(&self) -> &CodecParameters {
+            &self.params
+        }
+
+        fn decode(&mut self, _packet: &Packet) -> SymphoniaResult<AudioBufferRef<'_>> {
+            Ok(self.output.as_audio_buffer_ref())
+        }
+
+        fn finalize(&mut self) -> FinalizeResult {
+            FinalizeResult::default()
+        }
+
+        fn last_decoded(&self) -> AudioBufferRef<'_> {
+            AudioBufferRef::F32(Cow::Borrowed(&self.output))
+        }
     }
 }
