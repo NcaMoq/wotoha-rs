@@ -324,6 +324,7 @@ pub struct AutoMixQualityReport {
     pub handoff_phrase_phase_error: Option<Duration>,
     pub phrase_boundary_bars: Option<u8>,
     pub structure_overlap_ratio: Option<f32>,
+    pub harmonic_compatibility: Option<f32>,
     pub low_handoff_min: Option<f32>,
     pub low_handoff_max: Option<f32>,
     pub vocal_overlap_samples_checked: usize,
@@ -1056,6 +1057,7 @@ pub fn evaluate_transition_quality(
         handoff_phrase_phase_error,
         phrase_boundary_bars,
         structure_overlap_ratio,
+        harmonic_compatibility: plan.harmonic_compatibility,
         low_handoff_min,
         low_handoff_max,
         vocal_overlap_samples_checked,
@@ -2050,12 +2052,21 @@ fn transition_start_energy_score(
 
 fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
     let energy_score = energy_balance_score(quality)?;
+    let harmonic_clash = harmonic_clash_amount(quality.harmonic_compatibility);
+    let vocal_penalty_weight = 0.8 + harmonic_clash * 0.6;
     let vocal_penalty = quality
         .max_dual_vocal_risk
         .filter(|risk| risk.is_finite())
-        .map(|risk| (risk / MAX_DUAL_VOCAL_RISK).clamp(0.0, 1.0).powi(2) * 0.8)
+        .map(|risk| (risk / MAX_DUAL_VOCAL_RISK).clamp(0.0, 1.0).powi(2) * vocal_penalty_weight)
         .unwrap_or(0.0);
-    let short_mix_penalty = MIN_NATURAL_MIX_OVERLAP
+    let minimum_natural_overlap = if harmonic_clash > 0.0 {
+        Duration::from_secs_f32(
+            (MIN_NATURAL_MIX_OVERLAP.as_secs_f32() * (1.0 - harmonic_clash * 0.5)).max(2.0),
+        )
+    } else {
+        MIN_NATURAL_MIX_OVERLAP
+    };
+    let short_mix_penalty = minimum_natural_overlap
         .checked_sub(quality.overlap)
         .map(|shortfall| shortfall.as_secs_f32() * 0.12)
         .unwrap_or(0.0);
@@ -2069,10 +2080,11 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|ratio| ratio.is_finite())
         .map(|ratio| (0.85 - ratio).max(0.0) * 3.0 + (ratio - 1.15).max(0.0) * 2.0)
         .unwrap_or(0.0);
+    let handoff_incoming_target = 0.7 + harmonic_clash * 0.1;
     let handoff_ownership_penalty = quality
         .handoff_incoming_mix_share
         .filter(|share| share.is_finite())
-        .map(|share| (0.7 - share).max(0.0) * 1.5)
+        .map(|share| (handoff_incoming_target - share).max(0.0) * (1.5 + harmonic_clash))
         .unwrap_or(0.0);
     let tempo_smoothness_penalty = quality
         .max_tempo_speed_step
@@ -2091,6 +2103,11 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|ratio| ratio.is_finite())
         .map(|ratio| (0.7 - ratio).max(0.0) * 0.12)
         .unwrap_or(0.0);
+    let harmonic_overlap_penalty = if harmonic_clash > 0.0 {
+        (quality.overlap.as_secs_f32() - 4.0).max(0.0) * 0.04 * harmonic_clash
+    } else {
+        0.0
+    };
     Some(
         energy_score
             + vocal_penalty
@@ -2100,8 +2117,16 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
             + handoff_ownership_penalty
             + tempo_smoothness_penalty
             + phrase_strength_penalty
-            + structure_usage_penalty,
+            + structure_usage_penalty
+            + harmonic_overlap_penalty,
     )
+}
+
+fn harmonic_clash_amount(score: Option<f32>) -> f32 {
+    score
+        .filter(|score| score.is_finite())
+        .map(|score| ((0.5 - score) / 0.5).clamp(0.0, 1.0))
+        .unwrap_or(0.0)
 }
 
 fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
@@ -4511,6 +4536,59 @@ mod tests {
             transition_start_score(&outgoing_owned).unwrap()
                 > transition_start_score(&quality).unwrap(),
             "quality={quality:?} outgoing_owned={outgoing_owned:?}"
+        );
+    }
+
+    #[test]
+    fn transition_score_weights_vocal_risk_more_when_keys_clash() {
+        let outgoing = keyed(0, KeyMode::Major);
+        let incoming = keyed(6, KeyMode::Major);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(4),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: Some(1.0),
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let mut compatible_quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        compatible_quality.max_dual_vocal_risk = Some(0.35);
+        let mut clashing_quality = compatible_quality.clone();
+        clashing_quality.harmonic_compatibility = Some(0.2);
+
+        assert!(
+            transition_start_score(&clashing_quality).unwrap()
+                > transition_start_score(&compatible_quality).unwrap(),
+            "compatible={compatible_quality:?} clashing={clashing_quality:?}"
+        );
+    }
+
+    #[test]
+    fn transition_score_allows_shorter_overlap_for_key_clashes() {
+        let outgoing = keyed(0, KeyMode::Major);
+        let incoming = keyed(6, KeyMode::Major);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(176),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(3),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: Some(1.0),
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let compatible_quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let mut clashing_quality = compatible_quality.clone();
+        clashing_quality.harmonic_compatibility = Some(0.2);
+
+        assert!(
+            transition_start_score(&clashing_quality).unwrap()
+                < transition_start_score(&compatible_quality).unwrap(),
+            "compatible={compatible_quality:?} clashing={clashing_quality:?}"
         );
     }
 
