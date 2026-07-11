@@ -20,6 +20,8 @@ const MIN_MARKER_BACKED_KICK_MARKERS: usize = 8;
 const MAX_AUDIBLE_PICKUP: Duration = Duration::from_millis(100);
 const MAX_LOW_ENERGY_INTRO_SKIP: Duration = Duration::from_secs(8);
 const MAX_SKIPPED_INTRO_VOCAL_RISK: f32 = 0.2;
+const MAX_SHORTER_TRANSITION_SEARCH: Duration = Duration::from_secs(8);
+const MIN_NATURAL_MIX_OVERLAP: Duration = Duration::from_secs(4);
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
@@ -1743,6 +1745,36 @@ fn select_energy_balanced_start(
             search_window,
             phase_bias,
         ));
+        if let Some(shorter_window) = shorter_transition_search_window(search_window, phase_bias) {
+            if harmonic_compatibility.is_none_or(|score| score >= 0.5)
+                && incoming.downbeat_confidence >= 0.25
+                && incoming.first_downbeat.is_some()
+            {
+                candidates.extend(matching_phrase_phase_candidates(
+                    outgoing,
+                    incoming,
+                    incoming_start,
+                    target,
+                    shorter_window,
+                    PhraseLength::FourBars,
+                    BarPhaseBias::AtOrAfter,
+                ));
+            }
+            candidates.extend(matching_bar_phase_candidates(
+                outgoing,
+                incoming,
+                incoming_start,
+                target,
+                shorter_window,
+                BarPhaseBias::AtOrAfter,
+            ));
+            candidates.extend(beat_start_candidates(
+                outgoing,
+                target,
+                shorter_window,
+                BarPhaseBias::AtOrAfter,
+            ));
+        }
     } else {
         candidates.extend(energy_grid_start_candidates(
             outgoing,
@@ -1875,7 +1907,11 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|risk| risk.is_finite())
         .map(|risk| (risk / MAX_DUAL_VOCAL_RISK).clamp(0.0, 1.0).powi(2) * 0.8)
         .unwrap_or(0.0);
-    Some(energy_score + vocal_penalty)
+    let short_mix_penalty = MIN_NATURAL_MIX_OVERLAP
+        .checked_sub(quality.overlap)
+        .map(|shortfall| shortfall.as_secs_f32() * 0.12)
+        .unwrap_or(0.0);
+    Some(energy_score + vocal_penalty + short_mix_penalty)
 }
 
 fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
@@ -1896,6 +1932,17 @@ fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
 
 fn has_energy_profile(analysis: &TrackAnalysis) -> bool {
     analysis.energy_profile_rate > 0 && !analysis.energy_profile.is_empty()
+}
+
+fn shorter_transition_search_window(
+    search_window: Duration,
+    phase_bias: BarPhaseBias,
+) -> Option<Duration> {
+    if !matches!(phase_bias, BarPhaseBias::AtOrBefore) {
+        return None;
+    }
+    let window = MAX_SHORTER_TRANSITION_SEARCH.min(search_window);
+    (window >= MIN_AUDIBLE_MIX_OVERLAP).then_some(window)
 }
 
 fn candidate_bounds(
@@ -4067,6 +4114,45 @@ mod tests {
         assert!(
             plan.outgoing_start < default_plan.outgoing_start,
             "default={default_plan:?} plan={plan:?}"
+        );
+        assert!(!quality.has_blocking_issue(), "quality={quality:?}");
+    }
+
+    #[test]
+    fn start_selection_can_shorten_transition_to_avoid_energy_buildup() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(172.0, 175.0, -6.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[]);
+        let default_start = Duration::from_secs(169);
+        let default_plan = TransitionPlan {
+            kind: TransitionKind::BeatMatched,
+            outgoing_start: default_start,
+            incoming_start: incoming.audible_start,
+            duration: outgoing.audible_end.saturating_sub(default_start),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: harmonic_compatibility(&outgoing, &incoming),
+            incoming_gain: recommended_incoming_gain(&outgoing, &incoming),
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let default_quality = evaluate_transition_quality(&outgoing, &incoming, &default_plan);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert!(
+            plan.outgoing_start > default_start,
+            "default={default_plan:?} plan={plan:?}"
+        );
+        assert!(
+            plan.duration < default_plan.duration,
+            "default={default_plan:?} plan={plan:?}"
+        );
+        assert!(
+            quality.max_mix_energy_ratio.unwrap() < default_quality.max_mix_energy_ratio.unwrap(),
+            "default_quality={default_quality:?} quality={quality:?}"
         );
         assert!(!quality.has_blocking_issue(), "quality={quality:?}");
     }
