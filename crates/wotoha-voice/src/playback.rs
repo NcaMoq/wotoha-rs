@@ -1372,6 +1372,7 @@ where
                     source_start: plan.outgoing_start,
                     duration: plan.duration,
                     role: EqTransitionRole::Outgoing,
+                    harmonic_compatibility: plan.harmonic_compatibility,
                 });
                 options.equalizer_transition = Some(EqTransition {
                     id,
@@ -1380,6 +1381,7 @@ where
                         envelope.source_elapsed(plan.duration)
                     }),
                     role: EqTransitionRole::Incoming,
+                    harmonic_compatibility: plan.harmonic_compatibility,
                 });
             }
         }

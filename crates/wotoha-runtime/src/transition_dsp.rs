@@ -333,6 +333,7 @@ mod tests {
             source_start: start,
             duration: Duration::from_secs(4),
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: None,
         }
     }
 
@@ -427,12 +428,14 @@ mod tests {
             source_start: plan.outgoing_start,
             duration: plan.duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: plan.harmonic_compatibility,
         };
         let incoming_transition = EqTransition {
             id: 91,
             source_start: plan.incoming_start,
             duration: envelope.source_elapsed(plan.duration),
             role: EqTransitionRole::Incoming,
+            harmonic_compatibility: plan.harmonic_compatibility,
         };
         let mut outgoing_samples =
             render_deck_segment(frames, SAMPLE_RATE, 120.0, plan.outgoing_start, None);

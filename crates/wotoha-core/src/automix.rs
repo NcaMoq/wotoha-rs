@@ -222,13 +222,14 @@ pub struct EqGains {
 }
 
 /// A source-timeline EQ automation used to exchange bass between overlapping decks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EqTransition {
     /// Stable identifier used to replace or cancel scheduled automation.
     pub id: u64,
     pub source_start: Duration,
     pub duration: Duration,
     pub role: EqTransitionRole,
+    pub harmonic_compatibility: Option<f32>,
 }
 
 impl EqTransition {
@@ -252,16 +253,17 @@ impl EqTransition {
         .clamp(0.0, 1.0);
         let bass_handoff = smoothstep((progress * 2.0).clamp(0.0, 1.0));
         let presence_handoff = smoothstep(progress);
+        let harmonic_duck = harmonic_presence_duck(self.harmonic_compatibility);
         let (low, mid, high) = match self.role {
             EqTransitionRole::Outgoing => (
                 1.0 - bass_handoff,
-                1.0 - 0.25 * presence_handoff,
-                1.0 - 0.18 * presence_handoff,
+                1.0 - (0.25 + harmonic_duck) * presence_handoff,
+                1.0 - (0.18 + harmonic_duck * 0.7) * presence_handoff,
             ),
             EqTransitionRole::Incoming => (
                 bass_handoff,
-                0.7 + 0.3 * presence_handoff,
-                0.82 + 0.18 * presence_handoff,
+                (0.7 - harmonic_duck) + (0.3 + harmonic_duck) * presence_handoff,
+                (0.82 - harmonic_duck * 0.7) + (0.18 + harmonic_duck * 0.7) * presence_handoff,
             ),
         };
 
@@ -276,6 +278,13 @@ impl EqTransition {
 fn smoothstep(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
     value * value * (3.0 - 2.0 * value)
+}
+
+fn harmonic_presence_duck(score: Option<f32>) -> f32 {
+    score
+        .filter(|score| score.is_finite())
+        .map(|score| ((0.5 - score) / 0.5).clamp(0.0, 1.0) * 0.2)
+        .unwrap_or(0.0)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1545,12 +1554,14 @@ fn low_handoff_range(plan: &TransitionPlan) -> (Option<f32>, Option<f32>) {
         source_start: plan.outgoing_start,
         duration: plan.duration,
         role: EqTransitionRole::Outgoing,
+        harmonic_compatibility: plan.harmonic_compatibility,
     };
     let incoming = EqTransition {
         id: 0,
         source_start: plan.incoming_start,
         duration: incoming_mix_source(plan),
         role: EqTransitionRole::Incoming,
+        harmonic_compatibility: plan.harmonic_compatibility,
     };
     let mut min_gain = f32::INFINITY;
     let mut max_gain = f32::NEG_INFINITY;
@@ -1616,6 +1627,7 @@ fn dual_vocal_overlap_report(
             source_start: plan.outgoing_start,
             duration: plan.duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: plan.harmonic_compatibility,
         }
         .gains_at(outgoing_position);
         let incoming_eq = EqTransition {
@@ -1623,6 +1635,7 @@ fn dual_vocal_overlap_report(
             source_start: plan.incoming_start,
             duration: incoming_mix_source(plan),
             role: EqTransitionRole::Incoming,
+            harmonic_compatibility: plan.harmonic_compatibility,
         }
         .gains_at(incoming_position);
         let outgoing_risk = effective_vocal_risk(outgoing, outgoing_position)
@@ -1717,6 +1730,7 @@ fn transition_energy_report(
             source_start: plan.outgoing_start,
             duration: plan.duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: plan.harmonic_compatibility,
         }
         .gains_at(outgoing_position);
         let incoming_eq = EqTransition {
@@ -1724,6 +1738,7 @@ fn transition_energy_report(
             source_start: plan.incoming_start,
             duration: incoming_mix_source(plan),
             role: EqTransitionRole::Incoming,
+            harmonic_compatibility: plan.harmonic_compatibility,
         }
         .gains_at(incoming_position);
         let outgoing_level = outgoing_energy * outgoing_mix_gain * full_band_gain(outgoing_eq);
@@ -3149,6 +3164,7 @@ mod tests {
             source_start: start,
             duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: None,
         };
         let incoming = EqTransition {
             role: EqTransitionRole::Incoming,
@@ -3207,6 +3223,7 @@ mod tests {
             source_start: start,
             duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: None,
         };
         let incoming = EqTransition {
             role: EqTransitionRole::Incoming,
@@ -3226,6 +3243,32 @@ mod tests {
     }
 
     #[test]
+    fn equalizer_transition_ducks_presence_more_for_incompatible_keys() {
+        let start = Duration::from_secs(10);
+        let duration = Duration::from_secs(8);
+        let neutral = EqTransition {
+            id: 1,
+            source_start: start,
+            duration,
+            role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: None,
+        };
+        let clashing = EqTransition {
+            harmonic_compatibility: Some(0.2),
+            ..neutral
+        };
+        let midpoint = start + duration / 2;
+
+        assert!(
+            vocal_band_gain(clashing.gains_at(midpoint))
+                < vocal_band_gain(neutral.gains_at(midpoint)),
+            "neutral={:?} clashing={:?}",
+            neutral.gains_at(midpoint),
+            clashing.gains_at(midpoint)
+        );
+    }
+
+    #[test]
     fn equalizer_transition_is_clamped_and_zero_duration_is_safe() {
         for role in [EqTransitionRole::Outgoing, EqTransitionRole::Incoming] {
             let transition = EqTransition {
@@ -3233,6 +3276,7 @@ mod tests {
                 source_start: Duration::from_secs(5),
                 duration: Duration::from_secs(4),
                 role,
+                harmonic_compatibility: None,
             };
             for position in [
                 Duration::ZERO,

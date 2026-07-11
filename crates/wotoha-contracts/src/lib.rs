@@ -344,6 +344,7 @@ mod tests {
             source_start: Duration::from_secs(3),
             duration: Duration::from_secs(4),
             role: wotoha_core::automix::EqTransitionRole::Incoming,
+            harmonic_compatibility: None,
         };
         assert!(!handle.schedule_equalizer_transition(transition));
         handle.cancel_equalizer_transition(transition.id);

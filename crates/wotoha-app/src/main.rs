@@ -892,6 +892,7 @@ mod tests {
             source_start: Duration::from_secs(30),
             duration: Duration::from_secs(8),
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: None,
         };
 
         assert!(handle.schedule_equalizer_transition(transition));

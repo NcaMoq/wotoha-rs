@@ -132,6 +132,7 @@ pub(crate) fn render_automix_preview_inputs(
             source_start: plan.outgoing_start,
             duration: plan.duration,
             role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: plan.harmonic_compatibility,
         },
     );
     apply_equalizer(
@@ -147,6 +148,7 @@ pub(crate) fn render_automix_preview_inputs(
             source_start: plan.incoming_start,
             duration: incoming_source_duration,
             role: EqTransitionRole::Incoming,
+            harmonic_compatibility: plan.harmonic_compatibility,
         },
     );
 
