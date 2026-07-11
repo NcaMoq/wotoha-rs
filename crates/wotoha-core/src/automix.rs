@@ -322,6 +322,7 @@ pub struct AutoMixQualityReport {
     pub max_mix_energy_ratio: Option<f32>,
     pub max_mix_energy_step: Option<f32>,
     pub handoff_mix_energy_ratio: Option<f32>,
+    pub max_tempo_speed_step: Option<f32>,
 }
 
 impl AutoMixQualityReport {
@@ -916,6 +917,7 @@ pub fn evaluate_transition_quality(
     let mut max_mix_energy_ratio = None;
     let mut max_mix_energy_step = None;
     let mut handoff_mix_energy_ratio = None;
+    let max_tempo_speed_step = tempo_speed_step(plan.tempo_envelope);
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
     if plan.kind != TransitionKind::Gapless {
@@ -1046,7 +1048,29 @@ pub fn evaluate_transition_quality(
         max_mix_energy_ratio,
         max_mix_energy_step,
         handoff_mix_energy_ratio,
+        max_tempo_speed_step,
     }
+}
+
+fn tempo_speed_step(envelope: Option<TempoEnvelope>) -> Option<f32> {
+    let envelope = envelope?;
+    let mut previous = envelope.initial_speed;
+    if !previous.is_finite() {
+        return None;
+    }
+    let mut max_step = 0.0_f32;
+    for segment in &envelope.phase_segments[..usize::from(envelope.phase_segment_count)] {
+        if !segment.speed.is_finite() || !previous.is_finite() {
+            return None;
+        }
+        max_step = max_step.max((segment.speed - previous).abs());
+        previous = segment.speed;
+    }
+    if !envelope.mix_end_speed.is_finite() || !max_step.is_finite() {
+        return None;
+    }
+    max_step = max_step.max((envelope.mix_end_speed - previous).abs());
+    Some(max_step)
 }
 
 #[derive(Clone, Copy)]
@@ -1942,12 +1966,18 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|ratio| ratio.is_finite())
         .map(|ratio| (0.85 - ratio).max(0.0) * 3.0 + (ratio - 1.15).max(0.0) * 2.0)
         .unwrap_or(0.0);
+    let tempo_smoothness_penalty = quality
+        .max_tempo_speed_step
+        .filter(|step| step.is_finite())
+        .map(|step| (step - 0.015).max(0.0) * 8.0)
+        .unwrap_or(0.0);
     Some(
         energy_score
             + vocal_penalty
             + short_mix_penalty
             + energy_step_penalty
-            + handoff_energy_penalty,
+            + handoff_energy_penalty
+            + tempo_smoothness_penalty,
     )
 }
 
@@ -3828,6 +3858,55 @@ mod tests {
             let source = envelope.source_elapsed(output);
             assert!(envelope.output_elapsed(source).abs_diff(output) < Duration::from_micros(2));
         }
+    }
+
+    #[test]
+    fn transition_score_penalizes_abrupt_tempo_speed_steps() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+        let mut smooth_plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: Some(TempoEnvelope::new(
+                1.0,
+                1.0,
+                Duration::from_secs(8),
+                Duration::ZERO,
+            )),
+            energy_selection: None,
+        };
+        let smooth_quality = evaluate_transition_quality(&outgoing, &incoming, &smooth_plan);
+        smooth_plan.tempo_envelope = Some(
+            TempoEnvelope::new(1.0, 1.04, Duration::from_secs(8), Duration::ZERO)
+                .with_phase_segments(&[
+                    TempoSegment {
+                        output_end: Duration::from_secs(4),
+                        speed: 0.96,
+                    },
+                    TempoSegment {
+                        output_end: Duration::from_secs(8),
+                        speed: 1.04,
+                    },
+                ]),
+        );
+        let abrupt_quality = evaluate_transition_quality(&outgoing, &incoming, &smooth_plan);
+
+        assert_eq!(smooth_quality.max_tempo_speed_step, Some(0.0));
+        assert!(
+            abrupt_quality.max_tempo_speed_step.unwrap()
+                > smooth_quality.max_tempo_speed_step.unwrap(),
+            "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
+        );
+        assert!(
+            transition_start_score(&abrupt_quality).unwrap()
+                > transition_start_score(&smooth_quality).unwrap(),
+            "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
+        );
     }
 
     #[test]
