@@ -17,6 +17,9 @@ const MAX_ENERGY_START_CANDIDATES: usize = 96;
 const MIN_MARKER_BACKED_BEAT_CONFIDENCE: f32 = 0.45;
 const MIN_MARKER_BACKED_KICK_COVERAGE: f32 = 0.55;
 const MIN_MARKER_BACKED_KICK_MARKERS: usize = 8;
+const MAX_AUDIBLE_PICKUP: Duration = Duration::from_millis(100);
+const MAX_LOW_ENERGY_INTRO_SKIP: Duration = Duration::from_secs(8);
+const MAX_SKIPPED_INTRO_VOCAL_RISK: f32 = 0.2;
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 const MIX_PEAK_HEADROOM_DBFS: f32 = -1.0;
 
@@ -612,21 +615,8 @@ pub fn plan_transition(
         return gapless_plan(outgoing, incoming);
     }
 
-    let available_outgoing = outgoing.audible_end.saturating_sub(outgoing.audible_start);
-    let available_incoming = incoming.audible_end.saturating_sub(incoming.audible_start);
-    let Some(timing) =
-        plan_transition_timing(available_outgoing, available_incoming, config.crossfade)
-    else {
-        return gapless_plan(outgoing, incoming);
-    };
     let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
     let incoming_gain = recommended_incoming_gain(outgoing, incoming);
-    let base_duration = if harmonic_compatibility.is_some_and(|score| score < 0.5) {
-        timing.fade_duration.min(Duration::from_secs(4))
-    } else {
-        timing.fade_duration
-    };
-    let structured_duration = trusted_structure_overlap(outgoing, incoming, base_duration);
     let incoming_beat_start = safe_incoming_beat_start(incoming);
     let tempo_curve =
         incoming_beat_start.and_then(|_| compatible_tempo_curve(outgoing, incoming, config));
@@ -637,6 +627,20 @@ pub fn plan_transition(
     } else {
         incoming.audible_start
     };
+    let available_outgoing = outgoing.audible_end.saturating_sub(outgoing.audible_start);
+    let available_incoming = incoming.audible_end.saturating_sub(incoming_start);
+    let Some(timing) =
+        plan_transition_timing(available_outgoing, available_incoming, config.crossfade)
+    else {
+        return gapless_plan(outgoing, incoming);
+    };
+    let base_duration = if harmonic_compatibility.is_some_and(|score| score < 0.5) {
+        timing.fade_duration.min(Duration::from_secs(4))
+    } else {
+        timing.fade_duration
+    };
+    let structured_duration =
+        trusted_structure_overlap(outgoing, incoming, incoming_start, base_duration);
     let mut target_duration = structured_duration.unwrap_or(base_duration);
     let preliminary_envelope = tempo_curve
         .map(|(start, end)| TempoEnvelope::new(start, end, target_duration, Duration::ZERO));
@@ -2189,6 +2193,7 @@ fn build_tempo_envelope(
 fn trusted_structure_overlap(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
+    incoming_start: Duration,
     maximum: Duration,
 ) -> Option<Duration> {
     const MINIMUM: Duration = Duration::from_secs(1);
@@ -2199,20 +2204,81 @@ fn trusted_structure_overlap(
         .intro_end
         .filter(|_| incoming.intro_confidence >= 0.65)?;
     let outgoing_span = outgoing.audible_end.saturating_sub(outgoing_start);
-    let incoming_span = incoming_end.saturating_sub(incoming.audible_start);
+    let incoming_span = incoming_end.saturating_sub(incoming_start);
     let duration = maximum.min(outgoing_span).min(incoming_span);
     (duration >= MINIMUM).then_some(duration)
 }
 
 fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
-    const MAX_AUDIBLE_PICKUP: Duration = Duration::from_millis(100);
-    let candidate = first_trusted_downbeat_after_audible_start(incoming, MAX_AUDIBLE_PICKUP)
-        .or_else(|| first_trusted_beat_marker_after_audible_start(incoming, MAX_AUDIBLE_PICKUP))
+    if let Some(candidate) =
+        first_trusted_downbeat_after_audible_start(incoming, MAX_AUDIBLE_PICKUP)
+            .or_else(|| first_trusted_beat_marker_after_audible_start(incoming, MAX_AUDIBLE_PICKUP))
+            .or(incoming.first_beat)
+            .filter(|candidate| {
+                *candidate >= incoming.audible_start
+                    && candidate.saturating_sub(incoming.audible_start) <= MAX_AUDIBLE_PICKUP
+            })
+    {
+        return (!known_vocal_risk_between(incoming, incoming.audible_start, candidate))
+            .then_some(candidate);
+    }
+
+    let candidate = first_trusted_downbeat_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
+        .or_else(|| {
+            first_trusted_beat_marker_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
+        })
         .or(incoming.first_beat)?;
-    (candidate >= incoming.audible_start
-        && candidate.saturating_sub(incoming.audible_start) <= MAX_AUDIBLE_PICKUP)
-        .then_some(candidate)
-        .filter(|candidate| !known_vocal_risk_between(incoming, incoming.audible_start, *candidate))
+    safe_to_skip_low_energy_intro(incoming, candidate).then_some(candidate)
+}
+
+fn safe_to_skip_low_energy_intro(incoming: &TrackAnalysis, candidate: Duration) -> bool {
+    if candidate <= incoming.audible_start
+        || candidate.saturating_sub(incoming.audible_start) > MAX_LOW_ENERGY_INTRO_SKIP
+        || candidate >= incoming.audible_end
+    {
+        return false;
+    }
+    if max_vocal_risk_between(incoming, incoming.audible_start, candidate)
+        .is_none_or(|risk| risk > MAX_SKIPPED_INTRO_VOCAL_RISK)
+    {
+        return false;
+    }
+    let before = average_energy_between(incoming, incoming.audible_start, candidate, 12);
+    let after = average_energy_between(
+        incoming,
+        candidate,
+        incoming
+            .audible_end
+            .min(candidate.saturating_add(Duration::from_secs(2))),
+        8,
+    );
+    let Some((before, after)) = before.zip(after) else {
+        return false;
+    };
+    before.is_finite() && after.is_finite() && after > 1.0e-6 && before <= after * 0.45
+}
+
+fn average_energy_between(
+    analysis: &TrackAnalysis,
+    start: Duration,
+    end: Duration,
+    samples: u32,
+) -> Option<f32> {
+    if end <= start || samples == 0 {
+        return None;
+    }
+    let span = end.saturating_sub(start);
+    let mut total = 0.0;
+    let mut checked = 0;
+    for index in 0..samples {
+        let position =
+            start.saturating_add(span.mul_f64((f64::from(index) + 0.5) / f64::from(samples)));
+        if let Some(energy) = energy_at(analysis, position).filter(|energy| energy.is_finite()) {
+            total += energy;
+            checked += 1;
+        }
+    }
+    (checked > 0).then_some(total / checked as f32)
 }
 
 fn first_trusted_downbeat_after_audible_start(
@@ -2321,16 +2387,20 @@ fn summarize_vocals(analysis: &TrackAnalysis) -> VocalSummary {
 }
 
 fn known_vocal_risk_between(analysis: &TrackAnalysis, start: Duration, end: Duration) -> bool {
+    max_vocal_risk_between(analysis, start, end).is_some_and(|risk| risk >= 0.58)
+}
+
+fn max_vocal_risk_between(analysis: &TrackAnalysis, start: Duration, end: Duration) -> Option<f32> {
     let summary = summarize_vocals(analysis);
     if !summary.known || end <= start {
-        return false;
+        return None;
     }
     let rate = f64::from(analysis.vocal_activity_rate);
     let first = (start.as_secs_f64() * rate).floor() as usize;
     let last = (end.as_secs_f64() * rate).ceil() as usize;
-    (first..last.min(analysis.vocal_activity.len())).any(|index| {
-        effective_vocal_risk(analysis, Duration::from_secs_f64(index as f64 / rate)) >= 0.58
-    })
+    (first..last.min(analysis.vocal_activity.len()))
+        .map(|index| effective_vocal_risk(analysis, Duration::from_secs_f64(index as f64 / rate)))
+        .reduce(f32::max)
 }
 
 fn vocal_overlap_limit(
@@ -3430,6 +3500,48 @@ mod tests {
         assert_eq!(plan.incoming_start, Duration::from_millis(1_050));
         assert!(!quality.has_blocking_issue(), "report={quality:?}");
         assert!(guarded.rejected_plan.is_none(), "guarded={guarded:?}");
+    }
+
+    #[test]
+    fn beatmatch_skips_safe_low_energy_intro_to_first_downbeat() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.first_beat = Some(Duration::from_secs(5));
+        incoming.first_downbeat = Some(Duration::from_secs(5));
+        incoming.beat_markers = (0..350)
+            .map(|index| Duration::from_secs_f32(5.0 + index as f32 * 0.5))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 5.0, -50.0)]);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.incoming_start, Duration::from_secs(5));
+        assert!(
+            !quality.has_blocking_issue(),
+            "plan={plan:?} quality={quality:?}"
+        );
+    }
+
+    #[test]
+    fn low_energy_intro_skip_keeps_vocal_pickup_intact() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.first_beat = Some(Duration::from_secs(5));
+        incoming.first_downbeat = Some(Duration::from_secs(5));
+        incoming.beat_markers = (0..350)
+            .map(|index| Duration::from_secs_f32(5.0 + index as f32 * 0.5))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 5.0, -50.0)]);
+        set_soft_vocal_ranges(&mut incoming, &[(1.0, 5.0)], 0.3);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+
+        assert_eq!(plan.kind, TransitionKind::Crossfade);
+        assert_eq!(plan.incoming_start, incoming.audible_start);
     }
 
     #[test]
