@@ -236,9 +236,8 @@ impl EqTransition {
     ///
     /// The incoming deck starts with its low band removed and restores it by the
     /// midpoint. The outgoing deck performs the complementary bass handoff.
-    /// The incoming mid/high bands open during the first half. The outgoing
-    /// mid/high bands remain clear through the bass handoff, then recede during
-    /// the second half while the regular crossfade owns the overall level.
+    /// The mid/high bands cross over through the whole overlap so vocal and
+    /// presence-heavy content does not stay fully open on both decks at once.
     pub fn gains_at(self, timeline_position: Duration) -> EqGains {
         let progress = if timeline_position < self.source_start {
             0.0
@@ -252,17 +251,17 @@ impl EqTransition {
         }
         .clamp(0.0, 1.0);
         let bass_handoff = smoothstep((progress * 2.0).clamp(0.0, 1.0));
-        let outgoing_recede = smoothstep(((progress - 0.5) * 2.0).clamp(0.0, 1.0));
+        let presence_handoff = smoothstep(progress);
         let (low, mid, high) = match self.role {
             EqTransitionRole::Outgoing => (
                 1.0 - bass_handoff,
-                1.0 - 0.3 * outgoing_recede,
-                1.0 - 0.2 * outgoing_recede,
+                1.0 - 0.25 * presence_handoff,
+                1.0 - 0.18 * presence_handoff,
             ),
             EqTransitionRole::Incoming => (
                 bass_handoff,
-                0.65 + 0.35 * bass_handoff,
-                0.8 + 0.2 * bass_handoff,
+                0.7 + 0.3 * presence_handoff,
+                0.82 + 0.18 * presence_handoff,
             ),
         };
 
@@ -3075,36 +3074,28 @@ mod tests {
             }
         );
         assert_eq!(incoming.gains_at(start).low, 0.0);
-        assert_eq!(incoming.gains_at(start).mid, 0.65);
-        assert_eq!(incoming.gains_at(start).high, 0.8);
+        assert_eq!(incoming.gains_at(start).mid, 0.7);
+        assert_eq!(incoming.gains_at(start).high, 0.82);
 
         let quarter = start + duration / 4;
         assert!((outgoing.gains_at(quarter).low - 0.5).abs() < f32::EPSILON);
         assert!((incoming.gains_at(quarter).low - 0.5).abs() < f32::EPSILON);
 
         let midpoint = start + duration / 2;
-        assert_eq!(
-            outgoing.gains_at(midpoint),
-            EqGains {
-                low: 0.0,
-                mid: 1.0,
-                high: 1.0,
-            }
-        );
-        assert_eq!(
-            incoming.gains_at(midpoint),
-            EqGains {
-                low: 1.0,
-                mid: 1.0,
-                high: 1.0,
-            }
-        );
+        let outgoing_midpoint = outgoing.gains_at(midpoint);
+        assert_eq!(outgoing_midpoint.low, 0.0);
+        assert!((outgoing_midpoint.mid - 0.875).abs() < 0.0001);
+        assert!((outgoing_midpoint.high - 0.91).abs() < 0.0001);
+        let incoming_midpoint = incoming.gains_at(midpoint);
+        assert_eq!(incoming_midpoint.low, 1.0);
+        assert!((incoming_midpoint.mid - 0.85).abs() < 0.0001);
+        assert!((incoming_midpoint.high - 0.91).abs() < 0.0001);
         assert_eq!(
             outgoing.gains_at(start + duration),
             EqGains {
                 low: 0.0,
-                mid: 0.7,
-                high: 0.8,
+                mid: 0.75,
+                high: 0.82,
             }
         );
         assert_eq!(
@@ -3114,6 +3105,33 @@ mod tests {
                 mid: 1.0,
                 high: 1.0,
             }
+        );
+    }
+
+    #[test]
+    fn equalizer_transition_ducks_vocal_band_overlap_at_midpoint() {
+        let start = Duration::from_secs(10);
+        let duration = Duration::from_secs(8);
+        let outgoing = EqTransition {
+            id: 1,
+            source_start: start,
+            duration,
+            role: EqTransitionRole::Outgoing,
+        };
+        let incoming = EqTransition {
+            role: EqTransitionRole::Incoming,
+            ..outgoing
+        };
+        let midpoint = start + duration / 2;
+
+        let outgoing_vocal = vocal_band_gain(outgoing.gains_at(midpoint));
+        let incoming_vocal = vocal_band_gain(incoming.gains_at(midpoint));
+
+        assert!(outgoing_vocal < 0.9, "outgoing_vocal={outgoing_vocal}");
+        assert!(incoming_vocal < 0.9, "incoming_vocal={incoming_vocal}");
+        assert!(
+            outgoing_vocal + incoming_vocal < 1.8,
+            "outgoing_vocal={outgoing_vocal} incoming_vocal={incoming_vocal}"
         );
     }
 
@@ -3344,7 +3362,7 @@ mod tests {
         );
         assert!(report.energy_samples_checked > 0, "report={report:?}");
         assert!(
-            report.min_mix_energy_ratio.unwrap() >= 0.75,
+            report.min_mix_energy_ratio.unwrap() >= 0.7,
             "report={report:?}"
         );
         assert!(
@@ -4047,7 +4065,7 @@ mod tests {
         assert_eq!(energy_selection.selected_start, plan.outgoing_start);
         assert!(energy_selection.candidates_checked > 1);
         assert!(
-            report.min_mix_energy_ratio.unwrap() > 0.6,
+            report.min_mix_energy_ratio.unwrap() > 0.55,
             "plan={plan:?} report={report:?}"
         );
         assert!(!report.has_blocking_issue(), "report={report:?}");
@@ -4073,7 +4091,7 @@ mod tests {
         assert_eq!(energy_selection.selected_start, plan.outgoing_start);
         assert!(energy_selection.candidates_checked > 1);
         assert!(
-            report.min_mix_energy_ratio.unwrap() > 0.6,
+            report.min_mix_energy_ratio.unwrap() > 0.55,
             "plan={plan:?} report={report:?}"
         );
         assert!(!report.has_blocking_issue(), "report={report:?}");
