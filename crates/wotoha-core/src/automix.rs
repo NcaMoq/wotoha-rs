@@ -351,6 +351,21 @@ impl AutoMixQualityReport {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoMixScoreBreakdown {
+    pub total: f32,
+    pub energy_balance_penalty: f32,
+    pub vocal_penalty: f32,
+    pub short_mix_penalty: f32,
+    pub energy_step_penalty: f32,
+    pub handoff_energy_penalty: f32,
+    pub handoff_ownership_penalty: f32,
+    pub tempo_smoothness_penalty: f32,
+    pub phrase_strength_penalty: f32,
+    pub structure_usage_penalty: f32,
+    pub harmonic_overlap_penalty: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AutoMixQualityIssue {
     MixOverlapTooShort {
         overlap: Duration,
@@ -2050,8 +2065,8 @@ fn transition_start_energy_score(
     transition_start_score(&quality).map(|score| (outgoing_start, score))
 }
 
-fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
-    let energy_score = energy_balance_score(quality)?;
+pub fn transition_score_breakdown(quality: &AutoMixQualityReport) -> Option<AutoMixScoreBreakdown> {
+    let energy_balance_penalty = energy_balance_score(quality)?;
     let harmonic_clash = harmonic_clash_amount(quality.harmonic_compatibility);
     let vocal_penalty_weight = 0.8 + harmonic_clash * 0.6;
     let vocal_penalty = quality
@@ -2108,18 +2123,33 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
     } else {
         0.0
     };
-    Some(
-        energy_score
-            + vocal_penalty
-            + short_mix_penalty
-            + energy_step_penalty
-            + handoff_energy_penalty
-            + handoff_ownership_penalty
-            + tempo_smoothness_penalty
-            + phrase_strength_penalty
-            + structure_usage_penalty
-            + harmonic_overlap_penalty,
-    )
+    let total = energy_balance_penalty
+        + vocal_penalty
+        + short_mix_penalty
+        + energy_step_penalty
+        + handoff_energy_penalty
+        + handoff_ownership_penalty
+        + tempo_smoothness_penalty
+        + phrase_strength_penalty
+        + structure_usage_penalty
+        + harmonic_overlap_penalty;
+    Some(AutoMixScoreBreakdown {
+        total,
+        energy_balance_penalty,
+        vocal_penalty,
+        short_mix_penalty,
+        energy_step_penalty,
+        handoff_energy_penalty,
+        handoff_ownership_penalty,
+        tempo_smoothness_penalty,
+        phrase_strength_penalty,
+        structure_usage_penalty,
+        harmonic_overlap_penalty,
+    })
+}
+
+fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
+    transition_score_breakdown(quality).map(|breakdown| breakdown.total)
 }
 
 fn harmonic_clash_amount(score: Option<f32>) -> f32 {
@@ -4166,6 +4196,46 @@ mod tests {
             transition_start_score(&abrupt_quality).unwrap()
                 > transition_start_score(&smooth_quality).unwrap(),
             "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
+        );
+    }
+
+    #[test]
+    fn transition_score_breakdown_matches_total_score() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let breakdown = transition_score_breakdown(&quality).unwrap();
+        let component_sum = [
+            breakdown.energy_balance_penalty,
+            breakdown.vocal_penalty,
+            breakdown.short_mix_penalty,
+            breakdown.energy_step_penalty,
+            breakdown.handoff_energy_penalty,
+            breakdown.handoff_ownership_penalty,
+            breakdown.tempo_smoothness_penalty,
+            breakdown.phrase_strength_penalty,
+            breakdown.structure_usage_penalty,
+            breakdown.harmonic_overlap_penalty,
+        ]
+        .into_iter()
+        .sum::<f32>();
+
+        assert!((breakdown.total - component_sum).abs() < f32::EPSILON);
+        assert_eq!(
+            transition_start_score(&quality).unwrap(),
+            breakdown.total,
+            "quality={quality:?} breakdown={breakdown:?}"
         );
     }
 

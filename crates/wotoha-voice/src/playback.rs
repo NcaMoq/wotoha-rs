@@ -27,7 +27,7 @@ use wotoha_core::{
     automix::{
         AutoMixConfig, EqTransition, EqTransitionRole, TempoEnvelope, TrackAnalysis,
         TransitionKind, TransitionTiming, explain_beatmatch_decision, plan_guarded_transition,
-        plan_transition_timing,
+        plan_transition_timing, transition_score_breakdown,
     },
     debug::append_debug_log,
 };
@@ -1297,6 +1297,7 @@ where
                     "AutoMix transition quality guard applied"
                 );
             }
+            let score_breakdown = transition_score_breakdown(quality);
             info!(
                 guild_id = guild_id.get(),
                 transition_kind = ?plan.kind,
@@ -1333,6 +1334,26 @@ where
                 tempo_end_ratio = plan
                     .tempo_envelope
                     .map_or(plan.incoming_tempo_ratio, |envelope| envelope.mix_end_speed),
+                transition_score = score_breakdown.map(|breakdown| breakdown.total),
+                score_energy_balance_penalty = score_breakdown
+                    .map(|breakdown| breakdown.energy_balance_penalty),
+                score_vocal_penalty = score_breakdown.map(|breakdown| breakdown.vocal_penalty),
+                score_short_mix_penalty = score_breakdown
+                    .map(|breakdown| breakdown.short_mix_penalty),
+                score_energy_step_penalty = score_breakdown
+                    .map(|breakdown| breakdown.energy_step_penalty),
+                score_handoff_energy_penalty = score_breakdown
+                    .map(|breakdown| breakdown.handoff_energy_penalty),
+                score_handoff_ownership_penalty = score_breakdown
+                    .map(|breakdown| breakdown.handoff_ownership_penalty),
+                score_tempo_smoothness_penalty = score_breakdown
+                    .map(|breakdown| breakdown.tempo_smoothness_penalty),
+                score_phrase_strength_penalty = score_breakdown
+                    .map(|breakdown| breakdown.phrase_strength_penalty),
+                score_structure_usage_penalty = score_breakdown
+                    .map(|breakdown| breakdown.structure_usage_penalty),
+                score_harmonic_overlap_penalty = score_breakdown
+                    .map(|breakdown| breakdown.harmonic_overlap_penalty),
                 quality_issues = ?quality.issues,
                 beat_pairs_checked = quality.beat_pairs_checked,
                 max_beat_phase_error_ms = quality

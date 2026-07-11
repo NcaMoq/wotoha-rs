@@ -7,7 +7,7 @@ use songbird::Songbird;
 use wotoha_contracts::VoiceRuntime;
 use wotoha_core::{
     TrackRequest,
-    automix::{AutoMixConfig, TrackAnalysis, plan_guarded_transition},
+    automix::{AutoMixConfig, TrackAnalysis, plan_guarded_transition, transition_score_breakdown},
 };
 use wotoha_media::MediaResolver;
 use wotoha_runtime::SongbirdRuntime;
@@ -183,8 +183,9 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
         let guarded = plan_guarded_transition(outgoing_analysis, incoming_analysis, &config);
         let plan = &guarded.plan;
         let quality = &guarded.quality;
+        let score_breakdown = transition_score_breakdown(quality);
         println!(
-            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\tharmonic_compatibility={}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
+            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\ttransition_score={}\tscore_energy_balance_penalty={}\tscore_vocal_penalty={}\tscore_short_mix_penalty={}\tscore_energy_step_penalty={}\tscore_handoff_energy_penalty={}\tscore_handoff_ownership_penalty={}\tscore_tempo_smoothness_penalty={}\tscore_phrase_strength_penalty={}\tscore_structure_usage_penalty={}\tscore_harmonic_overlap_penalty={}\tharmonic_compatibility={}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
             outgoing.index,
             incoming.index,
             track_key(outgoing),
@@ -208,6 +209,23 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
             plan.incoming_gain,
             quality.is_ok(),
             quality.issues,
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.total)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.energy_balance_penalty)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.vocal_penalty)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.short_mix_penalty)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.energy_step_penalty)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.handoff_energy_penalty)),
+            format_optional_f32(
+                score_breakdown.map(|breakdown| breakdown.handoff_ownership_penalty),
+            ),
+            format_optional_f32(
+                score_breakdown.map(|breakdown| breakdown.tempo_smoothness_penalty)
+            ),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.phrase_strength_penalty)),
+            format_optional_f32(score_breakdown.map(|breakdown| breakdown.structure_usage_penalty)),
+            format_optional_f32(
+                score_breakdown.map(|breakdown| breakdown.harmonic_overlap_penalty)
+            ),
             format_optional_f32(quality.harmonic_compatibility),
             quality.beat_pairs_checked,
             format_optional_duration_ms(quality.max_beat_phase_error),
