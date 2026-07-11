@@ -320,6 +320,7 @@ pub struct AutoMixQualityReport {
     pub energy_samples_checked: usize,
     pub min_mix_energy_ratio: Option<f32>,
     pub max_mix_energy_ratio: Option<f32>,
+    pub max_mix_energy_step: Option<f32>,
 }
 
 impl AutoMixQualityReport {
@@ -912,6 +913,7 @@ pub fn evaluate_transition_quality(
     let mut energy_samples_checked = 0;
     let mut min_mix_energy_ratio = None;
     let mut max_mix_energy_ratio = None;
+    let mut max_mix_energy_step = None;
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
     if plan.kind != TransitionKind::Gapless {
@@ -965,6 +967,7 @@ pub fn evaluate_transition_quality(
         energy_samples_checked = energy.samples;
         min_mix_energy_ratio = energy.min_ratio;
         max_mix_energy_ratio = energy.max_ratio;
+        max_mix_energy_step = energy.max_step;
     }
 
     if plan.kind == TransitionKind::BeatMatched {
@@ -1038,6 +1041,7 @@ pub fn evaluate_transition_quality(
         energy_samples_checked,
         min_mix_energy_ratio,
         max_mix_energy_ratio,
+        max_mix_energy_step,
     }
 }
 
@@ -1612,6 +1616,7 @@ struct TransitionEnergyReport {
     samples: usize,
     min_ratio: Option<f32>,
     max_ratio: Option<f32>,
+    max_step: Option<f32>,
 }
 
 fn transition_energy_report(
@@ -1625,6 +1630,7 @@ fn transition_energy_report(
             samples: 0,
             min_ratio: None,
             max_ratio: None,
+            max_step: None,
         };
     }
     let outgoing_reference = energy_at(outgoing, plan.outgoing_start);
@@ -1642,12 +1648,15 @@ fn transition_energy_report(
             samples: 0,
             min_ratio: None,
             max_ratio: None,
+            max_step: None,
         };
     };
 
     let mut samples = 0;
     let mut min_ratio = f32::INFINITY;
     let mut max_ratio = f32::NEG_INFINITY;
+    let mut previous_ratio: Option<f32> = None;
+    let mut max_step = 0.0_f32;
     for index in 0..=SAMPLES {
         let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
         let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
@@ -1686,12 +1695,17 @@ fn transition_energy_report(
         samples += 1;
         min_ratio = min_ratio.min(combined);
         max_ratio = max_ratio.max(combined);
+        if let Some(previous) = previous_ratio {
+            max_step = max_step.max((combined - previous).abs());
+        }
+        previous_ratio = Some(combined);
     }
 
     TransitionEnergyReport {
         samples,
         min_ratio: (samples > 0).then_some(min_ratio),
         max_ratio: (samples > 0).then_some(max_ratio),
+        max_step: (samples > 1).then_some(max_step),
     }
 }
 
@@ -1910,7 +1924,12 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .checked_sub(quality.overlap)
         .map(|shortfall| shortfall.as_secs_f32() * 0.12)
         .unwrap_or(0.0);
-    Some(energy_score + vocal_penalty + short_mix_penalty)
+    let energy_step_penalty = quality
+        .max_mix_energy_step
+        .filter(|step| step.is_finite())
+        .map(|step| (step - 0.12).max(0.0) * 2.0)
+        .unwrap_or(0.0);
+    Some(energy_score + vocal_penalty + short_mix_penalty + energy_step_penalty)
 }
 
 fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
@@ -4042,6 +4061,40 @@ mod tests {
         assert!(
             report.min_mix_energy_ratio.unwrap() < 0.2,
             "report={report:?}"
+        );
+    }
+
+    #[test]
+    fn energy_score_penalizes_abrupt_mid_mix_level_changes() {
+        let smooth_outgoing = analyzed(120.0);
+        let smooth_incoming = analyzed(120.0);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let smooth_quality = evaluate_transition_quality(&smooth_outgoing, &smooth_incoming, &plan);
+
+        let mut abrupt_outgoing = analyzed(120.0);
+        let abrupt_incoming = analyzed(120.0);
+        set_energy_ranges(&mut abrupt_outgoing, -18.0, &[(174.0, 175.0, -3.0)]);
+        let abrupt_quality = evaluate_transition_quality(&abrupt_outgoing, &abrupt_incoming, &plan);
+
+        assert!(
+            abrupt_quality.max_mix_energy_step.unwrap()
+                > smooth_quality.max_mix_energy_step.unwrap(),
+            "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
+        );
+        assert!(
+            transition_start_score(&abrupt_quality).unwrap()
+                > transition_start_score(&smooth_quality).unwrap(),
+            "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
         );
     }
 

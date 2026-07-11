@@ -1353,6 +1353,7 @@ where
                 energy_samples_checked = quality.energy_samples_checked,
                 min_mix_energy_ratio = quality.min_mix_energy_ratio,
                 max_mix_energy_ratio = quality.max_mix_energy_ratio,
+                max_mix_energy_step = quality.max_mix_energy_step,
                 "AutoMix transition planned"
             );
         }
