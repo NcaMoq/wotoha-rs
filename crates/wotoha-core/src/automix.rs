@@ -321,6 +321,7 @@ pub struct AutoMixQualityReport {
     pub min_mix_energy_ratio: Option<f32>,
     pub max_mix_energy_ratio: Option<f32>,
     pub max_mix_energy_step: Option<f32>,
+    pub handoff_mix_energy_ratio: Option<f32>,
 }
 
 impl AutoMixQualityReport {
@@ -914,6 +915,7 @@ pub fn evaluate_transition_quality(
     let mut min_mix_energy_ratio = None;
     let mut max_mix_energy_ratio = None;
     let mut max_mix_energy_step = None;
+    let mut handoff_mix_energy_ratio = None;
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
     if plan.kind != TransitionKind::Gapless {
@@ -968,6 +970,7 @@ pub fn evaluate_transition_quality(
         min_mix_energy_ratio = energy.min_ratio;
         max_mix_energy_ratio = energy.max_ratio;
         max_mix_energy_step = energy.max_step;
+        handoff_mix_energy_ratio = energy.handoff_ratio;
     }
 
     if plan.kind == TransitionKind::BeatMatched {
@@ -1042,6 +1045,7 @@ pub fn evaluate_transition_quality(
         min_mix_energy_ratio,
         max_mix_energy_ratio,
         max_mix_energy_step,
+        handoff_mix_energy_ratio,
     }
 }
 
@@ -1617,6 +1621,7 @@ struct TransitionEnergyReport {
     min_ratio: Option<f32>,
     max_ratio: Option<f32>,
     max_step: Option<f32>,
+    handoff_ratio: Option<f32>,
 }
 
 fn transition_energy_report(
@@ -1631,6 +1636,7 @@ fn transition_energy_report(
             min_ratio: None,
             max_ratio: None,
             max_step: None,
+            handoff_ratio: None,
         };
     }
     let outgoing_reference = energy_at(outgoing, plan.outgoing_start);
@@ -1649,6 +1655,7 @@ fn transition_energy_report(
             min_ratio: None,
             max_ratio: None,
             max_step: None,
+            handoff_ratio: None,
         };
     };
 
@@ -1706,6 +1713,7 @@ fn transition_energy_report(
         min_ratio: (samples > 0).then_some(min_ratio),
         max_ratio: (samples > 0).then_some(max_ratio),
         max_step: (samples > 1).then_some(max_step),
+        handoff_ratio: previous_ratio,
     }
 }
 
@@ -1929,7 +1937,18 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|step| step.is_finite())
         .map(|step| (step - 0.12).max(0.0) * 2.0)
         .unwrap_or(0.0);
-    Some(energy_score + vocal_penalty + short_mix_penalty + energy_step_penalty)
+    let handoff_energy_penalty = quality
+        .handoff_mix_energy_ratio
+        .filter(|ratio| ratio.is_finite())
+        .map(|ratio| (0.85 - ratio).max(0.0) * 3.0 + (ratio - 1.15).max(0.0) * 2.0)
+        .unwrap_or(0.0);
+    Some(
+        energy_score
+            + vocal_penalty
+            + short_mix_penalty
+            + energy_step_penalty
+            + handoff_energy_penalty,
+    )
 }
 
 fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
@@ -4095,6 +4114,41 @@ mod tests {
             transition_start_score(&abrupt_quality).unwrap()
                 > transition_start_score(&smooth_quality).unwrap(),
             "smooth={smooth_quality:?} abrupt={abrupt_quality:?}"
+        );
+    }
+
+    #[test]
+    fn energy_score_penalizes_weak_handoff_energy() {
+        let mut outgoing = analyzed(120.0);
+        let mut matched_incoming = analyzed(120.0);
+        let mut weak_incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[]);
+        set_energy_ranges(&mut matched_incoming, -18.0, &[]);
+        set_energy_ranges(&mut weak_incoming, -30.0, &[]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        let matched_quality = evaluate_transition_quality(&outgoing, &matched_incoming, &plan);
+        let weak_quality = evaluate_transition_quality(&outgoing, &weak_incoming, &plan);
+
+        assert!(
+            weak_quality.handoff_mix_energy_ratio.unwrap()
+                < matched_quality.handoff_mix_energy_ratio.unwrap(),
+            "matched={matched_quality:?} weak={weak_quality:?}"
+        );
+        assert!(
+            transition_start_score(&weak_quality).unwrap()
+                > transition_start_score(&matched_quality).unwrap(),
+            "matched={matched_quality:?} weak={weak_quality:?}"
         );
     }
 
