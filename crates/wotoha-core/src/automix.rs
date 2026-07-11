@@ -683,13 +683,12 @@ pub fn plan_transition(
                 && incoming.downbeat_confidence >= 0.25
                 && incoming.first_downbeat.is_some())
             .then(|| {
-                align_to_matching_phrase_phase(
+                align_to_strongest_matching_phrase_phase(
                     outgoing,
                     incoming,
                     incoming_start,
                     target,
                     target_duration,
-                    PhraseLength::FourBars,
                     phase_bias,
                 )
                 .or_else(|| {
@@ -759,13 +758,12 @@ pub fn plan_transition(
     if exact_vocal_limit < duration {
         let target = outgoing.audible_end.saturating_sub(exact_vocal_limit);
         outgoing_start = if beat_aligned {
-            align_to_matching_phrase_phase(
+            align_to_strongest_matching_phrase_phase(
                 outgoing,
                 incoming,
                 incoming_start,
                 target,
                 exact_vocal_limit,
-                PhraseLength::FourBars,
                 BarPhaseBias::AtOrAfter,
             )
             .or_else(|| {
@@ -2628,6 +2626,33 @@ fn align_to_phrase(
         .map(|cue| snap_to_nearest_beat(analysis, cue.position).unwrap_or(cue.position))
 }
 
+fn align_to_strongest_matching_phrase_phase(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+    target: Duration,
+    search_window: Duration,
+    bias: BarPhaseBias,
+) -> Option<Duration> {
+    [
+        PhraseLength::SixteenBars,
+        PhraseLength::EightBars,
+        PhraseLength::FourBars,
+    ]
+    .into_iter()
+    .find_map(|length| {
+        align_to_matching_phrase_phase(
+            outgoing,
+            incoming,
+            incoming_start,
+            target,
+            search_window,
+            length,
+            bias,
+        )
+    })
+}
+
 fn align_to_matching_phrase_phase(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
@@ -3394,6 +3419,27 @@ mod tests {
             plan.outgoing_start + plan.duration,
             Duration::from_secs(179)
         );
+    }
+
+    #[test]
+    fn beatmatch_prefers_larger_phrase_boundary_when_search_window_allows() {
+        let mut outgoing = analyzed(120.0);
+        outgoing.duration = Duration::from_secs(188);
+        outgoing.audible_end = Duration::from_secs(187);
+        let mut beat = *outgoing.beat_markers.last().unwrap();
+        while beat < outgoing.audible_end {
+            beat += Duration::from_millis(500);
+            outgoing.beat_markers.push(beat);
+        }
+        let incoming = analyzed(120.0);
+        let mut config = config();
+        config.crossfade = Duration::from_secs(16);
+
+        let plan = plan_transition(&outgoing, &incoming, &config);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.outgoing_start, Duration::from_secs(161));
+        assert_eq!(plan.outgoing_start + plan.duration, outgoing.audible_end);
     }
 
     #[test]
