@@ -19,6 +19,7 @@ const MIN_MARKER_BACKED_KICK_COVERAGE: f32 = 0.55;
 const MIN_MARKER_BACKED_KICK_MARKERS: usize = 8;
 const MAX_AUDIBLE_PICKUP: Duration = Duration::from_millis(100);
 const MAX_LOW_ENERGY_INTRO_SKIP: Duration = Duration::from_secs(8);
+const MAX_STRUCTURED_INTRO_SKIP: Duration = Duration::from_secs(16);
 const MAX_SKIPPED_INTRO_VOCAL_RISK: f32 = 0.2;
 const MAX_SHORTER_TRANSITION_SEARCH: Duration = Duration::from_secs(8);
 const MIN_NATURAL_MIX_OVERLAP: Duration = Duration::from_secs(4);
@@ -2573,6 +2574,10 @@ fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
             .then_some(candidate);
     }
 
+    if let Some(candidate) = safe_structured_intro_beat_start(incoming) {
+        return Some(candidate);
+    }
+
     let candidate = first_trusted_downbeat_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
         .or_else(|| {
             first_trusted_beat_marker_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
@@ -2581,9 +2586,37 @@ fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
     safe_to_skip_low_energy_intro(incoming, candidate).then_some(candidate)
 }
 
+fn safe_structured_intro_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
+    let intro_end = incoming
+        .intro_end
+        .filter(|_| incoming.intro_confidence >= 0.65)?;
+    if intro_end <= incoming.audible_start
+        || intro_end >= incoming.audible_end
+        || intro_end.saturating_sub(incoming.audible_start) > MAX_STRUCTURED_INTRO_SKIP
+    {
+        return None;
+    }
+
+    let tolerance = marker_snap_tolerance(incoming)
+        .max(MAX_BEATMATCH_PHASE_ERROR)
+        .max(Duration::from_millis(120));
+    let candidate = trusted_marker_near(incoming, intro_end, tolerance)?;
+    safe_to_skip_intro_until(incoming, candidate, MAX_STRUCTURED_INTRO_SKIP, 0.55)
+        .then_some(candidate)
+}
+
 fn safe_to_skip_low_energy_intro(incoming: &TrackAnalysis, candidate: Duration) -> bool {
+    safe_to_skip_intro_until(incoming, candidate, MAX_LOW_ENERGY_INTRO_SKIP, 0.45)
+}
+
+fn safe_to_skip_intro_until(
+    incoming: &TrackAnalysis,
+    candidate: Duration,
+    maximum_skip: Duration,
+    max_before_ratio: f32,
+) -> bool {
     if candidate <= incoming.audible_start
-        || candidate.saturating_sub(incoming.audible_start) > MAX_LOW_ENERGY_INTRO_SKIP
+        || candidate.saturating_sub(incoming.audible_start) > maximum_skip
         || candidate >= incoming.audible_end
     {
         return false;
@@ -2605,7 +2638,7 @@ fn safe_to_skip_low_energy_intro(incoming: &TrackAnalysis, candidate: Duration) 
     let Some((before, after)) = before.zip(after) else {
         return false;
     };
-    before.is_finite() && after.is_finite() && after > 1.0e-6 && before <= after * 0.45
+    before.is_finite() && after.is_finite() && after > 1.0e-6 && before <= after * max_before_ratio
 }
 
 fn average_energy_between(
@@ -2659,6 +2692,26 @@ fn first_trusted_beat_marker_after_audible_start(
         })
         .map(|(_, beat)| beat)
         .min()
+}
+
+fn trusted_marker_near(
+    analysis: &TrackAnalysis,
+    position: Duration,
+    tolerance: Duration,
+) -> Option<Duration> {
+    analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, beat)| {
+            marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
+                && *beat >= analysis.audible_start
+                && *beat < analysis.audible_end
+                && beat.abs_diff(position) <= tolerance
+        })
+        .map(|(_, beat)| beat)
+        .min_by_key(|beat| beat.abs_diff(position))
 }
 
 fn has_trusted_marker_near(
@@ -4018,6 +4071,52 @@ mod tests {
             !quality.has_blocking_issue(),
             "plan={plan:?} quality={quality:?}"
         );
+    }
+
+    #[test]
+    fn beatmatch_skips_safe_low_energy_intro_to_trusted_intro_boundary() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.intro_end = Some(Duration::from_secs(13));
+        incoming.intro_confidence = 0.9;
+        incoming.first_beat = Some(Duration::from_secs(13));
+        incoming.first_downbeat = Some(Duration::from_secs(13));
+        incoming.beat_markers = (0..350)
+            .map(|index| Duration::from_secs_f32(13.0 + index as f32 * 0.5))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 13.0, -50.0)]);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.incoming_start, Duration::from_secs(13));
+        assert!(
+            !quality.has_blocking_issue(),
+            "plan={plan:?} quality={quality:?}"
+        );
+    }
+
+    #[test]
+    fn structured_intro_skip_keeps_vocal_pickup_intact() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.intro_end = Some(Duration::from_secs(13));
+        incoming.intro_confidence = 0.9;
+        incoming.first_beat = Some(Duration::from_secs(13));
+        incoming.first_downbeat = Some(Duration::from_secs(13));
+        incoming.beat_markers = (0..350)
+            .map(|index| Duration::from_secs_f32(13.0 + index as f32 * 0.5))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 13.0, -50.0)]);
+        set_soft_vocal_ranges(&mut incoming, &[(2.0, 12.0)], 0.3);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+
+        assert_eq!(plan.kind, TransitionKind::Crossfade);
+        assert_eq!(plan.incoming_start, incoming.audible_start);
     }
 
     #[test]
