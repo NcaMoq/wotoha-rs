@@ -1355,6 +1355,7 @@ where
                 max_mix_energy_ratio = quality.max_mix_energy_ratio,
                 max_mix_energy_step = quality.max_mix_energy_step,
                 handoff_mix_energy_ratio = quality.handoff_mix_energy_ratio,
+                handoff_incoming_mix_share = quality.handoff_incoming_mix_share,
                 max_tempo_speed_step = quality.max_tempo_speed_step,
                 "AutoMix transition planned"
             );

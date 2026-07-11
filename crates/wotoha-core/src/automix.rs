@@ -322,6 +322,7 @@ pub struct AutoMixQualityReport {
     pub max_mix_energy_ratio: Option<f32>,
     pub max_mix_energy_step: Option<f32>,
     pub handoff_mix_energy_ratio: Option<f32>,
+    pub handoff_incoming_mix_share: Option<f32>,
     pub max_tempo_speed_step: Option<f32>,
 }
 
@@ -917,6 +918,7 @@ pub fn evaluate_transition_quality(
     let mut max_mix_energy_ratio = None;
     let mut max_mix_energy_step = None;
     let mut handoff_mix_energy_ratio = None;
+    let mut handoff_incoming_mix_share = None;
     let max_tempo_speed_step = tempo_speed_step(plan.tempo_envelope);
     let (low_handoff_min, low_handoff_max) = low_handoff_range(plan);
 
@@ -973,6 +975,7 @@ pub fn evaluate_transition_quality(
         max_mix_energy_ratio = energy.max_ratio;
         max_mix_energy_step = energy.max_step;
         handoff_mix_energy_ratio = energy.handoff_ratio;
+        handoff_incoming_mix_share = energy.handoff_incoming_share;
     }
 
     if plan.kind == TransitionKind::BeatMatched {
@@ -1048,6 +1051,7 @@ pub fn evaluate_transition_quality(
         max_mix_energy_ratio,
         max_mix_energy_step,
         handoff_mix_energy_ratio,
+        handoff_incoming_mix_share,
         max_tempo_speed_step,
     }
 }
@@ -1646,6 +1650,7 @@ struct TransitionEnergyReport {
     max_ratio: Option<f32>,
     max_step: Option<f32>,
     handoff_ratio: Option<f32>,
+    handoff_incoming_share: Option<f32>,
 }
 
 fn transition_energy_report(
@@ -1661,6 +1666,7 @@ fn transition_energy_report(
             max_ratio: None,
             max_step: None,
             handoff_ratio: None,
+            handoff_incoming_share: None,
         };
     }
     let outgoing_reference = energy_at(outgoing, plan.outgoing_start);
@@ -1680,6 +1686,7 @@ fn transition_energy_report(
             max_ratio: None,
             max_step: None,
             handoff_ratio: None,
+            handoff_incoming_share: None,
         };
     };
 
@@ -1688,6 +1695,8 @@ fn transition_energy_report(
     let mut max_ratio = f32::NEG_INFINITY;
     let mut previous_ratio: Option<f32> = None;
     let mut max_step = 0.0_f32;
+    let mut handoff_incoming_share = f32::INFINITY;
+    let mut handoff_share_samples = 0;
     for index in 0..=SAMPLES {
         let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
         let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
@@ -1723,6 +1732,12 @@ fn transition_energy_report(
         let combined = (outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level))
             .sqrt()
             / reference;
+        let total_power = outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level);
+        if progress >= 0.75 && total_power > 1.0e-12 {
+            let incoming_share = (incoming_level * incoming_level / total_power).clamp(0.0, 1.0);
+            handoff_incoming_share = handoff_incoming_share.min(incoming_share);
+            handoff_share_samples += 1;
+        }
         samples += 1;
         min_ratio = min_ratio.min(combined);
         max_ratio = max_ratio.max(combined);
@@ -1738,6 +1753,7 @@ fn transition_energy_report(
         max_ratio: (samples > 0).then_some(max_ratio),
         max_step: (samples > 1).then_some(max_step),
         handoff_ratio: previous_ratio,
+        handoff_incoming_share: (handoff_share_samples > 0).then_some(handoff_incoming_share),
     }
 }
 
@@ -1966,6 +1982,11 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|ratio| ratio.is_finite())
         .map(|ratio| (0.85 - ratio).max(0.0) * 3.0 + (ratio - 1.15).max(0.0) * 2.0)
         .unwrap_or(0.0);
+    let handoff_ownership_penalty = quality
+        .handoff_incoming_mix_share
+        .filter(|share| share.is_finite())
+        .map(|share| (0.7 - share).max(0.0) * 1.5)
+        .unwrap_or(0.0);
     let tempo_smoothness_penalty = quality
         .max_tempo_speed_step
         .filter(|step| step.is_finite())
@@ -1977,6 +1998,7 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
             + short_mix_penalty
             + energy_step_penalty
             + handoff_energy_penalty
+            + handoff_ownership_penalty
             + tempo_smoothness_penalty,
     )
 }
@@ -4228,6 +4250,36 @@ mod tests {
             transition_start_score(&weak_quality).unwrap()
                 > transition_start_score(&matched_quality).unwrap(),
             "matched={matched_quality:?} weak={weak_quality:?}"
+        );
+    }
+
+    #[test]
+    fn energy_score_penalizes_outgoing_owned_handoff() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let mut outgoing_owned = quality.clone();
+        outgoing_owned.handoff_incoming_mix_share = Some(0.4);
+
+        assert!(
+            quality.handoff_incoming_mix_share.unwrap() > 0.7,
+            "quality={quality:?}"
+        );
+        assert!(
+            transition_start_score(&outgoing_owned).unwrap()
+                > transition_start_score(&quality).unwrap(),
+            "quality={quality:?} outgoing_owned={outgoing_owned:?}"
         );
     }
 
