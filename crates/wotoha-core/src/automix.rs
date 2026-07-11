@@ -649,10 +649,57 @@ pub fn plan_transition(
     }
 
     let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
-    let incoming_beat_start = safe_incoming_beat_start(incoming);
-    let tempo_curve =
-        incoming_beat_start.and_then(|_| compatible_tempo_curve(outgoing, incoming, config));
-    let beat_aligned = tempo_curve.is_some();
+    if let Some(tempo_curve) = compatible_tempo_curve(outgoing, incoming, config) {
+        let mut best_plan = None;
+        let mut best_score = f32::INFINITY;
+        for incoming_start in safe_incoming_beat_starts(incoming) {
+            let plan = plan_transition_with_incoming_start(
+                outgoing,
+                incoming,
+                config,
+                harmonic_compatibility,
+                incoming_start,
+                Some(tempo_curve),
+                true,
+            );
+            if plan.kind != TransitionKind::BeatMatched {
+                continue;
+            }
+            let Some(score) = transition_plan_score(outgoing, incoming, &plan) else {
+                continue;
+            };
+            if best_plan.is_none() || score + ENERGY_SELECTION_EPSILON < best_score {
+                best_score = score;
+                best_plan = Some(plan);
+            }
+        }
+        if let Some(plan) = best_plan {
+            return plan;
+        }
+    }
+
+    plan_transition_with_incoming_start(
+        outgoing,
+        incoming,
+        config,
+        harmonic_compatibility,
+        incoming.audible_start,
+        None,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_transition_with_incoming_start(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    harmonic_compatibility: Option<f32>,
+    selected_incoming_start: Duration,
+    tempo_curve: Option<(f32, f32)>,
+    beat_aligned: bool,
+) -> TransitionPlan {
+    let beat_aligned = beat_aligned && tempo_curve.is_some();
     let mut use_beatmatch = beat_aligned;
     let incoming_gain = recommended_incoming_gain(
         outgoing,
@@ -664,7 +711,7 @@ pub fn plan_transition(
         },
     );
     let incoming_start = if beat_aligned {
-        incoming_beat_start.unwrap_or(incoming.audible_start)
+        selected_incoming_start
     } else {
         incoming.audible_start
     };
@@ -879,6 +926,22 @@ pub fn plan_guarded_transition(
         rejected_plan: Some(plan),
         rejected_quality: Some(quality),
     }
+}
+
+fn transition_plan_score(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> Option<f32> {
+    let quality = evaluate_transition_quality(outgoing, incoming, plan);
+    let blocking_penalty = if quality.has_blocking_issue() {
+        1_000.0 + quality.issues.len() as f32
+    } else {
+        0.0
+    };
+    transition_start_score(&quality)
+        .or_else(|| quality.is_ok().then_some(0.0))
+        .map(|score| score + blocking_penalty)
 }
 
 pub fn explain_beatmatch_decision(
@@ -2561,6 +2624,11 @@ fn structure_overlap_usage_ratio(
 }
 
 fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
+    safe_incoming_beat_starts(incoming).into_iter().next()
+}
+
+fn safe_incoming_beat_starts(incoming: &TrackAnalysis) -> Vec<Duration> {
+    let mut candidates = Vec::new();
     if let Some(candidate) =
         first_trusted_downbeat_after_audible_start(incoming, MAX_AUDIBLE_PICKUP)
             .or_else(|| first_trusted_beat_marker_after_audible_start(incoming, MAX_AUDIBLE_PICKUP))
@@ -2569,21 +2637,31 @@ fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
                 *candidate >= incoming.audible_start
                     && candidate.saturating_sub(incoming.audible_start) <= MAX_AUDIBLE_PICKUP
             })
+            .filter(|candidate| {
+                !known_vocal_risk_between(incoming, incoming.audible_start, *candidate)
+            })
     {
-        return (!known_vocal_risk_between(incoming, incoming.audible_start, candidate))
-            .then_some(candidate);
+        candidates.push(candidate);
     }
 
     if let Some(candidate) = safe_structured_intro_beat_start(incoming) {
-        return Some(candidate);
+        candidates.push(candidate);
     }
 
-    let candidate = first_trusted_downbeat_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
-        .or_else(|| {
-            first_trusted_beat_marker_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
-        })
-        .or(incoming.first_beat)?;
-    safe_to_skip_low_energy_intro(incoming, candidate).then_some(candidate)
+    if let Some(candidate) =
+        first_trusted_downbeat_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
+            .or_else(|| {
+                first_trusted_beat_marker_after_audible_start(incoming, MAX_LOW_ENERGY_INTRO_SKIP)
+            })
+            .or(incoming.first_beat)
+            .filter(|candidate| safe_to_skip_low_energy_intro(incoming, *candidate))
+    {
+        candidates.push(candidate);
+    }
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates
 }
 
 fn safe_structured_intro_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
@@ -4079,10 +4157,10 @@ mod tests {
         let mut incoming = analyzed(120.0);
         incoming.intro_end = Some(Duration::from_secs(13));
         incoming.intro_confidence = 0.9;
-        incoming.first_beat = Some(Duration::from_secs(13));
-        incoming.first_downbeat = Some(Duration::from_secs(13));
+        incoming.first_beat = Some(Duration::from_secs(1));
+        incoming.first_downbeat = Some(Duration::from_secs(1));
         incoming.beat_markers = (0..350)
-            .map(|index| Duration::from_secs_f32(13.0 + index as f32 * 0.5))
+            .map(|index| Duration::from_secs_f32(1.0 + index as f32 * 0.5))
             .collect();
         incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
         set_energy_ranges(&mut incoming, -14.0, &[(1.0, 13.0, -50.0)]);
