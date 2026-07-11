@@ -322,6 +322,7 @@ pub struct AutoMixQualityReport {
     pub phrase_pairs_checked: usize,
     pub max_phrase_phase_error: Option<Duration>,
     pub handoff_phrase_phase_error: Option<Duration>,
+    pub phrase_boundary_bars: Option<u8>,
     pub low_handoff_min: Option<f32>,
     pub low_handoff_max: Option<f32>,
     pub vocal_overlap_samples_checked: usize,
@@ -918,6 +919,7 @@ pub fn evaluate_transition_quality(
     let mut phrase_pairs_checked = 0;
     let mut max_phrase_phase_error = None;
     let mut handoff_phrase_phase_error = None;
+    let mut phrase_boundary_bars = None;
     let mut vocal_overlap_samples_checked = 0;
     let mut max_dual_vocal_risk = None;
     let mut energy_samples_checked = 0;
@@ -1035,6 +1037,7 @@ pub fn evaluate_transition_quality(
         {
             issues.push(AutoMixQualityIssue::PhraseHandoffPhaseDriftTooLarge { error });
         }
+        phrase_boundary_bars = strongest_phrase_boundary_bars(outgoing, incoming, plan);
     }
 
     AutoMixQualityReport {
@@ -1049,6 +1052,7 @@ pub fn evaluate_transition_quality(
         phrase_pairs_checked,
         max_phrase_phase_error,
         handoff_phrase_phase_error,
+        phrase_boundary_bars,
         low_handoff_min,
         low_handoff_max,
         vocal_overlap_samples_checked,
@@ -1327,6 +1331,73 @@ fn handoff_cycle_phase_error(
         .unwrap_or(incoming_interval);
     let outgoing_phase = cycle_phase_fraction(outgoing_handoff, outgoing_first, outgoing_interval)?;
     let incoming_phase = cycle_phase_fraction(incoming_handoff, incoming_first, incoming_interval)?;
+    let delta = (outgoing_phase - incoming_phase).abs();
+    let wrapped_delta = delta.min(1.0 - delta);
+    Some(outgoing_interval.mul_f64(wrapped_delta))
+}
+
+fn strongest_phrase_boundary_bars(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> Option<u8> {
+    if plan.kind != TransitionKind::BeatMatched {
+        return None;
+    }
+    [
+        PhraseLength::SixteenBars,
+        PhraseLength::EightBars,
+        PhraseLength::FourBars,
+    ]
+    .into_iter()
+    .find_map(|length| {
+        (phrase_phase_is_actionable(outgoing, incoming, plan, length)
+            && phrase_start_phase_error(outgoing, incoming, plan, length)
+                .is_some_and(|error| error <= MAX_PHRASE_PHASE_ERROR))
+        .then_some(length.bars() as u8)
+    })
+}
+
+fn phrase_start_phase_error(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+    length: PhraseLength,
+) -> Option<Duration> {
+    let outgoing_grid = outgoing.beat_grid()?;
+    let incoming_grid = incoming.beat_grid()?;
+    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+        return None;
+    }
+    let outgoing_interval = phrase_interval(outgoing_grid, length);
+    let incoming_interval = phrase_interval(incoming_grid, length);
+    if outgoing_interval.is_zero() || incoming_interval.is_zero() {
+        return None;
+    }
+    cycle_phase_error(
+        plan.outgoing_start,
+        outgoing_grid.first_downbeat,
+        outgoing_interval,
+        plan.incoming_start,
+        incoming_grid.first_downbeat,
+        incoming_interval,
+    )
+}
+
+fn cycle_phase_error(
+    outgoing_position: Duration,
+    outgoing_first: Duration,
+    outgoing_interval: Duration,
+    incoming_position: Duration,
+    incoming_first: Duration,
+    incoming_interval: Duration,
+) -> Option<Duration> {
+    let incoming_interval = closest_cycle_interval_family(outgoing_interval, incoming_interval)
+        .unwrap_or(incoming_interval);
+    let outgoing_phase =
+        cycle_phase_fraction(outgoing_position, outgoing_first, outgoing_interval)?;
+    let incoming_phase =
+        cycle_phase_fraction(incoming_position, incoming_first, incoming_interval)?;
     let delta = (outgoing_phase - incoming_phase).abs();
     let wrapped_delta = delta.min(1.0 - delta);
     Some(outgoing_interval.mul_f64(wrapped_delta))
@@ -2005,6 +2076,13 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         .filter(|step| step.is_finite())
         .map(|step| (step - 0.015).max(0.0) * 8.0)
         .unwrap_or(0.0);
+    let phrase_strength_penalty = match quality.phrase_boundary_bars {
+        Some(16) => 0.0,
+        Some(8) => 0.015,
+        Some(4) => 0.04,
+        Some(_) => 0.07,
+        None => 0.08,
+    };
     Some(
         energy_score
             + vocal_penalty
@@ -2012,7 +2090,8 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
             + energy_step_penalty
             + handoff_energy_penalty
             + handoff_ownership_penalty
-            + tempo_smoothness_penalty,
+            + tempo_smoothness_penalty
+            + phrase_strength_penalty,
     )
 }
 
@@ -3436,10 +3515,20 @@ mod tests {
         config.crossfade = Duration::from_secs(16);
 
         let plan = plan_transition(&outgoing, &incoming, &config);
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
 
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert_eq!(plan.outgoing_start, Duration::from_secs(161));
         assert_eq!(plan.outgoing_start + plan.duration, outgoing.audible_end);
+        assert_eq!(quality.phrase_boundary_bars, Some(16));
+
+        let mut four_bar_quality = quality.clone();
+        four_bar_quality.phrase_boundary_bars = Some(4);
+        assert!(
+            transition_start_score(&quality).unwrap()
+                < transition_start_score(&four_bar_quality).unwrap(),
+            "quality={quality:?} four_bar_quality={four_bar_quality:?}"
+        );
     }
 
     #[test]

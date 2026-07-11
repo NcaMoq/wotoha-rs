@@ -1346,6 +1346,7 @@ where
                 handoff_phrase_phase_error_ms = quality
                     .handoff_phrase_phase_error
                     .map(|value| value.as_millis()),
+                phrase_boundary_bars = quality.phrase_boundary_bars,
                 low_handoff_min = quality.low_handoff_min,
                 low_handoff_max = quality.low_handoff_max,
                 vocal_overlap_samples_checked = quality.vocal_overlap_samples_checked,
