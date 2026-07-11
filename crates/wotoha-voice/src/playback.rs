@@ -41,6 +41,7 @@ const BEAT_ALIGNMENT_LOOKAHEAD: std::time::Duration = std::time::Duration::from_
 const TRANSITION_PREPARE_LEAD: std::time::Duration = std::time::Duration::from_secs(15);
 const MIN_TRANSITION_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const MIN_EQUALIZER_TRANSITION: std::time::Duration = std::time::Duration::from_secs(2);
+const AUTOMIX_ANALYSIS_LOOKAHEAD: usize = 4;
 
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
@@ -347,12 +348,14 @@ where
                     .logical
                     .current()
                     .is_some_and(|current| track_analysis_key(current) == task_key);
-                let request_is_next = playback
+                let request_is_queued_candidate = playback
                     .logical
-                    .peek_next_track()
-                    .is_some_and(|next| track_analysis_key(next) == task_key);
+                    .queue()
+                    .iter()
+                    .take(AUTOMIX_ANALYSIS_LOOKAHEAD)
+                    .any(|queued| track_analysis_key(queued) == task_key);
                 if playback.automix_enabled
-                    && (request_is_current || request_is_next)
+                    && (request_is_current || request_is_queued_candidate)
                     && let Some(analysis) = analysis
                 {
                     playback.analysis_by_key.insert(task_key, analysis.clone());
@@ -387,7 +390,13 @@ where
                 .logical
                 .current()
                 .into_iter()
-                .chain(playback.logical.peek_next_track())
+                .chain(
+                    playback
+                        .logical
+                        .queue()
+                        .iter()
+                        .take(AUTOMIX_ANALYSIS_LOOKAHEAD),
+                )
                 .cloned()
                 .collect::<Vec<_>>();
             let relevant_keys = requests
@@ -3511,6 +3520,40 @@ mod tests {
         assert_eq!(
             calls.iter().filter(|key| key.as_str() == "second").count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn automix_analyzes_queue_lookahead_without_reordering() {
+        let guild_id = GuildKey::new(132);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_millis(20)),
+        );
+        for key in ["first", "second", "third", "fourth", "fifth", "sixth"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            runtime.analyze_with(key, beat_analysis(duration, 120.0));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+
+        runtime.wait_for_analysis_count(5).await;
+
+        let mut calls = runtime.analysis_calls();
+        calls.sort();
+        assert_eq!(calls, vec!["fifth", "first", "fourth", "second", "third"]);
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "first");
+        assert_eq!(
+            preview
+                .upcoming()
+                .iter()
+                .map(|track| track.metadata.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["second", "third", "fourth", "fifth", "sixth"]
         );
     }
 
