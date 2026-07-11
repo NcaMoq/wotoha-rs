@@ -324,7 +324,8 @@ mod tests {
     use super::*;
     use symphonia::core::audio::{Channels, SignalSpec};
     use wotoha_core::automix::{
-        AutoMixConfig, EqTransitionRole, TrackAnalysis, TransitionKind, plan_transition,
+        AutoMixConfig, EqTransitionRole, TrackAnalysis, TransitionKind, automix_mix_gains,
+        plan_transition,
     };
 
     fn outgoing(start: Duration) -> EqTransition {
@@ -467,7 +468,7 @@ mod tests {
             OutputTimeline::stretched(plan.incoming_start, envelope),
         );
 
-        let mixed = equal_power_mix(&outgoing_samples, &incoming_samples);
+        let mixed = automix_mix(&outgoing_samples, &incoming_samples, plan.kind);
         let continuity_window = Duration::from_millis(500);
         let start_rms = window_rms(&mixed, SAMPLE_RATE, continuity_window);
         let mid_rms = window_rms_at(&mixed, SAMPLE_RATE, plan.duration / 2, continuity_window);
@@ -564,7 +565,7 @@ mod tests {
         kick + musical_bed
     }
 
-    fn equal_power_mix(outgoing: &[f32], incoming: &[f32]) -> Vec<f32> {
+    fn automix_mix(outgoing: &[f32], incoming: &[f32], kind: TransitionKind) -> Vec<f32> {
         let last = outgoing.len().saturating_sub(1).max(1) as f32;
         outgoing
             .iter()
@@ -572,8 +573,8 @@ mod tests {
             .enumerate()
             .map(|(index, (outgoing, incoming))| {
                 let progress = index as f32 / last;
-                let angle = progress * std::f32::consts::FRAC_PI_2;
-                outgoing * angle.cos() + incoming * angle.sin()
+                let (outgoing_gain, incoming_gain) = automix_mix_gains(kind, progress);
+                outgoing * outgoing_gain + incoming * incoming_gain
             })
             .collect()
     }

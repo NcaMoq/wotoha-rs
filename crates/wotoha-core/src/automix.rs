@@ -648,12 +648,20 @@ pub fn plan_transition(
     }
 
     let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
-    let incoming_gain = recommended_incoming_gain(outgoing, incoming);
     let incoming_beat_start = safe_incoming_beat_start(incoming);
     let tempo_curve =
         incoming_beat_start.and_then(|_| compatible_tempo_curve(outgoing, incoming, config));
     let beat_aligned = tempo_curve.is_some();
     let mut use_beatmatch = beat_aligned;
+    let incoming_gain = recommended_incoming_gain(
+        outgoing,
+        incoming,
+        if beat_aligned {
+            TransitionKind::BeatMatched
+        } else {
+            TransitionKind::Crossfade
+        },
+    );
     let incoming_start = if beat_aligned {
         incoming_beat_start.unwrap_or(incoming.audible_start)
     } else {
@@ -1710,7 +1718,7 @@ fn dual_vocal_overlap_report(
         }
 
         let progress = elapsed.as_secs_f32() / plan.duration.as_secs_f32();
-        let (outgoing_mix_gain, incoming_mix_gain) = equal_power_mix_gains(progress);
+        let (outgoing_mix_gain, incoming_mix_gain) = automix_mix_gains(plan.kind, progress);
         let outgoing_eq = EqTransition {
             id: 0,
             source_start: plan.outgoing_start,
@@ -1813,7 +1821,7 @@ fn transition_energy_report(
         };
 
         let progress = elapsed.as_secs_f32() / plan.duration.as_secs_f32();
-        let (outgoing_mix_gain, incoming_mix_gain) = equal_power_mix_gains(progress);
+        let (outgoing_mix_gain, incoming_mix_gain) = automix_mix_gains(plan.kind, progress);
         let outgoing_eq = EqTransition {
             id: 0,
             source_start: plan.outgoing_start,
@@ -2068,7 +2076,7 @@ fn transition_start_energy_score(
 pub fn transition_score_breakdown(quality: &AutoMixQualityReport) -> Option<AutoMixScoreBreakdown> {
     let energy_balance_penalty = energy_balance_score(quality)?;
     let harmonic_clash = harmonic_clash_amount(quality.harmonic_compatibility);
-    let vocal_penalty_weight = 0.8 + harmonic_clash * 0.6;
+    let vocal_penalty_weight = 1.1 + harmonic_clash * 0.7;
     let vocal_penalty = quality
         .max_dual_vocal_risk
         .filter(|risk| risk.is_finite())
@@ -2108,10 +2116,10 @@ pub fn transition_score_breakdown(quality: &AutoMixQualityReport) -> Option<Auto
         .unwrap_or(0.0);
     let phrase_strength_penalty = match quality.phrase_boundary_bars {
         Some(16) => 0.0,
-        Some(8) => 0.015,
-        Some(4) => 0.04,
-        Some(_) => 0.07,
-        None => 0.08,
+        Some(8) => 0.04,
+        Some(4) => 0.10,
+        Some(_) => 0.14,
+        None => 0.16,
     };
     let structure_usage_penalty = quality
         .structure_overlap_ratio
@@ -2399,9 +2407,34 @@ fn valid_outgoing_start(analysis: &TrackAnalysis, candidate: Duration) -> bool {
         && analysis.audible_end.saturating_sub(candidate) >= MIN_AUDIBLE_MIX_OVERLAP
 }
 
+pub fn automix_mix_gains(kind: TransitionKind, progress: f32) -> (f32, f32) {
+    match kind {
+        TransitionKind::BeatMatched => beat_handoff_mix_gains(progress),
+        TransitionKind::Gapless | TransitionKind::Crossfade => equal_power_mix_gains(progress),
+    }
+}
+
 fn equal_power_mix_gains(progress: f32) -> (f32, f32) {
     let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
     (angle.cos(), angle.sin())
+}
+
+fn beat_handoff_mix_gains(progress: f32) -> (f32, f32) {
+    let progress = progress.clamp(0.0, 1.0);
+    let incoming_progress = smoothstep((progress / 0.75).clamp(0.0, 1.0));
+    let outgoing_progress = smoothstep(((progress - 0.15) / 0.85).clamp(0.0, 1.0));
+    let incoming = (incoming_progress * std::f32::consts::FRAC_PI_2).sin();
+    let outgoing = (outgoing_progress * std::f32::consts::FRAC_PI_2).cos();
+    let combined_power = outgoing.hypot(incoming);
+    let scale = if combined_power > 1.08 {
+        1.08 / combined_power
+    } else {
+        1.0
+    };
+    (
+        (outgoing * scale).clamp(0.0, 1.0),
+        (incoming * scale).clamp(0.0, 1.0),
+    )
 }
 
 fn vocal_band_gain(gains: EqGains) -> f32 {
@@ -3016,7 +3049,7 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
         duration: Duration::ZERO,
         incoming_tempo_ratio: 1.0,
         harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
-        incoming_gain: recommended_incoming_gain(outgoing, incoming),
+        incoming_gain: recommended_incoming_gain(outgoing, incoming, TransitionKind::Gapless),
         tempo_envelope: None,
         energy_selection: None,
     }
@@ -3063,13 +3096,17 @@ fn conservative_crossfade_plan(
         duration,
         incoming_tempo_ratio: 1.0,
         harmonic_compatibility,
-        incoming_gain: recommended_incoming_gain(outgoing, incoming),
+        incoming_gain: recommended_incoming_gain(outgoing, incoming, TransitionKind::Crossfade),
         tempo_envelope: None,
         energy_selection: None,
     }
 }
 
-fn recommended_incoming_gain(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> f32 {
+fn recommended_incoming_gain(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    kind: TransitionKind,
+) -> f32 {
     let level_gain = outgoing
         .rms_dbfs
         .zip(incoming.rms_dbfs)
@@ -3080,7 +3117,7 @@ fn recommended_incoming_gain(outgoing: &TrackAnalysis, incoming: &TrackAnalysis)
         .sample_peak_dbfs
         .map(|peak| dbfs_to_linear(MIX_PEAK_HEADROOM_DBFS - peak))
         .unwrap_or(1.0);
-    let mix_peak_gain = combined_peak_safe_incoming_gain(outgoing, incoming).unwrap_or(1.0);
+    let mix_peak_gain = combined_peak_safe_incoming_gain(outgoing, incoming, kind).unwrap_or(1.0);
     level_gain
         .min(peak_gain)
         .min(mix_peak_gain)
@@ -3090,19 +3127,28 @@ fn recommended_incoming_gain(outgoing: &TrackAnalysis, incoming: &TrackAnalysis)
 fn combined_peak_safe_incoming_gain(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
+    kind: TransitionKind,
 ) -> Option<f32> {
-    const MIDPOINT_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
     let outgoing_peak = dbfs_to_linear(outgoing.sample_peak_dbfs?);
     let incoming_peak = dbfs_to_linear(incoming.sample_peak_dbfs?);
     if outgoing_peak <= 0.0 || incoming_peak <= 0.0 {
         return None;
     }
     let peak_limit = dbfs_to_linear(MIX_PEAK_HEADROOM_DBFS);
-    let remaining = peak_limit - outgoing_peak * MIDPOINT_GAIN;
-    if remaining <= 0.0 {
-        return Some(0.25);
+    let mut safe_gain = 1.0_f32;
+    for step in 1..=32 {
+        let progress = step as f32 / 32.0;
+        let (outgoing_gain, incoming_gain) = automix_mix_gains(kind, progress);
+        if incoming_gain <= f32::EPSILON {
+            continue;
+        }
+        let remaining = peak_limit - outgoing_peak * outgoing_gain;
+        if remaining <= 0.0 {
+            return Some(0.25);
+        }
+        safe_gain = safe_gain.min(remaining / (incoming_peak * incoming_gain));
     }
-    Some((remaining / (incoming_peak * MIDPOINT_GAIN)).clamp(0.25, 1.0))
+    Some(safe_gain.clamp(0.25, 1.0))
 }
 
 fn dbfs_to_linear(dbfs: f32) -> f32 {
@@ -3507,6 +3553,32 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn beatmatched_mix_curve_moves_the_incoming_deck_forward() {
+        assert_eq!(
+            automix_mix_gains(TransitionKind::BeatMatched, 0.0),
+            (1.0, 0.0)
+        );
+        let (_, crossfade_incoming) = automix_mix_gains(TransitionKind::Crossfade, 0.5);
+        let (_, beatmatched_incoming) = automix_mix_gains(TransitionKind::BeatMatched, 0.5);
+        assert!(beatmatched_incoming > crossfade_incoming);
+
+        for step in 0..=100 {
+            let progress = step as f32 / 100.0;
+            let (outgoing, incoming) = automix_mix_gains(TransitionKind::BeatMatched, progress);
+            assert!(outgoing.is_finite() && incoming.is_finite());
+            assert!((0.0..=1.0).contains(&outgoing));
+            assert!((0.0..=1.0).contains(&incoming));
+            assert!(
+                outgoing.hypot(incoming) <= 1.0801,
+                "progress={progress} outgoing={outgoing} incoming={incoming}"
+            );
+        }
+        let (outgoing, incoming) = automix_mix_gains(TransitionKind::BeatMatched, 1.0);
+        assert!(outgoing.abs() < 0.0001);
+        assert_eq!(incoming, 1.0);
     }
 
     fn analyzed(bpm: f32) -> TrackAnalysis {
@@ -4732,7 +4804,11 @@ mod tests {
                 .saturating_sub(Duration::from_secs(161)),
             incoming_tempo_ratio: 1.0,
             harmonic_compatibility: harmonic_compatibility(&outgoing, &incoming),
-            incoming_gain: recommended_incoming_gain(&outgoing, &incoming),
+            incoming_gain: recommended_incoming_gain(
+                &outgoing,
+                &incoming,
+                TransitionKind::BeatMatched,
+            ),
             tempo_envelope: None,
             energy_selection: None,
         };
@@ -4767,7 +4843,11 @@ mod tests {
             duration: outgoing.audible_end.saturating_sub(default_start),
             incoming_tempo_ratio: 1.0,
             harmonic_compatibility: harmonic_compatibility(&outgoing, &incoming),
-            incoming_gain: recommended_incoming_gain(&outgoing, &incoming),
+            incoming_gain: recommended_incoming_gain(
+                &outgoing,
+                &incoming,
+                TransitionKind::BeatMatched,
+            ),
             tempo_envelope: None,
             energy_selection: None,
         };

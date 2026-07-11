@@ -5,7 +5,7 @@ use symphonia::core::{audio::SampleBuffer, errors::Error as SymphoniaError};
 use thiserror::Error;
 use wotoha_core::automix::{
     AutoMixConfig, AutoMixQualityReport, EqTransition, EqTransitionRole, TrackAnalysis,
-    TransitionPlan, plan_guarded_transition,
+    TransitionPlan, automix_mix_gains, plan_guarded_transition,
 };
 
 use crate::{
@@ -152,10 +152,11 @@ pub(crate) fn render_automix_preview_inputs(
         },
     );
 
-    let mixed = equal_power_mix(
+    let mixed = automix_mix(
         &outgoing.samples,
         &incoming.samples,
         PREVIEW_CHANNELS,
+        plan.kind,
         plan.incoming_gain,
     );
     let render_metrics = preview_render_metrics(&mixed, output_rate, PREVIEW_CHANNELS);
@@ -305,10 +306,11 @@ fn apply_equalizer(
     equalizer.process_interleaved(samples, 0, timeline);
 }
 
-fn equal_power_mix(
+fn automix_mix(
     outgoing: &[f32],
     incoming: &[f32],
     channels: usize,
+    kind: wotoha_core::automix::TransitionKind,
     incoming_gain: f32,
 ) -> Vec<f32> {
     let frames = (outgoing.len() / channels)
@@ -318,9 +320,8 @@ fn equal_power_mix(
     let mut output = Vec::with_capacity(frames * channels);
     for frame in 0..frames {
         let progress = frame as f32 / last;
-        let angle = progress * std::f32::consts::FRAC_PI_2;
-        let outgoing_gain = angle.cos();
-        let incoming_gain = incoming_gain * angle.sin();
+        let (outgoing_gain, incoming_curve_gain) = automix_mix_gains(kind, progress);
+        let incoming_gain = incoming_gain * incoming_curve_gain;
         for channel in 0..channels {
             let index = frame * channels + channel;
             output.push(outgoing[index] * outgoing_gain + incoming[index] * incoming_gain);

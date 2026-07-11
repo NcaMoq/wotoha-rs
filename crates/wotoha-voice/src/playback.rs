@@ -26,8 +26,8 @@ use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
         AutoMixConfig, EqTransition, EqTransitionRole, TempoEnvelope, TrackAnalysis,
-        TransitionKind, TransitionTiming, explain_beatmatch_decision, plan_guarded_transition,
-        plan_transition_timing, transition_score_breakdown,
+        TransitionKind, TransitionTiming, automix_mix_gains, explain_beatmatch_decision,
+        plan_guarded_transition, plan_transition_timing, transition_score_breakdown,
     },
     debug::append_debug_log,
 };
@@ -120,6 +120,7 @@ struct PreparedTransition {
     next: TrackRequest,
     incoming: StartedTrack,
     timing: TransitionTiming,
+    transition_kind: TransitionKind,
     start_delay: std::time::Duration,
     incoming_analysis: Option<TrackAnalysis>,
     incoming_gain: f32,
@@ -1262,6 +1263,7 @@ where
         };
         let mut timing = timing;
         let mut transition_after = timing.transition_after;
+        let mut transition_kind = TransitionKind::Crossfade;
         let mut incoming_gain = 1.0;
         let mut outgoing_equalizer_transition = None;
         let mut options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
@@ -1471,6 +1473,7 @@ where
             if !plan.duration.is_zero() && tempo_is_supported {
                 timing.fade_duration = plan.duration;
                 transition_after = plan.outgoing_start;
+                transition_kind = plan.kind;
             }
         }
         timing.transition_after = transition_after;
@@ -1501,6 +1504,7 @@ where
                     next,
                     incoming: incoming.take().expect("prefetched track is available"),
                     timing,
+                    transition_kind,
                     start_delay,
                     incoming_analysis,
                     incoming_gain,
@@ -1641,10 +1645,11 @@ where
 
         let coordinator = self.clone();
         let fade_task = tokio::spawn(async move {
-            run_equal_power_fade(
+            run_automix_fade(
                 outgoing.clone(),
                 prepared.incoming.handle,
                 prepared.timing.fade_duration,
+                prepared.transition_kind,
                 outgoing_gain,
                 prepared.incoming_gain,
             )
@@ -1810,15 +1815,11 @@ fn transition_remaining_delay(
     )
 }
 
-fn equal_power_gains(progress: f32) -> (f32, f32) {
-    let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
-    (angle.cos(), angle.sin())
-}
-
-async fn run_equal_power_fade(
+async fn run_automix_fade(
     outgoing: Arc<dyn RuntimeTrackHandle>,
     incoming: Arc<dyn RuntimeTrackHandle>,
     duration: std::time::Duration,
+    kind: TransitionKind,
     outgoing_base_gain: f32,
     incoming_base_gain: f32,
 ) {
@@ -1827,7 +1828,7 @@ async fn run_equal_power_fade(
     for step in 1..=steps {
         tokio::time::sleep(interval).await;
         let progress = step as f32 / steps as f32;
-        let (outgoing_gain, incoming_gain) = equal_power_gains(progress);
+        let (outgoing_gain, incoming_gain) = automix_mix_gains(kind, progress);
         outgoing.set_volume(outgoing_base_gain * outgoing_gain);
         incoming.set_volume(incoming_base_gain * incoming_gain);
     }
@@ -2169,7 +2170,7 @@ where
 mod tests {
     use super::{
         GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
-        equal_power_gains, track_start_options,
+        track_start_options,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -2194,7 +2195,10 @@ mod tests {
     };
     use wotoha_core::{
         PreparedSource, TrackMetadata, TrackRequest,
-        automix::{AutoMixConfig, EqTransition, EqTransitionRole, TrackAnalysis},
+        automix::{
+            AutoMixConfig, EqTransition, EqTransitionRole, TrackAnalysis, TransitionKind,
+            automix_mix_gains,
+        },
     };
 
     type TestPlayback = PlaybackCoordinator<MockMedia, MockRuntime>;
@@ -2203,10 +2207,27 @@ mod tests {
 
     #[test]
     fn equal_power_fade_preserves_power_and_endpoints() {
-        assert_eq!(equal_power_gains(0.0), (1.0, 0.0));
-        let (outgoing, incoming) = equal_power_gains(0.5);
+        assert_eq!(
+            automix_mix_gains(TransitionKind::Crossfade, 0.0),
+            (1.0, 0.0)
+        );
+        let (outgoing, incoming) = automix_mix_gains(TransitionKind::Crossfade, 0.5);
         assert!((outgoing * outgoing + incoming * incoming - 1.0).abs() < 0.0001);
-        let (outgoing, incoming) = equal_power_gains(1.0);
+        let (outgoing, incoming) = automix_mix_gains(TransitionKind::Crossfade, 1.0);
+        assert!(outgoing.abs() < 0.0001);
+        assert_eq!(incoming, 1.0);
+    }
+
+    #[test]
+    fn beatmatched_fade_brings_incoming_forward_without_changing_endpoints() {
+        assert_eq!(
+            automix_mix_gains(TransitionKind::BeatMatched, 0.0),
+            (1.0, 0.0)
+        );
+        let (_, crossfade_incoming) = automix_mix_gains(TransitionKind::Crossfade, 0.5);
+        let (_, beatmatched_incoming) = automix_mix_gains(TransitionKind::BeatMatched, 0.5);
+        assert!(beatmatched_incoming > crossfade_incoming);
+        let (outgoing, incoming) = automix_mix_gains(TransitionKind::BeatMatched, 1.0);
         assert!(outgoing.abs() < 0.0001);
         assert_eq!(incoming, 1.0);
     }
