@@ -323,6 +323,7 @@ pub struct AutoMixQualityReport {
     pub max_phrase_phase_error: Option<Duration>,
     pub handoff_phrase_phase_error: Option<Duration>,
     pub phrase_boundary_bars: Option<u8>,
+    pub structure_overlap_ratio: Option<f32>,
     pub low_handoff_min: Option<f32>,
     pub low_handoff_max: Option<f32>,
     pub vocal_overlap_samples_checked: usize,
@@ -920,6 +921,7 @@ pub fn evaluate_transition_quality(
     let mut max_phrase_phase_error = None;
     let mut handoff_phrase_phase_error = None;
     let mut phrase_boundary_bars = None;
+    let structure_overlap_ratio = structure_overlap_usage_ratio(outgoing, incoming, plan);
     let mut vocal_overlap_samples_checked = 0;
     let mut max_dual_vocal_risk = None;
     let mut energy_samples_checked = 0;
@@ -1053,6 +1055,7 @@ pub fn evaluate_transition_quality(
         max_phrase_phase_error,
         handoff_phrase_phase_error,
         phrase_boundary_bars,
+        structure_overlap_ratio,
         low_handoff_min,
         low_handoff_max,
         vocal_overlap_samples_checked,
@@ -2083,6 +2086,11 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
         Some(_) => 0.07,
         None => 0.08,
     };
+    let structure_usage_penalty = quality
+        .structure_overlap_ratio
+        .filter(|ratio| ratio.is_finite())
+        .map(|ratio| (0.7 - ratio).max(0.0) * 0.12)
+        .unwrap_or(0.0);
     Some(
         energy_score
             + vocal_penalty
@@ -2091,7 +2099,8 @@ fn transition_start_score(quality: &AutoMixQualityReport) -> Option<f32> {
             + handoff_energy_penalty
             + handoff_ownership_penalty
             + tempo_smoothness_penalty
-            + phrase_strength_penalty,
+            + phrase_strength_penalty
+            + structure_usage_penalty,
     )
 }
 
@@ -2425,6 +2434,16 @@ fn trusted_structure_overlap(
     maximum: Duration,
 ) -> Option<Duration> {
     const MINIMUM: Duration = Duration::from_secs(1);
+    let duration = trusted_structure_span(outgoing, incoming, incoming_start)?.min(maximum);
+    (duration >= MINIMUM).then_some(duration)
+}
+
+fn trusted_structure_span(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_start: Duration,
+) -> Option<Duration> {
+    const MINIMUM: Duration = Duration::from_secs(1);
     let outgoing_start = outgoing
         .outro_start
         .filter(|_| outgoing.outro_confidence >= 0.65)?;
@@ -2433,8 +2452,23 @@ fn trusted_structure_overlap(
         .filter(|_| incoming.intro_confidence >= 0.65)?;
     let outgoing_span = outgoing.audible_end.saturating_sub(outgoing_start);
     let incoming_span = incoming_end.saturating_sub(incoming_start);
-    let duration = maximum.min(outgoing_span).min(incoming_span);
+    let duration = outgoing_span.min(incoming_span);
     (duration >= MINIMUM).then_some(duration)
+}
+
+fn structure_overlap_usage_ratio(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> Option<f32> {
+    if plan.kind == TransitionKind::Gapless {
+        return None;
+    }
+    let span = trusted_structure_span(outgoing, incoming, plan.incoming_start)?;
+    if span.is_zero() {
+        return None;
+    }
+    Some((plan.duration.as_secs_f32() / span.as_secs_f32()).clamp(0.0, 1.0))
 }
 
 fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
@@ -4246,6 +4280,20 @@ mod tests {
         assert_eq!(plan.duration, Duration::from_secs(12));
         assert_eq!(plan.outgoing_start + plan.duration, outgoing.audible_end);
         assert_eq!(plan.incoming_start, incoming.audible_start);
+
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let structure_overlap_ratio = quality
+            .structure_overlap_ratio
+            .expect("trusted structure overlap should be measured");
+        assert!((structure_overlap_ratio - 1.0).abs() < 0.0001);
+
+        let mut low_structure_quality = quality.clone();
+        low_structure_quality.structure_overlap_ratio = Some(0.2);
+        assert!(
+            transition_start_score(&low_structure_quality).unwrap()
+                > transition_start_score(&quality).unwrap(),
+            "quality={quality:?} low_structure_quality={low_structure_quality:?}"
+        );
     }
 
     #[test]
@@ -4291,6 +4339,10 @@ mod tests {
             "plan={plan:?} report={quality:?}"
         );
         assert!(quality.vocal_overlap_samples_checked > 0);
+        assert!(
+            quality.structure_overlap_ratio.unwrap() < 0.5,
+            "plan={plan:?} report={quality:?}"
+        );
         assert!(
             quality.max_dual_vocal_risk.unwrap() <= MAX_DUAL_VOCAL_RISK,
             "plan={plan:?} report={quality:?}"
