@@ -13,6 +13,9 @@ use crate::{ResolveError, provider::MediaProvider};
 
 const ANDROID_VR_CLIENT_VERSION: &str = "1.60.19";
 const ANDROID_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+const ANDROID_CLIENT_VERSION: &str = "20.10.38";
+const ANDROID_USER_AGENT: &str =
+    "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip";
 const YOUTUBE_RANGE_CHUNK_SIZE: u64 = 11_862_014;
 const YOUTUBE_ANDROID_VR_FAST_PATH_TIMEOUT: Duration = Duration::from_millis(900);
 
@@ -292,20 +295,34 @@ fn android_vr_stream_headers() -> Vec<PreparedHeader> {
     vec![PreparedHeader::new("User-Agent", ANDROID_VR_USER_AGENT)]
 }
 
+fn android_stream_headers() -> Vec<PreparedHeader> {
+    vec![PreparedHeader::new("User-Agent", ANDROID_USER_AGENT)]
+}
+
 async fn fetch_android_vr_audio_format(
     probe_client: &Client,
     canonical_url: &str,
     video_id: &str,
 ) -> Result<Option<ChosenFormat>, ResolveError> {
-    let Some(response) =
-        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?
-    else {
-        return Ok(None);
-    };
-    Ok(response
-        .streaming_data
+    let vr_response =
+        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
+    if let Some(format) = vr_response
         .as_ref()
-        .and_then(chosen_format_from_android_streaming_data))
+        .and_then(|response| response.streaming_data.as_ref())
+        .and_then(|streaming_data| {
+            chosen_format_from_android_streaming_data(streaming_data, android_vr_stream_headers())
+        })
+    {
+        return Ok(Some(format));
+    }
+
+    let android_response = fetch_direct_android_player_response(probe_client, video_id).await?;
+    Ok(android_response
+        .and_then(|response| response.streaming_data)
+        .as_ref()
+        .and_then(|streaming_data| {
+            chosen_format_from_android_streaming_data(streaming_data, android_stream_headers())
+        }))
 }
 
 async fn fetch_android_vr_track_request_fast(
@@ -332,19 +349,35 @@ async fn fetch_android_vr_track_request(
     raw_url: &str,
     video_id: &str,
 ) -> Result<Option<TrackRequest>, ResolveError> {
-    let Some(response) = fetch_direct_android_vr_player_response(probe_client, video_id).await?
-    else {
-        return Ok(None);
-    };
-    let Some(details) = response.video_details else {
-        return Ok(None);
-    };
-    let Some(streaming_data) = response.streaming_data else {
-        return Ok(None);
-    };
-    let Some(format) = chosen_format_from_android_streaming_data(&streaming_data) else {
-        return Ok(None);
-    };
+    let response = fetch_direct_android_vr_player_response(probe_client, video_id).await?;
+    if let Some(request) = android_track_request_from_response(
+        response,
+        raw_url,
+        video_id,
+        android_vr_stream_headers(),
+    ) {
+        return Ok(Some(request));
+    }
+
+    let response = fetch_direct_android_player_response(probe_client, video_id).await?;
+    Ok(android_track_request_from_response(
+        response,
+        raw_url,
+        video_id,
+        android_stream_headers(),
+    ))
+}
+
+fn android_track_request_from_response(
+    response: Option<AndroidPlayerResponse>,
+    raw_url: &str,
+    video_id: &str,
+    stream_headers: Vec<PreparedHeader>,
+) -> Option<TrackRequest> {
+    let response = response?;
+    let details = response.video_details?;
+    let streaming_data = response.streaming_data?;
+    let format = chosen_format_from_android_streaming_data(&streaming_data, stream_headers)?;
 
     let expires_at_unix = format_url_expiry(format.stream_url.as_ref());
     let content_length = format.content_length.as_deref().and_then(|value| {
@@ -381,7 +414,7 @@ async fn fetch_android_vr_track_request(
         .as_deref()
         .and_then(|length| parse_duration(length, is_live_content));
 
-    Ok(Some(TrackRequest::new(
+    Some(TrackRequest::new(
         "youtube",
         format!("youtube:video:{canonical_video_id}"),
         raw_url.to_owned(),
@@ -389,7 +422,7 @@ async fn fetch_android_vr_track_request(
         canonical_url.clone(),
         prepared,
         TrackMetadata::new(title, author, canonical_url, thumbnail_url, duration),
-    )))
+    ))
 }
 
 async fn fetch_android_vr_player_response(
@@ -459,8 +492,28 @@ async fn fetch_direct_android_vr_player_response(
         .map(Some)
 }
 
+async fn fetch_direct_android_player_response(
+    probe_client: &Client,
+    video_id: &str,
+) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
+    probe_client
+        .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
+        .headers(android_direct_api_headers()?)
+        .json(&direct_android_player_request(video_id))
+        .send()
+        .await
+        .map_err(ResolveError::Request)?
+        .error_for_status()
+        .map_err(ResolveError::Request)?
+        .json::<AndroidPlayerResponse>()
+        .await
+        .map_err(ResolveError::Request)
+        .map(Some)
+}
+
 fn chosen_format_from_android_streaming_data(
     streaming_data: &AndroidStreamingData,
+    headers: Vec<PreparedHeader>,
 ) -> Option<ChosenFormat> {
     if let Some(format) = choose_android_audio_stream(&streaming_data.adaptive_formats) {
         let content_length = format
@@ -471,7 +524,7 @@ fn chosen_format_from_android_streaming_data(
             stream_url: format.url.clone(),
             content_length: content_length.clone(),
             is_hls: false,
-            headers: android_vr_stream_headers(),
+            headers,
             range_chunk_size: content_length.is_some().then_some(YOUTUBE_RANGE_CHUNK_SIZE),
         });
     }
@@ -485,7 +538,7 @@ fn chosen_format_from_android_streaming_data(
             stream_url: hls_manifest_url.clone(),
             content_length: None,
             is_hls: true,
-            headers: android_vr_stream_headers(),
+            headers,
             range_chunk_size: None,
         });
     }
@@ -499,7 +552,7 @@ fn chosen_format_from_android_streaming_data(
             stream_url: server_abr_streaming_url.clone(),
             content_length: None,
             is_hls: true,
-            headers: android_vr_stream_headers(),
+            headers,
             range_chunk_size: None,
         });
     }
@@ -607,6 +660,31 @@ fn android_vr_direct_api_headers() -> Result<reqwest::header::HeaderMap, Resolve
     Ok(headers)
 }
 
+fn android_direct_api_headers() -> Result<reqwest::header::HeaderMap, ResolveError> {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("content-type"),
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        HeaderName::from_static("origin"),
+        HeaderValue::from_static("https://www.youtube.com"),
+    );
+    headers.insert(
+        HeaderName::from_static("referer"),
+        HeaderValue::from_static("https://www.youtube.com/"),
+    );
+    headers.insert(
+        HeaderName::from_static("user-agent"),
+        HeaderValue::from_str(ANDROID_USER_AGENT)
+            .map_err(|_| ResolveError::InvalidHeaderValue(ANDROID_USER_AGENT.to_owned()))?,
+    );
+
+    Ok(headers)
+}
+
 fn direct_android_vr_player_request(video_id: &str) -> serde_json::Value {
     serde_json::json!({
         "context": {
@@ -620,6 +698,27 @@ fn direct_android_vr_player_request(video_id: &str) -> serde_json::Value {
                 "timeZone": "UTC",
                 "utcOffsetMinutes": 0,
                 "androidSdkVersion": 32,
+            }
+        },
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+        "videoId": video_id,
+    })
+}
+
+fn direct_android_player_request(video_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "context": {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": ANDROID_CLIENT_VERSION,
+                "userAgent": ANDROID_USER_AGENT,
+                "osName": "Android",
+                "osVersion": "14",
+                "hl": "en",
+                "timeZone": "UTC",
+                "utcOffsetMinutes": 0,
+                "androidSdkVersion": 34,
             }
         },
         "contentCheckOk": true,
