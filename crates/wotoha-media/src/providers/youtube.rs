@@ -304,24 +304,24 @@ async fn fetch_android_vr_audio_format(
     canonical_url: &str,
     video_id: &str,
 ) -> Result<Option<ChosenFormat>, ResolveError> {
-    let vr_response =
-        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
-    if let Some(format) = vr_response
+    let android_response = fetch_direct_android_player_response(probe_client, video_id).await?;
+    if let Some(format) = android_response
         .as_ref()
         .and_then(|response| response.streaming_data.as_ref())
         .and_then(|streaming_data| {
-            chosen_format_from_android_streaming_data(streaming_data, android_vr_stream_headers())
+            chosen_format_from_android_streaming_data(streaming_data, android_stream_headers())
         })
     {
         return Ok(Some(format));
     }
 
-    let android_response = fetch_direct_android_player_response(probe_client, video_id).await?;
-    Ok(android_response
-        .and_then(|response| response.streaming_data)
+    let vr_response =
+        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
+    Ok(vr_response
         .as_ref()
+        .and_then(|response| response.streaming_data.as_ref())
         .and_then(|streaming_data| {
-            chosen_format_from_android_streaming_data(streaming_data, android_stream_headers())
+            chosen_format_from_android_streaming_data(streaming_data, android_vr_stream_headers())
         }))
 }
 
@@ -349,22 +349,19 @@ async fn fetch_android_vr_track_request(
     raw_url: &str,
     video_id: &str,
 ) -> Result<Option<TrackRequest>, ResolveError> {
-    let response = fetch_direct_android_vr_player_response(probe_client, video_id).await?;
-    if let Some(request) = android_track_request_from_response(
-        response,
-        raw_url,
-        video_id,
-        android_vr_stream_headers(),
-    ) {
+    let response = fetch_direct_android_player_response(probe_client, video_id).await?;
+    if let Some(request) =
+        android_track_request_from_response(response, raw_url, video_id, android_stream_headers())
+    {
         return Ok(Some(request));
     }
 
-    let response = fetch_direct_android_player_response(probe_client, video_id).await?;
+    let response = fetch_direct_android_vr_player_response(probe_client, video_id).await?;
     Ok(android_track_request_from_response(
         response,
         raw_url,
         video_id,
-        android_stream_headers(),
+        android_vr_stream_headers(),
     ))
 }
 
