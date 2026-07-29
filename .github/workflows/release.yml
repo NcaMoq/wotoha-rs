@@ -30,7 +30,7 @@ jobs:
           install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-app "$package/bin/wotoha-app"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
           install -m 0755 deploy/install-ubuntu.sh deploy/wotoha-update.sh "$package/"
-          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example "$package/deploy/"
+          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json "$package/deploy/"
           install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
           (cd "$package" && sha256sum bin/wotoha-app > SHA256SUMS.txt)
           tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl

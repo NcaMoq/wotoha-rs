@@ -1,23 +1,210 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::{Arc, OnceLock, RwLock as StdRwLock},
+    time::{Duration, Instant, SystemTime},
+};
 
 use async_trait::async_trait;
 use regex::Regex;
-use reqwest::{Client, Url};
+use reqwest::{
+    Client, Url,
+    header::{HeaderMap, HeaderName, HeaderValue, RANGE},
+};
 use rusty_ytdl::{
     Video, VideoFormat, VideoOptions, VideoQuality, VideoSearchOptions, choose_format,
 };
 use serde::Deserialize;
+use tokio::sync::RwLock as AsyncRwLock;
 use wotoha_core::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
 
 use crate::{ResolveError, provider::MediaProvider};
 
-const ANDROID_VR_CLIENT_VERSION: &str = "1.60.19";
-const ANDROID_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-const ANDROID_CLIENT_VERSION: &str = "20.10.38";
-const ANDROID_USER_AGENT: &str =
-    "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US) gzip";
+use super::youtube_ytdlp;
+
 const YOUTUBE_RANGE_CHUNK_SIZE: u64 = 11_862_014;
-const YOUTUBE_ANDROID_VR_FAST_PATH_TIMEOUT: Duration = Duration::from_millis(900);
+const YOUTUBE_NATIVE_FAST_PATH_TIMEOUT: Duration = Duration::from_secs(2);
+const YOUTUBE_STREAM_VALIDATION_TIMEOUT: Duration = Duration::from_secs(4);
+const YOUTUBE_STREAM_VALIDATION_RANGE: &str = "bytes=0-1023";
+const YOUTUBE_VISITOR_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+
+static YOUTUBE_VISITOR_SESSION: OnceLock<AsyncRwLock<Option<CachedVisitorSession>>> =
+    OnceLock::new();
+static YOUTUBE_NATIVE_CLIENTS: OnceLock<StdRwLock<CachedNativeClients>> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+struct CachedVisitorSession {
+    visitor_data: String,
+    signature_timestamp: u64,
+    cached_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct CachedNativeClients {
+    path: PathBuf,
+    modified_at: Option<SystemTime>,
+    profiles: Arc<[NativeClientProfile]>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct NativeClientProfile {
+    id: String,
+    client_name: String,
+    client_version: String,
+    client_number: String,
+    user_agent: String,
+    os_name: String,
+    os_version: String,
+    device_make: Option<String>,
+    device_model: Option<String>,
+    android_sdk_version: Option<u64>,
+}
+
+// These are ordered by expected GVS reliability. Every returned URL is verified before use,
+// so a rollout that breaks one client automatically falls through to the next strategy.
+fn default_native_client_profiles() -> Vec<NativeClientProfile> {
+    vec![
+        NativeClientProfile {
+            id: "visionos".to_owned(),
+            client_name: "VISIONOS".to_owned(),
+            client_version: "1.02".to_owned(),
+            client_number: "101".to_owned(),
+            user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15".to_owned(),
+            os_name: "visionOS".to_owned(),
+            os_version: "26.5.23O471".to_owned(),
+            device_make: Some("Apple".to_owned()),
+            device_model: Some("RealityDevice17,1".to_owned()),
+            android_sdk_version: None,
+        },
+        NativeClientProfile {
+            id: "android_vr".to_owned(),
+            client_name: "ANDROID_VR".to_owned(),
+            client_version: "1.65.10".to_owned(),
+            client_number: "28".to_owned(),
+            user_agent: "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip".to_owned(),
+            os_name: "Android".to_owned(),
+            os_version: "12L".to_owned(),
+            device_make: Some("Oculus".to_owned()),
+            device_model: Some("Quest 3".to_owned()),
+            android_sdk_version: Some(32),
+        },
+        NativeClientProfile {
+            id: "android".to_owned(),
+            client_name: "ANDROID".to_owned(),
+            client_version: "21.26.364".to_owned(),
+            client_number: "3".to_owned(),
+            user_agent: "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip".to_owned(),
+            os_name: "Android".to_owned(),
+            os_version: "11".to_owned(),
+            device_make: None,
+            device_model: None,
+            android_sdk_version: Some(30),
+        },
+    ]
+}
+
+fn native_client_profiles() -> Arc<[NativeClientProfile]> {
+    let path = env::var_os("WOTOHA_YOUTUBE_CLIENTS_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/wotoha/youtube-clients.json"));
+    let modified_at = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let cache = YOUTUBE_NATIVE_CLIENTS.get_or_init(|| {
+        StdRwLock::new(CachedNativeClients {
+            path: PathBuf::new(),
+            modified_at: None,
+            profiles: default_native_client_profiles().into(),
+        })
+    });
+    {
+        let cached = cache.read().expect("YouTube client cache read lock");
+        if cached.path == path && cached.modified_at == modified_at {
+            return cached.profiles.clone();
+        }
+    }
+
+    let profiles: Arc<[NativeClientProfile]> = load_native_client_profiles(&path).into();
+    let mut cached = cache.write().expect("YouTube client cache write lock");
+    if cached.path != path || cached.modified_at != modified_at {
+        cached.path = path;
+        cached.modified_at = modified_at;
+        cached.profiles = profiles;
+    }
+    cached.profiles.clone()
+}
+
+fn visitor_native_client_profile() -> NativeClientProfile {
+    native_client_profiles()
+        .iter()
+        .find(|profile| profile.id == "android_vr")
+        .cloned()
+        .unwrap_or_else(|| native_client_profiles()[0].clone())
+}
+
+fn load_native_client_profiles(path: &PathBuf) -> Vec<NativeClientProfile> {
+    match fs::read_to_string(path) {
+        Ok(json) => match serde_json::from_str::<Vec<NativeClientProfile>>(&json) {
+            Ok(profiles) if validate_native_client_profiles(&profiles) => {
+                tracing::info!(
+                    path = %path.display(),
+                    profiles = profiles.len(),
+                    "loaded external YouTube native client profiles"
+                );
+                profiles
+            }
+            Ok(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ignored invalid YouTube native client profile file"
+                );
+                default_native_client_profiles()
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to parse YouTube native client profile file"
+                );
+                default_native_client_profiles()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            default_native_client_profiles()
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to read YouTube native client profile file"
+            );
+            default_native_client_profiles()
+        }
+    }
+}
+
+fn validate_native_client_profiles(profiles: &[NativeClientProfile]) -> bool {
+    !profiles.is_empty()
+        && profiles.len() <= 8
+        && profiles.iter().all(|profile| {
+            !profile.id.is_empty()
+                && profile
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                && !profile.client_name.is_empty()
+                && profile.client_name.len() <= 64
+                && !profile.client_version.is_empty()
+                && profile.client_version.len() <= 64
+                && profile.client_number.parse::<u16>().is_ok()
+                && !profile.user_agent.is_empty()
+                && profile.user_agent.len() <= 512
+                && !profile.os_name.is_empty()
+                && profile.os_name.len() <= 64
+                && !profile.os_version.is_empty()
+                && profile.os_version.len() <= 64
+        })
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct YouTubeProvider;
@@ -58,7 +245,34 @@ impl MediaProvider for YouTubeProvider {
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "YouTube Android VR fast path failed; falling back to rusty_ytdl"
+                    "YouTube native fast path failed"
+                );
+            }
+        }
+
+        match youtube_ytdlp::probe(raw_url).await {
+            Ok(request) => match validate_prepared_source(probe_client, &request.prepared).await {
+                Ok(()) => {
+                    tracing::info!(
+                        extractor = "yt-dlp",
+                        video_key = %request.canonical_key,
+                        "YouTube extraction selected verified fallback"
+                    );
+                    return Ok(request);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        extractor = "yt-dlp",
+                        error = %error,
+                        "YouTube fallback returned an unplayable stream"
+                    );
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "yt-dlp",
+                    error = %error,
+                    "YouTube maintained fallback extraction failed"
                 );
             }
         }
@@ -107,6 +321,13 @@ impl MediaProvider for YouTubeProvider {
             content_length,
             expires_at_unix,
         );
+        validate_prepared_source(probe_client, &prepared)
+            .await
+            .map_err(|error| {
+                ResolveError::Parse(format!(
+                    "YouTube extractors did not expose a verified stream: {error}"
+                ))
+            })?;
 
         Ok(TrackRequest::new(
             self.id(),
@@ -145,17 +366,44 @@ impl MediaProvider for YouTubeProvider {
         .await
         {
             Ok(Some(format)) => format,
-            Ok(None) => return Ok(None),
+            Ok(None) => return refresh_with_ytdlp(request, probe_client).await,
             Err(error) => {
                 tracing::warn!(
                     error = %error,
-                    "YouTube playback refresh failed; falling back to full probe"
+                    "YouTube native playback refresh failed"
                 );
-                return Ok(None);
+                return refresh_with_ytdlp(request, probe_client).await;
             }
         };
 
         Ok(Some(track_request_with_format(request, format)))
+    }
+}
+
+async fn refresh_with_ytdlp(
+    request: &TrackRequest,
+    probe_client: &Client,
+) -> Result<Option<TrackRequest>, ResolveError> {
+    match youtube_ytdlp::refresh(request).await {
+        Ok(refreshed) => match validate_prepared_source(probe_client, &refreshed.prepared).await {
+            Ok(()) => Ok(Some(refreshed)),
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "yt-dlp",
+                    error = %error,
+                    "YouTube fallback refresh returned an unplayable stream"
+                );
+                Ok(None)
+            }
+        },
+        Err(error) => {
+            tracing::warn!(
+                extractor = "yt-dlp",
+                error = %error,
+                "YouTube fallback refresh failed"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -213,6 +461,92 @@ fn prepared_source_from_format(
             expires_at_unix,
         )
     }
+}
+
+async fn validate_chosen_format(
+    probe_client: &Client,
+    format: &ChosenFormat,
+) -> Result<(), String> {
+    let content_length = format.content_length.as_deref().and_then(|value| {
+        value
+            .parse::<u64>()
+            .ok()
+            .or_else(|| parse_content_length_from_url(format.stream_url.as_ref()))
+    });
+    let prepared = prepared_source_from_format(
+        format.clone(),
+        false,
+        content_length,
+        format_url_expiry(format.stream_url.as_ref()),
+    );
+    validate_prepared_source(probe_client, &prepared).await
+}
+
+async fn validate_prepared_source(
+    probe_client: &Client,
+    prepared: &PreparedSource,
+) -> Result<(), String> {
+    let (raw_url, prepared_headers, range_mode, is_hls) = match prepared {
+        PreparedSource::Http {
+            stream_url,
+            headers,
+            range_mode,
+            ..
+        } => (
+            stream_url.as_ref(),
+            headers.as_ref(),
+            Some(*range_mode),
+            false,
+        ),
+        PreparedSource::Hls {
+            playlist_url,
+            headers,
+            ..
+        } => (playlist_url.as_ref(), headers.as_ref(), None, true),
+    };
+    let headers = prepared_headers_to_map(prepared_headers)?;
+    let mut url = Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
+    let mut request = probe_client
+        .get(url.clone())
+        .headers(headers)
+        .timeout(YOUTUBE_STREAM_VALIDATION_TIMEOUT);
+    if !is_hls {
+        if range_mode == Some(PreparedRangeMode::QueryParam) {
+            let range = YOUTUBE_STREAM_VALIDATION_RANGE
+                .strip_prefix("bytes=")
+                .unwrap_or(YOUTUBE_STREAM_VALIDATION_RANGE);
+            url.query_pairs_mut().append_pair("range", range);
+            request = probe_client
+                .get(url)
+                .headers(prepared_headers_to_map(prepared_headers)?)
+                .timeout(YOUTUBE_STREAM_VALIDATION_TIMEOUT);
+        } else {
+            request = request.header(RANGE, YOUTUBE_STREAM_VALIDATION_RANGE);
+        }
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("stream request failed: {error}"))?;
+    let status = response.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        Err(format!("stream returned {status}"))
+    }
+}
+
+fn prepared_headers_to_map(headers: &[PreparedHeader]) -> Result<HeaderMap, String> {
+    let mut prepared = HeaderMap::new();
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes())
+            .map_err(|_| format!("invalid header name: {}", header.name))?;
+        let value = HeaderValue::from_str(header.value.as_ref())
+            .map_err(|_| format!("invalid header value for {}", header.name))?;
+        prepared.insert(name, value);
+    }
+    Ok(prepared)
 }
 
 fn choose_playable_format(
@@ -291,12 +625,11 @@ fn web_stream_headers() -> Vec<PreparedHeader> {
     ]
 }
 
-fn android_vr_stream_headers() -> Vec<PreparedHeader> {
-    vec![PreparedHeader::new("User-Agent", ANDROID_VR_USER_AGENT)]
-}
-
-fn android_stream_headers() -> Vec<PreparedHeader> {
-    vec![PreparedHeader::new("User-Agent", ANDROID_USER_AGENT)]
+fn native_stream_headers(profile: &NativeClientProfile) -> Vec<PreparedHeader> {
+    vec![PreparedHeader::new(
+        "User-Agent",
+        profile.user_agent.clone(),
+    )]
 }
 
 async fn fetch_android_vr_audio_format(
@@ -304,25 +637,76 @@ async fn fetch_android_vr_audio_format(
     canonical_url: &str,
     video_id: &str,
 ) -> Result<Option<ChosenFormat>, ResolveError> {
-    let android_response = fetch_direct_android_player_response(probe_client, video_id).await?;
-    if let Some(format) = android_response
+    let visitor_profile = visitor_native_client_profile();
+    let vr_response =
+        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
+    if let Some(format) = vr_response
         .as_ref()
         .and_then(|response| response.streaming_data.as_ref())
         .and_then(|streaming_data| {
-            chosen_format_from_android_streaming_data(streaming_data, android_stream_headers())
+            chosen_format_from_android_streaming_data(
+                streaming_data,
+                native_stream_headers(&visitor_profile),
+            )
         })
+        && validate_chosen_format(probe_client, &format).await.is_ok()
     {
+        tracing::info!(
+            extractor = "native",
+            strategy = "android_vr_visitor",
+            "YouTube selected verified visitor-bound stream"
+        );
         return Ok(Some(format));
     }
 
-    let vr_response =
-        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
-    Ok(vr_response
-        .as_ref()
-        .and_then(|response| response.streaming_data.as_ref())
-        .and_then(|streaming_data| {
-            chosen_format_from_android_streaming_data(streaming_data, android_vr_stream_headers())
-        }))
+    let profiles = native_client_profiles();
+    for profile in profiles.iter() {
+        let response =
+            match fetch_direct_native_player_response(probe_client, video_id, profile).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!(
+                        extractor = "native",
+                        strategy = profile.id.as_str(),
+                        error = %error,
+                        "YouTube native player request failed"
+                    );
+                    continue;
+                }
+            };
+        let Some(format) = response
+            .as_ref()
+            .and_then(|response| response.streaming_data.as_ref())
+            .and_then(|streaming_data| {
+                chosen_format_from_android_streaming_data(
+                    streaming_data,
+                    native_stream_headers(profile),
+                )
+            })
+        else {
+            continue;
+        };
+        match validate_chosen_format(probe_client, &format).await {
+            Ok(()) => {
+                tracing::info!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    "YouTube selected verified native stream"
+                );
+                return Ok(Some(format));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    error = %error,
+                    "YouTube rejected native stream candidate"
+                );
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 async fn fetch_android_vr_track_request_fast(
@@ -334,7 +718,7 @@ async fn fetch_android_vr_track_request_fast(
     };
 
     match tokio::time::timeout(
-        YOUTUBE_ANDROID_VR_FAST_PATH_TIMEOUT,
+        YOUTUBE_NATIVE_FAST_PATH_TIMEOUT,
         fetch_android_vr_track_request(probe_client, raw_url, &video_id),
     )
     .await
@@ -349,23 +733,79 @@ async fn fetch_android_vr_track_request(
     raw_url: &str,
     video_id: &str,
 ) -> Result<Option<TrackRequest>, ResolveError> {
-    let response = fetch_direct_android_player_response(probe_client, video_id).await?;
-    if let Some(request) =
-        android_track_request_from_response(response, raw_url, video_id, android_stream_headers())
-    {
-        return Ok(Some(request));
-    }
-
-    let response = fetch_direct_android_vr_player_response(probe_client, video_id).await?;
-    Ok(android_track_request_from_response(
+    let visitor_profile = visitor_native_client_profile();
+    let response = fetch_android_vr_player_response(
+        probe_client,
+        &format!("https://www.youtube.com/watch?v={video_id}"),
+        video_id,
+    )
+    .await?;
+    if let Some(request) = native_track_request_from_response(
         response,
         raw_url,
         video_id,
-        android_vr_stream_headers(),
-    ))
+        native_stream_headers(&visitor_profile),
+    ) && validate_prepared_source(probe_client, &request.prepared)
+        .await
+        .is_ok()
+    {
+        tracing::info!(
+            extractor = "native",
+            strategy = "android_vr_visitor",
+            video_key = %request.canonical_key,
+            "YouTube selected verified visitor-bound native path"
+        );
+        return Ok(Some(request));
+    }
+
+    let profiles = native_client_profiles();
+    for profile in profiles.iter() {
+        let response =
+            match fetch_direct_native_player_response(probe_client, video_id, profile).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!(
+                        extractor = "native",
+                        strategy = profile.id.as_str(),
+                        error = %error,
+                        "YouTube native metadata request failed"
+                    );
+                    continue;
+                }
+            };
+        let Some(request) = native_track_request_from_response(
+            response,
+            raw_url,
+            video_id,
+            native_stream_headers(profile),
+        ) else {
+            continue;
+        };
+        match validate_prepared_source(probe_client, &request.prepared).await {
+            Ok(()) => {
+                tracing::info!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    video_key = %request.canonical_key,
+                    "YouTube selected verified native fast path"
+                );
+                return Ok(Some(request));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    error = %error,
+                    "YouTube native fast path returned an unplayable stream"
+                );
+            }
+        }
+    }
+
+    Ok(None)
 }
 
-fn android_track_request_from_response(
+fn native_track_request_from_response(
     response: Option<AndroidPlayerResponse>,
     raw_url: &str,
     video_id: &str,
@@ -427,10 +867,58 @@ async fn fetch_android_vr_player_response(
     canonical_url: &str,
     video_id: &str,
 ) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
-    if let Some(response) = fetch_direct_android_vr_player_response(probe_client, video_id).await?
-        && response.streaming_data.is_some()
-    {
+    let (session, was_cached) = visitor_session(probe_client, canonical_url, false).await?;
+    let response = fetch_visitor_bound_player_response(probe_client, video_id, &session).await?;
+    if !was_cached || !response.requires_fresh_visitor_session() {
         return Ok(Some(response));
+    }
+
+    let (session, _) = visitor_session(probe_client, canonical_url, true).await?;
+    fetch_visitor_bound_player_response(probe_client, video_id, &session)
+        .await
+        .map(Some)
+}
+
+async fn fetch_visitor_bound_player_response(
+    probe_client: &Client,
+    video_id: &str,
+    session: &CachedVisitorSession,
+) -> Result<AndroidPlayerResponse, ResolveError> {
+    let visitor_profile = visitor_native_client_profile();
+    probe_client
+        .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
+        .headers(native_api_headers(
+            &visitor_profile,
+            Some(session.visitor_data.as_str()),
+        )?)
+        .json(&native_player_request(
+            video_id,
+            &visitor_profile,
+            Some(session.signature_timestamp),
+            Some(session.visitor_data.as_str()),
+        ))
+        .send()
+        .await
+        .map_err(ResolveError::Request)?
+        .error_for_status()
+        .map_err(ResolveError::Request)?
+        .json::<AndroidPlayerResponse>()
+        .await
+        .map_err(ResolveError::Request)
+}
+
+async fn visitor_session(
+    probe_client: &Client,
+    canonical_url: &str,
+    force_refresh: bool,
+) -> Result<(CachedVisitorSession, bool), ResolveError> {
+    let cache = YOUTUBE_VISITOR_SESSION.get_or_init(|| AsyncRwLock::new(None));
+    let mut cached = cache.write().await;
+    if !force_refresh
+        && let Some(session) = cached.as_ref()
+        && session.cached_at.elapsed() <= YOUTUBE_VISITOR_SESSION_TTL
+    {
+        return Ok((session.clone(), true));
     }
 
     let watch_html = probe_client
@@ -445,58 +933,33 @@ async fn fetch_android_vr_player_response(
         .await
         .map_err(ResolveError::Request)?;
     let Some(signature_timestamp) = extract_signature_timestamp(&watch_html) else {
-        return Ok(None);
+        return Err(ResolveError::Parse(
+            "YouTube visitor session was missing signature timestamp".to_owned(),
+        ));
     };
     let Some(visitor_data) = extract_visitor_data(&watch_html) else {
-        return Ok(None);
+        return Err(ResolveError::Parse(
+            "YouTube visitor session was missing visitor data".to_owned(),
+        ));
     };
-
-    probe_client
-        .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
-        .headers(android_vr_api_headers(visitor_data.as_str())?)
-        .json(&android_vr_player_request(
-            video_id,
-            signature_timestamp,
-            visitor_data.as_str(),
-        ))
-        .send()
-        .await
-        .map_err(ResolveError::Request)?
-        .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json::<AndroidPlayerResponse>()
-        .await
-        .map_err(ResolveError::Request)
-        .map(Some)
+    let session = CachedVisitorSession {
+        visitor_data,
+        signature_timestamp,
+        cached_at: Instant::now(),
+    };
+    *cached = Some(session.clone());
+    Ok((session, false))
 }
 
-async fn fetch_direct_android_vr_player_response(
+async fn fetch_direct_native_player_response(
     probe_client: &Client,
     video_id: &str,
+    profile: &NativeClientProfile,
 ) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
     probe_client
         .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
-        .headers(android_vr_direct_api_headers()?)
-        .json(&direct_android_vr_player_request(video_id))
-        .send()
-        .await
-        .map_err(ResolveError::Request)?
-        .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json::<AndroidPlayerResponse>()
-        .await
-        .map_err(ResolveError::Request)
-        .map(Some)
-}
-
-async fn fetch_direct_android_player_response(
-    probe_client: &Client,
-    video_id: &str,
-) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
-    probe_client
-        .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
-        .headers(android_direct_api_headers()?)
-        .json(&direct_android_player_request(video_id))
+        .headers(native_api_headers(profile, None)?)
+        .json(&native_player_request(video_id, profile, None, None))
         .send()
         .await
         .map_err(ResolveError::Request)?
@@ -533,20 +996,6 @@ fn chosen_format_from_android_streaming_data(
     {
         return Some(ChosenFormat {
             stream_url: hls_manifest_url.clone(),
-            content_length: None,
-            is_hls: true,
-            headers,
-            range_chunk_size: None,
-        });
-    }
-
-    if let Some(server_abr_streaming_url) = streaming_data
-        .server_abr_streaming_url
-        .as_ref()
-        .filter(|url| !url.is_empty())
-    {
-        return Some(ChosenFormat {
-            stream_url: server_abr_streaming_url.clone(),
             content_length: None,
             is_hls: true,
             headers,
@@ -619,22 +1068,10 @@ fn choose_android_audio_stream(
         })
 }
 
-fn android_vr_api_headers(visitor_data: &str) -> Result<reqwest::header::HeaderMap, ResolveError> {
-    use reqwest::header::{HeaderName, HeaderValue};
-
-    let mut headers = android_vr_direct_api_headers()?;
-    headers.insert(
-        HeaderName::from_static("x-goog-visitor-id"),
-        HeaderValue::from_str(visitor_data)
-            .map_err(|_| ResolveError::InvalidHeaderValue(visitor_data.to_owned()))?,
-    );
-
-    Ok(headers)
-}
-
-fn android_vr_direct_api_headers() -> Result<reqwest::header::HeaderMap, ResolveError> {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-
+fn native_api_headers(
+    profile: &NativeClientProfile,
+    visitor_data: Option<&str>,
+) -> Result<HeaderMap, ResolveError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         HeaderName::from_static("content-type"),
@@ -650,127 +1087,99 @@ fn android_vr_direct_api_headers() -> Result<reqwest::header::HeaderMap, Resolve
     );
     headers.insert(
         HeaderName::from_static("user-agent"),
-        HeaderValue::from_str(ANDROID_VR_USER_AGENT)
-            .map_err(|_| ResolveError::InvalidHeaderValue(ANDROID_VR_USER_AGENT.to_owned()))?,
+        HeaderValue::from_str(&profile.user_agent)
+            .map_err(|_| ResolveError::InvalidHeaderValue(profile.user_agent.clone()))?,
     );
+    headers.insert(
+        HeaderName::from_static("x-youtube-client-name"),
+        HeaderValue::from_str(&profile.client_number)
+            .map_err(|_| ResolveError::InvalidHeaderValue(profile.client_number.clone()))?,
+    );
+    headers.insert(
+        HeaderName::from_static("x-youtube-client-version"),
+        HeaderValue::from_str(&profile.client_version)
+            .map_err(|_| ResolveError::InvalidHeaderValue(profile.client_version.clone()))?,
+    );
+    if let Some(visitor_data) = visitor_data {
+        headers.insert(
+            HeaderName::from_static("x-goog-visitor-id"),
+            HeaderValue::from_str(visitor_data)
+                .map_err(|_| ResolveError::InvalidHeaderValue(visitor_data.to_owned()))?,
+        );
+    }
 
     Ok(headers)
 }
 
-fn android_direct_api_headers() -> Result<reqwest::header::HeaderMap, ResolveError> {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        HeaderName::from_static("content-type"),
-        HeaderValue::from_static("application/json"),
-    );
-    headers.insert(
-        HeaderName::from_static("origin"),
-        HeaderValue::from_static("https://www.youtube.com"),
-    );
-    headers.insert(
-        HeaderName::from_static("referer"),
-        HeaderValue::from_static("https://www.youtube.com/"),
-    );
-    headers.insert(
-        HeaderName::from_static("user-agent"),
-        HeaderValue::from_str(ANDROID_USER_AGENT)
-            .map_err(|_| ResolveError::InvalidHeaderValue(ANDROID_USER_AGENT.to_owned()))?,
-    );
-
-    Ok(headers)
-}
-
-fn direct_android_vr_player_request(video_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "context": {
-            "client": {
-                "clientName": "ANDROID_VR",
-                "clientVersion": ANDROID_VR_CLIENT_VERSION,
-                "userAgent": ANDROID_VR_USER_AGENT,
-                "osName": "Android",
-                "osVersion": "12L",
-                "hl": "en",
-                "timeZone": "UTC",
-                "utcOffsetMinutes": 0,
-                "androidSdkVersion": 32,
-            }
-        },
-        "contentCheckOk": true,
-        "racyCheckOk": true,
-        "videoId": video_id,
-    })
-}
-
-fn direct_android_player_request(video_id: &str) -> serde_json::Value {
-    serde_json::json!({
-        "context": {
-            "client": {
-                "clientName": "ANDROID",
-                "clientVersion": ANDROID_CLIENT_VERSION,
-                "userAgent": ANDROID_USER_AGENT,
-                "osName": "Android",
-                "osVersion": "14",
-                "hl": "en",
-                "timeZone": "UTC",
-                "utcOffsetMinutes": 0,
-                "androidSdkVersion": 34,
-            }
-        },
-        "contentCheckOk": true,
-        "racyCheckOk": true,
-        "videoId": video_id,
-    })
-}
-
-fn android_vr_player_request(
+fn native_player_request(
     video_id: &str,
-    signature_timestamp: u64,
-    visitor_data: &str,
+    profile: &NativeClientProfile,
+    signature_timestamp: Option<u64>,
+    visitor_data: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "context": {
-            "client": {
-                "clientName": "ANDROID_VR",
-                "clientVersion": ANDROID_VR_CLIENT_VERSION,
-                "userAgent": ANDROID_VR_USER_AGENT,
-                "osName": "Android",
-                "osVersion": "12L",
-                "hl": "en",
-                "timeZone": "UTC",
-                "utcOffsetMinutes": 0,
-                "androidSdkVersion": 32,
-                "visitorData": visitor_data,
-            }
-        },
-        "playbackContext": {
-            "contentPlaybackContext": {
-                "signatureTimestamp": signature_timestamp,
-                "html5Preference": "HTML5_PREF_WANTS",
-            }
-        },
+    let mut client = serde_json::json!({
+        "clientName": profile.client_name.as_str(),
+        "clientVersion": profile.client_version.as_str(),
+        "userAgent": profile.user_agent.as_str(),
+        "osName": profile.os_name.as_str(),
+        "osVersion": profile.os_version.as_str(),
+        "hl": "en",
+        "timeZone": "UTC",
+        "utcOffsetMinutes": 0,
+    });
+    let client = client
+        .as_object_mut()
+        .expect("native YouTube client context should be an object");
+    if let Some(device_make) = profile.device_make.as_deref() {
+        client.insert("deviceMake".to_owned(), device_make.into());
+    }
+    if let Some(device_model) = profile.device_model.as_deref() {
+        client.insert("deviceModel".to_owned(), device_model.into());
+    }
+    if let Some(android_sdk_version) = profile.android_sdk_version {
+        client.insert("androidSdkVersion".to_owned(), android_sdk_version.into());
+    }
+    if let Some(visitor_data) = visitor_data {
+        client.insert("visitorData".to_owned(), visitor_data.into());
+    }
+
+    let mut request = serde_json::json!({
+        "context": { "client": client },
         "contentCheckOk": true,
         "racyCheckOk": true,
         "videoId": video_id,
-    })
+    });
+    if let Some(signature_timestamp) = signature_timestamp {
+        request
+            .as_object_mut()
+            .expect("native YouTube player request should be an object")
+            .insert(
+                "playbackContext".to_owned(),
+                serde_json::json!({
+                    "contentPlaybackContext": {
+                        "signatureTimestamp": signature_timestamp,
+                        "html5Preference": "HTML5_PREF_WANTS",
+                    }
+                }),
+            );
+    }
+    request
 }
 
 fn extract_signature_timestamp(html: &str) -> Option<u64> {
-    let regex = Regex::new(r#""sts":(\d+)|"STS":(\d+)"#).ok()?;
+    let regex = Regex::new(r#""(?:sts|STS)"\s*:\s*(\d+)"#).ok()?;
     let captures = regex.captures(html)?;
     captures
         .get(1)
-        .or_else(|| captures.get(2))
         .and_then(|capture| capture.as_str().parse::<u64>().ok())
 }
 
 fn extract_visitor_data(html: &str) -> Option<String> {
-    let regex = Regex::new(r#""VISITOR_DATA":"([^"]+)""#).ok()?;
-    regex
-        .captures(html)?
-        .get(1)
-        .map(|capture| capture.as_str().to_owned())
+    let regex = Regex::new(r#""(?:VISITOR_DATA|visitorData)"\s*:\s*"([^"]+)""#).ok()?;
+    let encoded = regex.captures(html)?.get(1)?.as_str();
+    serde_json::from_str::<String>(&format!("\"{encoded}\""))
+        .ok()
+        .or_else(|| Some(encoded.to_owned()))
 }
 
 fn pick_thumbnail(thumbnails: &[rusty_ytdl::Thumbnail]) -> Option<Arc<str>> {
@@ -826,6 +1235,22 @@ struct AndroidPlayerResponse {
     streaming_data: Option<AndroidStreamingData>,
     #[serde(rename = "videoDetails")]
     video_details: Option<AndroidVideoDetails>,
+    #[serde(rename = "playabilityStatus")]
+    playability_status: Option<AndroidPlayabilityStatus>,
+}
+
+impl AndroidPlayerResponse {
+    fn requires_fresh_visitor_session(&self) -> bool {
+        self.playability_status
+            .as_ref()
+            .is_some_and(|status| status.status == "LOGIN_REQUIRED")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AndroidPlayabilityStatus {
+    #[serde(default)]
+    status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -834,8 +1259,6 @@ struct AndroidStreamingData {
     adaptive_formats: Vec<AndroidAdaptiveFormat>,
     #[serde(rename = "hlsManifestUrl")]
     hls_manifest_url: Option<String>,
-    #[serde(rename = "serverAbrStreamingUrl")]
-    server_abr_streaming_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -910,6 +1333,13 @@ mod tests {
         let url =
             "https://rr1---sn-a5mekn7k.googlevideo.com/videoplayback?expire=1777111066&id=o-AH";
         assert_eq!(format_url_expiry(url), Some(1777111066));
+    }
+
+    #[test]
+    fn parses_current_visitor_session_fields() {
+        let html = r#"{"sts": 20660,"visitorData":"abc\u003d\u003d"}"#;
+        assert_eq!(extract_signature_timestamp(html), Some(20_660));
+        assert_eq!(extract_visitor_data(html).as_deref(), Some("abc=="));
     }
 
     #[test]
@@ -1044,5 +1474,31 @@ mod tests {
 
         let chosen = choose_android_audio_stream(&formats).expect("android audio format");
         assert_eq!(chosen.url, "https://example.com/opus");
+    }
+
+    #[test]
+    fn shipped_native_client_manifest_is_valid() {
+        let profiles: Vec<NativeClientProfile> =
+            serde_json::from_str(include_str!("../../../../deploy/youtube-clients.json"))
+                .expect("shipped YouTube client manifest should parse");
+
+        assert!(validate_native_client_profiles(&profiles));
+        assert!(profiles.iter().any(|profile| profile.id == "android_vr"));
+    }
+
+    #[test]
+    fn rejects_unsafe_native_client_ids() {
+        let mut profiles = default_native_client_profiles();
+        profiles[0].id = "../visionos".to_owned();
+        assert!(!validate_native_client_profiles(&profiles));
+    }
+
+    #[test]
+    fn login_required_invalidates_cached_visitor_session() {
+        let response: AndroidPlayerResponse = serde_json::from_value(json!({
+            "playabilityStatus": { "status": "LOGIN_REQUIRED" }
+        }))
+        .unwrap();
+        assert!(response.requires_fresh_visitor_session());
     }
 }

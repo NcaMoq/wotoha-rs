@@ -22,6 +22,7 @@ install -m 0755 "$PACKAGE_DIR/wotoha-update.sh" /opt/wotoha/bin/wotoha-update
 install -m 0644 "$PACKAGE_DIR/deploy/wotoha.service" /etc/systemd/system/wotoha.service
 install -m 0644 "$PACKAGE_DIR/deploy/wotoha-update.service" /etc/systemd/system/wotoha-update.service
 install -m 0644 "$PACKAGE_DIR/deploy/wotoha-update.timer" /etc/systemd/system/wotoha-update.timer
+install -m 0644 "$PACKAGE_DIR/deploy/youtube-clients.json" /etc/wotoha/youtube-clients.json
 
 if [ ! -f /etc/wotoha/wotoha.env ]; then
   install -m 0600 "$PACKAGE_DIR/deploy/wotoha.env.example" /etc/wotoha/wotoha.env

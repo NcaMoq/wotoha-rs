@@ -71,6 +71,7 @@ Copy-Item (Join-Path $repoRoot 'deploy\wotoha.env.example') (Join-Path $packageR
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.env.example') (Join-Path $packageRoot 'deploy\wotoha-update.env.example')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.service') (Join-Path $packageRoot 'deploy\wotoha-update.service')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.timer') (Join-Path $packageRoot 'deploy\wotoha-update.timer')
+Copy-Item (Join-Path $repoRoot 'deploy\youtube-clients.json') (Join-Path $packageRoot 'deploy\youtube-clients.json')
 Copy-Item (Join-Path $repoRoot 'docs\ubuntu-deploy.md') (Join-Path $packageRoot 'docs\ubuntu-deploy.md')
 
 $binaryHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-app') -Algorithm SHA256).Hash.ToLowerInvariant()

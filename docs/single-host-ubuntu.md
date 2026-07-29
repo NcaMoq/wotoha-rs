@@ -10,7 +10,7 @@ This repository is being shaped for a single Ubuntu server deployment with the s
 - `TrackRequest` and `TrackMetadata` now use shared string storage so queue mutations, loop transitions, and queue previews avoid deep string copies.
 - `TrackRequest` now carries provider-scoped canonical identity and URL fields, so metadata and playback can stop treating raw slash-command URLs as durable cache keys.
 - Media resolution is split into a metadata probe path and a playback input path. This removes the eager creation of playback inputs for queued tracks.
-- Media providers now sit behind a registry and resolver facade with native extraction only. There is no `yt-dlp` fallback left in the workspace.
+- Media providers sit behind a registry and resolver facade. YouTube uses verified native extraction first and can use `yt-dlp` only as an optional emergency fallback when upstream changes invalidate every native strategy.
 - Resolver metadata is cached in memory with canonical-key storage, raw-url aliasing, in-flight request deduplication, and bounded probe concurrency.
 - Playback input creation is now async and expiry-aware, so signed provider URLs can be refreshed at play time instead of being frozen when a track is first queued.
 - Native providers now exist for YouTube, SoundCloud, Bandcamp, NicoNico, X/Twitter, Vimeo, and Twitch.

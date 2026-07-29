@@ -5,6 +5,7 @@ mod twitch;
 mod vimeo;
 mod x;
 mod youtube;
+mod youtube_ytdlp;
 
 pub use bandcamp::BandcampProvider;
 pub use niconico::NiconicoProvider;

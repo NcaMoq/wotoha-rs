@@ -54,6 +54,40 @@ if [[ -n "$token" ]]; then
   curl_auth=(--config "$auth_config")
 fi
 
+youtube_clients_changed=false
+if [[ "${WOTOHA_UPDATE_YOUTUBE_CLIENTS:-true}" == true ]]; then
+  youtube_clients="$tmp_dir/youtube-clients.json"
+  if curl "${curl_auth[@]}" --fail --silent --show-error --location --retry 3 \
+    --header "Accept: application/vnd.github.raw+json" \
+    --header "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/$repository/contents/deploy/youtube-clients.json?ref=main" \
+    --output "$youtube_clients"; then
+    if ! jq --exit-status '
+      type == "array"
+      and length > 0
+      and length <= 8
+      and all(.[];
+        (.id | type == "string" and test("^[A-Za-z0-9_]+$"))
+        and (.client_name | type == "string" and length > 0 and length <= 64)
+        and (.client_version | type == "string" and length > 0 and length <= 64)
+        and (.client_number | type == "string" and test("^[0-9]+$"))
+        and (.user_agent | type == "string" and length > 0 and length <= 512)
+        and (.os_name | type == "string" and length > 0 and length <= 64)
+        and (.os_version | type == "string" and length > 0 and length <= 64)
+      )
+    ' "$youtube_clients" >/dev/null; then
+      echo "downloaded YouTube client profile is invalid; keeping installed copy" >&2
+    elif [[ ! -r /etc/wotoha/youtube-clients.json ]] \
+      || ! cmp --silent "$youtube_clients" /etc/wotoha/youtube-clients.json; then
+      install -m 0644 "$youtube_clients" /etc/wotoha/youtube-clients.json
+      youtube_clients_changed=true
+      echo "updated YouTube client profiles"
+    fi
+  else
+    echo "unable to check YouTube client profile updates; continuing" >&2
+  fi
+fi
+
 release_json="$tmp_dir/release.json"
 curl "${curl_auth[@]}" --fail --silent --show-error --location --retry 3 \
   --header "Accept: application/vnd.github+json" \
@@ -63,6 +97,10 @@ curl "${curl_auth[@]}" --fail --silent --show-error --location --retry 3 \
 tag="$(jq --exit-status --raw-output '.tag_name' "$release_json")"
 
 if [[ -r "$STATE_FILE" && "$(<"$STATE_FILE")" == "$tag" ]]; then
+  if [[ "$youtube_clients_changed" == true ]]; then
+    echo "wotoha is already at $tag; new YouTube profiles load on the next request"
+    exit 0
+  fi
   echo "wotoha is already at $tag"
   exit 0
 fi
@@ -82,6 +120,17 @@ if [[ ! -d "$package" ]]; then
   exit 1
 fi
 (cd "$package" && sha256sum --check SHA256SUMS.txt)
+
+if [[ -x "$package/wotoha-update.sh" ]] \
+  && ! cmp --silent "$package/wotoha-update.sh" "$INSTALL_DIR/wotoha-update"; then
+  install -m 0755 "$package/wotoha-update.sh" "$INSTALL_DIR/wotoha-update.new"
+  mv -f "$INSTALL_DIR/wotoha-update.new" "$INSTALL_DIR/wotoha-update"
+  echo "updated wotoha updater"
+fi
+if [[ ! -r /etc/wotoha/youtube-clients.json ]] \
+  && [[ -r "$package/deploy/youtube-clients.json" ]]; then
+  install -m 0644 "$package/deploy/youtube-clients.json" /etc/wotoha/youtube-clients.json
+fi
 
 new_binary="$package/bin/wotoha-app"
 if [[ -x "$INSTALL_DIR/wotoha-app" ]] && cmp --silent "$new_binary" "$INSTALL_DIR/wotoha-app"; then
