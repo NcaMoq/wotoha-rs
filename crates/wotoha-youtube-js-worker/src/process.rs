@@ -16,22 +16,55 @@ const MAX_VALUE_BYTES: usize = 16 * 1024;
 #[derive(Deserialize)]
 struct WorkerRequest {
     protocol_version: u32,
+    #[serde(default)]
+    request_id: Option<u64>,
     player_key: String,
     player_source: Option<String>,
     inputs: Vec<ChallengeInput>,
+    #[serde(default)]
+    per_input_results: bool,
 }
 
 #[derive(Serialize)]
 struct WorkerResponse {
     protocol_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<u64>,
     outputs: Option<Vec<ChallengeOutput>>,
+    results: Option<Vec<WorkerChallengeResult>>,
     error: Option<String>,
 }
+
+#[derive(Serialize)]
+struct WorkerChallengeResult {
+    output: Option<ChallengeOutput>,
+    error: Option<String>,
+}
+
+type WorkerResultPayload = (
+    Option<Vec<ChallengeOutput>>,
+    Option<Vec<WorkerChallengeResult>>,
+);
 
 pub fn run_worker() {
     if apply_process_limits().is_err() {
         std::process::exit(70);
     }
+    let worker = std::thread::Builder::new()
+        .name("youtube-js-worker".to_owned())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(run_worker_loop);
+    match worker.and_then(|worker| {
+        worker
+            .join()
+            .map_err(|_| io::Error::other("worker thread panicked"))
+    }) {
+        Ok(()) => {}
+        Err(_) => std::process::exit(70),
+    }
+}
+
+fn run_worker_loop() {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut sessions = HashMap::<String, SolverSession>::new();
@@ -47,9 +80,11 @@ pub fn run_worker() {
 }
 
 fn handle_request(sessions: &mut HashMap<String, SolverSession>, frame: &[u8]) -> WorkerResponse {
-    let result: Result<Vec<ChallengeOutput>, String> = (|| {
-        let request: WorkerRequest =
-            serde_json::from_slice(frame).map_err(|_| "invalid request JSON".to_owned())?;
+    let request = serde_json::from_slice::<WorkerRequest>(frame)
+        .map_err(|_| "invalid request JSON".to_owned());
+    let request_id = request.as_ref().ok().and_then(|request| request.request_id);
+    let result: Result<WorkerResultPayload, String> = (|| {
+        let request = request?;
         validate_request(&request)?;
         if !sessions.contains_key(&request.player_key) {
             let source = request
@@ -63,23 +98,48 @@ fn handle_request(sessions: &mut HashMap<String, SolverSession>, frame: &[u8]) -
             let session = SolverSession::new(&prepared).map_err(|error| error.to_string())?;
             sessions.insert(request.player_key.clone(), session);
         }
-        let outputs = sessions
+        let session = sessions
             .get_mut(&request.player_key)
-            .ok_or_else(|| "player session was not created".to_owned())?
-            .solve_batch(&request.inputs)
-            .map_err(|error| error.to_string())?;
-        validate_outputs(&outputs)?;
-        Ok(outputs)
+            .ok_or_else(|| "player session was not created".to_owned())?;
+        if request.per_input_results {
+            let results = session
+                .solve_batch_isolated(&request.inputs)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|result| match result {
+                    Ok(output) => WorkerChallengeResult {
+                        output: Some(output),
+                        error: None,
+                    },
+                    Err(_) => WorkerChallengeResult {
+                        output: None,
+                        error: Some("no_unique_solution".to_owned()),
+                    },
+                })
+                .collect::<Vec<_>>();
+            validate_results(&results, request.inputs.len())?;
+            Ok((None, Some(results)))
+        } else {
+            let outputs = session
+                .solve_batch(&request.inputs)
+                .map_err(|error| error.to_string())?;
+            validate_outputs(&outputs, request.inputs.len())?;
+            Ok((Some(outputs), None))
+        }
     })();
     match result {
-        Ok(outputs) => WorkerResponse {
+        Ok((outputs, results)) => WorkerResponse {
             protocol_version: PROTOCOL_VERSION,
-            outputs: Some(outputs),
+            request_id,
+            outputs,
+            results,
             error: None,
         },
         Err(error) => WorkerResponse {
             protocol_version: PROTOCOL_VERSION,
+            request_id,
             outputs: None,
+            results: None,
             error: Some(sanitize_error(&error)),
         },
     }
@@ -110,8 +170,9 @@ fn validate_request(request: &WorkerRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_outputs(outputs: &[ChallengeOutput]) -> Result<(), String> {
-    if outputs.len() > MAX_JOBS
+fn validate_outputs(outputs: &[ChallengeOutput], expected_count: usize) -> Result<(), String> {
+    if outputs.len() != expected_count
+        || outputs.len() > MAX_JOBS
         || outputs.iter().any(|output| {
             output
                 .signature
@@ -124,6 +185,27 @@ fn validate_outputs(outputs: &[ChallengeOutput]) -> Result<(), String> {
         })
     {
         return Err("challenge output exceeded its size limit".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_results(
+    results: &[WorkerChallengeResult],
+    expected_count: usize,
+) -> Result<(), String> {
+    if results.len() != expected_count
+        || results.len() > MAX_JOBS
+        || results.iter().any(|result| match &result.output {
+            Some(output) => {
+                result.error.is_some() || validate_outputs(std::slice::from_ref(output), 1).is_err()
+            }
+            None => result
+                .error
+                .as_ref()
+                .is_none_or(|error| error.is_empty() || error.len() > 512),
+        })
+    {
+        return Err("challenge result exceeded its size limit".to_owned());
     }
     Ok(())
 }
@@ -228,6 +310,38 @@ var _player = {};
             assert!(response.error.is_none());
             assert_eq!(response.outputs.unwrap()[0].n.as_deref(), Some(expected));
         }
+    }
+
+    #[test]
+    fn reports_per_input_failures_without_rejecting_the_batch() {
+        let source = PLAYER_FIXTURE.replace(
+            "const value = new Param();",
+            r#"
+    if (c && decodeURIComponent(c) === "reject") throw new Error("rejected");
+    const value = new Param();"#,
+        );
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "protocol_version": 1,
+            "player_key": "partial-fixture",
+            "player_source": source,
+            "per_input_results": true,
+            "inputs": [
+                {"signature": "reject", "n": null},
+                {"signature": null, "n": "1234"}
+            ]
+        }))
+        .unwrap();
+        let response = handle_request(&mut HashMap::new(), &frame);
+        assert!(response.error.is_none());
+        assert!(response.outputs.is_none());
+        let results = response.results.unwrap();
+        assert_eq!(results[0].error.as_deref(), Some("no_unique_solution"));
+        assert!(results[0].output.is_none());
+        assert_eq!(
+            results[1].output.as_ref().unwrap().n.as_deref(),
+            Some("2341")
+        );
+        assert!(results[1].error.is_none());
     }
 
     #[test]

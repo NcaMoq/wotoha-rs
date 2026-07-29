@@ -7,36 +7,76 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: "1.95.0"
           components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test the workspace
         run: cargo test --workspace --locked
       - name: Lint the isolated JavaScript worker
         run: cargo clippy --locked -p wotoha-youtube-js-worker --all-targets -- -D warnings
+      - name: Verify worker supervision
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
+        run: |
+          cargo build --locked -p wotoha-youtube-js-worker --bin wotoha-youtube-js-worker
+          cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
+          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_hot_swaps_after_atomic_replacement -- --ignored --exact
+          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_promotes_content_addressed_candidate -- --ignored --exact
+      - name: Compare current Player with official EJS
+        shell: bash
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
+          WOTOHA_EJS_RUN: ${{ github.workspace }}/target/ejs-reference/run.ts
+        run: |
+          set -euo pipefail
+          mkdir -p target/ejs-reference
+          git -C target/ejs-reference init
+          git -C target/ejs-reference remote add origin https://github.com/yt-dlp/ejs.git
+          git -C target/ejs-reference fetch --depth 1 origin 6f8587bb7009a1fc81038538071d2cb66b8b8ed0
+          git -C target/ejs-reference checkout --detach FETCH_HEAD
+          npm --prefix target/ejs-reference ci
+          node scripts/youtube-differential-canary.mjs
 
   ubuntu-x86_64:
     needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
       - name: Build
         run: |
           docker run --rm \
             --volume "$PWD:/work" \
             --workdir /work \
             --env WOTOHA_BUILD_VERSION="$GITHUB_REF_NAME" \
-            ghcr.io/rust-cross/cargo-zigbuild:0.22.3 \
-            bash -c 'apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo zigbuild --locked --release --bin wotoha-app --bin wotoha-youtube-js-worker --target x86_64-unknown-linux-musl'
+            ghcr.io/rust-cross/cargo-zigbuild@sha256:b66e2a5063921aca74fc53248d75d187b7499fe1e076d78eb7d87ab1dbc52f6a \
+            bash -c 'rustup toolchain install 1.95.0 --profile minimal --target x86_64-unknown-linux-musl && apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo +1.95.0 zigbuild --locked --release --bin wotoha-app --bin wotoha-youtube-js-worker --target x86_64-unknown-linux-musl'
+      - name: Exercise exact musl worker protocol
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker
+        run: node scripts/youtube-worker-smoke.mjs
       - name: Package
         shell: bash
         run: |
@@ -47,14 +87,112 @@ jobs:
           install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker "$package/bin/wotoha-youtube-js-worker"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
           install -m 0755 deploy/install-ubuntu.sh deploy/wotoha-update.sh "$package/"
-          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json "$package/deploy/"
+          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json deploy/YOUTUBE_WORKER_SEQUENCE "$package/deploy/"
           install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
           (cd "$package" && sha256sum bin/wotoha-app bin/wotoha-youtube-js-worker > SHA256SUMS.txt)
           (cd "$package" && sha256sum --check SHA256SUMS.txt)
-          "$package/bin/wotoha-youtube-js-worker" </dev/null
+          WOTOHA_YOUTUBE_JS_WORKER="$package/bin/wotoha-youtube-js-worker" \
+            node scripts/youtube-worker-smoke.mjs
           tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
           (cd dist && sha256sum wotoha-ubuntu-x86_64-musl.tar.gz > wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
+          digest="$(sha256sum dist/wotoha-ubuntu-x86_64-musl.tar.gz | awk '{print $1}')"
+          jq --null-input \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            --arg digest "$digest" \
+            '{
+              schema_version: 1,
+              tag: $tag,
+              commit: $commit,
+              asset: "wotoha-ubuntu-x86_64-musl.tar.gz",
+              sha256: $digest
+            }' > dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json
+      - name: Attest release archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/wotoha-ubuntu-x86_64-musl.tar.gz
+      - name: Attest release manifest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json
+      - name: Download archive attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          download_bundle() {
+            local subject="$1"
+            local destination="$2"
+            rm -f sha256*.jsonl
+            for attempt in 1 2 3 4 5; do
+              if gh attestation download "$subject" --repo "$GITHUB_REPOSITORY"; then
+                break
+              fi
+              (( attempt < 5 ))
+              sleep $((attempt * 2))
+            done
+            local bundle
+            bundle="$(find . -maxdepth 1 -type f -name 'sha256*.jsonl' -print -quit)"
+            test -n "$bundle"
+            mv "$bundle" "$destination"
+          }
+          download_bundle wotoha-ubuntu-x86_64-musl.tar.gz archive.jsonl
+          download_bundle wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json manifest.jsonl
+          cat archive.jsonl manifest.jsonl \
+            > wotoha-ubuntu-x86_64-musl.tar.gz.attestation.jsonl
+          rm -f archive.jsonl manifest.jsonl
+      - name: Verify archive attestation policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=dist/wotoha-ubuntu-x86_64-musl.tar.gz
+          bundle="$archive.attestation.jsonl"
+          gh attestation verify "$archive" \
+            --bundle "$bundle" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners >/dev/null
+          gh attestation verify "$archive.manifest.json" \
+            --bundle "$bundle" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --deny-self-hosted-runners >/dev/null
+          cp "$archive" "$archive.tampered"
+          printf x >> "$archive.tampered"
+          if gh attestation verify "$archive.tampered" \
+            --bundle "$bundle" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "tampered release archive passed attestation verification" >&2
+            exit 1
+          fi
+          rm -f "$archive.tampered"
+          cp "$archive.manifest.json" "$archive.manifest.json.tampered"
+          printf x >> "$archive.manifest.json.tampered"
+          if gh attestation verify "$archive.manifest.json.tampered" \
+            --bundle "$bundle" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "tampered release manifest passed attestation verification" >&2
+            exit 1
+          fi
+          rm -f "$archive.manifest.json.tampered"
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/wotoha-ubuntu-x86_64-musl.tar.gz dist/wotoha-ubuntu-x86_64-musl.tar.gz.sha256 --verify-tag --generate-notes
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz \
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz.sha256 \
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json \
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz.attestation.jsonl \
+            --verify-tag \
+            --draft \
+            --generate-notes
+          gh release edit "$GITHUB_REF_NAME" --draft=false

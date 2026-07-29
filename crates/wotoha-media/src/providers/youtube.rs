@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, Semaphore},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore},
 };
 use wotoha_core::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
 
@@ -55,8 +55,10 @@ const YOUTUBE_JS_WORKER_SESSION_LIMIT: usize = 4;
 const YOUTUBE_JS_WORKER_REQUEST_MAX_BYTES: usize = 12 * 1024 * 1024;
 const YOUTUBE_JS_WORKER_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
 const YOUTUBE_JS_WORKER_QUEUE_TIMEOUT: Duration = Duration::from_secs(12);
-const YOUTUBE_JS_WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+const YOUTUBE_JS_WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(12);
+const YOUTUBE_JS_WORKER_CANDIDATE_TIMEOUT: Duration = Duration::from_secs(6);
 const YOUTUBE_JS_WORKER_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const YOUTUBE_JS_WORKER_CANDIDATE_REJECTION_TTL: Duration = Duration::from_secs(5 * 60);
 const YOUTUBE_CHALLENGE_JOB_LIMIT: usize = 64;
 const YOUTUBE_CHALLENGE_VALUE_MAX_BYTES: usize = 16 * 1024;
 
@@ -69,6 +71,7 @@ static YOUTUBE_PO_TOKEN_PROVIDER_BACKOFF: OnceLock<StdMutex<Option<Instant>>> = 
 static YOUTUBE_PLAYER_SCRIPT: OnceLock<AsyncMutex<Option<CachedPlayerScript>>> = OnceLock::new();
 static YOUTUBE_PLAYER_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
 static YOUTUBE_JS_WORKER: OnceLock<AsyncMutex<JsWorkerSupervisor>> = OnceLock::new();
+static YOUTUBE_JS_WORKER_VERIFIED_DIGESTS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct CachedVisitorSession {
@@ -91,7 +94,7 @@ struct ChallengeInput {
     n: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 struct ChallengeOutput {
     signature: Option<String>,
     n: Option<String>,
@@ -100,22 +103,39 @@ struct ChallengeOutput {
 #[derive(Serialize)]
 struct JsWorkerRequest<'a> {
     protocol_version: u32,
+    request_id: u64,
     player_key: &'a str,
     player_source: Option<&'a str>,
     inputs: &'a [ChallengeInput],
+    per_input_results: bool,
 }
 
 #[derive(Deserialize)]
 struct JsWorkerResponse {
     protocol_version: u32,
+    request_id: Option<u64>,
     outputs: Option<Vec<ChallengeOutput>>,
+    results: Option<Vec<JsWorkerChallengeResult>>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JsWorkerChallengeResult {
+    output: Option<ChallengeOutput>,
     error: Option<String>,
 }
 
 #[derive(Default)]
 struct JsWorkerSupervisor {
-    process: Option<JsWorkerProcess>,
-    failure_until: HashMap<String, Instant>,
+    current: Option<Arc<JsWorkerLane>>,
+    candidate: Option<Arc<JsWorkerLane>>,
+    failure_until: HashMap<WorkerPlayerKey, Instant>,
+    rejected_candidates: HashMap<WorkerPlayerKey, Instant>,
+}
+
+struct JsWorkerLane {
+    executable: JsWorkerExecutable,
+    process: Arc<AsyncMutex<Option<JsWorkerProcess>>>,
 }
 
 struct JsWorkerProcess {
@@ -123,11 +143,83 @@ struct JsWorkerProcess {
     stdin: ChildStdin,
     stdout: ChildStdout,
     loaded_players: HashSet<String>,
+    next_request_id: u64,
 }
 
+struct JsWorkerProcessLease {
+    guard: OwnedMutexGuard<Option<JsWorkerProcess>>,
+    process: Option<JsWorkerProcess>,
+}
+
+#[derive(Clone)]
 struct JsWorkerExecutable {
     path: PathBuf,
     app_worker_mode: bool,
+    identity: String,
+}
+
+#[derive(Clone)]
+struct JsWorkerCandidate {
+    executable: JsWorkerExecutable,
+    release_id: String,
+    ack_path: PathBuf,
+}
+
+struct JsWorkerSelection {
+    current: JsWorkerExecutable,
+    candidate: Option<JsWorkerCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WorkerPlayerKey {
+    executable_identity: String,
+    player_key: String,
+}
+
+#[derive(Clone)]
+struct JsWorkerCandidateProof {
+    release_id: String,
+    ack_path: PathBuf,
+    executable_identity: String,
+    baseline_current_identity: String,
+    player_key: String,
+}
+
+#[derive(Clone)]
+struct JsWorkerCandidateRoute {
+    lane: Arc<JsWorkerLane>,
+    proof: JsWorkerCandidateProof,
+}
+
+struct JsWorkerRoutes {
+    current: Arc<JsWorkerLane>,
+    candidate: Option<JsWorkerCandidateRoute>,
+}
+
+struct JsWorkerCandidateBatch {
+    outputs: Vec<Result<ChallengeOutput, String>>,
+    proof: JsWorkerCandidateProof,
+}
+
+struct SolvedNChallenge {
+    stream_url: String,
+    candidate_proof: Option<JsWorkerCandidateProof>,
+}
+
+struct SolvedCipherPlayerResponse {
+    response: AndroidPlayerResponse,
+    candidate_proof: Option<JsWorkerCandidateProof>,
+}
+
+#[derive(Clone, Copy)]
+enum CipherWorkerChoice {
+    Current,
+    Candidate,
+}
+
+struct SolvedCipherFormats {
+    solved: usize,
+    candidate_proof: Option<JsWorkerCandidateProof>,
 }
 
 #[derive(Clone, Debug)]
@@ -768,17 +860,53 @@ async fn validate_native_format_with_pot(
     visitor_data: Option<&str>,
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
+    allow_n_candidate_ack: bool,
 ) -> Result<(), String> {
     let original_url = format.stream_url.clone();
     match solve_url_n_challenge(probe_client, &original_url, player_url, challenge_detected).await {
-        Ok(Some(solved_url)) => {
-            format.stream_url = solved_url;
+        Ok(Some(solved)) => {
+            format.stream_url = solved.stream_url;
             if validate_chosen_format(probe_client, format).await.is_ok() {
+                if allow_n_candidate_ack {
+                    if let Some(proof) = solved.candidate_proof.as_ref() {
+                        acknowledge_validated_js_worker_candidate(proof);
+                    } else if let Some(player_url) = player_url {
+                        spawn_n_candidate_format_validation(
+                            probe_client.clone(),
+                            original_url.clone(),
+                            player_url.to_owned(),
+                            format.clone(),
+                        );
+                    }
+                }
                 tracing::info!(
                     extractor = "native_js",
                     "YouTube selected stream after solving the n challenge"
                 );
                 return Ok(());
+            }
+            if allow_n_candidate_ack && let Some(proof) = solved.candidate_proof.as_ref() {
+                reject_js_worker_candidate(proof).await;
+            }
+            if solved.candidate_proof.is_none()
+                && let Ok(Some(candidate)) =
+                    solve_url_n_challenge_candidate(&original_url, player_url).await
+            {
+                format.stream_url = candidate.stream_url;
+                if validate_chosen_format(probe_client, format).await.is_ok() {
+                    if allow_n_candidate_ack && let Some(proof) = candidate.candidate_proof.as_ref()
+                    {
+                        acknowledge_validated_js_worker_candidate(proof);
+                    }
+                    tracing::info!(
+                        extractor = "native_js",
+                        "YouTube selected stream from the candidate JavaScript worker"
+                    );
+                    return Ok(());
+                }
+                if allow_n_candidate_ack && let Some(proof) = candidate.candidate_proof.as_ref() {
+                    reject_js_worker_candidate(proof).await;
+                }
             }
             format.stream_url = original_url;
         }
@@ -865,6 +993,7 @@ async fn validate_native_request_with_pot(
     visitor_data: Option<&str>,
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
+    allow_n_candidate_ack: bool,
 ) -> Result<(), String> {
     let original_prepared = request.prepared.clone();
     let stream_url = match &request.prepared {
@@ -872,20 +1001,69 @@ async fn validate_native_request_with_pot(
         PreparedSource::Hls { playlist_url, .. } => playlist_url.to_string(),
     };
     match solve_url_n_challenge(probe_client, &stream_url, player_url, challenge_detected).await {
-        Ok(Some(solved_url)) => {
+        Ok(Some(solved)) => {
             match &mut request.prepared {
-                PreparedSource::Http { stream_url, .. } => *stream_url = solved_url.into(),
-                PreparedSource::Hls { playlist_url, .. } => *playlist_url = solved_url.into(),
+                PreparedSource::Http { stream_url, .. } => {
+                    *stream_url = solved.stream_url.clone().into()
+                }
+                PreparedSource::Hls { playlist_url, .. } => {
+                    *playlist_url = solved.stream_url.clone().into()
+                }
             }
             if validate_prepared_source(probe_client, &request.prepared)
                 .await
                 .is_ok()
             {
+                if allow_n_candidate_ack {
+                    if let Some(proof) = solved.candidate_proof.as_ref() {
+                        acknowledge_validated_js_worker_candidate(proof);
+                    } else if let Some(player_url) = player_url {
+                        spawn_n_candidate_request_validation(
+                            probe_client.clone(),
+                            stream_url.clone(),
+                            player_url.to_owned(),
+                            request.clone(),
+                        );
+                    }
+                }
                 tracing::info!(
                     extractor = "native_js",
                     "YouTube selected stream after solving the n challenge"
                 );
                 return Ok(());
+            }
+            if allow_n_candidate_ack && let Some(proof) = solved.candidate_proof.as_ref() {
+                reject_js_worker_candidate(proof).await;
+            }
+            if solved.candidate_proof.is_none()
+                && let Ok(Some(candidate)) =
+                    solve_url_n_challenge_candidate(&stream_url, player_url).await
+            {
+                match &mut request.prepared {
+                    PreparedSource::Http { stream_url, .. } => {
+                        *stream_url = candidate.stream_url.clone().into()
+                    }
+                    PreparedSource::Hls { playlist_url, .. } => {
+                        *playlist_url = candidate.stream_url.clone().into()
+                    }
+                }
+                if validate_prepared_source(probe_client, &request.prepared)
+                    .await
+                    .is_ok()
+                {
+                    if allow_n_candidate_ack && let Some(proof) = candidate.candidate_proof.as_ref()
+                    {
+                        acknowledge_validated_js_worker_candidate(proof);
+                    }
+                    tracing::info!(
+                        extractor = "native_js",
+                        "YouTube selected stream from the candidate JavaScript worker"
+                    );
+                    return Ok(());
+                }
+                if allow_n_candidate_ack && let Some(proof) = candidate.candidate_proof.as_ref() {
+                    reject_js_worker_candidate(proof).await;
+                }
             }
             request.prepared = original_prepared;
         }
@@ -1315,10 +1493,23 @@ async fn fetch_android_vr_audio_format(
             Some(session.visitor_data.as_str()),
             session.player_url.as_deref(),
             None,
+            !response.has_cipher_stream(),
         )
         .await
         {
             Ok(()) => {
+                if response.has_cipher_stream()
+                    && let Some(player_url) = session.player_url.as_deref()
+                {
+                    spawn_cipher_candidate_format_validation(
+                        probe_client.clone(),
+                        response.clone(),
+                        visitor_profile.clone(),
+                        video_id.to_owned(),
+                        Some(session.visitor_data.clone()),
+                        player_url.to_owned(),
+                    );
+                }
                 tracing::info!(
                     extractor = "native",
                     strategy = "android_vr_visitor",
@@ -1401,10 +1592,29 @@ async fn fetch_android_vr_audio_format(
                 .as_ref()
                 .and_then(|(_, session)| session.player_url.as_deref()),
             None,
+            response
+                .as_ref()
+                .is_none_or(|response| !response.has_cipher_stream()),
         )
         .await
         {
             Ok(()) => {
+                if let Some(response) = response
+                    .as_ref()
+                    .filter(|response| response.has_cipher_stream())
+                    && let Some(player_url) = vr_response
+                        .as_ref()
+                        .and_then(|(_, session)| session.player_url.as_deref())
+                {
+                    spawn_cipher_candidate_format_validation(
+                        probe_client.clone(),
+                        response.clone(),
+                        profile.clone(),
+                        video_id.to_owned(),
+                        None,
+                        player_url.to_owned(),
+                    );
+                }
                 tracing::info!(
                     extractor = "native",
                     strategy = profile.id.as_str(),
@@ -1512,10 +1722,24 @@ async fn fetch_android_vr_track_request(
             Some(session.visitor_data.as_str()),
             session.player_url.as_deref(),
             challenge_detected,
+            !response.has_cipher_stream(),
         )
         .await
         {
             Ok(()) => {
+                if response.has_cipher_stream()
+                    && let Some(player_url) = session.player_url.as_deref()
+                {
+                    spawn_cipher_candidate_request_validation(
+                        probe_client.clone(),
+                        response.clone(),
+                        raw_url.to_owned(),
+                        visitor_profile.clone(),
+                        video_id.to_owned(),
+                        Some(session.visitor_data.clone()),
+                        player_url.to_owned(),
+                    );
+                }
                 tracing::info!(
                     extractor = "native",
                     strategy = "android_vr_visitor",
@@ -1597,10 +1821,30 @@ async fn fetch_android_vr_track_request(
                 .as_ref()
                 .and_then(|(_, session)| session.player_url.as_deref()),
             challenge_detected,
+            response
+                .as_ref()
+                .is_none_or(|response| !response.has_cipher_stream()),
         )
         .await
         {
             Ok(()) => {
+                if let Some(response) = response
+                    .as_ref()
+                    .filter(|response| response.has_cipher_stream())
+                    && let Some(player_url) = vr_response
+                        .as_ref()
+                        .and_then(|(_, session)| session.player_url.as_deref())
+                {
+                    spawn_cipher_candidate_request_validation(
+                        probe_client.clone(),
+                        response.clone(),
+                        raw_url.to_owned(),
+                        profile.clone(),
+                        video_id.to_owned(),
+                        None,
+                        player_url.to_owned(),
+                    );
+                }
                 tracing::info!(
                     extractor = "native",
                     strategy = profile.id.as_str(),
@@ -1951,14 +2195,39 @@ async fn solved_cipher_player_response(
     response: &AndroidPlayerResponse,
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
-) -> Result<Option<AndroidPlayerResponse>, String> {
+) -> Result<Option<SolvedCipherPlayerResponse>, String> {
     let Some(player_url) = player_url else {
         return Ok(None);
     };
-    let mut cipher_response = response.clone();
-    let Some(streaming_data) = cipher_response.streaming_data.as_mut() else {
+    let Some(mut cipher_response) = cipher_only_player_response(response) else {
         return Ok(None);
     };
+    if let Some(challenge_detected) = challenge_detected {
+        challenge_detected.store(true, Ordering::Relaxed);
+    }
+    match solve_android_cipher_formats_with_worker(
+        probe_client,
+        &mut cipher_response,
+        player_url,
+        CipherWorkerChoice::Current,
+    )
+    .await
+    {
+        Ok(solved) if solved.solved > 0 && cipher_response.has_playable_stream() => {
+            Ok(Some(SolvedCipherPlayerResponse {
+                response: cipher_response,
+                candidate_proof: None,
+            }))
+        }
+        Ok(_) | Err(_) => {
+            solved_cipher_player_response_candidate(probe_client, response, player_url).await
+        }
+    }
+}
+
+fn cipher_only_player_response(response: &AndroidPlayerResponse) -> Option<AndroidPlayerResponse> {
+    let mut cipher_response = response.clone();
+    let streaming_data = cipher_response.streaming_data.as_mut()?;
     streaming_data.adaptive_formats.retain(|format| {
         format.mime_type.starts_with("audio/")
             && format
@@ -1966,16 +2235,123 @@ async fn solved_cipher_player_response(
                 .as_ref()
                 .is_some_and(|cipher| !cipher.is_empty())
     });
+    for format in &mut streaming_data.adaptive_formats {
+        format.url = None;
+    }
     streaming_data.hls_manifest_url = None;
-    if streaming_data.adaptive_formats.is_empty() {
+    (!streaming_data.adaptive_formats.is_empty()).then_some(cipher_response)
+}
+
+async fn solved_cipher_player_response_candidate(
+    probe_client: &Client,
+    response: &AndroidPlayerResponse,
+    player_url: &str,
+) -> Result<Option<SolvedCipherPlayerResponse>, String> {
+    let Some(mut cipher_response) = cipher_only_player_response(response) else {
         return Ok(None);
-    }
-    if let Some(challenge_detected) = challenge_detected {
-        challenge_detected.store(true, Ordering::Relaxed);
-    }
-    let solved =
-        solve_android_cipher_formats(probe_client, &mut cipher_response, player_url).await?;
-    Ok((solved > 0 && cipher_response.has_playable_stream()).then_some(cipher_response))
+    };
+    let solved = solve_android_cipher_formats_with_worker(
+        probe_client,
+        &mut cipher_response,
+        player_url,
+        CipherWorkerChoice::Candidate,
+    )
+    .await?;
+    Ok(
+        (solved.solved > 0 && cipher_response.has_playable_stream()).then_some(
+            SolvedCipherPlayerResponse {
+                response: cipher_response,
+                candidate_proof: solved.candidate_proof,
+            },
+        ),
+    )
+}
+
+fn spawn_cipher_candidate_format_validation(
+    probe_client: Client,
+    response: AndroidPlayerResponse,
+    profile: NativeClientProfile,
+    video_id: String,
+    visitor_data: Option<String>,
+    player_url: String,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(candidate)) =
+            solved_cipher_player_response_candidate(&probe_client, &response, &player_url).await
+        else {
+            return;
+        };
+        let Some(mut format) =
+            candidate
+                .response
+                .streaming_data
+                .as_ref()
+                .and_then(|streaming_data| {
+                    chosen_format_from_android_streaming_data(
+                        streaming_data,
+                        native_stream_headers(&profile),
+                    )
+                })
+        else {
+            return;
+        };
+        let validation = validate_native_format_with_pot_only(
+            &probe_client,
+            &mut format,
+            &profile,
+            &video_id,
+            visitor_data.as_deref(),
+        )
+        .await;
+        if let Some(proof) = candidate.candidate_proof.as_ref() {
+            if validation.is_ok() {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else {
+                reject_js_worker_candidate(proof).await;
+            }
+        }
+    });
+}
+
+fn spawn_cipher_candidate_request_validation(
+    probe_client: Client,
+    response: AndroidPlayerResponse,
+    raw_url: String,
+    profile: NativeClientProfile,
+    video_id: String,
+    visitor_data: Option<String>,
+    player_url: String,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(candidate)) =
+            solved_cipher_player_response_candidate(&probe_client, &response, &player_url).await
+        else {
+            return;
+        };
+        let Some(mut request) = native_track_request_from_response(
+            Some(candidate.response),
+            &raw_url,
+            &video_id,
+            native_stream_headers(&profile),
+        ) else {
+            return;
+        };
+        let validation = validate_native_request_with_pot_only(
+            &probe_client,
+            &mut request,
+            &profile,
+            &video_id,
+            visitor_data.as_deref(),
+        )
+        .await;
+        if let Some(proof) = candidate.candidate_proof.as_ref() {
+            if validation.is_ok() {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else {
+                reject_js_worker_candidate(proof).await;
+            }
+        }
+    });
 }
 
 async fn validated_cipher_format(
@@ -1987,26 +2363,98 @@ async fn validated_cipher_format(
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
 ) -> Result<Option<ChosenFormat>, String> {
-    let Some(response) =
+    let Some(solved) =
         solved_cipher_player_response(probe_client, response, player_url, challenge_detected)
             .await?
     else {
         return Ok(None);
     };
-    let Some(mut format) = response.streaming_data.as_ref().and_then(|streaming_data| {
-        chosen_format_from_android_streaming_data(streaming_data, native_stream_headers(profile))
-    }) else {
+    let Some(mut format) = solved
+        .response
+        .streaming_data
+        .as_ref()
+        .and_then(|streaming_data| {
+            chosen_format_from_android_streaming_data(
+                streaming_data,
+                native_stream_headers(profile),
+            )
+        })
+    else {
         return Ok(None);
     };
-    validate_native_format_with_pot_only(
+    let validation = validate_native_format_with_pot_only(
         probe_client,
         &mut format,
         profile,
         video_id,
         visitor_data,
     )
-    .await?;
-    Ok(Some(format))
+    .await;
+    match validation {
+        Ok(()) => {
+            if let Some(proof) = solved.candidate_proof.as_ref() {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else if let Some(player_url) = player_url {
+                spawn_cipher_candidate_format_validation(
+                    probe_client.clone(),
+                    response.clone(),
+                    profile.clone(),
+                    video_id.to_owned(),
+                    visitor_data.map(str::to_owned),
+                    player_url.to_owned(),
+                );
+            }
+            Ok(Some(format))
+        }
+        Err(current_error) if solved.candidate_proof.is_none() => {
+            let Some(player_url) = player_url else {
+                return Err(current_error);
+            };
+            let Some(candidate) =
+                solved_cipher_player_response_candidate(probe_client, response, player_url).await?
+            else {
+                return Err(current_error);
+            };
+            let Some(mut candidate_format) =
+                candidate
+                    .response
+                    .streaming_data
+                    .as_ref()
+                    .and_then(|streaming_data| {
+                        chosen_format_from_android_streaming_data(
+                            streaming_data,
+                            native_stream_headers(profile),
+                        )
+                    })
+            else {
+                return Err(current_error);
+            };
+            let candidate_validation = validate_native_format_with_pot_only(
+                probe_client,
+                &mut candidate_format,
+                profile,
+                video_id,
+                visitor_data,
+            )
+            .await;
+            if let Err(error) = candidate_validation {
+                if let Some(proof) = candidate.candidate_proof.as_ref() {
+                    reject_js_worker_candidate(proof).await;
+                }
+                return Err(error);
+            }
+            if let Some(proof) = candidate.candidate_proof.as_ref() {
+                acknowledge_validated_js_worker_candidate(proof);
+            }
+            Ok(Some(candidate_format))
+        }
+        Err(error) => {
+            if let Some(proof) = solved.candidate_proof.as_ref() {
+                reject_js_worker_candidate(proof).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn validated_cipher_request(
@@ -2019,29 +2467,88 @@ async fn validated_cipher_request(
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
 ) -> Result<Option<TrackRequest>, String> {
-    let Some(response) =
+    let Some(solved) =
         solved_cipher_player_response(probe_client, response, player_url, challenge_detected)
             .await?
     else {
         return Ok(None);
     };
     let Some(mut request) = native_track_request_from_response(
-        Some(response),
+        Some(solved.response),
         raw_url,
         video_id,
         native_stream_headers(profile),
     ) else {
         return Ok(None);
     };
-    validate_native_request_with_pot_only(
+    let validation = validate_native_request_with_pot_only(
         probe_client,
         &mut request,
         profile,
         video_id,
         visitor_data,
     )
-    .await?;
-    Ok(Some(request))
+    .await;
+    match validation {
+        Ok(()) => {
+            if let Some(proof) = solved.candidate_proof.as_ref() {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else if let Some(player_url) = player_url {
+                spawn_cipher_candidate_request_validation(
+                    probe_client.clone(),
+                    response.clone(),
+                    raw_url.to_owned(),
+                    profile.clone(),
+                    video_id.to_owned(),
+                    visitor_data.map(str::to_owned),
+                    player_url.to_owned(),
+                );
+            }
+            Ok(Some(request))
+        }
+        Err(current_error) if solved.candidate_proof.is_none() => {
+            let Some(player_url) = player_url else {
+                return Err(current_error);
+            };
+            let Some(candidate) =
+                solved_cipher_player_response_candidate(probe_client, response, player_url).await?
+            else {
+                return Err(current_error);
+            };
+            let Some(mut candidate_request) = native_track_request_from_response(
+                Some(candidate.response),
+                raw_url,
+                video_id,
+                native_stream_headers(profile),
+            ) else {
+                return Err(current_error);
+            };
+            let candidate_validation = validate_native_request_with_pot_only(
+                probe_client,
+                &mut candidate_request,
+                profile,
+                video_id,
+                visitor_data,
+            )
+            .await;
+            if let Err(error) = candidate_validation {
+                if let Some(proof) = candidate.candidate_proof.as_ref() {
+                    reject_js_worker_candidate(proof).await;
+                }
+                return Err(error);
+            }
+            if let Some(proof) = candidate.candidate_proof.as_ref() {
+                acknowledge_validated_js_worker_candidate(proof);
+            }
+            Ok(Some(candidate_request))
+        }
+        Err(error) => {
+            if let Some(proof) = solved.candidate_proof.as_ref() {
+                reject_js_worker_candidate(proof).await;
+            }
+            Err(error)
+        }
+    }
 }
 
 async fn run_youtube_js_solver(
@@ -2049,152 +2556,438 @@ async fn run_youtube_js_solver(
     player_source: Arc<str>,
     inputs: Vec<ChallengeInput>,
 ) -> Result<Vec<ChallengeOutput>, String> {
+    run_youtube_js_solver_isolated(player_url, player_source, inputs)
+        .await?
+        .into_iter()
+        .collect()
+}
+
+async fn run_youtube_js_solver_isolated(
+    player_url: &str,
+    player_source: Arc<str>,
+    inputs: Vec<ChallengeInput>,
+) -> Result<Vec<Result<ChallengeOutput, String>>, String> {
     let player_key = youtube_player_key(player_url, player_source.as_ref());
     let worker = YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
-    let mut supervisor = tokio::time::timeout(YOUTUBE_JS_WORKER_QUEUE_TIMEOUT, worker.lock())
-        .await
-        .map_err(|_| "Player JavaScript solver queue timed out".to_owned())?;
-    supervisor
-        .failure_until
-        .retain(|_, deadline| *deadline > Instant::now());
-    if supervisor.failure_until.contains_key(&player_key) {
-        return Err("Player JavaScript solver is temporarily backed off".to_owned());
-    }
-    let result = tokio::time::timeout(
+    let routes = {
+        let mut supervisor = tokio::time::timeout(YOUTUBE_JS_WORKER_QUEUE_TIMEOUT, worker.lock())
+            .await
+            .map_err(|_| "Player JavaScript solver queue timed out".to_owned())?;
+        supervisor.routes(&player_key, true)?
+    };
+    let current_key = WorkerPlayerKey {
+        executable_identity: routes.current.executable.identity.clone(),
+        player_key: player_key.clone(),
+    };
+    let current = solve_with_js_worker_lane(
+        routes.current,
+        &player_key,
+        player_source.as_ref(),
+        &inputs,
         YOUTUBE_JS_WORKER_EXECUTION_TIMEOUT,
-        supervisor.solve_once(&player_key, player_source.as_ref(), &inputs),
     )
     .await;
-    match result {
-        Ok(Ok(outputs)) => {
-            supervisor.failure_until.remove(&player_key);
-            Ok(outputs)
-        }
-        Ok(Err(error)) => {
-            supervisor.stop().await;
-            supervisor.back_off(player_key);
-            Err(error)
-        }
-        Err(_) => {
-            supervisor.stop().await;
-            supervisor.back_off(player_key);
-            Err("Player JavaScript solver execution timed out".to_owned())
+    {
+        let mut supervisor = worker.lock().await;
+        match &current {
+            Ok(_) => {
+                supervisor.failure_until.remove(&current_key);
+            }
+            Err(_) => supervisor.back_off(current_key),
         }
     }
+    if let (Some(candidate), Ok(current_results)) = (routes.candidate, current.as_ref()) {
+        let candidate_source = player_source;
+        let candidate_inputs = inputs;
+        let candidate_player_key = player_key.clone();
+        let current_results = current_results.clone();
+        tokio::spawn(async move {
+            let result = solve_with_js_worker_lane(
+                candidate.lane,
+                &candidate_player_key,
+                candidate_source.as_ref(),
+                &candidate_inputs,
+                YOUTUBE_JS_WORKER_CANDIDATE_TIMEOUT,
+            )
+            .await;
+            let preserves_current = match &result {
+                Ok(candidate) => {
+                    js_worker_candidate_preserves_current_successes(candidate, &current_results)
+                }
+                Err(_) => false,
+            };
+            if !preserves_current {
+                reject_js_worker_candidate(&candidate.proof).await;
+                if let Err(error) = result {
+                    tracing::debug!(
+                        extractor = "native_js",
+                        error = %error,
+                        "YouTube candidate JavaScript worker shadow failed"
+                    );
+                }
+            }
+        });
+    }
+    current
 }
 
 impl JsWorkerSupervisor {
-    async fn solve_once(
+    fn routes(
         &mut self,
         player_key: &str,
-        player_source: &str,
-        inputs: &[ChallengeInput],
-    ) -> Result<Vec<ChallengeOutput>, String> {
-        if self.process.is_none() {
-            self.process = Some(start_youtube_js_worker()?);
-        }
-        let process = self
-            .process
-            .as_mut()
-            .ok_or_else(|| "Player JavaScript solver worker did not start".to_owned())?;
-        if process
-            .child
-            .try_wait()
-            .map_err(|_| "Player JavaScript solver status check failed".to_owned())?
-            .is_some()
-        {
-            return Err("Player JavaScript solver worker exited".to_owned());
-        }
-        let is_new_player = !process.loaded_players.contains(player_key);
-        if is_new_player && process.loaded_players.len() >= YOUTUBE_JS_WORKER_SESSION_LIMIT {
-            process.loaded_players.clear();
-        }
-        let request = serde_json::to_vec(&JsWorkerRequest {
-            protocol_version: YOUTUBE_JS_WORKER_PROTOCOL_VERSION,
-            player_key,
-            player_source: is_new_player.then_some(player_source),
-            inputs,
-        })
-        .map_err(|_| "Player JavaScript solver request encoding failed".to_owned())?;
-        if request.is_empty() || request.len() > YOUTUBE_JS_WORKER_REQUEST_MAX_BYTES {
-            return Err("Player JavaScript solver request exceeded its size limit".to_owned());
-        }
-        process
-            .stdin
-            .write_all(&(request.len() as u32).to_be_bytes())
-            .await
-            .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
-        process
-            .stdin
-            .write_all(&request)
-            .await
-            .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
-        process
-            .stdin
-            .flush()
-            .await
-            .map_err(|_| "Player JavaScript solver request flush failed".to_owned())?;
-
-        let mut header = [0_u8; 4];
-        process
-            .stdout
-            .read_exact(&mut header)
-            .await
-            .map_err(|_| "Player JavaScript solver response header failed".to_owned())?;
-        let response_length = u32::from_be_bytes(header) as usize;
-        if response_length == 0 || response_length > YOUTUBE_JS_WORKER_RESPONSE_MAX_BYTES {
-            return Err("Player JavaScript solver response exceeded its size limit".to_owned());
-        }
-        let mut response = vec![0_u8; response_length];
-        process
-            .stdout
-            .read_exact(&mut response)
-            .await
-            .map_err(|_| "Player JavaScript solver response read failed".to_owned())?;
-        let response: JsWorkerResponse = serde_json::from_slice(&response)
-            .map_err(|_| "Player JavaScript solver returned invalid JSON".to_owned())?;
-        if response.protocol_version != YOUTUBE_JS_WORKER_PROTOCOL_VERSION {
-            return Err("Player JavaScript solver returned an unsupported protocol".to_owned());
-        }
-        if let Some(error) = response.error {
-            return Err(format!(
-                "Player JavaScript solver rejected the challenge: {}",
-                sanitize_js_worker_error(&error)
-            ));
-        }
-        let outputs = response
-            .outputs
-            .ok_or_else(|| "Player JavaScript solver returned no outputs".to_owned())?;
-        validate_js_worker_outputs(&outputs, inputs.len())?;
-        if is_new_player {
-            process.loaded_players.insert(player_key.to_owned());
-        }
-        Ok(outputs)
-    }
-
-    async fn stop(&mut self) {
-        let Some(mut process) = self.process.take() else {
-            return;
+        enforce_current_backoff: bool,
+    ) -> Result<JsWorkerRoutes, String> {
+        let JsWorkerSelection { current, candidate } = youtube_js_worker_selection()?;
+        let now = Instant::now();
+        self.failure_until.retain(|_, deadline| *deadline > now);
+        self.rejected_candidates
+            .retain(|_, deadline| *deadline > now);
+        let current_lane = self.reconcile_current(current.clone());
+        let current_key = WorkerPlayerKey {
+            executable_identity: current.identity.clone(),
+            player_key: player_key.to_owned(),
         };
-        let _ = process.child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), process.child.wait()).await;
+        if enforce_current_backoff && self.failure_until.contains_key(&current_key) {
+            return Err("Player JavaScript solver is temporarily backed off".to_owned());
+        }
+        let candidate = candidate.and_then(|candidate| {
+            let key = WorkerPlayerKey {
+                executable_identity: candidate.executable.identity.clone(),
+                player_key: player_key.to_owned(),
+            };
+            if js_worker_candidate_is_rejected(&self.rejected_candidates, &key, now) {
+                return None;
+            }
+            let candidate_changed = self
+                .candidate
+                .as_ref()
+                .is_none_or(|lane| lane.executable.identity != candidate.executable.identity);
+            if candidate_changed {
+                self.candidate = Some(Arc::new(JsWorkerLane::new(candidate.executable.clone())));
+            }
+            Some(JsWorkerCandidateRoute {
+                lane: self
+                    .candidate
+                    .as_ref()
+                    .expect("the candidate worker lane was reconciled")
+                    .clone(),
+                proof: JsWorkerCandidateProof {
+                    release_id: candidate.release_id,
+                    ack_path: candidate.ack_path,
+                    executable_identity: candidate.executable.identity,
+                    baseline_current_identity: current.identity.clone(),
+                    player_key: player_key.to_owned(),
+                },
+            })
+        });
+        if candidate.is_none() {
+            self.candidate = None;
+        }
+        Ok(JsWorkerRoutes {
+            current: current_lane,
+            candidate,
+        })
     }
 
-    fn back_off(&mut self, player_key: String) {
+    fn reconcile_current(&mut self, current: JsWorkerExecutable) -> Arc<JsWorkerLane> {
+        let current_changed = self
+            .current
+            .as_ref()
+            .is_none_or(|lane| lane.executable.identity != current.identity);
+        if current_changed {
+            self.current = Some(Arc::new(JsWorkerLane::new(current)));
+            self.failure_until.clear();
+        }
+        self.current
+            .as_ref()
+            .expect("the current worker lane was reconciled")
+            .clone()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    async fn stop(&mut self) {
+        let lanes = [self.current.take(), self.candidate.take()];
+        for lane in lanes.into_iter().flatten() {
+            let mut process = lane.process.lock().await;
+            if let Some(process) = process.take() {
+                stop_js_worker_process(process).await;
+            }
+        }
+    }
+
+    fn back_off(&mut self, key: WorkerPlayerKey) {
         if self.failure_until.len() >= 16 {
             self.failure_until.clear();
         }
-        self.failure_until.insert(
-            player_key,
-            Instant::now() + YOUTUBE_JS_WORKER_FAILURE_BACKOFF,
+        self.failure_until
+            .insert(key, Instant::now() + YOUTUBE_JS_WORKER_FAILURE_BACKOFF);
+    }
+
+    fn reject_candidate(&mut self, proof: &JsWorkerCandidateProof) {
+        if self.rejected_candidates.len() >= 64 {
+            self.rejected_candidates.clear();
+        }
+        self.rejected_candidates.insert(
+            WorkerPlayerKey {
+                executable_identity: proof.executable_identity.clone(),
+                player_key: proof.player_key.clone(),
+            },
+            Instant::now() + YOUTUBE_JS_WORKER_CANDIDATE_REJECTION_TTL,
         );
     }
 }
 
-fn start_youtube_js_worker() -> Result<JsWorkerProcess, String> {
-    let executable = youtube_js_worker_path()?;
-    let mut command = Command::new(executable.path);
-    if executable.app_worker_mode {
+impl JsWorkerLane {
+    fn new(executable: JsWorkerExecutable) -> Self {
+        Self {
+            executable,
+            process: Arc::new(AsyncMutex::new(None)),
+        }
+    }
+}
+
+impl JsWorkerProcessLease {
+    fn new(guard: OwnedMutexGuard<Option<JsWorkerProcess>>, process: JsWorkerProcess) -> Self {
+        Self {
+            guard,
+            process: Some(process),
+        }
+    }
+
+    fn process_mut(&mut self) -> &mut JsWorkerProcess {
+        self.process
+            .as_mut()
+            .expect("the worker process lease is active")
+    }
+
+    fn commit(mut self) {
+        *self.guard = self.process.take();
+    }
+}
+
+impl Drop for JsWorkerProcessLease {
+    fn drop(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            let _ = process.child.start_kill();
+        }
+    }
+}
+
+async fn solve_with_js_worker_lane(
+    lane: Arc<JsWorkerLane>,
+    player_key: &str,
+    player_source: &str,
+    inputs: &[ChallengeInput],
+    execution_timeout: Duration,
+) -> Result<Vec<Result<ChallengeOutput, String>>, String> {
+    let mut guard = tokio::time::timeout(
+        YOUTUBE_JS_WORKER_QUEUE_TIMEOUT,
+        lane.process.clone().lock_owned(),
+    )
+    .await
+    .map_err(|_| "Player JavaScript solver queue timed out".to_owned())?;
+    let process = match guard.take() {
+        Some(process) => process,
+        None => start_youtube_js_worker(lane.executable.clone())?,
+    };
+    let mut lease = JsWorkerProcessLease::new(guard, process);
+    let result = tokio::time::timeout(
+        execution_timeout,
+        solve_with_js_worker(lease.process_mut(), player_key, player_source, inputs),
+    )
+    .await
+    .map_err(|_| "Player JavaScript solver execution timed out".to_owned())?;
+    match result {
+        Ok(outputs) => {
+            lease.commit();
+            Ok(outputs)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn reject_js_worker_candidate(proof: &JsWorkerCandidateProof) {
+    let worker = YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+    worker.lock().await.reject_candidate(proof);
+}
+
+fn js_worker_candidate_is_rejected(
+    rejected: &HashMap<WorkerPlayerKey, Instant>,
+    key: &WorkerPlayerKey,
+    now: Instant,
+) -> bool {
+    rejected.get(key).is_some_and(|deadline| *deadline > now)
+}
+
+async fn run_youtube_js_candidate_solver_isolated(
+    player_url: &str,
+    player_source: Arc<str>,
+    inputs: Vec<ChallengeInput>,
+) -> Result<Option<JsWorkerCandidateBatch>, String> {
+    let player_key = youtube_player_key(player_url, player_source.as_ref());
+    let worker = YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+    let candidate = {
+        let mut supervisor = tokio::time::timeout(YOUTUBE_JS_WORKER_QUEUE_TIMEOUT, worker.lock())
+            .await
+            .map_err(|_| "Player JavaScript solver queue timed out".to_owned())?;
+        supervisor.routes(&player_key, false)?.candidate
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let outputs = solve_with_js_worker_lane(
+        candidate.lane,
+        &player_key,
+        player_source.as_ref(),
+        &inputs,
+        YOUTUBE_JS_WORKER_CANDIDATE_TIMEOUT,
+    )
+    .await;
+    match outputs {
+        Ok(outputs) if outputs.iter().any(Result::is_ok) => Ok(Some(JsWorkerCandidateBatch {
+            outputs,
+            proof: candidate.proof,
+        })),
+        Ok(_) => {
+            reject_js_worker_candidate(&candidate.proof).await;
+            Err("updated Player JavaScript worker solved no challenges".to_owned())
+        }
+        Err(error) => {
+            reject_js_worker_candidate(&candidate.proof).await;
+            Err(error)
+        }
+    }
+}
+
+async fn solve_with_js_worker(
+    process: &mut JsWorkerProcess,
+    player_key: &str,
+    player_source: &str,
+    inputs: &[ChallengeInput],
+) -> Result<Vec<Result<ChallengeOutput, String>>, String> {
+    if process
+        .child
+        .try_wait()
+        .map_err(|_| "Player JavaScript solver status check failed".to_owned())?
+        .is_some()
+    {
+        return Err("Player JavaScript solver worker exited".to_owned());
+    }
+    let is_new_player = !process.loaded_players.contains(player_key);
+    if is_new_player && process.loaded_players.len() >= YOUTUBE_JS_WORKER_SESSION_LIMIT {
+        process.loaded_players.clear();
+    }
+    let request_id = process.next_request_id;
+    process.next_request_id = process.next_request_id.wrapping_add(1).max(1);
+    let request = serde_json::to_vec(&JsWorkerRequest {
+        protocol_version: YOUTUBE_JS_WORKER_PROTOCOL_VERSION,
+        request_id,
+        player_key,
+        player_source: is_new_player.then_some(player_source),
+        inputs,
+        per_input_results: true,
+    })
+    .map_err(|_| "Player JavaScript solver request encoding failed".to_owned())?;
+    if request.is_empty() || request.len() > YOUTUBE_JS_WORKER_REQUEST_MAX_BYTES {
+        return Err("Player JavaScript solver request exceeded its size limit".to_owned());
+    }
+    process
+        .stdin
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .await
+        .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
+    process
+        .stdin
+        .write_all(&request)
+        .await
+        .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
+    process
+        .stdin
+        .flush()
+        .await
+        .map_err(|_| "Player JavaScript solver request flush failed".to_owned())?;
+
+    let mut header = [0_u8; 4];
+    process
+        .stdout
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| "Player JavaScript solver response header failed".to_owned())?;
+    let response_length = u32::from_be_bytes(header) as usize;
+    if response_length == 0 || response_length > YOUTUBE_JS_WORKER_RESPONSE_MAX_BYTES {
+        return Err("Player JavaScript solver response exceeded its size limit".to_owned());
+    }
+    let mut response = vec![0_u8; response_length];
+    process
+        .stdout
+        .read_exact(&mut response)
+        .await
+        .map_err(|_| "Player JavaScript solver response read failed".to_owned())?;
+    let response: JsWorkerResponse = serde_json::from_slice(&response)
+        .map_err(|_| "Player JavaScript solver returned invalid JSON".to_owned())?;
+    if response.protocol_version != YOUTUBE_JS_WORKER_PROTOCOL_VERSION {
+        return Err("Player JavaScript solver returned an unsupported protocol".to_owned());
+    }
+    validate_js_worker_response_request_id(response.request_id, request_id)?;
+    if let Some(error) = response.error {
+        return Err(format!(
+            "Player JavaScript solver rejected the challenge: {}",
+            sanitize_js_worker_error(&error)
+        ));
+    }
+    let results = if let Some(results) = response.results {
+        validate_js_worker_results(&results, inputs.len())?
+    } else {
+        let outputs = response
+            .outputs
+            .ok_or_else(|| "Player JavaScript solver returned no outputs".to_owned())?;
+        validate_js_worker_outputs(&outputs, inputs.len())?;
+        outputs.into_iter().map(Ok).collect()
+    };
+    if is_new_player {
+        process.loaded_players.insert(player_key.to_owned());
+    }
+    Ok(results)
+}
+
+fn validate_js_worker_response_request_id(
+    response_id: Option<u64>,
+    request_id: u64,
+) -> Result<(), String> {
+    if response_id.is_some_and(|response_id| response_id != request_id) {
+        Err("Player JavaScript solver returned a mismatched request ID".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+async fn stop_js_worker_process(mut process: JsWorkerProcess) {
+    let _ = process.child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(2), process.child.wait()).await;
+}
+
+fn js_worker_candidate_preserves_current_successes(
+    candidate: &[Result<ChallengeOutput, String>],
+    current: &[Result<ChallengeOutput, String>],
+) -> bool {
+    candidate.len() == current.len()
+        && candidate.iter().any(Result::is_ok)
+        && candidate
+            .iter()
+            .zip(current)
+            .all(|(candidate, current)| match (candidate, current) {
+                (Err(_), Ok(_)) => false,
+                _ => true,
+            })
+}
+
+fn start_youtube_js_worker(executable: JsWorkerExecutable) -> Result<JsWorkerProcess, String> {
+    let path = executable.path;
+    let app_worker_mode = executable.app_worker_mode;
+    let expected_identity = executable.identity;
+    let mut command = Command::new(&path);
+    if app_worker_mode {
         command.arg("--youtube-js-worker");
     }
     let mut child = command
@@ -2205,6 +2998,11 @@ fn start_youtube_js_worker() -> Result<JsWorkerProcess, String> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|_| "failed to start Player JavaScript solver worker".to_owned())?;
+    let observed_identity = js_worker_executable(path, app_worker_mode)?.identity;
+    if observed_identity != expected_identity {
+        let _ = child.start_kill();
+        return Err("Player JavaScript solver changed during startup".to_owned());
+    }
     let stdin = child
         .stdin
         .take()
@@ -2218,18 +3016,19 @@ fn start_youtube_js_worker() -> Result<JsWorkerProcess, String> {
         stdin,
         stdout,
         loaded_players: HashSet::new(),
+        next_request_id: 1,
     })
 }
 
-fn youtube_js_worker_path() -> Result<JsWorkerExecutable, String> {
+fn youtube_js_worker_selection() -> Result<JsWorkerSelection, String> {
+    if let Some(root) = env::var_os("WOTOHA_YOUTUBE_JS_WORKER_DIR").map(PathBuf::from) {
+        return content_addressed_js_worker_selection(root);
+    }
     if let Some(path) = env::var_os("WOTOHA_YOUTUBE_JS_WORKER").map(PathBuf::from) {
         if !path.is_absolute() {
             return Err("WOTOHA_YOUTUBE_JS_WORKER must be an absolute path".to_owned());
         }
-        return Ok(JsWorkerExecutable {
-            path,
-            app_worker_mode: false,
-        });
+        return current_js_worker_selection(path, false);
     }
     let executable =
         env::current_exe().map_err(|_| "current executable path was unavailable".to_owned())?;
@@ -2243,32 +3042,293 @@ fn youtube_js_worker_path() -> Result<JsWorkerExecutable, String> {
     };
     let sibling = parent.join(worker_name);
     if sibling.is_file() {
-        return Ok(JsWorkerExecutable {
-            path: sibling,
-            app_worker_mode: false,
-        });
+        return current_js_worker_selection(sibling, false);
     }
     if parent.file_name().is_some_and(|name| name == "deps")
         && let Some(debug_root) = parent.parent()
     {
         let debug_worker = debug_root.join(worker_name);
         if debug_worker.is_file() {
-            return Ok(JsWorkerExecutable {
-                path: debug_worker,
-                app_worker_mode: false,
-            });
+            return current_js_worker_selection(debug_worker, false);
         }
     }
     if executable
         .file_stem()
         .is_some_and(|name| name == "wotoha-app")
     {
-        return Ok(JsWorkerExecutable {
-            path: executable,
-            app_worker_mode: true,
-        });
+        return current_js_worker_selection(executable, true);
     }
     Err("Player JavaScript solver worker executable was not found".to_owned())
+}
+
+fn current_js_worker_selection(
+    path: PathBuf,
+    app_worker_mode: bool,
+) -> Result<JsWorkerSelection, String> {
+    Ok(JsWorkerSelection {
+        current: js_worker_executable(path, app_worker_mode)?,
+        candidate: None,
+    })
+}
+
+fn content_addressed_js_worker_selection(root: PathBuf) -> Result<JsWorkerSelection, String> {
+    if !root.is_absolute() {
+        return Err("WOTOHA_YOUTUBE_JS_WORKER_DIR must be an absolute path".to_owned());
+    }
+    let current_id = read_js_worker_pointer(&root.join("current"))?
+        .ok_or_else(|| "YouTube JavaScript worker current pointer was missing".to_owned())?;
+    let current = content_addressed_js_worker(&root, &current_id)?;
+    let candidate_id = match read_js_worker_pointer(&root.join("candidate")) {
+        Ok(candidate_id) => candidate_id.filter(|candidate_id| candidate_id != &current_id),
+        Err(error) => {
+            tracing::warn!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube ignored an invalid JavaScript worker candidate pointer"
+            );
+            None
+        }
+    };
+    let candidate = candidate_id.and_then(|release_id| {
+        let ack_path = env::var_os("WOTOHA_YOUTUBE_JS_WORKER_ACK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/var/lib/wotoha/youtube-worker-ack"));
+        if !ack_path.is_absolute() {
+            tracing::warn!(
+                extractor = "native_js",
+                "YouTube ignored a JavaScript worker candidate with a relative ACK path"
+            );
+            return None;
+        }
+        match content_addressed_js_worker(&root, &release_id) {
+            Ok(executable) => Some(JsWorkerCandidate {
+                executable,
+                release_id,
+                ack_path,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "native_js",
+                    error = %error,
+                    "YouTube ignored an invalid JavaScript worker candidate release"
+                );
+                None
+            }
+        }
+    });
+    Ok(JsWorkerSelection { current, candidate })
+}
+
+fn read_js_worker_pointer(path: &std::path::Path) -> Result<Option<String>, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("YouTube JavaScript worker pointer was unreadable".to_owned()),
+    };
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 128 {
+        return Err("YouTube JavaScript worker pointer was invalid".to_owned());
+    }
+    let release_id = fs::read_to_string(path)
+        .map_err(|_| "YouTube JavaScript worker pointer was unreadable".to_owned())?;
+    let release_id = release_id.trim();
+    if release_id.len() != 64
+        || !release_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("YouTube JavaScript worker pointer digest was invalid".to_owned());
+    }
+    Ok(Some(release_id.to_owned()))
+}
+
+fn content_addressed_js_worker(
+    root: &std::path::Path,
+    release_id: &str,
+) -> Result<JsWorkerExecutable, String> {
+    let worker_name = if cfg!(windows) {
+        "wotoha-youtube-js-worker.exe"
+    } else {
+        "wotoha-youtube-js-worker"
+    };
+    let versions = fs::canonicalize(root.join("versions"))
+        .map_err(|_| "YouTube JavaScript worker versions directory was unavailable".to_owned())?;
+    let requested = versions.join(release_id).join(worker_name);
+    if fs::symlink_metadata(&requested)
+        .map_err(|_| "YouTube JavaScript worker release was unavailable".to_owned())?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("YouTube JavaScript worker release must not be a symlink".to_owned());
+    }
+    let path = fs::canonicalize(&requested)
+        .map_err(|_| "YouTube JavaScript worker release was unavailable".to_owned())?;
+    if !path.starts_with(&versions) {
+        return Err("YouTube JavaScript worker release escaped its versions directory".to_owned());
+    }
+    let executable = js_worker_executable(path, false)?;
+    let cache_key = format!("{release_id}:{}", executable.identity);
+    let verified = YOUTUBE_JS_WORKER_VERIFIED_DIGESTS.get_or_init(|| StdMutex::new(HashSet::new()));
+    let mut verified = verified
+        .lock()
+        .map_err(|_| "YouTube JavaScript worker digest cache was unavailable".to_owned())?;
+    if !verified.contains(&cache_key) {
+        use std::io::Read;
+
+        let mut file = fs::File::open(&executable.path)
+            .map_err(|_| "YouTube JavaScript worker release was unreadable".to_owned())?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|_| "YouTube JavaScript worker release was unreadable".to_owned())?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let actual = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != release_id {
+            return Err("YouTube JavaScript worker digest did not match its release ID".to_owned());
+        }
+        if verified.len() >= 16 {
+            verified.clear();
+        }
+        verified.insert(cache_key);
+    }
+    Ok(executable)
+}
+
+fn acknowledge_validated_js_worker_candidate(proof: &JsWorkerCandidateProof) {
+    let selection = match youtube_js_worker_selection() {
+        Ok(selection) => selection,
+        Err(error) => {
+            tracing::warn!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube could not revalidate the JavaScript worker candidate before ACK"
+            );
+            return;
+        }
+    };
+    match write_validated_js_worker_candidate_ack(&selection, proof) {
+        Ok(true) => {
+            tracing::info!(
+                extractor = "native_js",
+                "YouTube acknowledged a JavaScript worker after stream validation"
+            );
+        }
+        Ok(false) => {
+            tracing::debug!(
+                extractor = "native_js",
+                "YouTube skipped ACK for a stale JavaScript worker candidate proof"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube could not acknowledge the validated JavaScript worker candidate"
+            );
+        }
+    }
+}
+
+fn write_validated_js_worker_candidate_ack(
+    selection: &JsWorkerSelection,
+    proof: &JsWorkerCandidateProof,
+) -> Result<bool, String> {
+    if selection.current.identity == proof.executable_identity {
+        return Ok(false);
+    }
+    let still_pending = selection.candidate.as_ref().is_some_and(|candidate| {
+        candidate.release_id == proof.release_id
+            && candidate.executable.identity == proof.executable_identity
+            && candidate.ack_path == proof.ack_path
+            && selection.current.identity == proof.baseline_current_identity
+    });
+    if !still_pending {
+        return Ok(false);
+    }
+    write_js_worker_ack(&proof.ack_path, &proof.release_id)?;
+    Ok(true)
+}
+
+fn write_js_worker_ack(path: &std::path::Path, release_id: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "YouTube JavaScript worker ACK directory was unavailable".to_owned())?;
+    let temporary = parent.join(format!(
+        ".youtube-worker-ack-{}-{}.tmp",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let result = (|| {
+        use std::io::Write;
+
+        let mut file = fs::File::create(&temporary)
+            .map_err(|_| "YouTube JavaScript worker ACK write failed".to_owned())?;
+        file.write_all(format!("{release_id}\n").as_bytes())
+            .map_err(|_| "YouTube JavaScript worker ACK write failed".to_owned())?;
+        file.sync_all()
+            .map_err(|_| "YouTube JavaScript worker ACK sync failed".to_owned())?;
+        drop(file);
+        fs::rename(&temporary, path)
+            .map_err(|_| "YouTube JavaScript worker ACK promotion failed".to_owned())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn js_worker_executable(
+    path: PathBuf,
+    app_worker_mode: bool,
+) -> Result<JsWorkerExecutable, String> {
+    let metadata = fs::metadata(&path)
+        .map_err(|_| "Player JavaScript solver worker metadata was unavailable".to_owned())?;
+    if !metadata.is_file() {
+        return Err("Player JavaScript solver worker was not a regular file".to_owned());
+    }
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            path.display(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        )
+    };
+    #[cfg(not(unix))]
+    let identity = format!(
+        "{}:{}:{}",
+        path.display(),
+        metadata.len(),
+        metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    Ok(JsWorkerExecutable {
+        path,
+        app_worker_mode,
+        identity,
+    })
 }
 
 fn youtube_player_key(player_url: &str, player_source: &str) -> String {
@@ -2304,6 +3364,29 @@ fn validate_js_worker_outputs(
     Ok(())
 }
 
+fn validate_js_worker_results(
+    results: &[JsWorkerChallengeResult],
+    expected_count: usize,
+) -> Result<Vec<Result<ChallengeOutput, String>>, String> {
+    if results.len() != expected_count || results.len() > YOUTUBE_CHALLENGE_JOB_LIMIT {
+        return Err("Player JavaScript solver returned invalid result count".to_owned());
+    }
+    results
+        .iter()
+        .map(|result| match (&result.output, &result.error) {
+            (Some(output), None) => {
+                validate_js_worker_outputs(std::slice::from_ref(output), 1)?;
+                Ok(Ok(output.clone()))
+            }
+            (None, Some(error)) if !error.is_empty() && error.len() <= 256 => Ok(Err(format!(
+                "Player JavaScript challenge had no unique solution: {}",
+                sanitize_js_worker_error(error)
+            ))),
+            _ => Err("Player JavaScript solver returned an invalid item result".to_owned()),
+        })
+        .collect()
+}
+
 fn sanitize_js_worker_error(error: &str) -> String {
     error
         .chars()
@@ -2313,12 +3396,31 @@ fn sanitize_js_worker_error(error: &str) -> String {
 }
 
 async fn solve_android_cipher_formats(
-    _probe_client: &Client,
+    probe_client: &Client,
     response: &mut AndroidPlayerResponse,
     player_url: &str,
 ) -> Result<usize, String> {
+    Ok(solve_android_cipher_formats_with_worker(
+        probe_client,
+        response,
+        player_url,
+        CipherWorkerChoice::Current,
+    )
+    .await?
+    .solved)
+}
+
+async fn solve_android_cipher_formats_with_worker(
+    _probe_client: &Client,
+    response: &mut AndroidPlayerResponse,
+    player_url: &str,
+    worker_choice: CipherWorkerChoice,
+) -> Result<SolvedCipherFormats, String> {
     let Some(streaming_data) = response.streaming_data.as_mut() else {
-        return Ok(0);
+        return Ok(SolvedCipherFormats {
+            solved: 0,
+            candidate_proof: None,
+        });
     };
     let mut jobs = Vec::new();
     for (format_index, format) in streaming_data.adaptive_formats.iter().enumerate() {
@@ -2342,7 +3444,10 @@ async fn solve_android_cipher_formats(
         }
     }
     if jobs.is_empty() {
-        return Ok(0);
+        return Ok(SolvedCipherFormats {
+            solved: 0,
+            candidate_proof: None,
+        });
     }
     if jobs.len() > YOUTUBE_CHALLENGE_JOB_LIMIT {
         return Err("YouTube returned too many Player JavaScript challenge jobs".to_owned());
@@ -2370,48 +3475,44 @@ async fn solve_android_cipher_formats(
     if inputs.len() > YOUTUBE_CHALLENGE_JOB_LIMIT {
         return Err("YouTube returned too many Player JavaScript challenge inputs".to_owned());
     }
-    let outputs = run_youtube_js_solver(player_url, player_source, inputs).await?;
+    let (outputs, candidate_proof) = match worker_choice {
+        CipherWorkerChoice::Current => (
+            run_youtube_js_solver_isolated(player_url, player_source, inputs).await?,
+            None,
+        ),
+        CipherWorkerChoice::Candidate => {
+            let Some(candidate) =
+                run_youtube_js_candidate_solver_isolated(player_url, player_source, inputs).await?
+            else {
+                return Err("updated Player JavaScript worker candidate was unavailable".to_owned());
+            };
+            (candidate.outputs, Some(candidate.proof))
+        }
+    };
     if outputs.len() != targets.len() {
         return Err("Player JavaScript solver returned the wrong output count".to_owned());
     }
 
-    let mut solved_urls = jobs
-        .iter()
-        .map(|job| job.stream_url.clone())
-        .collect::<Vec<_>>();
-    for (target, output) in targets.into_iter().zip(outputs) {
-        let (job_index, key, value) = match target {
-            CipherOutputTarget::Signature(job_index) => {
-                let value = output
-                    .signature
-                    .filter(|signature| {
-                        !signature.is_empty()
-                            && signature.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES
-                    })
-                    .ok_or_else(|| "Player JavaScript returned an empty signature".to_owned())?;
-                (
-                    job_index,
-                    jobs[job_index].signature_parameter.as_str(),
-                    value,
-                )
-            }
-            CipherOutputTarget::N(job_index) => {
-                let value = output
-                    .n
-                    .filter(|n| !n.is_empty() && n.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
-                    .ok_or_else(|| "Player JavaScript returned an empty n value".to_owned())?;
-                (job_index, "n", value)
+    let solved_urls = apply_cipher_outputs(&jobs, targets, outputs)?;
+    for (job, stream_url) in jobs.into_iter().zip(solved_urls) {
+        let stream_url = match stream_url {
+            Ok(stream_url) => stream_url,
+            Err(error) => {
+                tracing::debug!(
+                    extractor = "native_js",
+                    format_index = job.format_index,
+                    error = %error,
+                    "YouTube skipped a cipher format with an unsolved challenge"
+                );
+                continue;
             }
         };
-        solved_urls[job_index] = url_with_query_value(&solved_urls[job_index], key, &value)?;
-    }
-    for (job, stream_url) in jobs.into_iter().zip(solved_urls) {
         let Some(format) = streaming_data.adaptive_formats.get_mut(job.format_index) else {
             return Err("Player JavaScript format index changed during solving".to_owned());
         };
         format.url = Some(stream_url);
     }
-    Ok(streaming_data
+    let solved = streaming_data
         .adaptive_formats
         .iter()
         .filter(|format| {
@@ -2419,7 +3520,73 @@ async fn solve_android_cipher_formats(
                 && format.url.is_some()
                 && format.signature_cipher.is_some()
         })
-        .count())
+        .count();
+    Ok(SolvedCipherFormats {
+        solved,
+        candidate_proof,
+    })
+}
+
+fn apply_cipher_outputs(
+    jobs: &[CipherFormatJob],
+    targets: Vec<CipherOutputTarget>,
+    outputs: Vec<Result<ChallengeOutput, String>>,
+) -> Result<Vec<Result<String, String>>, String> {
+    if targets.len() != outputs.len() {
+        return Err("Player JavaScript solver returned the wrong output count".to_owned());
+    }
+    let mut solved_urls = jobs
+        .iter()
+        .map(|job| Ok(job.stream_url.clone()))
+        .collect::<Vec<_>>();
+    for (target, output) in targets.into_iter().zip(outputs) {
+        let job_index = match target {
+            CipherOutputTarget::Signature(job_index) | CipherOutputTarget::N(job_index) => {
+                job_index
+            }
+        };
+        if job_index >= jobs.len() {
+            return Err("Player JavaScript solver returned an invalid cipher target".to_owned());
+        }
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                solved_urls[job_index] = Err(error);
+                continue;
+            }
+        };
+        if solved_urls[job_index].is_err() {
+            continue;
+        }
+        let (key, value) = match target {
+            CipherOutputTarget::Signature(job_index) => {
+                let Some(value) = output.signature.filter(|signature| {
+                    !signature.is_empty() && signature.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES
+                }) else {
+                    solved_urls[job_index] =
+                        Err("Player JavaScript returned an empty signature".to_owned());
+                    continue;
+                };
+                (jobs[job_index].signature_parameter.as_str(), value)
+            }
+            CipherOutputTarget::N(_) => {
+                let Some(value) = output
+                    .n
+                    .filter(|n| !n.is_empty() && n.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+                else {
+                    solved_urls[job_index] =
+                        Err("Player JavaScript returned an empty n value".to_owned());
+                    continue;
+                };
+                ("n", value)
+            }
+        };
+        let current_url = solved_urls[job_index]
+            .as_ref()
+            .expect("a failed cipher job was skipped");
+        solved_urls[job_index] = url_with_query_value(current_url, key, &value);
+    }
+    Ok(solved_urls)
 }
 
 async fn solve_url_n_challenge(
@@ -2427,10 +3594,133 @@ async fn solve_url_n_challenge(
     stream_url: &str,
     player_url: Option<&str>,
     challenge_detected: Option<&AtomicBool>,
-) -> Result<Option<String>, String> {
+) -> Result<Option<SolvedNChallenge>, String> {
     let Some(player_url) = player_url else {
         return Ok(None);
     };
+    let Some((n, in_path)) = url_n_challenge_input(stream_url)? else {
+        return Ok(None);
+    };
+    if let Some(challenge_detected) = challenge_detected {
+        challenge_detected.store(true, Ordering::Relaxed);
+    }
+    let player_source = youtube_player_source(player_url).await?;
+    let input = ChallengeInput {
+        signature: None,
+        n: Some(n),
+    };
+    let (outputs, candidate_proof) =
+        match run_youtube_js_solver(player_url, player_source.clone(), vec![input.clone()]).await {
+            Ok(outputs) => (outputs, None),
+            Err(current_error) => {
+                let Some(candidate) = run_youtube_js_candidate_solver_isolated(
+                    player_url,
+                    player_source,
+                    vec![input],
+                )
+                .await?
+                else {
+                    return Err(current_error);
+                };
+                (
+                    candidate
+                        .outputs
+                        .into_iter()
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(candidate.proof),
+                )
+            }
+        };
+    solved_n_challenge(stream_url, in_path, outputs, candidate_proof).map(Some)
+}
+
+async fn solve_url_n_challenge_candidate(
+    stream_url: &str,
+    player_url: Option<&str>,
+) -> Result<Option<SolvedNChallenge>, String> {
+    let Some(player_url) = player_url else {
+        return Ok(None);
+    };
+    let Some((n, in_path)) = url_n_challenge_input(stream_url)? else {
+        return Ok(None);
+    };
+    let player_source = youtube_player_source(player_url).await?;
+    let Some(candidate) = run_youtube_js_candidate_solver_isolated(
+        player_url,
+        player_source,
+        vec![ChallengeInput {
+            signature: None,
+            n: Some(n),
+        }],
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let outputs = candidate
+        .outputs
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    solved_n_challenge(stream_url, in_path, outputs, Some(candidate.proof)).map(Some)
+}
+
+fn spawn_n_candidate_format_validation(
+    probe_client: Client,
+    original_url: String,
+    player_url: String,
+    mut format: ChosenFormat,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(candidate)) =
+            solve_url_n_challenge_candidate(&original_url, Some(&player_url)).await
+        else {
+            return;
+        };
+        format.stream_url = candidate.stream_url;
+        if let Some(proof) = candidate.candidate_proof.as_ref() {
+            if validate_chosen_format(&probe_client, &format).await.is_ok() {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else {
+                reject_js_worker_candidate(proof).await;
+            }
+        }
+    });
+}
+
+fn spawn_n_candidate_request_validation(
+    probe_client: Client,
+    original_url: String,
+    player_url: String,
+    mut request: TrackRequest,
+) {
+    tokio::spawn(async move {
+        let Ok(Some(candidate)) =
+            solve_url_n_challenge_candidate(&original_url, Some(&player_url)).await
+        else {
+            return;
+        };
+        match &mut request.prepared {
+            PreparedSource::Http { stream_url, .. } => {
+                *stream_url = candidate.stream_url.clone().into()
+            }
+            PreparedSource::Hls { playlist_url, .. } => {
+                *playlist_url = candidate.stream_url.clone().into()
+            }
+        }
+        if let Some(proof) = candidate.candidate_proof.as_ref() {
+            if validate_prepared_source(&probe_client, &request.prepared)
+                .await
+                .is_ok()
+            {
+                acknowledge_validated_js_worker_candidate(proof);
+            } else {
+                reject_js_worker_candidate(proof).await;
+            }
+        }
+    });
+}
+
+fn url_n_challenge_input(stream_url: &str) -> Result<Option<(String, bool)>, String> {
     let parsed = Url::parse(stream_url)
         .map_err(|error| format!("invalid stream URL for n solve: {error}"))?;
     if !youtube_googlevideo_origin_is_allowed(&parsed) {
@@ -2451,30 +3741,30 @@ async fn solve_url_n_challenge(
     if stream_url.len() > 64 * 1024 || n.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES {
         return Err("YouTube n challenge input exceeded its size limit".to_owned());
     }
-    if let Some(challenge_detected) = challenge_detected {
-        challenge_detected.store(true, Ordering::Relaxed);
-    }
-    let player_source = youtube_player_source(player_url).await?;
-    let outputs = run_youtube_js_solver(
-        player_url,
-        player_source,
-        vec![ChallengeInput {
-            signature: None,
-            n: Some(n),
-        }],
-    )
-    .await?;
+    Ok(Some((n, in_path)))
+}
+
+fn solved_n_challenge(
+    stream_url: &str,
+    in_path: bool,
+    outputs: Vec<ChallengeOutput>,
+    candidate_proof: Option<JsWorkerCandidateProof>,
+) -> Result<SolvedNChallenge, String> {
     let solved_n = outputs
         .into_iter()
         .next()
         .and_then(|output| output.n)
         .filter(|value| !value.is_empty() && value.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
         .ok_or_else(|| "Player JavaScript returned an empty n value".to_owned())?;
-    Ok(Some(if in_path {
+    let stream_url = if in_path {
         url_with_path_n_value(stream_url, &solved_n)?
     } else {
         url_with_query_value(stream_url, "n", &solved_n)?
-    }))
+    };
+    Ok(SolvedNChallenge {
+        stream_url,
+        candidate_proof,
+    })
 }
 
 #[derive(Debug)]
@@ -3146,6 +4436,25 @@ mod tests {
     use serde_json::json;
     use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
+    const WORKER_PLAYER_FIXTURE: &str = r#"
+var _player = {};
+(function(g) {
+  function Param() { this.values = new Map(); }
+  Param.prototype.set = function(key, value) { this.values.set(key, value); };
+  Param.prototype.get = function(key) { return this.values.get(key); };
+  Param.prototype.clone = function() { return this; };
+  Param.prototype.transform = function() {
+    const n = this.values.get("n");
+    if (n) this.values.set("n", n.slice(1) + n[0]);
+  };
+  function solve(a, b, c) {
+    const value = new Param();
+    value.set("alr", "yes");
+    return value;
+  }
+})(_player);
+"#;
+
     fn sample_format(
         url: &str,
         has_audio: bool,
@@ -3195,26 +4504,7 @@ mod tests {
     #[ignore = "requires WOTOHA_YOUTUBE_JS_WORKER pointing to a built helper binary"]
     async fn isolated_javascript_worker_round_trips_and_restarts() {
         assert!(env::var_os("WOTOHA_YOUTUBE_JS_WORKER").is_some());
-        let source = Arc::<str>::from(
-            r#"
-var _player = {};
-(function(g) {
-  function Param() { this.values = new Map(); }
-  Param.prototype.set = function(key, value) { this.values.set(key, value); };
-  Param.prototype.get = function(key) { return this.values.get(key); };
-  Param.prototype.clone = function() { return this; };
-  Param.prototype.transform = function() {
-    const n = this.values.get("n");
-    if (n) this.values.set("n", n.slice(1) + n[0]);
-  };
-  function solve(a, b, c) {
-    const value = new Param();
-    value.set("alr", "yes");
-    return value;
-  }
-})(_player);
-"#,
-        );
+        let source = Arc::<str>::from(WORKER_PLAYER_FIXTURE);
         let solve = |value: &str| ChallengeInput {
             signature: None,
             n: Some(value.to_owned()),
@@ -3239,6 +4529,198 @@ var _player = {};
         .await
         .unwrap();
         assert_eq!(second[0].n.as_deref(), Some("bcda"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires WOTOHA_YOUTUBE_JS_WORKER pointing to a built helper binary"]
+    async fn javascript_worker_hot_swaps_after_atomic_replacement() {
+        let original = env::var_os("WOTOHA_YOUTUBE_JS_WORKER")
+            .map(PathBuf::from)
+            .expect("set WOTOHA_YOUTUBE_JS_WORKER");
+        let temporary = env::temp_dir().join(format!(
+            "wotoha-worker-hot-swap-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&temporary).unwrap();
+        let installed = temporary.join("wotoha-youtube-js-worker");
+        fs::copy(&original, &installed).unwrap();
+        unsafe {
+            env::set_var("WOTOHA_YOUTUBE_JS_WORKER", &installed);
+        }
+
+        let source = Arc::<str>::from(WORKER_PLAYER_FIXTURE);
+        let first = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/hot-swap/base.js",
+            source.clone(),
+            vec![ChallengeInput {
+                signature: None,
+                n: Some("1234".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(first[0].n.as_deref(), Some("2341"));
+        let worker =
+            YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+        let first_lane = worker.lock().await.current.as_ref().cloned().unwrap();
+        let first_pid = first_lane
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|process| process.child.id())
+            .unwrap();
+
+        let candidate = temporary.join("wotoha-youtube-js-worker.new");
+        fs::copy(&original, &candidate).unwrap();
+        fs::rename(&candidate, &installed).unwrap();
+        let second = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/hot-swap/base.js",
+            source,
+            vec![ChallengeInput {
+                signature: None,
+                n: Some("abcd".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(second[0].n.as_deref(), Some("bcda"));
+        let mut supervisor = worker.lock().await;
+        let second_lane = supervisor.current.as_ref().cloned().unwrap();
+        let second_pid = second_lane
+            .process
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|process| process.child.id())
+            .unwrap();
+        assert_ne!(first_pid, second_pid);
+        supervisor.stop().await;
+        drop(supervisor);
+
+        unsafe {
+            env::set_var("WOTOHA_YOUTUBE_JS_WORKER", original);
+        }
+        fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires WOTOHA_YOUTUBE_JS_WORKER pointing to a built helper binary"]
+    async fn javascript_worker_promotes_content_addressed_candidate() {
+        use std::io::Write;
+
+        let original = env::var_os("WOTOHA_YOUTUBE_JS_WORKER")
+            .map(PathBuf::from)
+            .expect("set WOTOHA_YOUTUBE_JS_WORKER");
+        let root = env::temp_dir().join(format!(
+            "wotoha-worker-candidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let original_bytes = fs::read(&original).unwrap();
+        let current_id = Sha256::digest(&original_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let mut candidate_bytes = original_bytes.clone();
+        candidate_bytes.extend_from_slice(b"\nWOTOHA_CANDIDATE\n");
+        let candidate_id = Sha256::digest(&candidate_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for (release_id, bytes) in [
+            (&current_id, original_bytes.as_slice()),
+            (&candidate_id, candidate_bytes.as_slice()),
+        ] {
+            let version = root.join("versions").join(release_id);
+            fs::create_dir_all(&version).unwrap();
+            let worker = version.join("wotoha-youtube-js-worker");
+            let mut file = fs::File::create(&worker).unwrap();
+            file.write_all(bytes).unwrap();
+            fs::set_permissions(&worker, fs::metadata(&original).unwrap().permissions()).unwrap();
+        }
+        fs::write(root.join("current"), format!("{current_id}\n")).unwrap();
+        fs::write(root.join("candidate"), format!("{candidate_id}\n")).unwrap();
+        let ack = root.join("ack");
+        unsafe {
+            env::set_var("WOTOHA_YOUTUBE_JS_WORKER_DIR", &root);
+            env::set_var("WOTOHA_YOUTUBE_JS_WORKER_ACK", &ack);
+        }
+
+        let output = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/candidate/base.js",
+            Arc::<str>::from(WORKER_PLAYER_FIXTURE),
+            vec![ChallengeInput {
+                signature: None,
+                n: Some("1234".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(output[0].n.as_deref(), Some("2341"));
+        assert!(!ack.exists());
+        let worker =
+            YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+        let mut supervisor = worker.lock().await;
+        assert!(
+            supervisor
+                .current
+                .as_ref()
+                .unwrap()
+                .executable
+                .identity
+                .contains(&current_id)
+        );
+        assert!(
+            supervisor
+                .candidate
+                .as_ref()
+                .unwrap()
+                .executable
+                .identity
+                .contains(&candidate_id)
+        );
+        fs::write(root.join("current"), format!("{candidate_id}\n")).unwrap();
+        fs::remove_file(root.join("candidate")).unwrap();
+        drop(supervisor);
+        let promoted = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/candidate/base.js",
+            Arc::<str>::from(WORKER_PLAYER_FIXTURE),
+            vec![ChallengeInput {
+                signature: None,
+                n: Some("abcd".to_owned()),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(promoted[0].n.as_deref(), Some("bcda"));
+        let mut supervisor = worker.lock().await;
+        assert!(
+            supervisor
+                .current
+                .as_ref()
+                .unwrap()
+                .executable
+                .identity
+                .contains(&candidate_id)
+        );
+        supervisor.stop().await;
+        drop(supervisor);
+
+        unsafe {
+            env::remove_var("WOTOHA_YOUTUBE_JS_WORKER_DIR");
+            env::remove_var("WOTOHA_YOUTUBE_JS_WORKER_ACK");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -3481,6 +4963,299 @@ var _player = {};
     }
 
     #[test]
+    fn content_addressed_worker_requires_matching_digest() {
+        let root = env::temp_dir().join(format!(
+            "wotoha-worker-digest-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = b"fixture worker";
+        let release_id = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let worker_name = if cfg!(windows) {
+            "wotoha-youtube-js-worker.exe"
+        } else {
+            "wotoha-youtube-js-worker"
+        };
+        let version = root.join("versions").join(&release_id);
+        fs::create_dir_all(&version).unwrap();
+        fs::write(version.join(worker_name), bytes).unwrap();
+        fs::write(root.join("current"), format!("{release_id}\n")).unwrap();
+
+        assert_eq!(
+            read_js_worker_pointer(&root.join("current"))
+                .unwrap()
+                .as_deref(),
+            Some(release_id.as_str())
+        );
+        assert!(content_addressed_js_worker(&root, &release_id).is_ok());
+        fs::write(version.join(worker_name), b"tampered worker").unwrap();
+        assert!(content_addressed_js_worker(&root, &release_id).is_err());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_candidate_pointer_does_not_block_content_addressed_current() {
+        let root = env::temp_dir().join(format!(
+            "wotoha-worker-invalid-candidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = b"fixture current worker";
+        let release_id = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let worker_name = if cfg!(windows) {
+            "wotoha-youtube-js-worker.exe"
+        } else {
+            "wotoha-youtube-js-worker"
+        };
+        let version = root.join("versions").join(&release_id);
+        fs::create_dir_all(&version).unwrap();
+        fs::write(version.join(worker_name), bytes).unwrap();
+        fs::write(root.join("current"), format!("{release_id}\n")).unwrap();
+        fs::write(root.join("candidate"), "invalid-candidate\n").unwrap();
+
+        let selection = content_addressed_js_worker_selection(root.clone()).unwrap();
+        assert_eq!(
+            selection.current.path,
+            fs::canonicalize(version.join(worker_name)).unwrap()
+        );
+        assert!(selection.candidate.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_ack_is_promoted_atomically() {
+        let root = env::temp_dir().join(format!(
+            "wotoha-worker-ack-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let ack = root.join("ack");
+        let release_id = "a".repeat(64);
+        write_js_worker_ack(&ack, &release_id).unwrap();
+        assert_eq!(fs::read_to_string(&ack).unwrap(), format!("{release_id}\n"));
+        assert_eq!(
+            fs::read_dir(&root).unwrap().filter_map(Result::ok).count(),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn validated_worker_ack_retries_after_write_failure_and_rejects_stale_proof() {
+        let root = env::temp_dir().join(format!(
+            "wotoha-worker-ack-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let current = JsWorkerExecutable {
+            path: PathBuf::from("current"),
+            app_worker_mode: false,
+            identity: "current-identity".to_owned(),
+        };
+        let candidate_executable = JsWorkerExecutable {
+            path: PathBuf::from("candidate"),
+            app_worker_mode: false,
+            identity: "candidate-identity".to_owned(),
+        };
+        let release_id = "a".repeat(64);
+        let proof = JsWorkerCandidateProof {
+            release_id: release_id.clone(),
+            ack_path: root.join("ack"),
+            executable_identity: candidate_executable.identity.clone(),
+            baseline_current_identity: current.identity.clone(),
+            player_key: "player".to_owned(),
+        };
+        let pending = JsWorkerSelection {
+            current: current.clone(),
+            candidate: Some(JsWorkerCandidate {
+                executable: candidate_executable.clone(),
+                release_id: release_id.clone(),
+                ack_path: proof.ack_path.clone(),
+            }),
+        };
+        assert!(write_validated_js_worker_candidate_ack(&pending, &proof).is_err());
+        fs::create_dir(&root).unwrap();
+        assert_eq!(
+            write_validated_js_worker_candidate_ack(&pending, &proof),
+            Ok(true)
+        );
+        assert_eq!(
+            fs::read_to_string(&proof.ack_path).unwrap(),
+            format!("{release_id}\n")
+        );
+
+        let promoted = JsWorkerSelection {
+            current: candidate_executable,
+            candidate: None,
+        };
+        assert_eq!(
+            write_validated_js_worker_candidate_ack(&promoted, &proof),
+            Ok(false)
+        );
+        let stale_current = JsWorkerSelection {
+            current: JsWorkerExecutable {
+                path: PathBuf::from("new-current"),
+                app_worker_mode: false,
+                identity: "new-current-identity".to_owned(),
+            },
+            candidate: pending.candidate,
+        };
+        assert_eq!(
+            write_validated_js_worker_candidate_ack(&stale_current, &proof),
+            Ok(false)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_candidate_must_not_regress_a_current_success() {
+        let output = |value: &str| {
+            Ok(ChallengeOutput {
+                signature: None,
+                n: Some(value.to_owned()),
+            })
+        };
+        assert!(js_worker_candidate_preserves_current_successes(
+            &[output("same"), output("new")],
+            &[output("same"), Err("old failure".to_owned())]
+        ));
+        assert!(js_worker_candidate_preserves_current_successes(
+            &[output("different")],
+            &[output("same")]
+        ));
+        assert!(!js_worker_candidate_preserves_current_successes(
+            &[Err("new failure".to_owned())],
+            &[output("same")]
+        ));
+        assert!(!js_worker_candidate_preserves_current_successes(
+            &[Err("new failure".to_owned())],
+            &[Err("old failure".to_owned())]
+        ));
+    }
+
+    #[test]
+    fn worker_candidate_rejection_is_player_scoped_and_expires() {
+        let now = Instant::now();
+        let rejected_key = WorkerPlayerKey {
+            executable_identity: "candidate-a".to_owned(),
+            player_key: "player-a".to_owned(),
+        };
+        let mut rejected = HashMap::new();
+        rejected.insert(
+            rejected_key.clone(),
+            now + YOUTUBE_JS_WORKER_CANDIDATE_REJECTION_TTL,
+        );
+        assert!(js_worker_candidate_is_rejected(
+            &rejected,
+            &rejected_key,
+            now
+        ));
+        assert!(!js_worker_candidate_is_rejected(
+            &rejected,
+            &WorkerPlayerKey {
+                executable_identity: "candidate-a".to_owned(),
+                player_key: "player-b".to_owned(),
+            },
+            now
+        ));
+        assert!(!js_worker_candidate_is_rejected(
+            &rejected,
+            &WorkerPlayerKey {
+                executable_identity: "candidate-b".to_owned(),
+                player_key: "player-a".to_owned(),
+            },
+            now
+        ));
+        assert!(!js_worker_candidate_is_rejected(
+            &rejected,
+            &rejected_key,
+            now + YOUTUBE_JS_WORKER_CANDIDATE_REJECTION_TTL
+        ));
+    }
+
+    #[test]
+    fn official_current_reconcile_ignores_candidate_rejection_and_old_backoff() {
+        let now = Instant::now();
+        let mut supervisor = JsWorkerSupervisor::default();
+        supervisor.current = Some(Arc::new(JsWorkerLane::new(JsWorkerExecutable {
+            path: PathBuf::from("old-current"),
+            app_worker_mode: false,
+            identity: "old-current".to_owned(),
+        })));
+        supervisor.failure_until.insert(
+            WorkerPlayerKey {
+                executable_identity: "old-current".to_owned(),
+                player_key: "player".to_owned(),
+            },
+            now + YOUTUBE_JS_WORKER_FAILURE_BACKOFF,
+        );
+        supervisor.rejected_candidates.insert(
+            WorkerPlayerKey {
+                executable_identity: "promoted-candidate".to_owned(),
+                player_key: "player".to_owned(),
+            },
+            now + YOUTUBE_JS_WORKER_CANDIDATE_REJECTION_TTL,
+        );
+        let lane = supervisor.reconcile_current(JsWorkerExecutable {
+            path: PathBuf::from("promoted-current"),
+            app_worker_mode: false,
+            identity: "promoted-candidate".to_owned(),
+        });
+        assert_eq!(lane.executable.identity, "promoted-candidate");
+        assert!(supervisor.failure_until.is_empty());
+    }
+
+    #[test]
+    fn worker_response_request_id_rejects_stale_echo_and_accepts_legacy() {
+        assert!(validate_js_worker_response_request_id(Some(7), 7).is_ok());
+        assert!(validate_js_worker_response_request_id(None, 7).is_ok());
+        assert!(validate_js_worker_response_request_id(Some(6), 7).is_err());
+    }
+
+    #[tokio::test]
+    async fn uncommitted_worker_process_lease_leaves_the_lane_empty() {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--help")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let process = JsWorkerProcess {
+            stdin: child.stdin.take().unwrap(),
+            stdout: child.stdout.take().unwrap(),
+            child,
+            loaded_players: HashSet::new(),
+            next_request_id: 1,
+        };
+        let slot = Arc::new(AsyncMutex::new(None));
+        let guard = slot.clone().lock_owned().await;
+        drop(JsWorkerProcessLease::new(guard, process));
+        assert!(slot.lock().await.is_none());
+    }
+
+    #[test]
     fn hls_token_uses_manifest_path() {
         let updated = hls_url_with_po_token(
             "https://example.com/manifest/playlist.m3u8?sig=a%2Fb#part",
@@ -3536,5 +5311,67 @@ var _player = {};
         assert_eq!(job.signature_parameter, "sig");
         assert_eq!(job.input.signature.as_deref(), Some("encrypted"));
         assert_eq!(job.input.n.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn cipher_output_failure_is_isolated_to_its_format() {
+        let jobs = (0..3)
+            .map(|format_index| CipherFormatJob {
+                format_index,
+                stream_url: format!("https://r{format_index}.googlevideo.com/videoplayback?n=old"),
+                signature_parameter: "sig".to_owned(),
+                input: ChallengeInput {
+                    signature: (format_index < 2).then(|| "encrypted".to_owned()),
+                    n: Some("old".to_owned()),
+                },
+            })
+            .collect::<Vec<_>>();
+        let targets = vec![
+            CipherOutputTarget::Signature(0),
+            CipherOutputTarget::N(0),
+            CipherOutputTarget::Signature(1),
+            CipherOutputTarget::N(1),
+            CipherOutputTarget::N(2),
+        ];
+        let outputs = vec![
+            Ok(ChallengeOutput {
+                signature: Some("sig-0".to_owned()),
+                n: None,
+            }),
+            Ok(ChallengeOutput {
+                signature: None,
+                n: Some("n-0".to_owned()),
+            }),
+            Ok(ChallengeOutput {
+                signature: Some("sig-1".to_owned()),
+                n: None,
+            }),
+            Err("no_unique_solution".to_owned()),
+            Ok(ChallengeOutput {
+                signature: None,
+                n: Some("n-2".to_owned()),
+            }),
+        ];
+
+        let solved = apply_cipher_outputs(&jobs, targets, outputs).unwrap();
+        let first = Url::parse(solved[0].as_ref().unwrap()).unwrap();
+        assert_eq!(
+            first
+                .query_pairs()
+                .find(|(key, _)| key == "sig")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("sig-0")
+        );
+        assert_eq!(
+            first
+                .query_pairs()
+                .find(|(key, _)| key == "n")
+                .map(|(_, value)| value.into_owned())
+                .as_deref(),
+            Some("n-0")
+        );
+        assert!(solved[1].is_err());
+        assert!(solved[2].as_ref().unwrap().contains("n=n-2"));
     }
 }

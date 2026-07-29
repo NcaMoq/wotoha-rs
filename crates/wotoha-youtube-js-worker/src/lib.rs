@@ -181,6 +181,13 @@ impl SolverSession {
         &mut self,
         inputs: &[ChallengeInput],
     ) -> Result<Vec<ChallengeOutput>, SolverError> {
+        self.solve_batch_isolated(inputs)?.into_iter().collect()
+    }
+
+    pub fn solve_batch_isolated(
+        &mut self,
+        inputs: &[ChallengeInput],
+    ) -> Result<Vec<Result<ChallengeOutput, SolverError>>, SolverError> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
@@ -217,7 +224,7 @@ return inputs.map(input => {{
         if solution_sets.len() != input_count {
             return Err(SolverError::NoUniqueSolution);
         }
-        solution_sets
+        Ok(solution_sets
             .into_iter()
             .map(|solutions| {
                 if solutions.len() != 1 {
@@ -229,7 +236,7 @@ return inputs.map(input => {{
                         .expect("one solution was checked"))
                 }
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -521,6 +528,32 @@ var _player = {};
                 Some(signature.chars().rev().collect::<String>().as_str())
             );
         }
+    }
+
+    #[test]
+    fn isolates_an_input_failure_from_the_rest_of_the_batch() {
+        let source = PLAYER_FIXTURE.replace(
+            "const value = new Param();",
+            r#"
+    if (c && decodeURIComponent(c) === "reject") throw new Error("rejected");
+    const value = new Param();"#,
+        );
+        let prepared = prepare_player(&source).unwrap();
+        let mut session = SolverSession::new(&prepared).unwrap();
+        let output = session
+            .solve_batch_isolated(&[
+                ChallengeInput {
+                    signature: Some("reject".to_owned()),
+                    n: None,
+                },
+                ChallengeInput {
+                    signature: None,
+                    n: Some("1234".to_owned()),
+                },
+            ])
+            .unwrap();
+        assert!(matches!(output[0], Err(SolverError::NoUniqueSolution)));
+        assert_eq!(output[1].as_ref().unwrap().n.as_deref(), Some("2341"));
     }
 
     #[tokio::test]

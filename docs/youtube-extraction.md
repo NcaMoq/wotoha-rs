@@ -22,6 +22,11 @@ backs off the failing Player fingerprint, and starts a fresh process on a later 
 the worker also limits its own address space and dies with its parent. A Player parser/runtime
 panic therefore cannot directly abort the Discord bot process.
 
+Challenge results are isolated per input. If one format exposes an ambiguous or unsupported
+signature/`n` transform, only that format is discarded; successful formats in the same response
+remain available. A format requiring both signature and `n` is published only after both
+transformations succeed.
+
 Release packages contain a standalone worker. For compatibility with an older updater that only
 installs `wotoha-app`, the app can also re-exec itself in worker mode; Player code is still handled
 in a child process rather than inside the bot process.
@@ -31,8 +36,10 @@ Cipher candidates are kept as a verified fallback if a direct or HLS candidate i
 
 GitHub Actions runs deterministic workspace and worker-protocol tests on every pull request and
 push to `main`. A separate daily canary downloads the current Player, checks historical official
-EJS answer vectors, verifies worker restart behavior, and requires a real YouTube track probe to
-report `PLAYABLE`. Live-network failures alert without making ordinary pull requests flaky.
+EJS answer vectors, and compares multiple current signature/`n` outputs byte-for-byte against a
+pinned official `yt-dlp/ejs` revision. It also verifies worker restart behavior and requires a real
+YouTube track probe to report `PLAYABLE`. Live-network failures alert without making ordinary pull
+requests flaky.
 
 ## PO Token provider protocol
 
@@ -86,9 +93,27 @@ added as `/pot/{token}`. The PO Token expiry shortens the prepared-source cache 
 
 ## Update boundaries
 
-Client profiles and the PO Token provider can be updated independently of the bot. The native
-Player solver is intentionally generic and follows structural markers instead of minified symbol
-names. Its AST discovery logic is compiled into the separately packaged worker executable, so a
-normal release can replace that boundary together with the bot while keeping crashes isolated. A
-future signed worker-only update channel can decouple its cadence further if Player changes prove
-to require it.
+Client profiles, the PO Token provider and the Player worker can be updated independently of the
+bot. The native Player solver is intentionally generic and follows structural markers instead of
+minified symbol names.
+
+Worker-only releases use `youtube-worker-v*` prerelease tags. GitHub Actions compares the current
+Player against pinned official EJS, exercises the exact musl artifact, and attests both the binary
+and manifest before publishing them with their Sigstore bundle. The updater verifies the
+repository, signer workflow, source tag, source commit and GitHub-hosted runner provenance for
+both files. A monotonic sequence shared by full and worker-only releases prevents signed
+downgrades. Published assets are protected by GitHub Immutable Releases.
+
+Accepted binaries live under `/opt/wotoha/workers/versions/<sha256>/`. The updater writes only a
+`candidate` pointer; it never executes a downloaded candidate as root. Wotoha keeps `current` and
+`candidate` in independent process lanes. A current result returns without waiting for candidate
+shadow analysis, so normal playback latency is unchanged. If the current URL fails, a differing
+candidate result can be tried as a semantic fallback. The candidate is acknowledged only after
+its derived GVS/HLS stream is actually readable.
+
+Every framed transaction leases its process out of the lane. Cancellation, timeout or a partial
+response kills that process instead of leaving a stale response for the next request; additive
+request IDs provide a second correlation check. Candidate rejection is scoped to the Player and
+expires, while a new authoritative `current` pointer always takes precedence. The next updater run
+moves `current` to `previous` and commits an acknowledged candidate. A crash or restart before ACK
+therefore returns to the previous known-good worker.

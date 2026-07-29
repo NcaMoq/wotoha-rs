@@ -147,7 +147,7 @@ WOTOHA_UPDATE_GITHUB_TOKEN=github_pat_xxxxxxxxxxxx
 
 Private Repositoryでは、対象リポジトリの `Contents: Read-only` 権限だけを持つfine-grained personal access tokenを設定してください。このファイルはrootだけが読めるモードで作成されます。Public Repositoryではトークンを空にできます。
 
-GitHubで `v` から始まるタグ（例: `v0.2.0`）をpushすると、ReleaseワークフローがUbuntu用配布物をビルドして公開します。自動更新はドラフトとプレリリースを対象にしません。
+GitHubで `v` から始まるタグ（例: `v0.2.0`）をpushすると、ReleaseワークフローがUbuntu用配布物をビルドして公開します。自動更新はドラフトとプレリリースを対象にしません。配布archiveとmanifestは両方ともGitHub Artifact Attestationで署名され、更新前にrepository、workflow、tag、commit、GitHub-hosted runnerまで検証されます。このため通常の自動更新にもGitHub公式配布の新しい`gh`が必要です。
 
 ### 手動で更新する
 
@@ -180,3 +180,53 @@ sudo rm -rf /var/lib/wotoha-updater
 sudo rm -rf /var/log/wotoha
 sudo systemctl daemon-reload
 ```
+
+## YouTube worker-only updates
+
+The first release containing the worker channel performs one normal bot restart to bootstrap
+`/opt/wotoha/workers` and add these settings to `/etc/wotoha/wotoha.env`:
+
+```dotenv
+WOTOHA_YOUTUBE_JS_WORKER_DIR=/opt/wotoha/workers
+WOTOHA_YOUTUBE_JS_WORKER_ACK=/var/lib/wotoha/youtube-worker-ack
+```
+
+After that bootstrap, `youtube-worker-v*` prereleases update only the isolated Player worker and
+do not restart the Discord bot. Both normal and worker-only updates require GitHub CLI 2.49 or
+newer with `gh attestation verify` support. Ubuntu 24.04's original archive version may be too old;
+install a current GitHub CLI from
+[GitHub's official apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
+and verify it with:
+
+```bash
+gh version
+gh attestation verify --help | grep deny-self-hosted-runners
+```
+
+The public repository also enforces GitHub Immutable Releases. Release assets are assembled as a
+draft and become immutable when published.
+
+Worker updates are enabled by default. They can be disabled independently in
+`/etc/wotoha/wotoha-update.env`:
+
+```dotenv
+WOTOHA_UPDATE_YOUTUBE_WORKER=false
+```
+
+Inspect the two-phase state without exposing bot credentials:
+
+```bash
+cat /opt/wotoha/workers/current
+cat /opt/wotoha/workers/previous 2>/dev/null || true
+cat /opt/wotoha/workers/candidate 2>/dev/null || true
+cat /opt/wotoha/YOUTUBE_WORKER_SEQUENCE
+cat /var/lib/wotoha-updater/installed-youtube-worker
+cat /var/lib/wotoha/youtube-worker-ack 2>/dev/null || true
+journalctl -u wotoha-update.service --since today
+```
+
+`current` is always the restart-safe known-good worker. `candidate` is executed only by the
+unprivileged bot process under the existing systemd sandbox. It becomes `current` only after a
+candidate-derived GVS/HLS stream is actually readable, the bot returns a matching ACK, and a later
+updater run commits the promotion. The monotonic sequence prevents an older signed worker from
+being reintroduced as a downgrade.

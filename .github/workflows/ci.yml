@@ -19,12 +19,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
+          toolchain: "1.95.0"
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check YouTube canary syntax
+        run: |
+          node --check scripts/youtube-differential-canary.mjs
+          node --check scripts/youtube-worker-smoke.mjs
+      - name: Test deployment updater safety
+        run: bash deploy/tests/run.sh
       - name: Test the workspace
         run: cargo test --workspace --locked
       - name: Lint the isolated JavaScript worker
@@ -34,4 +41,7 @@ jobs:
       - name: Test worker supervision and restart
         env:
           WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-        run: cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
+        run: |
+          cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
+          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_hot_swaps_after_atomic_replacement -- --ignored --exact
+          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_promotes_content_addressed_candidate -- --ignored --exact

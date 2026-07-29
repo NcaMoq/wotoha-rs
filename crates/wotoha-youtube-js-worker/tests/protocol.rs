@@ -35,12 +35,13 @@ fn binary_protocol_reuses_player_session() {
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
 
-    for (source, input, expected) in [
-        (Some(PLAYER_FIXTURE), "1234", "2341"),
-        (None, "abcd", "bcda"),
+    for (request_id, source, input, expected) in [
+        (40, Some(PLAYER_FIXTURE), "1234", "2341"),
+        (41, None, "abcd", "bcda"),
     ] {
         let request = serde_json::to_vec(&json!({
             "protocol_version": 1,
+            "request_id": request_id,
             "player_key": "fixture",
             "player_source": source,
             "inputs": [{"signature": null, "n": input}]
@@ -48,9 +49,27 @@ fn binary_protocol_reuses_player_session() {
         .unwrap();
         write_frame(&mut stdin, &request);
         let response: Value = serde_json::from_slice(&read_frame(&mut stdout)).unwrap();
+        assert_eq!(response["request_id"], request_id);
         assert_eq!(response["error"], Value::Null);
         assert_eq!(response["outputs"][0]["n"], expected);
     }
+    let request = serde_json::to_vec(&json!({
+        "protocol_version": 1,
+        "request_id": 42,
+        "player_key": "fixture",
+        "player_source": null,
+        "per_input_results": true,
+        "inputs": [{"signature": null, "n": "wxyz"}]
+    }))
+    .unwrap();
+    write_frame(&mut stdin, &request);
+    let response: Value = serde_json::from_slice(&read_frame(&mut stdout)).unwrap();
+    assert_eq!(response["request_id"], 42);
+    assert_eq!(response["error"], Value::Null);
+    assert_eq!(response["outputs"], Value::Null);
+    assert_eq!(response["results"][0]["output"]["n"], "xyzw");
+    assert_eq!(response["results"][0]["error"], Value::Null);
+
     child.kill().unwrap();
     child.wait().unwrap();
 }
