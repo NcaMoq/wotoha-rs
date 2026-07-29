@@ -1,36 +1,47 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock as StdRwLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock},
     time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use regex::Regex;
 use reqwest::{
-    Client, Url,
+    Client, StatusCode, Url,
     header::{HeaderMap, HeaderName, HeaderValue, RANGE},
 };
 use rusty_ytdl::{
     Video, VideoFormat, VideoOptions, VideoQuality, VideoSearchOptions, choose_format,
 };
 use serde::Deserialize;
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{RwLock as AsyncRwLock, Semaphore};
 use wotoha_core::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
 
 use crate::{ResolveError, provider::MediaProvider};
 
-use super::youtube_ytdlp;
+use super::{
+    youtube_pot::{self, PoToken, PoTokenClient, PoTokenContext},
+    youtube_ytdlp,
+};
 
 const YOUTUBE_RANGE_CHUNK_SIZE: u64 = 11_862_014;
 const YOUTUBE_NATIVE_FAST_PATH_TIMEOUT: Duration = Duration::from_secs(2);
 const YOUTUBE_STREAM_VALIDATION_TIMEOUT: Duration = Duration::from_secs(4);
 const YOUTUBE_STREAM_VALIDATION_RANGE: &str = "bytes=0-1023";
 const YOUTUBE_VISITOR_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const YOUTUBE_PO_TOKEN_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const YOUTUBE_PO_TOKEN_MAX_CONCURRENCY: usize = 2;
+const YOUTUBE_PO_TOKEN_FAST_PATH_TIMEOUT: Duration = Duration::from_secs(15);
 
 static YOUTUBE_VISITOR_SESSION: OnceLock<AsyncRwLock<Option<CachedVisitorSession>>> =
     OnceLock::new();
 static YOUTUBE_NATIVE_CLIENTS: OnceLock<StdRwLock<CachedNativeClients>> = OnceLock::new();
+static YOUTUBE_PO_TOKEN_CACHE: OnceLock<DashMap<String, PoToken>> = OnceLock::new();
+static YOUTUBE_PO_TOKEN_PROVIDER_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+static YOUTUBE_PO_TOKEN_PROVIDER_BACKOFF: OnceLock<StdMutex<Option<Instant>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct CachedVisitorSession {
@@ -184,10 +195,12 @@ fn load_native_client_profiles(path: &PathBuf) -> Vec<NativeClientProfile> {
 }
 
 fn validate_native_client_profiles(profiles: &[NativeClientProfile]) -> bool {
+    let mut profile_ids = HashSet::with_capacity(profiles.len());
     !profiles.is_empty()
         && profiles.len() <= 8
         && profiles.iter().all(|profile| {
-            !profile.id.is_empty()
+            profile_ids.insert(profile.id.as_str())
+                && !profile.id.is_empty()
                 && profile
                     .id
                     .bytes()
@@ -204,6 +217,158 @@ fn validate_native_client_profiles(profiles: &[NativeClientProfile]) -> bool {
                 && !profile.os_version.is_empty()
                 && profile.os_version.len() <= 64
         })
+}
+
+async fn po_token(
+    profile: &NativeClientProfile,
+    context: PoTokenContext,
+    video_id: &str,
+    visitor_data: Option<&str>,
+    bypass_cache: bool,
+) -> Option<(PoToken, bool)> {
+    if !youtube_pot::is_configured() {
+        return None;
+    }
+    let context_name = match context {
+        PoTokenContext::Player => "player",
+        PoTokenContext::Gvs => "gvs",
+    };
+    let cache_key = po_token_cache_key(profile, context_name, video_id, visitor_data);
+    let cache = YOUTUBE_PO_TOKEN_CACHE.get_or_init(DashMap::new);
+    if !bypass_cache && let Some(token) = cached_po_token(cache, &cache_key) {
+        return Some((token, true));
+    }
+    if bypass_cache {
+        cache.remove(&cache_key);
+    }
+    if po_token_provider_is_backing_off() {
+        return None;
+    }
+
+    let slots = YOUTUBE_PO_TOKEN_PROVIDER_SLOTS
+        .get_or_init(|| Semaphore::new(YOUTUBE_PO_TOKEN_MAX_CONCURRENCY));
+    let Ok(_permit) = slots.acquire().await else {
+        return None;
+    };
+    if !bypass_cache && let Some(token) = cached_po_token(cache, &cache_key) {
+        return Some((token, true));
+    }
+    if po_token_provider_is_backing_off() {
+        return None;
+    }
+
+    let client = PoTokenClient {
+        profile_id: profile.id.as_str(),
+        client_name: profile.client_name.as_str(),
+        client_version: profile.client_version.as_str(),
+        client_number: profile.client_number.as_str(),
+        user_agent: profile.user_agent.as_str(),
+        os_name: profile.os_name.as_str(),
+        os_version: profile.os_version.as_str(),
+        device_make: profile.device_make.as_deref(),
+        device_model: profile.device_model.as_deref(),
+        android_sdk_version: profile.android_sdk_version,
+    };
+    match youtube_pot::request_token(client, context, video_id, visitor_data).await {
+        Ok(Some(token)) => {
+            if token.expires_at > Instant::now() + Duration::from_secs(5) {
+                cache.insert(cache_key.clone(), token.clone());
+            }
+            if cache.len() > 4_096 {
+                let now = Instant::now();
+                cache.retain(|_, token| token.expires_at > now);
+                let overflow = cache.len().saturating_sub(4_096);
+                let keys = cache
+                    .iter()
+                    .filter(|entry| entry.key().as_str() != cache_key)
+                    .take(overflow)
+                    .map(|entry| entry.key().clone())
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    cache.remove(&key);
+                }
+            }
+            Some((token, false))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            *YOUTUBE_PO_TOKEN_PROVIDER_BACKOFF
+                .get_or_init(|| StdMutex::new(None))
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(Instant::now() + YOUTUBE_PO_TOKEN_FAILURE_BACKOFF);
+            tracing::warn!(
+                extractor = "native",
+                strategy = profile.id.as_str(),
+                context = context_name,
+                error = %error,
+                "YouTube PO Token provider failed"
+            );
+            None
+        }
+    }
+}
+
+fn po_token_cache_key(
+    profile: &NativeClientProfile,
+    context_name: &str,
+    video_id: &str,
+    visitor_data: Option<&str>,
+) -> String {
+    serde_json::to_string(&(
+        profile.id.as_str(),
+        profile.client_name.as_str(),
+        profile.client_version.as_str(),
+        profile.client_number.as_str(),
+        profile.user_agent.as_str(),
+        context_name,
+        video_id,
+        visitor_data.unwrap_or_default(),
+    ))
+    .expect("PO Token cache key fields should serialize")
+}
+
+fn invalidate_po_token(
+    profile: &NativeClientProfile,
+    context: PoTokenContext,
+    video_id: &str,
+    visitor_data: Option<&str>,
+) {
+    let context_name = match context {
+        PoTokenContext::Player => "player",
+        PoTokenContext::Gvs => "gvs",
+    };
+    if let Some(cache) = YOUTUBE_PO_TOKEN_CACHE.get() {
+        cache.remove(&po_token_cache_key(
+            profile,
+            context_name,
+            video_id,
+            visitor_data,
+        ));
+    }
+}
+
+fn cached_po_token(cache: &DashMap<String, PoToken>, cache_key: &str) -> Option<PoToken> {
+    if let Some(cached) = cache.get(cache_key)
+        && cached.expires_at > Instant::now() + Duration::from_secs(5)
+    {
+        return Some(cached.clone());
+    }
+    cache.remove(cache_key);
+    None
+}
+
+fn po_token_provider_is_backing_off() -> bool {
+    let mut backoff = YOUTUBE_PO_TOKEN_PROVIDER_BACKOFF
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if backoff.is_some_and(|until| until > Instant::now()) {
+        true
+    } else {
+        *backoff = None;
+        false
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -307,7 +472,10 @@ impl MediaProvider for YouTubeProvider {
                 ResolveError::Parse("YouTube did not expose a playable stream URL".to_owned())
             })?;
 
-        let expires_at_unix = format_url_expiry(format.stream_url.as_ref());
+        let expires_at_unix = earliest_expiry(
+            format_url_expiry(format.stream_url.as_ref()),
+            format.po_token_expires_at_unix,
+        );
         let content_length = format.content_length.as_deref().and_then(|value| {
             value
                 .parse::<u64>()
@@ -414,10 +582,37 @@ struct ChosenFormat {
     is_hls: bool,
     headers: Vec<PreparedHeader>,
     range_chunk_size: Option<u64>,
+    po_token_expires_at_unix: Option<u64>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum StreamValidationError {
+    #[error("{0}")]
+    InvalidRequest(String),
+    #[error("stream request failed: {0}")]
+    Request(reqwest::Error),
+    #[error("stream returned {0}")]
+    HttpStatus(StatusCode),
+    #[error("stream returned only {0} byte(s)")]
+    InsufficientBody(usize),
+    #[error("HLS stream did not return an M3U8 playlist")]
+    InvalidHlsBody,
+}
+
+impl StreamValidationError {
+    fn may_need_po_token(&self) -> bool {
+        matches!(
+            self,
+            Self::HttpStatus(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        )
+    }
 }
 
 fn track_request_with_format(request: &TrackRequest, format: ChosenFormat) -> TrackRequest {
-    let expires_at_unix = format_url_expiry(format.stream_url.as_ref());
+    let expires_at_unix = earliest_expiry(
+        format_url_expiry(format.stream_url.as_ref()),
+        format.po_token_expires_at_unix,
+    );
     let content_length = format.content_length.as_deref().and_then(|value| {
         value
             .parse::<u64>()
@@ -466,7 +661,7 @@ fn prepared_source_from_format(
 async fn validate_chosen_format(
     probe_client: &Client,
     format: &ChosenFormat,
-) -> Result<(), String> {
+) -> Result<(), StreamValidationError> {
     let content_length = format.content_length.as_deref().and_then(|value| {
         value
             .parse::<u64>()
@@ -477,15 +672,216 @@ async fn validate_chosen_format(
         format.clone(),
         false,
         content_length,
-        format_url_expiry(format.stream_url.as_ref()),
+        earliest_expiry(
+            format_url_expiry(format.stream_url.as_ref()),
+            format.po_token_expires_at_unix,
+        ),
     );
     validate_prepared_source(probe_client, &prepared).await
+}
+
+async fn validate_native_format_with_pot(
+    probe_client: &Client,
+    format: &mut ChosenFormat,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
+) -> Result<(), String> {
+    match validate_chosen_format(probe_client, format).await {
+        Ok(()) => Ok(()),
+        Err(initial_error) => {
+            if !initial_error.may_need_po_token() {
+                return Err(initial_error.to_string());
+            }
+            let Some((token, was_cached)) =
+                po_token(profile, PoTokenContext::Gvs, video_id, visitor_data, false).await
+            else {
+                return Err(initial_error.to_string());
+            };
+            format.stream_url = if format.is_hls {
+                hls_url_with_po_token(&format.stream_url, &token.value)?
+            } else {
+                url_with_po_token(&format.stream_url, &token.value)?
+            };
+            format.po_token_expires_at_unix = Some(token.expires_at_unix);
+            match validate_chosen_format(probe_client, format).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    invalidate_po_token(profile, PoTokenContext::Gvs, video_id, visitor_data);
+                    if !error.may_need_po_token() || !was_cached {
+                        return Err(format!("{initial_error}; PO Token retry failed: {error}"));
+                    }
+                    let Some((fresh_token, _)) =
+                        po_token(profile, PoTokenContext::Gvs, video_id, visitor_data, true).await
+                    else {
+                        return Err(format!("{initial_error}; PO Token retry failed: {error}"));
+                    };
+                    format.stream_url = if format.is_hls {
+                        hls_url_with_po_token(&format.stream_url, &fresh_token.value)?
+                    } else {
+                        url_with_po_token(&format.stream_url, &fresh_token.value)?
+                    };
+                    format.po_token_expires_at_unix = Some(fresh_token.expires_at_unix);
+                    match validate_chosen_format(probe_client, format).await {
+                        Ok(()) => Ok(()),
+                        Err(fresh_error) => {
+                            invalidate_po_token(
+                                profile,
+                                PoTokenContext::Gvs,
+                                video_id,
+                                visitor_data,
+                            );
+                            Err(format!(
+                                "{initial_error}; cached PO Token failed: {error}; fresh PO Token failed: {fresh_error}"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn validate_native_request_with_pot(
+    probe_client: &Client,
+    request: &mut TrackRequest,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
+) -> Result<(), String> {
+    match validate_prepared_source(probe_client, &request.prepared).await {
+        Ok(()) => Ok(()),
+        Err(initial_error) => {
+            if !initial_error.may_need_po_token() {
+                return Err(initial_error.to_string());
+            }
+            let Some((token, was_cached)) =
+                po_token(profile, PoTokenContext::Gvs, video_id, visitor_data, false).await
+            else {
+                return Err(initial_error.to_string());
+            };
+            add_po_token_to_prepared_source(&mut request.prepared, &token)?;
+            match validate_prepared_source(probe_client, &request.prepared).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    invalidate_po_token(profile, PoTokenContext::Gvs, video_id, visitor_data);
+                    if !error.may_need_po_token() || !was_cached {
+                        return Err(format!("{initial_error}; PO Token retry failed: {error}"));
+                    }
+                    let Some((fresh_token, _)) =
+                        po_token(profile, PoTokenContext::Gvs, video_id, visitor_data, true).await
+                    else {
+                        return Err(format!("{initial_error}; PO Token retry failed: {error}"));
+                    };
+                    add_po_token_to_prepared_source(&mut request.prepared, &fresh_token)?;
+                    match validate_prepared_source(probe_client, &request.prepared).await {
+                        Ok(()) => Ok(()),
+                        Err(fresh_error) => {
+                            invalidate_po_token(
+                                profile,
+                                PoTokenContext::Gvs,
+                                video_id,
+                                visitor_data,
+                            );
+                            Err(format!(
+                                "{initial_error}; cached PO Token failed: {error}; fresh PO Token failed: {fresh_error}"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn add_po_token_to_prepared_source(
+    prepared: &mut PreparedSource,
+    token: &PoToken,
+) -> Result<(), String> {
+    match prepared {
+        PreparedSource::Http {
+            stream_url,
+            expires_at_unix,
+            ..
+        } => {
+            let stream_expires_at_unix = format_url_expiry(stream_url.as_ref());
+            *stream_url = url_with_po_token(stream_url.as_ref(), &token.value)?.into();
+            *expires_at_unix = earliest_expiry(stream_expires_at_unix, Some(token.expires_at_unix));
+        }
+        PreparedSource::Hls {
+            playlist_url,
+            expires_at_unix,
+            ..
+        } => {
+            let stream_expires_at_unix = format_url_expiry(playlist_url.as_ref());
+            *playlist_url = hls_url_with_po_token(playlist_url.as_ref(), &token.value)?.into();
+            *expires_at_unix = earliest_expiry(stream_expires_at_unix, Some(token.expires_at_unix));
+        }
+    }
+    Ok(())
+}
+
+fn url_with_po_token(raw_url: &str, token: &str) -> Result<String, String> {
+    Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
+    let mut encoded = Url::parse("https://localhost/").expect("static URL should parse");
+    encoded.query_pairs_mut().append_pair("pot", token);
+    let encoded_pair = encoded
+        .query()
+        .expect("PO Token query should have been created");
+
+    let (without_fragment, fragment) = raw_url
+        .split_once('#')
+        .map_or((raw_url, None), |(url, fragment)| (url, Some(fragment)));
+    let (base, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(base, query)| {
+            (base, Some(query))
+        });
+    let mut pairs = query
+        .into_iter()
+        .flat_map(|query| query.split('&'))
+        .filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            !key.eq_ignore_ascii_case("pot")
+        })
+        .filter(|pair| !pair.is_empty())
+        .collect::<Vec<_>>();
+    pairs.push(encoded_pair);
+
+    let mut updated = format!("{base}?{}", pairs.join("&"));
+    if let Some(fragment) = fragment {
+        updated.push('#');
+        updated.push_str(fragment);
+    }
+    Ok(updated)
+}
+
+fn hls_url_with_po_token(raw_url: &str, token: &str) -> Result<String, String> {
+    let mut url = Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
+    let replaces_existing = url
+        .path_segments()
+        .map(|segments| segments.collect::<Vec<_>>())
+        .is_some_and(|segments| {
+            segments.len() >= 2 && segments[segments.len() - 2].eq_ignore_ascii_case("pot")
+        });
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| "HLS stream URL cannot contain path segments".to_owned())?;
+    segments.pop_if_empty();
+    if replaces_existing {
+        segments.pop();
+        segments.pop();
+    }
+    segments.push("pot");
+    segments.push(token);
+    drop(segments);
+    Ok(url.to_string())
 }
 
 async fn validate_prepared_source(
     probe_client: &Client,
     prepared: &PreparedSource,
-) -> Result<(), String> {
+) -> Result<(), StreamValidationError> {
     let (raw_url, prepared_headers, range_mode, is_hls) = match prepared {
         PreparedSource::Http {
             stream_url,
@@ -504,8 +900,11 @@ async fn validate_prepared_source(
             ..
         } => (playlist_url.as_ref(), headers.as_ref(), None, true),
     };
-    let headers = prepared_headers_to_map(prepared_headers)?;
-    let mut url = Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
+    let headers =
+        prepared_headers_to_map(prepared_headers).map_err(StreamValidationError::InvalidRequest)?;
+    let mut url = Url::parse(raw_url).map_err(|error| {
+        StreamValidationError::InvalidRequest(format!("invalid stream URL: {error}"))
+    })?;
     let mut request = probe_client
         .get(url.clone())
         .headers(headers)
@@ -518,22 +917,58 @@ async fn validate_prepared_source(
             url.query_pairs_mut().append_pair("range", range);
             request = probe_client
                 .get(url)
-                .headers(prepared_headers_to_map(prepared_headers)?)
+                .headers(
+                    prepared_headers_to_map(prepared_headers)
+                        .map_err(StreamValidationError::InvalidRequest)?,
+                )
                 .timeout(YOUTUBE_STREAM_VALIDATION_TIMEOUT);
         } else {
             request = request.header(RANGE, YOUTUBE_STREAM_VALIDATION_RANGE);
         }
     }
 
-    let response = request
+    let mut response = request
         .send()
         .await
-        .map_err(|error| format!("stream request failed: {error}"))?;
+        .map_err(StreamValidationError::Request)?;
     let status = response.status();
-    if status.is_success() {
-        Ok(())
+    if !status.is_success() {
+        return Err(StreamValidationError::HttpStatus(status));
+    }
+
+    if is_hls {
+        let mut prefix = Vec::with_capacity(256);
+        while prefix.len() < 256 {
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(StreamValidationError::Request)?
+            else {
+                break;
+            };
+            prefix.extend_from_slice(&chunk[..chunk.len().min(256 - prefix.len())]);
+            if prefix.windows(7).any(|window| window == b"#EXTM3U") {
+                return Ok(());
+            }
+        }
+        Err(StreamValidationError::InvalidHlsBody)
     } else {
-        Err(format!("stream returned {status}"))
+        let mut received = 0;
+        while received < 1_024 {
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(StreamValidationError::Request)?
+            else {
+                break;
+            };
+            received += chunk.len();
+        }
+        if received >= 1_024 {
+            Ok(())
+        } else {
+            Err(StreamValidationError::InsufficientBody(received))
+        }
     }
 }
 
@@ -569,6 +1004,7 @@ fn choose_playable_format(
             headers: web_stream_headers(),
             range_chunk_size: (!format.is_hls && content_length.is_some())
                 .then_some(YOUTUBE_RANGE_CHUNK_SIZE),
+            po_token_expires_at_unix: None,
         });
     }
 
@@ -579,6 +1015,7 @@ fn choose_playable_format(
             is_hls: true,
             headers: web_stream_headers(),
             range_chunk_size: None,
+            po_token_expires_at_unix: None,
         });
     }
 
@@ -596,6 +1033,7 @@ fn choose_playable_format(
             headers: web_stream_headers(),
             range_chunk_size: (!format.is_hls && content_length.is_some())
                 .then_some(YOUTUBE_RANGE_CHUNK_SIZE),
+            po_token_expires_at_unix: None,
         });
     }
 
@@ -640,23 +1078,40 @@ async fn fetch_android_vr_audio_format(
     let visitor_profile = visitor_native_client_profile();
     let vr_response =
         fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
-    if let Some(format) = vr_response
-        .as_ref()
-        .and_then(|response| response.streaming_data.as_ref())
-        .and_then(|streaming_data| {
+    if let Some((response, visitor_data)) = vr_response.as_ref()
+        && let Some(mut format) = response.streaming_data.as_ref().and_then(|streaming_data| {
             chosen_format_from_android_streaming_data(
                 streaming_data,
                 native_stream_headers(&visitor_profile),
             )
         })
-        && validate_chosen_format(probe_client, &format).await.is_ok()
     {
-        tracing::info!(
-            extractor = "native",
-            strategy = "android_vr_visitor",
-            "YouTube selected verified visitor-bound stream"
-        );
-        return Ok(Some(format));
+        match validate_native_format_with_pot(
+            probe_client,
+            &mut format,
+            &visitor_profile,
+            video_id,
+            Some(visitor_data.as_str()),
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    extractor = "native",
+                    strategy = "android_vr_visitor",
+                    "YouTube selected verified visitor-bound stream"
+                );
+                return Ok(Some(format));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "native",
+                    strategy = "android_vr_visitor",
+                    error = %error,
+                    "YouTube rejected visitor-bound stream candidate"
+                );
+            }
+        }
     }
 
     let profiles = native_client_profiles();
@@ -674,7 +1129,7 @@ async fn fetch_android_vr_audio_format(
                     continue;
                 }
             };
-        let Some(format) = response
+        let Some(mut format) = response
             .as_ref()
             .and_then(|response| response.streaming_data.as_ref())
             .and_then(|streaming_data| {
@@ -686,7 +1141,9 @@ async fn fetch_android_vr_audio_format(
         else {
             continue;
         };
-        match validate_chosen_format(probe_client, &format).await {
+        match validate_native_format_with_pot(probe_client, &mut format, profile, video_id, None)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(
                     extractor = "native",
@@ -717,8 +1174,13 @@ async fn fetch_android_vr_track_request_fast(
         return Ok(None);
     };
 
+    let timeout_duration = if youtube_pot::is_configured() {
+        YOUTUBE_PO_TOKEN_FAST_PATH_TIMEOUT
+    } else {
+        YOUTUBE_NATIVE_FAST_PATH_TIMEOUT
+    };
     match tokio::time::timeout(
-        YOUTUBE_NATIVE_FAST_PATH_TIMEOUT,
+        timeout_duration,
         fetch_android_vr_track_request(probe_client, raw_url, &video_id),
     )
     .await
@@ -740,22 +1202,41 @@ async fn fetch_android_vr_track_request(
         video_id,
     )
     .await?;
-    if let Some(request) = native_track_request_from_response(
-        response,
-        raw_url,
-        video_id,
-        native_stream_headers(&visitor_profile),
-    ) && validate_prepared_source(probe_client, &request.prepared)
-        .await
-        .is_ok()
+    if let Some((response, visitor_data)) = response
+        && let Some(mut request) = native_track_request_from_response(
+            Some(response),
+            raw_url,
+            video_id,
+            native_stream_headers(&visitor_profile),
+        )
     {
-        tracing::info!(
-            extractor = "native",
-            strategy = "android_vr_visitor",
-            video_key = %request.canonical_key,
-            "YouTube selected verified visitor-bound native path"
-        );
-        return Ok(Some(request));
+        match validate_native_request_with_pot(
+            probe_client,
+            &mut request,
+            &visitor_profile,
+            video_id,
+            Some(visitor_data.as_str()),
+        )
+        .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    extractor = "native",
+                    strategy = "android_vr_visitor",
+                    video_key = %request.canonical_key,
+                    "YouTube selected verified visitor-bound native path"
+                );
+                return Ok(Some(request));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    extractor = "native",
+                    strategy = "android_vr_visitor",
+                    error = %error,
+                    "YouTube visitor-bound native path returned an unplayable stream"
+                );
+            }
+        }
     }
 
     let profiles = native_client_profiles();
@@ -773,7 +1254,7 @@ async fn fetch_android_vr_track_request(
                     continue;
                 }
             };
-        let Some(request) = native_track_request_from_response(
+        let Some(mut request) = native_track_request_from_response(
             response,
             raw_url,
             video_id,
@@ -781,7 +1262,9 @@ async fn fetch_android_vr_track_request(
         ) else {
             continue;
         };
-        match validate_prepared_source(probe_client, &request.prepared).await {
+        match validate_native_request_with_pot(probe_client, &mut request, profile, video_id, None)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(
                     extractor = "native",
@@ -866,17 +1349,16 @@ async fn fetch_android_vr_player_response(
     probe_client: &Client,
     canonical_url: &str,
     video_id: &str,
-) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
+) -> Result<Option<(AndroidPlayerResponse, String)>, ResolveError> {
     let (session, was_cached) = visitor_session(probe_client, canonical_url, false).await?;
     let response = fetch_visitor_bound_player_response(probe_client, video_id, &session).await?;
     if !was_cached || !response.requires_fresh_visitor_session() {
-        return Ok(Some(response));
+        return Ok(Some((response, session.visitor_data)));
     }
 
     let (session, _) = visitor_session(probe_client, canonical_url, true).await?;
-    fetch_visitor_bound_player_response(probe_client, video_id, &session)
-        .await
-        .map(Some)
+    let response = fetch_visitor_bound_player_response(probe_client, video_id, &session).await?;
+    Ok(Some((response, session.visitor_data)))
 }
 
 async fn fetch_visitor_bound_player_response(
@@ -885,17 +1367,98 @@ async fn fetch_visitor_bound_player_response(
     session: &CachedVisitorSession,
 ) -> Result<AndroidPlayerResponse, ResolveError> {
     let visitor_profile = visitor_native_client_profile();
+    let response = send_native_player_request(
+        probe_client,
+        video_id,
+        &visitor_profile,
+        Some(session.signature_timestamp),
+        Some(session.visitor_data.as_str()),
+        None,
+    )
+    .await?;
+    if response.has_playable_stream() {
+        return Ok(response);
+    }
+    let Some((player_token, was_cached)) = po_token(
+        &visitor_profile,
+        PoTokenContext::Player,
+        video_id,
+        Some(session.visitor_data.as_str()),
+        false,
+    )
+    .await
+    else {
+        return Ok(response);
+    };
+    let response = send_native_player_request(
+        probe_client,
+        video_id,
+        &visitor_profile,
+        Some(session.signature_timestamp),
+        Some(session.visitor_data.as_str()),
+        Some(player_token.value.as_str()),
+    )
+    .await?;
+    if response.has_playable_stream() {
+        return Ok(response);
+    }
+    invalidate_po_token(
+        &visitor_profile,
+        PoTokenContext::Player,
+        video_id,
+        Some(session.visitor_data.as_str()),
+    );
+    if !was_cached {
+        return Ok(response);
+    }
+    let Some((fresh_token, _)) = po_token(
+        &visitor_profile,
+        PoTokenContext::Player,
+        video_id,
+        Some(session.visitor_data.as_str()),
+        true,
+    )
+    .await
+    else {
+        return Ok(response);
+    };
+    let fresh_response = send_native_player_request(
+        probe_client,
+        video_id,
+        &visitor_profile,
+        Some(session.signature_timestamp),
+        Some(session.visitor_data.as_str()),
+        Some(fresh_token.value.as_str()),
+    )
+    .await?;
+    if !fresh_response.has_playable_stream() {
+        invalidate_po_token(
+            &visitor_profile,
+            PoTokenContext::Player,
+            video_id,
+            Some(session.visitor_data.as_str()),
+        );
+    }
+    Ok(fresh_response)
+}
+
+async fn send_native_player_request(
+    probe_client: &Client,
+    video_id: &str,
+    profile: &NativeClientProfile,
+    signature_timestamp: Option<u64>,
+    visitor_data: Option<&str>,
+    player_token: Option<&str>,
+) -> Result<AndroidPlayerResponse, ResolveError> {
     probe_client
         .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
-        .headers(native_api_headers(
-            &visitor_profile,
-            Some(session.visitor_data.as_str()),
-        )?)
+        .headers(native_api_headers(profile, visitor_data)?)
         .json(&native_player_request(
             video_id,
-            &visitor_profile,
-            Some(session.signature_timestamp),
-            Some(session.visitor_data.as_str()),
+            profile,
+            signature_timestamp,
+            visitor_data,
+            player_token,
         ))
         .send()
         .await
@@ -913,12 +1476,13 @@ async fn visitor_session(
     force_refresh: bool,
 ) -> Result<(CachedVisitorSession, bool), ResolveError> {
     let cache = YOUTUBE_VISITOR_SESSION.get_or_init(|| AsyncRwLock::new(None));
-    let mut cached = cache.write().await;
-    if !force_refresh
-        && let Some(session) = cached.as_ref()
-        && session.cached_at.elapsed() <= YOUTUBE_VISITOR_SESSION_TTL
-    {
-        return Ok((session.clone(), true));
+    if !force_refresh {
+        let cached = cache.read().await;
+        if let Some(session) = cached.as_ref()
+            && session.cached_at.elapsed() <= YOUTUBE_VISITOR_SESSION_TTL
+        {
+            return Ok((session.clone(), true));
+        }
     }
 
     let watch_html = probe_client
@@ -947,6 +1511,13 @@ async fn visitor_session(
         signature_timestamp,
         cached_at: Instant::now(),
     };
+    let mut cached = cache.write().await;
+    if !force_refresh
+        && let Some(existing) = cached.as_ref()
+        && existing.cached_at.elapsed() <= YOUTUBE_VISITOR_SESSION_TTL
+    {
+        return Ok((existing.clone(), true));
+    }
     *cached = Some(session.clone());
     Ok((session, false))
 }
@@ -956,19 +1527,50 @@ async fn fetch_direct_native_player_response(
     video_id: &str,
     profile: &NativeClientProfile,
 ) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
-    probe_client
-        .post("https://youtubei.googleapis.com/youtubei/v1/player?prettyPrint=false")
-        .headers(native_api_headers(profile, None)?)
-        .json(&native_player_request(video_id, profile, None, None))
-        .send()
-        .await
-        .map_err(ResolveError::Request)?
-        .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json::<AndroidPlayerResponse>()
-        .await
-        .map_err(ResolveError::Request)
-        .map(Some)
+    let response =
+        send_native_player_request(probe_client, video_id, profile, None, None, None).await?;
+    if response.has_playable_stream() {
+        return Ok(Some(response));
+    }
+    let Some((player_token, was_cached)) =
+        po_token(profile, PoTokenContext::Player, video_id, None, false).await
+    else {
+        return Ok(Some(response));
+    };
+    let response = send_native_player_request(
+        probe_client,
+        video_id,
+        profile,
+        None,
+        None,
+        Some(player_token.value.as_str()),
+    )
+    .await?;
+    if response.has_playable_stream() {
+        return Ok(Some(response));
+    }
+    invalidate_po_token(profile, PoTokenContext::Player, video_id, None);
+    if !was_cached {
+        return Ok(Some(response));
+    }
+    let Some((fresh_token, _)) =
+        po_token(profile, PoTokenContext::Player, video_id, None, true).await
+    else {
+        return Ok(Some(response));
+    };
+    let fresh_response = send_native_player_request(
+        probe_client,
+        video_id,
+        profile,
+        None,
+        None,
+        Some(fresh_token.value.as_str()),
+    )
+    .await?;
+    if !fresh_response.has_playable_stream() {
+        invalidate_po_token(profile, PoTokenContext::Player, video_id, None);
+    }
+    Ok(Some(fresh_response))
 }
 
 fn chosen_format_from_android_streaming_data(
@@ -976,16 +1578,18 @@ fn chosen_format_from_android_streaming_data(
     headers: Vec<PreparedHeader>,
 ) -> Option<ChosenFormat> {
     if let Some(format) = choose_android_audio_stream(&streaming_data.adaptive_formats) {
+        let stream_url = format.url.as_ref()?;
         let content_length = format
             .content_length
             .clone()
-            .or_else(|| parse_content_length_from_url(format.url.as_str()).map(|v| v.to_string()));
+            .or_else(|| parse_content_length_from_url(stream_url).map(|v| v.to_string()));
         return Some(ChosenFormat {
-            stream_url: format.url.clone(),
+            stream_url: stream_url.clone(),
             content_length: content_length.clone(),
             is_hls: false,
             headers,
             range_chunk_size: content_length.is_some().then_some(YOUTUBE_RANGE_CHUNK_SIZE),
+            po_token_expires_at_unix: None,
         });
     }
 
@@ -1000,6 +1604,7 @@ fn chosen_format_from_android_streaming_data(
             is_hls: true,
             headers,
             range_chunk_size: None,
+            po_token_expires_at_unix: None,
         });
     }
 
@@ -1058,7 +1663,10 @@ fn choose_android_audio_stream(
 ) -> Option<&AndroidAdaptiveFormat> {
     formats
         .iter()
-        .filter(|format| format.mime_type.starts_with("audio/") && !format.url.is_empty())
+        .filter(|format| {
+            format.mime_type.starts_with("audio/")
+                && format.url.as_ref().is_some_and(|url| !url.is_empty())
+        })
         .max_by_key(|format| {
             (
                 format.mime_type.contains("opus"),
@@ -1116,6 +1724,7 @@ fn native_player_request(
     profile: &NativeClientProfile,
     signature_timestamp: Option<u64>,
     visitor_data: Option<&str>,
+    player_token: Option<&str>,
 ) -> serde_json::Value {
     let mut client = serde_json::json!({
         "clientName": profile.client_name.as_str(),
@@ -1161,6 +1770,15 @@ fn native_player_request(
                         "html5Preference": "HTML5_PREF_WANTS",
                     }
                 }),
+            );
+    }
+    if let Some(player_token) = player_token {
+        request
+            .as_object_mut()
+            .expect("native YouTube player request should be an object")
+            .insert(
+                "serviceIntegrityDimensions".to_owned(),
+                serde_json::json!({ "poToken": player_token }),
             );
     }
     request
@@ -1209,6 +1827,14 @@ fn format_url_expiry(stream_url: &str) -> Option<u64> {
         .and_then(|(_, value)| value.parse::<u64>().ok())
 }
 
+fn earliest_expiry(first: Option<u64>, second: Option<u64>) -> Option<u64> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(expiry), None) | (None, Some(expiry)) => Some(expiry),
+        (None, None) => None,
+    }
+}
+
 fn parse_content_length_from_url(stream_url: &str) -> Option<u64> {
     Url::parse(stream_url)
         .ok()?
@@ -1240,6 +1866,16 @@ struct AndroidPlayerResponse {
 }
 
 impl AndroidPlayerResponse {
+    fn has_playable_stream(&self) -> bool {
+        self.streaming_data.as_ref().is_some_and(|streaming_data| {
+            choose_android_audio_stream(&streaming_data.adaptive_formats).is_some()
+                || streaming_data
+                    .hls_manifest_url
+                    .as_ref()
+                    .is_some_and(|url| !url.is_empty())
+        })
+    }
+
     fn requires_fresh_visitor_session(&self) -> bool {
         self.playability_status
             .as_ref()
@@ -1265,7 +1901,9 @@ struct AndroidStreamingData {
 struct AndroidAdaptiveFormat {
     #[serde(rename = "mimeType")]
     mime_type: String,
-    url: String,
+    url: Option<String>,
+    #[serde(rename = "signatureCipher")]
+    _signature_cipher: Option<String>,
     bitrate: Option<u64>,
     #[serde(rename = "audioBitrate")]
     audio_bitrate: Option<u64>,
@@ -1458,14 +2096,16 @@ mod tests {
         let formats = vec![
             AndroidAdaptiveFormat {
                 mime_type: "audio/mp4; codecs=\"mp4a.40.2\"".to_owned(),
-                url: "https://example.com/aac".to_owned(),
+                url: Some("https://example.com/aac".to_owned()),
+                _signature_cipher: None,
                 bitrate: Some(128_000),
                 audio_bitrate: Some(128),
                 content_length: None,
             },
             AndroidAdaptiveFormat {
                 mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
-                url: "https://example.com/opus".to_owned(),
+                url: Some("https://example.com/opus".to_owned()),
+                _signature_cipher: None,
                 bitrate: Some(160_000),
                 audio_bitrate: Some(160),
                 content_length: None,
@@ -1473,7 +2113,7 @@ mod tests {
         ];
 
         let chosen = choose_android_audio_stream(&formats).expect("android audio format");
-        assert_eq!(chosen.url, "https://example.com/opus");
+        assert_eq!(chosen.url.as_deref(), Some("https://example.com/opus"));
     }
 
     #[test]
@@ -1494,11 +2134,93 @@ mod tests {
     }
 
     #[test]
+    fn rejects_duplicate_native_client_ids() {
+        let mut profiles = default_native_client_profiles();
+        profiles[1].id = profiles[0].id.clone();
+        assert!(!validate_native_client_profiles(&profiles));
+    }
+
+    #[test]
     fn login_required_invalidates_cached_visitor_session() {
         let response: AndroidPlayerResponse = serde_json::from_value(json!({
             "playabilityStatus": { "status": "LOGIN_REQUIRED" }
         }))
         .unwrap();
         assert!(response.requires_fresh_visitor_session());
+    }
+
+    #[test]
+    fn player_po_token_uses_service_integrity_dimensions() {
+        let profile = default_native_client_profiles().remove(0);
+        let request = native_player_request("video-id", &profile, None, None, Some("player-token"));
+        assert_eq!(
+            request.pointer("/serviceIntegrityDimensions/poToken"),
+            Some(&json!("player-token"))
+        );
+
+        let request = native_player_request("video-id", &profile, None, None, None);
+        assert!(request.pointer("/serviceIntegrityDimensions").is_none());
+    }
+
+    #[test]
+    fn gvs_query_token_replaces_only_existing_pot() {
+        let updated = url_with_po_token(
+            "https://example.com/videoplayback?sig=a%2Fb&foo=x+z&pot=old#part",
+            "new/token",
+        )
+        .unwrap();
+        assert_eq!(
+            updated,
+            "https://example.com/videoplayback?sig=a%2Fb&foo=x+z&pot=new%2Ftoken#part"
+        );
+    }
+
+    #[test]
+    fn hls_token_uses_manifest_path() {
+        let updated = hls_url_with_po_token(
+            "https://example.com/manifest/playlist.m3u8?sig=a%2Fb#part",
+            "new/token",
+        )
+        .unwrap();
+        assert_eq!(
+            updated,
+            "https://example.com/manifest/playlist.m3u8/pot/new%2Ftoken?sig=a%2Fb#part"
+        );
+        let replaced = hls_url_with_po_token(&updated, "fresh").unwrap();
+        assert_eq!(
+            replaced,
+            "https://example.com/manifest/playlist.m3u8/pot/fresh?sig=a%2Fb#part"
+        );
+    }
+
+    #[test]
+    fn po_token_shortens_prepared_source_expiry() {
+        let mut prepared = PreparedSource::http(
+            "https://example.com/videoplayback?expire=2000",
+            Vec::new(),
+            Some(10_000),
+            Some(2_000),
+        );
+        let token = PoToken {
+            value: "token".to_owned(),
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_unix: 1_500,
+        };
+        add_po_token_to_prepared_source(&mut prepared, &token).unwrap();
+        assert_eq!(prepared.expires_at_unix(), Some(1_500));
+    }
+
+    #[test]
+    fn cipher_only_formats_do_not_break_player_response_parsing() {
+        let response: AndroidPlayerResponse = serde_json::from_value(json!({
+            "streamingData": {
+                "adaptiveFormats": [{
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "signatureCipher": "s=encrypted&sp=sig&url=https%3A%2F%2Fexample.com"
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(!response.has_playable_stream());
     }
 }
