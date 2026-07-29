@@ -55,7 +55,7 @@ $env:CMAKE_GENERATOR = 'Ninja'
 
 rustup target add $target
 
-cargo zigbuild --release --bin wotoha-app --target $target --target-dir $targetDir
+cargo zigbuild --release --bin wotoha-app --bin wotoha-youtube-js-worker --target $target --target-dir $targetDir
 
 Remove-Item $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
@@ -64,6 +64,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'deploy') | Ou
 New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'docs') | Out-Null
 
 Copy-Item (Join-Path $targetDir "$target\release\wotoha-app") (Join-Path $packageRoot 'bin\wotoha-app')
+Copy-Item (Join-Path $targetDir "$target\release\wotoha-youtube-js-worker") (Join-Path $packageRoot 'bin\wotoha-youtube-js-worker')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha.service') (Join-Path $packageRoot 'deploy\wotoha.service')
 Copy-Item (Join-Path $repoRoot 'deploy\install-ubuntu.sh') (Join-Path $packageRoot 'install-ubuntu.sh')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.sh') (Join-Path $packageRoot 'wotoha-update.sh')
@@ -75,12 +76,17 @@ Copy-Item (Join-Path $repoRoot 'deploy\youtube-clients.json') (Join-Path $packag
 Copy-Item (Join-Path $repoRoot 'docs\ubuntu-deploy.md') (Join-Path $packageRoot 'docs\ubuntu-deploy.md')
 
 $binaryHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-app') -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -Path (Join-Path $packageRoot 'SHA256SUMS.txt') -Value "$binaryHash  bin/wotoha-app"
+$workerHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-youtube-js-worker') -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -Path (Join-Path $packageRoot 'SHA256SUMS.txt') -Value @(
+    "$binaryHash  bin/wotoha-app"
+    "$workerHash  bin/wotoha-youtube-js-worker"
+)
 Set-Content -Path (Join-Path $packageRoot 'RELEASE_VERSION') -Value 'manual'
 
 Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
 tar -czf $archivePath -C $distRoot 'wotoha-ubuntu-x86_64-musl'
 
 Write-Output "binary: $(Join-Path $targetDir "$target\release\wotoha-app")"
+Write-Output "worker: $(Join-Path $targetDir "$target\release\wotoha-youtube-js-worker")"
 Write-Output "package: $packageRoot"
 Write-Output "archive: $archivePath"

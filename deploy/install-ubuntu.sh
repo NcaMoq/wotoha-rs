@@ -18,6 +18,7 @@ install -d -o wotoha -g wotoha -m 0755 /var/log/wotoha
 install -d -o root -g root -m 0755 /var/lib/wotoha-updater
 
 install -m 0755 "$PACKAGE_DIR/bin/wotoha-app" /opt/wotoha/bin/wotoha-app
+install -m 0755 "$PACKAGE_DIR/bin/wotoha-youtube-js-worker" /opt/wotoha/bin/wotoha-youtube-js-worker
 install -m 0755 "$PACKAGE_DIR/wotoha-update.sh" /opt/wotoha/bin/wotoha-update
 install -m 0644 "$PACKAGE_DIR/deploy/wotoha.service" /etc/systemd/system/wotoha.service
 install -m 0644 "$PACKAGE_DIR/deploy/wotoha-update.service" /etc/systemd/system/wotoha-update.service

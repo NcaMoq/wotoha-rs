@@ -14,6 +14,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\build-ubuntu-musl.ps1
 次の成果物が作成されます。
 
 - `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-app`
+- `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-youtube-js-worker`
 - `dist\wotoha-ubuntu-x86_64-musl\`
 - `dist\wotoha-ubuntu-x86_64-musl.tar.gz`
 
@@ -51,6 +52,7 @@ sudo bash ./install-ubuntu.sh
 次の場所へ配置されます。
 
 - `/opt/wotoha/bin/wotoha-app`
+- `/opt/wotoha/bin/wotoha-youtube-js-worker`
 - `/etc/systemd/system/wotoha.service`
 - `/etc/wotoha/wotoha.env`
 - `/var/lib/wotoha`
@@ -107,8 +109,8 @@ tail -f /var/log/wotoha/wotoha-app.runtime.log
 バイナリと検査用摘要値を確認します。
 
 ```bash
-ls -lh /opt/wotoha/bin/wotoha-app
-sha256sum /opt/wotoha/bin/wotoha-app
+ls -lh /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/wotoha-youtube-js-worker
+sha256sum /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/wotoha-youtube-js-worker
 cat /tmp/wotoha-ubuntu-x86_64-musl/SHA256SUMS.txt
 ```
 

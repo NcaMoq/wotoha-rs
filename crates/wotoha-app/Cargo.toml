@@ -17,3 +17,4 @@ wotoha-core = { path = "../wotoha-core" }
 wotoha-media = { path = "../wotoha-media" }
 wotoha-runtime = { path = "../wotoha-runtime" }
 wotoha-voice = { path = "../wotoha-voice" }
+wotoha-youtube-js-worker = { path = "../wotoha-youtube-js-worker" }

@@ -9,7 +9,23 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test the workspace
+        run: cargo test --workspace --locked
+      - name: Lint the isolated JavaScript worker
+        run: cargo clippy --locked -p wotoha-youtube-js-worker --all-targets -- -D warnings
+
   ubuntu-x86_64:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +36,7 @@ jobs:
             --workdir /work \
             --env WOTOHA_BUILD_VERSION="$GITHUB_REF_NAME" \
             ghcr.io/rust-cross/cargo-zigbuild:0.22.3 \
-            bash -c 'apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo zigbuild --locked --release --bin wotoha-app --target x86_64-unknown-linux-musl'
+            bash -c 'apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo zigbuild --locked --release --bin wotoha-app --bin wotoha-youtube-js-worker --target x86_64-unknown-linux-musl'
       - name: Package
         shell: bash
         run: |
@@ -28,11 +44,14 @@ jobs:
           package="dist/wotoha-ubuntu-x86_64-musl"
           mkdir -p "$package/bin" "$package/deploy" "$package/docs"
           install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-app "$package/bin/wotoha-app"
+          install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker "$package/bin/wotoha-youtube-js-worker"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
           install -m 0755 deploy/install-ubuntu.sh deploy/wotoha-update.sh "$package/"
           install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json "$package/deploy/"
           install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
-          (cd "$package" && sha256sum bin/wotoha-app > SHA256SUMS.txt)
+          (cd "$package" && sha256sum bin/wotoha-app bin/wotoha-youtube-js-worker > SHA256SUMS.txt)
+          (cd "$package" && sha256sum --check SHA256SUMS.txt)
+          "$package/bin/wotoha-youtube-js-worker" </dev/null
           tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
           (cd dist && sha256sum wotoha-ubuntu-x86_64-musl.tar.gz > wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
       - name: Publish release

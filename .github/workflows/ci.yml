@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test the workspace
+        run: cargo test --workspace --locked
+      - name: Lint the isolated JavaScript worker
+        run: cargo clippy --locked -p wotoha-youtube-js-worker --all-targets -- -D warnings
+      - name: Build the isolated JavaScript worker
+        run: cargo build --locked -p wotoha-youtube-js-worker --bin wotoha-youtube-js-worker
+      - name: Test worker supervision and restart
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
+        run: cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact

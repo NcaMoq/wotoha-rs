@@ -133,9 +133,23 @@ if [[ ! -r /etc/wotoha/youtube-clients.json ]] \
 fi
 
 new_binary="$package/bin/wotoha-app"
+new_worker="$package/bin/wotoha-youtube-js-worker"
+if [[ ! -x "$new_binary" || ! -x "$new_worker" ]]; then
+  echo "release archive is missing a required executable" >&2
+  exit 1
+fi
+app_is_current=false
+worker_is_current=false
 if [[ -x "$INSTALL_DIR/wotoha-app" ]] && cmp --silent "$new_binary" "$INSTALL_DIR/wotoha-app"; then
+  app_is_current=true
+fi
+if [[ -x "$INSTALL_DIR/wotoha-youtube-js-worker" ]] \
+  && cmp --silent "$new_worker" "$INSTALL_DIR/wotoha-youtube-js-worker"; then
+  worker_is_current=true
+fi
+if [[ "$app_is_current" == true && "$worker_is_current" == true ]]; then
   printf '%s\n' "$tag" > "$STATE_FILE"
-  echo "binary is already current; recorded $tag"
+  echo "executables are already current; recorded $tag"
   exit 0
 fi
 if [[ ! -e "$STATE_FILE" && "$force" == false ]]; then
@@ -145,6 +159,7 @@ if [[ ! -e "$STATE_FILE" && "$force" == false ]]; then
 fi
 
 install -m 0755 "$new_binary" "$INSTALL_DIR/wotoha-app.new"
+install -m 0755 "$new_worker" "$INSTALL_DIR/wotoha-youtube-js-worker.new"
 was_active=false
 if systemctl is-active --quiet wotoha.service; then
   was_active=true
@@ -152,6 +167,12 @@ fi
 if [[ -x "$INSTALL_DIR/wotoha-app" ]]; then
   cp -a "$INSTALL_DIR/wotoha-app" "$INSTALL_DIR/wotoha-app.previous"
 fi
+worker_had_previous=false
+if [[ -x "$INSTALL_DIR/wotoha-youtube-js-worker" ]]; then
+  worker_had_previous=true
+  cp -a "$INSTALL_DIR/wotoha-youtube-js-worker" "$INSTALL_DIR/wotoha-youtube-js-worker.previous"
+fi
+mv -f "$INSTALL_DIR/wotoha-youtube-js-worker.new" "$INSTALL_DIR/wotoha-youtube-js-worker"
 mv -f "$INSTALL_DIR/wotoha-app.new" "$INSTALL_DIR/wotoha-app"
 
 restart_ok=true
@@ -165,8 +186,13 @@ if [[ "$was_active" == true ]] && { [[ "$restart_ok" == false ]] || ! systemctl 
   echo "updated service failed; rolling back" >&2
   if [[ -x "$INSTALL_DIR/wotoha-app.previous" ]]; then
     mv -f "$INSTALL_DIR/wotoha-app.previous" "$INSTALL_DIR/wotoha-app"
-    systemctl restart wotoha.service
   fi
+  if [[ -x "$INSTALL_DIR/wotoha-youtube-js-worker.previous" ]]; then
+    mv -f "$INSTALL_DIR/wotoha-youtube-js-worker.previous" "$INSTALL_DIR/wotoha-youtube-js-worker"
+  elif [[ "$worker_had_previous" == false ]]; then
+    rm -f "$INSTALL_DIR/wotoha-youtube-js-worker"
+  fi
+  systemctl restart wotoha.service
   exit 1
 fi
 

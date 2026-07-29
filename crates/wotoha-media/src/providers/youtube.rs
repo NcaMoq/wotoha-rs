@@ -1,8 +1,14 @@
 use std::{
-    collections::HashSet,
-    env, fs,
+    collections::{HashMap, HashSet},
+    env,
+    fmt::Write as FmtWrite,
+    fs,
     path::PathBuf,
-    sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock},
+    process::Stdio,
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -11,13 +17,19 @@ use dashmap::DashMap;
 use regex::Regex;
 use reqwest::{
     Client, StatusCode, Url,
-    header::{HeaderMap, HeaderName, HeaderValue, RANGE},
+    header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, RANGE},
+    redirect::Policy,
 };
 use rusty_ytdl::{
     Video, VideoFormat, VideoOptions, VideoQuality, VideoSearchOptions, choose_format,
 };
-use serde::Deserialize;
-use tokio::sync::{RwLock as AsyncRwLock, Semaphore};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, Semaphore},
+};
 use wotoha_core::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
 
 use crate::{ResolveError, provider::MediaProvider};
@@ -29,12 +41,24 @@ use super::{
 
 const YOUTUBE_RANGE_CHUNK_SIZE: u64 = 11_862_014;
 const YOUTUBE_NATIVE_FAST_PATH_TIMEOUT: Duration = Duration::from_secs(2);
+const YOUTUBE_JS_SLOW_PATH_TIMEOUT: Duration = Duration::from_secs(15);
 const YOUTUBE_STREAM_VALIDATION_TIMEOUT: Duration = Duration::from_secs(4);
 const YOUTUBE_STREAM_VALIDATION_RANGE: &str = "bytes=0-1023";
 const YOUTUBE_VISITOR_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 const YOUTUBE_PO_TOKEN_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const YOUTUBE_PO_TOKEN_MAX_CONCURRENCY: usize = 2;
 const YOUTUBE_PO_TOKEN_FAST_PATH_TIMEOUT: Duration = Duration::from_secs(15);
+const YOUTUBE_PLAYER_SCRIPT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const YOUTUBE_PLAYER_SCRIPT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const YOUTUBE_JS_WORKER_PROTOCOL_VERSION: u32 = 1;
+const YOUTUBE_JS_WORKER_SESSION_LIMIT: usize = 4;
+const YOUTUBE_JS_WORKER_REQUEST_MAX_BYTES: usize = 12 * 1024 * 1024;
+const YOUTUBE_JS_WORKER_RESPONSE_MAX_BYTES: usize = 2 * 1024 * 1024;
+const YOUTUBE_JS_WORKER_QUEUE_TIMEOUT: Duration = Duration::from_secs(12);
+const YOUTUBE_JS_WORKER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(10);
+const YOUTUBE_JS_WORKER_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const YOUTUBE_CHALLENGE_JOB_LIMIT: usize = 64;
+const YOUTUBE_CHALLENGE_VALUE_MAX_BYTES: usize = 16 * 1024;
 
 static YOUTUBE_VISITOR_SESSION: OnceLock<AsyncRwLock<Option<CachedVisitorSession>>> =
     OnceLock::new();
@@ -42,12 +66,68 @@ static YOUTUBE_NATIVE_CLIENTS: OnceLock<StdRwLock<CachedNativeClients>> = OnceLo
 static YOUTUBE_PO_TOKEN_CACHE: OnceLock<DashMap<String, PoToken>> = OnceLock::new();
 static YOUTUBE_PO_TOKEN_PROVIDER_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 static YOUTUBE_PO_TOKEN_PROVIDER_BACKOFF: OnceLock<StdMutex<Option<Instant>>> = OnceLock::new();
+static YOUTUBE_PLAYER_SCRIPT: OnceLock<AsyncMutex<Option<CachedPlayerScript>>> = OnceLock::new();
+static YOUTUBE_PLAYER_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+static YOUTUBE_JS_WORKER: OnceLock<AsyncMutex<JsWorkerSupervisor>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct CachedVisitorSession {
     visitor_data: String,
     signature_timestamp: u64,
+    player_url: Option<String>,
     cached_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct CachedPlayerScript {
+    url: String,
+    source: Arc<str>,
+    cached_at: Instant,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ChallengeInput {
+    signature: Option<String>,
+    n: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChallengeOutput {
+    signature: Option<String>,
+    n: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsWorkerRequest<'a> {
+    protocol_version: u32,
+    player_key: &'a str,
+    player_source: Option<&'a str>,
+    inputs: &'a [ChallengeInput],
+}
+
+#[derive(Deserialize)]
+struct JsWorkerResponse {
+    protocol_version: u32,
+    outputs: Option<Vec<ChallengeOutput>>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct JsWorkerSupervisor {
+    process: Option<JsWorkerProcess>,
+    failure_until: HashMap<String, Instant>,
+}
+
+struct JsWorkerProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    loaded_players: HashSet<String>,
+}
+
+struct JsWorkerExecutable {
+    path: PathBuf,
+    app_worker_mode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +766,41 @@ async fn validate_native_format_with_pot(
     profile: &NativeClientProfile,
     video_id: &str,
     visitor_data: Option<&str>,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let original_url = format.stream_url.clone();
+    match solve_url_n_challenge(probe_client, &original_url, player_url, challenge_detected).await {
+        Ok(Some(solved_url)) => {
+            format.stream_url = solved_url;
+            if validate_chosen_format(probe_client, format).await.is_ok() {
+                tracing::info!(
+                    extractor = "native_js",
+                    "YouTube selected stream after solving the n challenge"
+                );
+                return Ok(());
+            }
+            format.stream_url = original_url;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube n challenge solve was unavailable"
+            );
+        }
+    }
+    validate_native_format_with_pot_only(probe_client, format, profile, video_id, visitor_data)
+        .await
+}
+
+async fn validate_native_format_with_pot_only(
+    probe_client: &Client,
+    format: &mut ChosenFormat,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
 ) -> Result<(), String> {
     match validate_chosen_format(probe_client, format).await {
         Ok(()) => Ok(()),
@@ -743,6 +858,51 @@ async fn validate_native_format_with_pot(
 }
 
 async fn validate_native_request_with_pot(
+    probe_client: &Client,
+    request: &mut TrackRequest,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<(), String> {
+    let original_prepared = request.prepared.clone();
+    let stream_url = match &request.prepared {
+        PreparedSource::Http { stream_url, .. } => stream_url.to_string(),
+        PreparedSource::Hls { playlist_url, .. } => playlist_url.to_string(),
+    };
+    match solve_url_n_challenge(probe_client, &stream_url, player_url, challenge_detected).await {
+        Ok(Some(solved_url)) => {
+            match &mut request.prepared {
+                PreparedSource::Http { stream_url, .. } => *stream_url = solved_url.into(),
+                PreparedSource::Hls { playlist_url, .. } => *playlist_url = solved_url.into(),
+            }
+            if validate_prepared_source(probe_client, &request.prepared)
+                .await
+                .is_ok()
+            {
+                tracing::info!(
+                    extractor = "native_js",
+                    "YouTube selected stream after solving the n challenge"
+                );
+                return Ok(());
+            }
+            request.prepared = original_prepared;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube n challenge solve was unavailable"
+            );
+        }
+    }
+    validate_native_request_with_pot_only(probe_client, request, profile, video_id, visitor_data)
+        .await
+}
+
+async fn validate_native_request_with_pot_only(
     probe_client: &Client,
     request: &mut TrackRequest,
     profile: &NativeClientProfile,
@@ -822,12 +982,16 @@ fn add_po_token_to_prepared_source(
 }
 
 fn url_with_po_token(raw_url: &str, token: &str) -> Result<String, String> {
+    url_with_query_value(raw_url, "pot", token)
+}
+
+fn url_with_query_value(raw_url: &str, key: &str, value: &str) -> Result<String, String> {
     Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
     let mut encoded = Url::parse("https://localhost/").expect("static URL should parse");
-    encoded.query_pairs_mut().append_pair("pot", token);
+    encoded.query_pairs_mut().append_pair(key, value);
     let encoded_pair = encoded
         .query()
-        .expect("PO Token query should have been created");
+        .expect("query pair should have been created");
 
     let (without_fragment, fragment) = raw_url
         .split_once('#')
@@ -841,14 +1005,71 @@ fn url_with_po_token(raw_url: &str, token: &str) -> Result<String, String> {
         .into_iter()
         .flat_map(|query| query.split('&'))
         .filter(|pair| {
-            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
-            !key.eq_ignore_ascii_case("pot")
+            let existing_key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            !existing_key.eq_ignore_ascii_case(key)
         })
         .filter(|pair| !pair.is_empty())
         .collect::<Vec<_>>();
     pairs.push(encoded_pair);
 
     let mut updated = format!("{base}?{}", pairs.join("&"));
+    if let Some(fragment) = fragment {
+        updated.push('#');
+        updated.push_str(fragment);
+    }
+    Ok(updated)
+}
+
+fn path_n_challenge(url: &Url) -> Option<String> {
+    let segments = url.path().split('/').collect::<Vec<_>>();
+    segments.windows(2).find_map(|segments| {
+        (segments[0] == "n"
+            && !segments[1].is_empty()
+            && segments[1].len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+            .then(|| segments[1].to_owned())
+    })
+}
+
+fn url_with_path_n_value(raw_url: &str, value: &str) -> Result<String, String> {
+    Url::parse(raw_url).map_err(|error| format!("invalid stream URL: {error}"))?;
+    let mut encoded = Url::parse("https://localhost/").expect("static URL should parse");
+    {
+        let mut path = encoded
+            .path_segments_mut()
+            .expect("static URL should support path segments");
+        path.pop_if_empty();
+        path.push(value);
+    }
+    let encoded_value = encoded.path().trim_start_matches('/');
+
+    let (without_fragment, fragment) = raw_url
+        .split_once('#')
+        .map_or((raw_url, None), |(url, fragment)| (url, Some(fragment)));
+    let (without_query, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(url, query)| (url, Some(query)));
+    let authority_start = without_query
+        .find("://")
+        .map(|index| index + 3)
+        .ok_or_else(|| "stream URL had no authority".to_owned())?;
+    let path_start = without_query[authority_start..]
+        .find('/')
+        .map(|index| authority_start + index)
+        .ok_or_else(|| "stream URL had no path".to_owned())?;
+    let (origin, raw_path) = without_query.split_at(path_start);
+    let mut segments = raw_path.split('/').collect::<Vec<_>>();
+    let Some(index) = segments
+        .windows(2)
+        .position(|segments| segments[0] == "n" && !segments[1].is_empty())
+    else {
+        return Err("stream URL had no path n challenge".to_owned());
+    };
+    segments[index + 1] = encoded_value;
+    let mut updated = format!("{origin}{}", segments.join("/"));
+    if let Some(query) = query {
+        updated.push('?');
+        updated.push_str(query);
+    }
     if let Some(fragment) = fragment {
         updated.push('#');
         updated.push_str(fragment);
@@ -1077,8 +1298,8 @@ async fn fetch_android_vr_audio_format(
 ) -> Result<Option<ChosenFormat>, ResolveError> {
     let visitor_profile = visitor_native_client_profile();
     let vr_response =
-        fetch_android_vr_player_response(probe_client, canonical_url, video_id).await?;
-    if let Some((response, visitor_data)) = vr_response.as_ref()
+        fetch_android_vr_player_response(probe_client, canonical_url, video_id, None).await?;
+    if let Some((response, session)) = vr_response.as_ref()
         && let Some(mut format) = response.streaming_data.as_ref().and_then(|streaming_data| {
             chosen_format_from_android_streaming_data(
                 streaming_data,
@@ -1091,7 +1312,9 @@ async fn fetch_android_vr_audio_format(
             &mut format,
             &visitor_profile,
             video_id,
-            Some(visitor_data.as_str()),
+            Some(session.visitor_data.as_str()),
+            session.player_url.as_deref(),
+            None,
         )
         .await
         {
@@ -1104,6 +1327,24 @@ async fn fetch_android_vr_audio_format(
                 return Ok(Some(format));
             }
             Err(error) => {
+                if let Ok(Some(cipher_format)) = validated_cipher_format(
+                    probe_client,
+                    response,
+                    &visitor_profile,
+                    video_id,
+                    Some(session.visitor_data.as_str()),
+                    session.player_url.as_deref(),
+                    None,
+                )
+                .await
+                {
+                    tracing::info!(
+                        extractor = "native_js",
+                        strategy = "android_vr_visitor_cipher",
+                        "YouTube selected verified cipher fallback stream"
+                    );
+                    return Ok(Some(cipher_format));
+                }
                 tracing::warn!(
                     extractor = "native",
                     strategy = "android_vr_visitor",
@@ -1116,19 +1357,28 @@ async fn fetch_android_vr_audio_format(
 
     let profiles = native_client_profiles();
     for profile in profiles.iter() {
-        let response =
-            match fetch_direct_native_player_response(probe_client, video_id, profile).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::debug!(
-                        extractor = "native",
-                        strategy = profile.id.as_str(),
-                        error = %error,
-                        "YouTube native player request failed"
-                    );
-                    continue;
-                }
-            };
+        let response = match fetch_direct_native_player_response(
+            probe_client,
+            video_id,
+            profile,
+            vr_response
+                .as_ref()
+                .and_then(|(_, session)| session.player_url.as_deref()),
+            None,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    error = %error,
+                    "YouTube native player request failed"
+                );
+                continue;
+            }
+        };
         let Some(mut format) = response
             .as_ref()
             .and_then(|response| response.streaming_data.as_ref())
@@ -1141,8 +1391,18 @@ async fn fetch_android_vr_audio_format(
         else {
             continue;
         };
-        match validate_native_format_with_pot(probe_client, &mut format, profile, video_id, None)
-            .await
+        match validate_native_format_with_pot(
+            probe_client,
+            &mut format,
+            profile,
+            video_id,
+            None,
+            vr_response
+                .as_ref()
+                .and_then(|(_, session)| session.player_url.as_deref()),
+            None,
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!(
@@ -1153,6 +1413,27 @@ async fn fetch_android_vr_audio_format(
                 return Ok(Some(format));
             }
             Err(error) => {
+                if let Some(response) = response.as_ref()
+                    && let Ok(Some(cipher_format)) = validated_cipher_format(
+                        probe_client,
+                        response,
+                        profile,
+                        video_id,
+                        None,
+                        vr_response
+                            .as_ref()
+                            .and_then(|(_, session)| session.player_url.as_deref()),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        extractor = "native_js",
+                        strategy = profile.id.as_str(),
+                        "YouTube selected verified cipher fallback stream"
+                    );
+                    return Ok(Some(cipher_format));
+                }
                 tracing::warn!(
                     extractor = "native",
                     strategy = profile.id.as_str(),
@@ -1174,18 +1455,29 @@ async fn fetch_android_vr_track_request_fast(
         return Ok(None);
     };
 
-    let timeout_duration = if youtube_pot::is_configured() {
-        YOUTUBE_PO_TOKEN_FAST_PATH_TIMEOUT
-    } else {
-        YOUTUBE_NATIVE_FAST_PATH_TIMEOUT
-    };
-    match tokio::time::timeout(
-        timeout_duration,
-        fetch_android_vr_track_request(probe_client, raw_url, &video_id),
-    )
-    .await
-    {
+    let challenge_detected = AtomicBool::new(false);
+    let future =
+        fetch_android_vr_track_request(probe_client, raw_url, &video_id, Some(&challenge_detected));
+    tokio::pin!(future);
+    if youtube_pot::is_configured() {
+        return match tokio::time::timeout(YOUTUBE_PO_TOKEN_FAST_PATH_TIMEOUT, future).await {
+            Ok(result) => result,
+            Err(_) => Ok(None),
+        };
+    }
+    match tokio::time::timeout(YOUTUBE_NATIVE_FAST_PATH_TIMEOUT, future.as_mut()).await {
         Ok(result) => result,
+        Err(_) if challenge_detected.load(Ordering::Relaxed) => {
+            match tokio::time::timeout(
+                YOUTUBE_JS_SLOW_PATH_TIMEOUT - YOUTUBE_NATIVE_FAST_PATH_TIMEOUT,
+                future,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(None),
+            }
+        }
         Err(_) => Ok(None),
     }
 }
@@ -1194,17 +1486,19 @@ async fn fetch_android_vr_track_request(
     probe_client: &Client,
     raw_url: &str,
     video_id: &str,
+    challenge_detected: Option<&AtomicBool>,
 ) -> Result<Option<TrackRequest>, ResolveError> {
     let visitor_profile = visitor_native_client_profile();
-    let response = fetch_android_vr_player_response(
+    let vr_response = fetch_android_vr_player_response(
         probe_client,
         &format!("https://www.youtube.com/watch?v={video_id}"),
         video_id,
+        challenge_detected,
     )
     .await?;
-    if let Some((response, visitor_data)) = response
+    if let Some((response, session)) = vr_response.as_ref()
         && let Some(mut request) = native_track_request_from_response(
-            Some(response),
+            Some(response.clone()),
             raw_url,
             video_id,
             native_stream_headers(&visitor_profile),
@@ -1215,7 +1509,9 @@ async fn fetch_android_vr_track_request(
             &mut request,
             &visitor_profile,
             video_id,
-            Some(visitor_data.as_str()),
+            Some(session.visitor_data.as_str()),
+            session.player_url.as_deref(),
+            challenge_detected,
         )
         .await
         {
@@ -1229,6 +1525,26 @@ async fn fetch_android_vr_track_request(
                 return Ok(Some(request));
             }
             Err(error) => {
+                if let Ok(Some(cipher_request)) = validated_cipher_request(
+                    probe_client,
+                    response,
+                    raw_url,
+                    &visitor_profile,
+                    video_id,
+                    Some(session.visitor_data.as_str()),
+                    session.player_url.as_deref(),
+                    challenge_detected,
+                )
+                .await
+                {
+                    tracing::info!(
+                        extractor = "native_js",
+                        strategy = "android_vr_visitor_cipher",
+                        video_key = %cipher_request.canonical_key,
+                        "YouTube selected verified cipher fallback path"
+                    );
+                    return Ok(Some(cipher_request));
+                }
                 tracing::warn!(
                     extractor = "native",
                     strategy = "android_vr_visitor",
@@ -1241,29 +1557,48 @@ async fn fetch_android_vr_track_request(
 
     let profiles = native_client_profiles();
     for profile in profiles.iter() {
-        let response =
-            match fetch_direct_native_player_response(probe_client, video_id, profile).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::debug!(
-                        extractor = "native",
-                        strategy = profile.id.as_str(),
-                        error = %error,
-                        "YouTube native metadata request failed"
-                    );
-                    continue;
-                }
-            };
+        let response = match fetch_direct_native_player_response(
+            probe_client,
+            video_id,
+            profile,
+            vr_response
+                .as_ref()
+                .and_then(|(_, session)| session.player_url.as_deref()),
+            challenge_detected,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::debug!(
+                    extractor = "native",
+                    strategy = profile.id.as_str(),
+                    error = %error,
+                    "YouTube native metadata request failed"
+                );
+                continue;
+            }
+        };
         let Some(mut request) = native_track_request_from_response(
-            response,
+            response.clone(),
             raw_url,
             video_id,
             native_stream_headers(profile),
         ) else {
             continue;
         };
-        match validate_native_request_with_pot(probe_client, &mut request, profile, video_id, None)
-            .await
+        match validate_native_request_with_pot(
+            probe_client,
+            &mut request,
+            profile,
+            video_id,
+            None,
+            vr_response
+                .as_ref()
+                .and_then(|(_, session)| session.player_url.as_deref()),
+            challenge_detected,
+        )
+        .await
         {
             Ok(()) => {
                 tracing::info!(
@@ -1275,6 +1610,29 @@ async fn fetch_android_vr_track_request(
                 return Ok(Some(request));
             }
             Err(error) => {
+                if let Some(response) = response.as_ref()
+                    && let Ok(Some(cipher_request)) = validated_cipher_request(
+                        probe_client,
+                        response,
+                        raw_url,
+                        profile,
+                        video_id,
+                        None,
+                        vr_response
+                            .as_ref()
+                            .and_then(|(_, session)| session.player_url.as_deref()),
+                        challenge_detected,
+                    )
+                    .await
+                {
+                    tracing::info!(
+                        extractor = "native_js",
+                        strategy = profile.id.as_str(),
+                        video_key = %cipher_request.canonical_key,
+                        "YouTube selected verified cipher fallback path"
+                    );
+                    return Ok(Some(cipher_request));
+                }
                 tracing::warn!(
                     extractor = "native",
                     strategy = profile.id.as_str(),
@@ -1349,22 +1707,28 @@ async fn fetch_android_vr_player_response(
     probe_client: &Client,
     canonical_url: &str,
     video_id: &str,
-) -> Result<Option<(AndroidPlayerResponse, String)>, ResolveError> {
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<Option<(AndroidPlayerResponse, CachedVisitorSession)>, ResolveError> {
     let (session, was_cached) = visitor_session(probe_client, canonical_url, false).await?;
-    let response = fetch_visitor_bound_player_response(probe_client, video_id, &session).await?;
+    let response =
+        fetch_visitor_bound_player_response(probe_client, video_id, &session, challenge_detected)
+            .await?;
     if !was_cached || !response.requires_fresh_visitor_session() {
-        return Ok(Some((response, session.visitor_data)));
+        return Ok(Some((response, session)));
     }
 
     let (session, _) = visitor_session(probe_client, canonical_url, true).await?;
-    let response = fetch_visitor_bound_player_response(probe_client, video_id, &session).await?;
-    Ok(Some((response, session.visitor_data)))
+    let response =
+        fetch_visitor_bound_player_response(probe_client, video_id, &session, challenge_detected)
+            .await?;
+    Ok(Some((response, session)))
 }
 
 async fn fetch_visitor_bound_player_response(
     probe_client: &Client,
     video_id: &str,
     session: &CachedVisitorSession,
+    challenge_detected: Option<&AtomicBool>,
 ) -> Result<AndroidPlayerResponse, ResolveError> {
     let visitor_profile = visitor_native_client_profile();
     let response = send_native_player_request(
@@ -1376,6 +1740,13 @@ async fn fetch_visitor_bound_player_response(
         None,
     )
     .await?;
+    let response = solve_native_player_challenges(
+        probe_client,
+        response,
+        session.player_url.as_deref(),
+        challenge_detected,
+    )
+    .await;
     if response.has_playable_stream() {
         return Ok(response);
     }
@@ -1399,6 +1770,13 @@ async fn fetch_visitor_bound_player_response(
         Some(player_token.value.as_str()),
     )
     .await?;
+    let response = solve_native_player_challenges(
+        probe_client,
+        response,
+        session.player_url.as_deref(),
+        challenge_detected,
+    )
+    .await;
     if response.has_playable_stream() {
         return Ok(response);
     }
@@ -1431,6 +1809,13 @@ async fn fetch_visitor_bound_player_response(
         Some(fresh_token.value.as_str()),
     )
     .await?;
+    let fresh_response = solve_native_player_challenges(
+        probe_client,
+        fresh_response,
+        session.player_url.as_deref(),
+        challenge_detected,
+    )
+    .await;
     if !fresh_response.has_playable_stream() {
         invalidate_po_token(
             &visitor_profile,
@@ -1509,6 +1894,7 @@ async fn visitor_session(
     let session = CachedVisitorSession {
         visitor_data,
         signature_timestamp,
+        player_url: extract_player_url(&watch_html),
         cached_at: Instant::now(),
     };
     let mut cached = cache.write().await;
@@ -1522,13 +1908,760 @@ async fn visitor_session(
     Ok((session, false))
 }
 
+async fn solve_native_player_challenges(
+    probe_client: &Client,
+    mut response: AndroidPlayerResponse,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> AndroidPlayerResponse {
+    if response.has_playable_stream() || !response.has_cipher_stream() {
+        return response;
+    }
+    if let Some(challenge_detected) = challenge_detected {
+        challenge_detected.store(true, Ordering::Relaxed);
+    }
+    let Some(player_url) = player_url else {
+        tracing::debug!(
+            extractor = "native_js",
+            "YouTube returned ciphered streams without a Player JavaScript URL"
+        );
+        return response;
+    };
+    match solve_android_cipher_formats(probe_client, &mut response, player_url).await {
+        Ok(solved) => {
+            tracing::info!(
+                extractor = "native_js",
+                solved,
+                "YouTube solved Player JavaScript stream challenges"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                extractor = "native_js",
+                error = %error,
+                "YouTube Player JavaScript challenge solver failed"
+            );
+        }
+    }
+    response
+}
+
+async fn solved_cipher_player_response(
+    probe_client: &Client,
+    response: &AndroidPlayerResponse,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<Option<AndroidPlayerResponse>, String> {
+    let Some(player_url) = player_url else {
+        return Ok(None);
+    };
+    let mut cipher_response = response.clone();
+    let Some(streaming_data) = cipher_response.streaming_data.as_mut() else {
+        return Ok(None);
+    };
+    streaming_data.adaptive_formats.retain(|format| {
+        format.mime_type.starts_with("audio/")
+            && format
+                .signature_cipher
+                .as_ref()
+                .is_some_and(|cipher| !cipher.is_empty())
+    });
+    streaming_data.hls_manifest_url = None;
+    if streaming_data.adaptive_formats.is_empty() {
+        return Ok(None);
+    }
+    if let Some(challenge_detected) = challenge_detected {
+        challenge_detected.store(true, Ordering::Relaxed);
+    }
+    let solved =
+        solve_android_cipher_formats(probe_client, &mut cipher_response, player_url).await?;
+    Ok((solved > 0 && cipher_response.has_playable_stream()).then_some(cipher_response))
+}
+
+async fn validated_cipher_format(
+    probe_client: &Client,
+    response: &AndroidPlayerResponse,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<Option<ChosenFormat>, String> {
+    let Some(response) =
+        solved_cipher_player_response(probe_client, response, player_url, challenge_detected)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let Some(mut format) = response.streaming_data.as_ref().and_then(|streaming_data| {
+        chosen_format_from_android_streaming_data(streaming_data, native_stream_headers(profile))
+    }) else {
+        return Ok(None);
+    };
+    validate_native_format_with_pot_only(
+        probe_client,
+        &mut format,
+        profile,
+        video_id,
+        visitor_data,
+    )
+    .await?;
+    Ok(Some(format))
+}
+
+async fn validated_cipher_request(
+    probe_client: &Client,
+    response: &AndroidPlayerResponse,
+    raw_url: &str,
+    profile: &NativeClientProfile,
+    video_id: &str,
+    visitor_data: Option<&str>,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<Option<TrackRequest>, String> {
+    let Some(response) =
+        solved_cipher_player_response(probe_client, response, player_url, challenge_detected)
+            .await?
+    else {
+        return Ok(None);
+    };
+    let Some(mut request) = native_track_request_from_response(
+        Some(response),
+        raw_url,
+        video_id,
+        native_stream_headers(profile),
+    ) else {
+        return Ok(None);
+    };
+    validate_native_request_with_pot_only(
+        probe_client,
+        &mut request,
+        profile,
+        video_id,
+        visitor_data,
+    )
+    .await?;
+    Ok(Some(request))
+}
+
+async fn run_youtube_js_solver(
+    player_url: &str,
+    player_source: Arc<str>,
+    inputs: Vec<ChallengeInput>,
+) -> Result<Vec<ChallengeOutput>, String> {
+    let player_key = youtube_player_key(player_url, player_source.as_ref());
+    let worker = YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+    let mut supervisor = tokio::time::timeout(YOUTUBE_JS_WORKER_QUEUE_TIMEOUT, worker.lock())
+        .await
+        .map_err(|_| "Player JavaScript solver queue timed out".to_owned())?;
+    supervisor
+        .failure_until
+        .retain(|_, deadline| *deadline > Instant::now());
+    if supervisor.failure_until.contains_key(&player_key) {
+        return Err("Player JavaScript solver is temporarily backed off".to_owned());
+    }
+    let result = tokio::time::timeout(
+        YOUTUBE_JS_WORKER_EXECUTION_TIMEOUT,
+        supervisor.solve_once(&player_key, player_source.as_ref(), &inputs),
+    )
+    .await;
+    match result {
+        Ok(Ok(outputs)) => {
+            supervisor.failure_until.remove(&player_key);
+            Ok(outputs)
+        }
+        Ok(Err(error)) => {
+            supervisor.stop().await;
+            supervisor.back_off(player_key);
+            Err(error)
+        }
+        Err(_) => {
+            supervisor.stop().await;
+            supervisor.back_off(player_key);
+            Err("Player JavaScript solver execution timed out".to_owned())
+        }
+    }
+}
+
+impl JsWorkerSupervisor {
+    async fn solve_once(
+        &mut self,
+        player_key: &str,
+        player_source: &str,
+        inputs: &[ChallengeInput],
+    ) -> Result<Vec<ChallengeOutput>, String> {
+        if self.process.is_none() {
+            self.process = Some(start_youtube_js_worker()?);
+        }
+        let process = self
+            .process
+            .as_mut()
+            .ok_or_else(|| "Player JavaScript solver worker did not start".to_owned())?;
+        if process
+            .child
+            .try_wait()
+            .map_err(|_| "Player JavaScript solver status check failed".to_owned())?
+            .is_some()
+        {
+            return Err("Player JavaScript solver worker exited".to_owned());
+        }
+        let is_new_player = !process.loaded_players.contains(player_key);
+        if is_new_player && process.loaded_players.len() >= YOUTUBE_JS_WORKER_SESSION_LIMIT {
+            process.loaded_players.clear();
+        }
+        let request = serde_json::to_vec(&JsWorkerRequest {
+            protocol_version: YOUTUBE_JS_WORKER_PROTOCOL_VERSION,
+            player_key,
+            player_source: is_new_player.then_some(player_source),
+            inputs,
+        })
+        .map_err(|_| "Player JavaScript solver request encoding failed".to_owned())?;
+        if request.is_empty() || request.len() > YOUTUBE_JS_WORKER_REQUEST_MAX_BYTES {
+            return Err("Player JavaScript solver request exceeded its size limit".to_owned());
+        }
+        process
+            .stdin
+            .write_all(&(request.len() as u32).to_be_bytes())
+            .await
+            .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
+        process
+            .stdin
+            .write_all(&request)
+            .await
+            .map_err(|_| "Player JavaScript solver request write failed".to_owned())?;
+        process
+            .stdin
+            .flush()
+            .await
+            .map_err(|_| "Player JavaScript solver request flush failed".to_owned())?;
+
+        let mut header = [0_u8; 4];
+        process
+            .stdout
+            .read_exact(&mut header)
+            .await
+            .map_err(|_| "Player JavaScript solver response header failed".to_owned())?;
+        let response_length = u32::from_be_bytes(header) as usize;
+        if response_length == 0 || response_length > YOUTUBE_JS_WORKER_RESPONSE_MAX_BYTES {
+            return Err("Player JavaScript solver response exceeded its size limit".to_owned());
+        }
+        let mut response = vec![0_u8; response_length];
+        process
+            .stdout
+            .read_exact(&mut response)
+            .await
+            .map_err(|_| "Player JavaScript solver response read failed".to_owned())?;
+        let response: JsWorkerResponse = serde_json::from_slice(&response)
+            .map_err(|_| "Player JavaScript solver returned invalid JSON".to_owned())?;
+        if response.protocol_version != YOUTUBE_JS_WORKER_PROTOCOL_VERSION {
+            return Err("Player JavaScript solver returned an unsupported protocol".to_owned());
+        }
+        if let Some(error) = response.error {
+            return Err(format!(
+                "Player JavaScript solver rejected the challenge: {}",
+                sanitize_js_worker_error(&error)
+            ));
+        }
+        let outputs = response
+            .outputs
+            .ok_or_else(|| "Player JavaScript solver returned no outputs".to_owned())?;
+        validate_js_worker_outputs(&outputs, inputs.len())?;
+        if is_new_player {
+            process.loaded_players.insert(player_key.to_owned());
+        }
+        Ok(outputs)
+    }
+
+    async fn stop(&mut self) {
+        let Some(mut process) = self.process.take() else {
+            return;
+        };
+        let _ = process.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), process.child.wait()).await;
+    }
+
+    fn back_off(&mut self, player_key: String) {
+        if self.failure_until.len() >= 16 {
+            self.failure_until.clear();
+        }
+        self.failure_until.insert(
+            player_key,
+            Instant::now() + YOUTUBE_JS_WORKER_FAILURE_BACKOFF,
+        );
+    }
+}
+
+fn start_youtube_js_worker() -> Result<JsWorkerProcess, String> {
+    let executable = youtube_js_worker_path()?;
+    let mut command = Command::new(executable.path);
+    if executable.app_worker_mode {
+        command.arg("--youtube-js-worker");
+    }
+    let mut child = command
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "failed to start Player JavaScript solver worker".to_owned())?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Player JavaScript solver stdin was unavailable".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Player JavaScript solver stdout was unavailable".to_owned())?;
+    Ok(JsWorkerProcess {
+        child,
+        stdin,
+        stdout,
+        loaded_players: HashSet::new(),
+    })
+}
+
+fn youtube_js_worker_path() -> Result<JsWorkerExecutable, String> {
+    if let Some(path) = env::var_os("WOTOHA_YOUTUBE_JS_WORKER").map(PathBuf::from) {
+        if !path.is_absolute() {
+            return Err("WOTOHA_YOUTUBE_JS_WORKER must be an absolute path".to_owned());
+        }
+        return Ok(JsWorkerExecutable {
+            path,
+            app_worker_mode: false,
+        });
+    }
+    let executable =
+        env::current_exe().map_err(|_| "current executable path was unavailable".to_owned())?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "current executable directory was unavailable".to_owned())?;
+    let worker_name = if cfg!(windows) {
+        "wotoha-youtube-js-worker.exe"
+    } else {
+        "wotoha-youtube-js-worker"
+    };
+    let sibling = parent.join(worker_name);
+    if sibling.is_file() {
+        return Ok(JsWorkerExecutable {
+            path: sibling,
+            app_worker_mode: false,
+        });
+    }
+    if parent.file_name().is_some_and(|name| name == "deps")
+        && let Some(debug_root) = parent.parent()
+    {
+        let debug_worker = debug_root.join(worker_name);
+        if debug_worker.is_file() {
+            return Ok(JsWorkerExecutable {
+                path: debug_worker,
+                app_worker_mode: false,
+            });
+        }
+    }
+    if executable
+        .file_stem()
+        .is_some_and(|name| name == "wotoha-app")
+    {
+        return Ok(JsWorkerExecutable {
+            path: executable,
+            app_worker_mode: true,
+        });
+    }
+    Err("Player JavaScript solver worker executable was not found".to_owned())
+}
+
+fn youtube_player_key(player_url: &str, player_source: &str) -> String {
+    let digest = Sha256::digest(player_source.as_bytes());
+    let mut key = String::with_capacity(player_url.len() + 65);
+    key.push_str(player_url);
+    key.push('#');
+    for byte in digest {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+fn validate_js_worker_outputs(
+    outputs: &[ChallengeOutput],
+    expected_count: usize,
+) -> Result<(), String> {
+    if outputs.len() != expected_count
+        || outputs.len() > YOUTUBE_CHALLENGE_JOB_LIMIT
+        || outputs.iter().any(|output| {
+            output
+                .signature
+                .as_ref()
+                .is_some_and(|value| value.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+                || output
+                    .n
+                    .as_ref()
+                    .is_some_and(|value| value.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+        })
+    {
+        return Err("Player JavaScript solver returned invalid outputs".to_owned());
+    }
+    Ok(())
+}
+
+fn sanitize_js_worker_error(error: &str) -> String {
+    error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect()
+}
+
+async fn solve_android_cipher_formats(
+    _probe_client: &Client,
+    response: &mut AndroidPlayerResponse,
+    player_url: &str,
+) -> Result<usize, String> {
+    let Some(streaming_data) = response.streaming_data.as_mut() else {
+        return Ok(0);
+    };
+    let mut jobs = Vec::new();
+    for (format_index, format) in streaming_data.adaptive_formats.iter().enumerate() {
+        if !format.mime_type.starts_with("audio/") || format.url.is_some() {
+            continue;
+        }
+        let Some(cipher) = format.signature_cipher.as_deref() else {
+            continue;
+        };
+        match cipher_format_job(format_index, cipher) {
+            Ok(Some(job)) => jobs.push(job),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    extractor = "native_js",
+                    format_index,
+                    error = %error,
+                    "YouTube skipped a malformed cipher format"
+                );
+            }
+        }
+    }
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+    if jobs.len() > YOUTUBE_CHALLENGE_JOB_LIMIT {
+        return Err("YouTube returned too many Player JavaScript challenge jobs".to_owned());
+    }
+
+    let player_source = youtube_player_source(player_url).await?;
+    let mut inputs = Vec::with_capacity(jobs.len() * 2);
+    let mut targets = Vec::with_capacity(jobs.len() * 2);
+    for (job_index, job) in jobs.iter().enumerate() {
+        if let Some(signature) = job.input.signature.as_ref() {
+            inputs.push(ChallengeInput {
+                signature: Some(signature.clone()),
+                n: None,
+            });
+            targets.push(CipherOutputTarget::Signature(job_index));
+        }
+        if let Some(n) = job.input.n.as_ref() {
+            inputs.push(ChallengeInput {
+                signature: None,
+                n: Some(n.clone()),
+            });
+            targets.push(CipherOutputTarget::N(job_index));
+        }
+    }
+    if inputs.len() > YOUTUBE_CHALLENGE_JOB_LIMIT {
+        return Err("YouTube returned too many Player JavaScript challenge inputs".to_owned());
+    }
+    let outputs = run_youtube_js_solver(player_url, player_source, inputs).await?;
+    if outputs.len() != targets.len() {
+        return Err("Player JavaScript solver returned the wrong output count".to_owned());
+    }
+
+    let mut solved_urls = jobs
+        .iter()
+        .map(|job| job.stream_url.clone())
+        .collect::<Vec<_>>();
+    for (target, output) in targets.into_iter().zip(outputs) {
+        let (job_index, key, value) = match target {
+            CipherOutputTarget::Signature(job_index) => {
+                let value = output
+                    .signature
+                    .filter(|signature| {
+                        !signature.is_empty()
+                            && signature.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES
+                    })
+                    .ok_or_else(|| "Player JavaScript returned an empty signature".to_owned())?;
+                (
+                    job_index,
+                    jobs[job_index].signature_parameter.as_str(),
+                    value,
+                )
+            }
+            CipherOutputTarget::N(job_index) => {
+                let value = output
+                    .n
+                    .filter(|n| !n.is_empty() && n.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+                    .ok_or_else(|| "Player JavaScript returned an empty n value".to_owned())?;
+                (job_index, "n", value)
+            }
+        };
+        solved_urls[job_index] = url_with_query_value(&solved_urls[job_index], key, &value)?;
+    }
+    for (job, stream_url) in jobs.into_iter().zip(solved_urls) {
+        let Some(format) = streaming_data.adaptive_formats.get_mut(job.format_index) else {
+            return Err("Player JavaScript format index changed during solving".to_owned());
+        };
+        format.url = Some(stream_url);
+    }
+    Ok(streaming_data
+        .adaptive_formats
+        .iter()
+        .filter(|format| {
+            format.mime_type.starts_with("audio/")
+                && format.url.is_some()
+                && format.signature_cipher.is_some()
+        })
+        .count())
+}
+
+async fn solve_url_n_challenge(
+    _probe_client: &Client,
+    stream_url: &str,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
+) -> Result<Option<String>, String> {
+    let Some(player_url) = player_url else {
+        return Ok(None);
+    };
+    let parsed = Url::parse(stream_url)
+        .map_err(|error| format!("invalid stream URL for n solve: {error}"))?;
+    if !youtube_googlevideo_origin_is_allowed(&parsed) {
+        return Err("YouTube n challenge URL used an unexpected origin".to_owned());
+    }
+    let query_n = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "n")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty());
+    let path_n = path_n_challenge(&parsed);
+    let Some((n, in_path)) = query_n
+        .map(|value| (value, false))
+        .or_else(|| path_n.map(|value| (value, true)))
+    else {
+        return Ok(None);
+    };
+    if stream_url.len() > 64 * 1024 || n.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES {
+        return Err("YouTube n challenge input exceeded its size limit".to_owned());
+    }
+    if let Some(challenge_detected) = challenge_detected {
+        challenge_detected.store(true, Ordering::Relaxed);
+    }
+    let player_source = youtube_player_source(player_url).await?;
+    let outputs = run_youtube_js_solver(
+        player_url,
+        player_source,
+        vec![ChallengeInput {
+            signature: None,
+            n: Some(n),
+        }],
+    )
+    .await?;
+    let solved_n = outputs
+        .into_iter()
+        .next()
+        .and_then(|output| output.n)
+        .filter(|value| !value.is_empty() && value.len() <= YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+        .ok_or_else(|| "Player JavaScript returned an empty n value".to_owned())?;
+    Ok(Some(if in_path {
+        url_with_path_n_value(stream_url, &solved_n)?
+    } else {
+        url_with_query_value(stream_url, "n", &solved_n)?
+    }))
+}
+
+#[derive(Debug)]
+struct CipherFormatJob {
+    format_index: usize,
+    stream_url: String,
+    signature_parameter: String,
+    input: ChallengeInput,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CipherOutputTarget {
+    Signature(usize),
+    N(usize),
+}
+
+fn cipher_format_job(format_index: usize, cipher: &str) -> Result<Option<CipherFormatJob>, String> {
+    if cipher.len() > 64 * 1024 {
+        return Err("YouTube signatureCipher exceeded the 64 KiB limit".to_owned());
+    }
+    let mut stream_url = None;
+    let mut signature = None;
+    let mut signature_parameter = None;
+    for (key, value) in url::form_urlencoded::parse(cipher.as_bytes()) {
+        match key.as_ref() {
+            "url" if stream_url.is_none() => stream_url = Some(value.into_owned()),
+            "s" if signature.is_none() => signature = Some(value.into_owned()),
+            "sp" if signature_parameter.is_none() => signature_parameter = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    let Some(stream_url) = stream_url else {
+        return Ok(None);
+    };
+    if stream_url.len() > 64 * 1024 {
+        return Err("YouTube ciphered stream URL exceeded the 64 KiB limit".to_owned());
+    }
+    let parsed =
+        Url::parse(&stream_url).map_err(|error| format!("invalid ciphered stream URL: {error}"))?;
+    if !youtube_googlevideo_url_is_allowed(&parsed) {
+        return Err("YouTube ciphered stream URL used an unexpected origin".to_owned());
+    }
+    let n = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "n")
+        .map(|(_, value)| value.into_owned())
+        .filter(|value| !value.is_empty());
+    let signature = signature.filter(|value| !value.is_empty());
+    if signature
+        .as_ref()
+        .is_some_and(|value| value.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+        || n.as_ref()
+            .is_some_and(|value| value.len() > YOUTUBE_CHALLENGE_VALUE_MAX_BYTES)
+    {
+        return Err("YouTube challenge value exceeded the 16 KiB limit".to_owned());
+    }
+    if signature.is_none() && n.is_none() {
+        return Ok(None);
+    }
+    let signature_parameter = signature_parameter.unwrap_or_else(|| "signature".to_owned());
+    if signature_parameter.is_empty()
+        || signature_parameter.len() > 64
+        || !signature_parameter
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("YouTube signature parameter name was invalid".to_owned());
+    }
+    Ok(Some(CipherFormatJob {
+        format_index,
+        stream_url,
+        signature_parameter,
+        input: ChallengeInput { signature, n },
+    }))
+}
+
+async fn youtube_player_source(player_url: &str) -> Result<Arc<str>, String> {
+    let url = Url::parse(player_url)
+        .map_err(|error| format!("invalid Player JavaScript URL: {error}"))?;
+    if !youtube_player_url_is_allowed(&url) {
+        return Err("Player JavaScript URL used an unexpected origin or path".to_owned());
+    }
+    let cache = YOUTUBE_PLAYER_SCRIPT.get_or_init(|| AsyncMutex::new(None));
+    let mut cached = cache.lock().await;
+    if let Some(cached) = cached.as_ref()
+        && cached.url == player_url
+        && cached.cached_at.elapsed() <= YOUTUBE_PLAYER_SCRIPT_TTL
+    {
+        return Ok(cached.source.clone());
+    }
+
+    let player_client = YOUTUBE_PLAYER_CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .https_only(true)
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(12))
+                .redirect(Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 3 {
+                        attempt.error("too many Player JavaScript redirects")
+                    } else if youtube_player_url_is_allowed(attempt.url()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error("Player JavaScript redirect was rejected")
+                    }
+                }))
+                .build()
+                .map_err(|_| "failed to build Player JavaScript HTTP client".to_owned())
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    let mut response = player_client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| "Player JavaScript download failed".to_owned())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Player JavaScript returned HTTP {}",
+            response.status()
+        ));
+    }
+    if !youtube_player_url_is_allowed(response.url()) {
+        return Err("Player JavaScript redirected to an unexpected URL".to_owned());
+    }
+    if let Some(content_type) = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        let content_type = content_type.to_ascii_lowercase();
+        if !content_type.contains("javascript")
+            && !content_type.starts_with("text/plain")
+            && !content_type.starts_with("application/octet-stream")
+        {
+            return Err("Player JavaScript returned an unexpected content type".to_owned());
+        }
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > YOUTUBE_PLAYER_SCRIPT_MAX_BYTES as u64)
+    {
+        return Err("Player JavaScript exceeded the 8 MiB limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(YOUTUBE_PLAYER_SCRIPT_MAX_BYTES as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| "Player JavaScript download failed".to_owned())?
+    {
+        if bytes.len().saturating_add(chunk.len()) > YOUTUBE_PLAYER_SCRIPT_MAX_BYTES {
+            return Err("Player JavaScript exceeded the 8 MiB limit".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let source = Arc::<str>::from(
+        String::from_utf8(bytes).map_err(|_| "Player JavaScript was not valid UTF-8".to_owned())?,
+    );
+    if source.is_empty() {
+        return Err("Player JavaScript response was empty".to_owned());
+    }
+
+    *cached = Some(CachedPlayerScript {
+        url: player_url.to_owned(),
+        source: source.clone(),
+        cached_at: Instant::now(),
+    });
+    Ok(source)
+}
+
 async fn fetch_direct_native_player_response(
     probe_client: &Client,
     video_id: &str,
     profile: &NativeClientProfile,
+    player_url: Option<&str>,
+    challenge_detected: Option<&AtomicBool>,
 ) -> Result<Option<AndroidPlayerResponse>, ResolveError> {
     let response =
         send_native_player_request(probe_client, video_id, profile, None, None, None).await?;
+    let response =
+        solve_native_player_challenges(probe_client, response, player_url, challenge_detected)
+            .await;
     if response.has_playable_stream() {
         return Ok(Some(response));
     }
@@ -1546,6 +2679,9 @@ async fn fetch_direct_native_player_response(
         Some(player_token.value.as_str()),
     )
     .await?;
+    let response =
+        solve_native_player_challenges(probe_client, response, player_url, challenge_detected)
+            .await;
     if response.has_playable_stream() {
         return Ok(Some(response));
     }
@@ -1567,6 +2703,13 @@ async fn fetch_direct_native_player_response(
         Some(fresh_token.value.as_str()),
     )
     .await?;
+    let fresh_response = solve_native_player_challenges(
+        probe_client,
+        fresh_response,
+        player_url,
+        challenge_detected,
+    )
+    .await;
     if !fresh_response.has_playable_stream() {
         invalidate_po_token(profile, PoTokenContext::Player, video_id, None);
     }
@@ -1800,6 +2943,52 @@ fn extract_visitor_data(html: &str) -> Option<String> {
         .or_else(|| Some(encoded.to_owned()))
 }
 
+fn extract_player_url(html: &str) -> Option<String> {
+    let json_pattern = Regex::new(r#""(?:jsUrl|PLAYER_JS_URL)"\s*:\s*"([^"]+)""#).ok()?;
+    let script_pattern =
+        Regex::new(r#"(?i)<script[^>]+src=["']([^"']*/s/player/[^"']+\.js[^"']*)["']"#).ok()?;
+    let encoded = json_pattern
+        .captures(html)
+        .and_then(|captures| captures.get(1))
+        .or_else(|| {
+            script_pattern
+                .captures(html)
+                .and_then(|captures| captures.get(1))
+        })?
+        .as_str();
+    let decoded = serde_json::from_str::<String>(&format!("\"{encoded}\""))
+        .unwrap_or_else(|_| encoded.to_owned());
+    let base = Url::parse("https://www.youtube.com").expect("static YouTube URL should parse");
+    let url = Url::parse(&decoded).or_else(|_| base.join(&decoded)).ok()?;
+    youtube_player_url_is_allowed(&url).then(|| url.to_string())
+}
+
+fn youtube_player_url_is_allowed(url: &Url) -> bool {
+    url.as_str().len() <= 2048
+        && url.scheme() == "https"
+        && matches!(url.host_str(), Some("youtube.com" | "www.youtube.com"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none_or(|port| port == 443)
+        && url.fragment().is_none()
+        && url.path().starts_with("/s/player/")
+        && url.path().ends_with(".js")
+}
+
+fn youtube_googlevideo_url_is_allowed(url: &Url) -> bool {
+    youtube_googlevideo_origin_is_allowed(url) && url.path() == "/videoplayback"
+}
+
+fn youtube_googlevideo_origin_is_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host == "googlevideo.com" || host.ends_with(".googlevideo.com"))
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none_or(|port| port == 443)
+}
+
 fn pick_thumbnail(thumbnails: &[rusty_ytdl::Thumbnail]) -> Option<Arc<str>> {
     thumbnails
         .iter()
@@ -1876,6 +3065,18 @@ impl AndroidPlayerResponse {
         })
     }
 
+    fn has_cipher_stream(&self) -> bool {
+        self.streaming_data.as_ref().is_some_and(|streaming_data| {
+            streaming_data.adaptive_formats.iter().any(|format| {
+                format.mime_type.starts_with("audio/")
+                    && format
+                        .signature_cipher
+                        .as_ref()
+                        .is_some_and(|cipher| !cipher.is_empty())
+            })
+        })
+    }
+
     fn requires_fresh_visitor_session(&self) -> bool {
         self.playability_status
             .as_ref()
@@ -1903,7 +3104,7 @@ struct AndroidAdaptiveFormat {
     mime_type: String,
     url: Option<String>,
     #[serde(rename = "signatureCipher")]
-    _signature_cipher: Option<String>,
+    signature_cipher: Option<String>,
     bitrate: Option<u64>,
     #[serde(rename = "audioBitrate")]
     audio_bitrate: Option<u64>,
@@ -1975,9 +3176,79 @@ mod tests {
 
     #[test]
     fn parses_current_visitor_session_fields() {
-        let html = r#"{"sts": 20660,"visitorData":"abc\u003d\u003d"}"#;
+        let html = r#"{"sts": 20660,"visitorData":"abc\u003d\u003d","jsUrl":"\/s\/player\/b81a9a58\/player_ias.vflset\/en_US\/base.js"}"#;
         assert_eq!(extract_signature_timestamp(html), Some(20_660));
         assert_eq!(extract_visitor_data(html).as_deref(), Some("abc=="));
+        assert_eq!(
+            extract_player_url(html).as_deref(),
+            Some("https://www.youtube.com/s/player/b81a9a58/player_ias.vflset/en_US/base.js")
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_player_javascript_url() {
+        let html = r#"{"jsUrl":"https://example.com/s/player/b81a9a58/player_ias/base.js"}"#;
+        assert!(extract_player_url(html).is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WOTOHA_YOUTUBE_JS_WORKER pointing to a built helper binary"]
+    async fn isolated_javascript_worker_round_trips_and_restarts() {
+        assert!(env::var_os("WOTOHA_YOUTUBE_JS_WORKER").is_some());
+        let source = Arc::<str>::from(
+            r#"
+var _player = {};
+(function(g) {
+  function Param() { this.values = new Map(); }
+  Param.prototype.set = function(key, value) { this.values.set(key, value); };
+  Param.prototype.get = function(key) { return this.values.get(key); };
+  Param.prototype.clone = function() { return this; };
+  Param.prototype.transform = function() {
+    const n = this.values.get("n");
+    if (n) this.values.set("n", n.slice(1) + n[0]);
+  };
+  function solve(a, b, c) {
+    const value = new Param();
+    value.set("alr", "yes");
+    return value;
+  }
+})(_player);
+"#,
+        );
+        let solve = |value: &str| ChallengeInput {
+            signature: None,
+            n: Some(value.to_owned()),
+        };
+        let first = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/fixture/base.js",
+            source.clone(),
+            vec![solve("1234")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(first[0].n.as_deref(), Some("2341"));
+
+        let worker =
+            YOUTUBE_JS_WORKER.get_or_init(|| AsyncMutex::new(JsWorkerSupervisor::default()));
+        worker.lock().await.stop().await;
+        let second = run_youtube_js_solver(
+            "https://www.youtube.com/s/player/fixture/base.js",
+            source,
+            vec![solve("abcd")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(second[0].n.as_deref(), Some("bcda"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires WOTOHA_YOUTUBE_PLAYER_JS_URL and live YouTube access"]
+    async fn restricted_player_client_downloads_current_script() {
+        let player_url =
+            env::var("WOTOHA_YOUTUBE_PLAYER_JS_URL").expect("set Player JavaScript URL");
+        let source = youtube_player_source(&player_url).await.unwrap();
+        assert!(source.len() > 1024);
+        assert!(source.len() <= YOUTUBE_PLAYER_SCRIPT_MAX_BYTES);
     }
 
     #[test]
@@ -2097,7 +3368,7 @@ mod tests {
             AndroidAdaptiveFormat {
                 mime_type: "audio/mp4; codecs=\"mp4a.40.2\"".to_owned(),
                 url: Some("https://example.com/aac".to_owned()),
-                _signature_cipher: None,
+                signature_cipher: None,
                 bitrate: Some(128_000),
                 audio_bitrate: Some(128),
                 content_length: None,
@@ -2105,7 +3376,7 @@ mod tests {
             AndroidAdaptiveFormat {
                 mime_type: "audio/webm; codecs=\"opus\"".to_owned(),
                 url: Some("https://example.com/opus".to_owned()),
-                _signature_cipher: None,
+                signature_cipher: None,
                 bitrate: Some(160_000),
                 audio_bitrate: Some(160),
                 content_length: None,
@@ -2176,6 +3447,40 @@ mod tests {
     }
 
     #[test]
+    fn query_value_replacement_preserves_signed_query_bytes() {
+        let updated = url_with_query_value(
+            "https://example.com/videoplayback?sig=a%2Fb&n=old+value&foo=x%20z#part",
+            "n",
+            "new/value",
+        )
+        .unwrap();
+        assert_eq!(
+            updated,
+            "https://example.com/videoplayback?sig=a%2Fb&foo=x%20z&n=new%2Fvalue#part"
+        );
+    }
+
+    #[test]
+    fn hls_path_n_replacement_preserves_signed_query_bytes() {
+        let raw = "https://manifest.googlevideo.com/api/manifest/hls_playlist/n/old-value/sig/a%2Fb?foo=x+z#part";
+        let parsed = Url::parse(raw).unwrap();
+        assert_eq!(path_n_challenge(&parsed).as_deref(), Some("old-value"));
+        assert_eq!(
+            url_with_path_n_value(raw, "new/value").unwrap(),
+            "https://manifest.googlevideo.com/api/manifest/hls_playlist/n/new%2Fvalue/sig/a%2Fb?foo=x+z#part"
+        );
+    }
+
+    #[test]
+    fn player_key_changes_with_source_content() {
+        let url = "https://www.youtube.com/s/player/test/base.js";
+        assert_ne!(
+            youtube_player_key(url, "first"),
+            youtube_player_key(url, "second")
+        );
+    }
+
+    #[test]
     fn hls_token_uses_manifest_path() {
         let updated = hls_url_with_po_token(
             "https://example.com/manifest/playlist.m3u8?sig=a%2Fb#part",
@@ -2216,11 +3521,20 @@ mod tests {
             "streamingData": {
                 "adaptiveFormats": [{
                     "mimeType": "audio/webm; codecs=\"opus\"",
-                    "signatureCipher": "s=encrypted&sp=sig&url=https%3A%2F%2Fexample.com"
+                    "signatureCipher": "s=encrypted&sp=sig&url=https%3A%2F%2Fr1.googlevideo.com%2Fvideoplayback%3Fn%3Dold"
                 }]
             }
         }))
         .unwrap();
         assert!(!response.has_playable_stream());
+        assert!(response.has_cipher_stream());
+        let cipher = response.streaming_data.as_ref().unwrap().adaptive_formats[0]
+            .signature_cipher
+            .as_deref()
+            .unwrap();
+        let job = cipher_format_job(0, cipher).unwrap().unwrap();
+        assert_eq!(job.signature_parameter, "sig");
+        assert_eq!(job.input.signature.as_deref(), Some("encrypted"));
+        assert_eq!(job.input.n.as_deref(), Some("old"));
     }
 }

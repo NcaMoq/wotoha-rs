@@ -1,0 +1,44 @@
+name: YouTube compatibility
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: youtube-compatibility
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the isolated JavaScript worker
+        run: cargo test --locked -p wotoha-youtube-js-worker
+      - name: Test the YouTube resolver
+        run: cargo test --locked -p wotoha-media
+      - name: Verify official EJS golden vectors
+        run: cargo test --locked -p wotoha-youtube-js-worker matches_official_ejs_golden_vectors -- --ignored --nocapture
+      - name: Verify the current YouTube Player
+        run: cargo test --locked -p wotoha-youtube-js-worker solves_current_live_player -- --ignored --nocapture
+      - name: Build the isolated JavaScript worker
+        run: cargo build --locked -p wotoha-youtube-js-worker --bin wotoha-youtube-js-worker
+      - name: Verify worker supervision and restart
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
+        run: cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
+      - name: Probe a current YouTube track end to end
+        env:
+          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$(cargo run --locked -p wotoha-app --bin track_probe -- https://www.youtube.com/watch?v=H7HmzwI67ec)"
+          printf '%s\n' "$output"
+          grep -Fq $'PLAYABLE\t0\tok' <<<"$output"

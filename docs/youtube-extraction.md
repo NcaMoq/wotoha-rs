@@ -3,12 +3,36 @@
 Wotoha keeps YouTube-specific change points outside the playback engine:
 
 1. Rust selects an Innertube client strategy and creates a visitor-bound Player request.
-2. Every returned GVS or HLS source is verified by reading real response data.
-3. A configured PO Token provider is tried only after a `401` or `403`.
-4. `yt-dlp` remains an optional emergency fallback, not the primary extractor.
+2. Cipher-only formats are solved natively: OXC finds challenge functions structurally in the
+   Player JavaScript AST and Boa executes only the prepared challenge slice.
+3. Every returned GVS or HLS source is verified by reading real response data.
+4. On a failed direct URL, Wotoha solves its `n` challenge and verifies it again.
+5. A configured PO Token provider is tried only after a `401` or `403`.
+6. `yt-dlp` remains an optional emergency fallback, not the primary extractor.
 
 Native client profiles live in `/etc/wotoha/youtube-clients.json` and reload without restarting
 the bot. Profile changes alone therefore do not require a binary release.
+
+Player scripts are limited to 8 MiB, restricted to YouTube HTTPS origins and cached by URL.
+Wotoha sends length-prefixed, versioned requests to the separate
+`wotoha-youtube-js-worker` Rust process. That process owns OXC parsing and Boa execution, retains
+up to four Player sessions, and receives only small signature/`n` batches after the first request
+for a Player version. The parent applies queue and execution deadlines, kills a stuck worker,
+backs off the failing Player fingerprint, and starts a fresh process on a later request. On Linux
+the worker also limits its own address space and dies with its parent. A Player parser/runtime
+panic therefore cannot directly abort the Discord bot process.
+
+Release packages contain a standalone worker. For compatibility with an older updater that only
+installs `wotoha-app`, the app can also re-exec itself in worker mode; Player code is still handled
+in a child process rather than inside the bot process.
+
+The ordinary direct-URL path does not start the solver unless its URL carries an `n` challenge.
+Cipher candidates are kept as a verified fallback if a direct or HLS candidate is rejected.
+
+GitHub Actions runs deterministic workspace and worker-protocol tests on every pull request and
+push to `main`. A separate daily canary downloads the current Player, checks historical official
+EJS answer vectors, verifies worker restart behavior, and requires a real YouTube track probe to
+report `PLAYABLE`. Live-network failures alert without making ordinary pull requests flaky.
 
 ## PO Token provider protocol
 
@@ -60,11 +84,11 @@ failures.
 For HTTPS GVS sources the token is added as the `pot` query parameter. For HLS manifests it is
 added as `/pot/{token}`. The PO Token expiry shortens the prepared-source cache lifetime.
 
-## Remaining independently updatable boundary
+## Update boundaries
 
-Cipher-only formats still require Player JavaScript challenge solving. The intended boundary is a
-versioned bulk protocol that receives the Player URL/hash plus `signatureCipher` and `n` inputs,
-then returns solved values. The Rust extractor remains responsible for strategy selection,
-fallback, caching, URL assembly and final data verification. Solver logic should be shipped as a
-signed, independently updatable WASM component so a YouTube Player change does not require
-rebuilding the bot.
+Client profiles and the PO Token provider can be updated independently of the bot. The native
+Player solver is intentionally generic and follows structural markers instead of minified symbol
+names. Its AST discovery logic is compiled into the separately packaged worker executable, so a
+normal release can replace that boundary together with the bot while keeping crashes isolated. A
+future signed worker-only update channel can decouple its cadence further if Player changes prove
+to require it.

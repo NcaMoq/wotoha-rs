@@ -30,8 +30,21 @@ use wotoha_media::MediaResolver;
 use wotoha_runtime::{DiscordGateway, SongbirdRuntime, recommended_cache_settings};
 use wotoha_voice::PlaybackCoordinator;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|argument| argument == "--youtube-js-worker")
+    {
+        wotoha_youtube_js_worker::run_worker();
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(app_main())
+}
+
+async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = BotConfig::load()?;
     std::fs::create_dir_all(&config.logging.directory)?;
     let log_path = config.logging.file_path();
