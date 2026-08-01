@@ -18,10 +18,10 @@ case "$command_name" in
           maximum_bytes="${2:?missing curl size limit}"
           shift 2
           ;;
-        --header|--retry|--config|--range|--max-time)
+        --header|--retry|--retry-delay|--retry-max-time|--connect-timeout|--config|--range|--max-time)
           shift 2
           ;;
-        --fail|--silent|--show-error|--location|--remove-on-error)
+        --fail|--silent|--show-error|--location|--remove-on-error|--retry-all-errors)
           shift
           ;;
         http://*|https://*|fixture://*)
@@ -35,34 +35,29 @@ case "$command_name" in
     done
 
     [[ -n "$url" && -n "${FIXTURE_DIR:-}" ]]
+    if [[ "$url" == https://media.example/* ]]; then
+      [[ "${FAKE_DIRECT_FAIL:-false}" != true ]] || exit 22
+      [[ -n "$output" ]] || {
+        head -c "${FAKE_DIRECT_BYTES:-1024}" /dev/zero
+        exit "${FAKE_DIRECT_STATUS:-0}"
+      }
+      mkdir -p "$(dirname "$output")"
+      head -c "${FAKE_DIRECT_BYTES:-1024}" /dev/zero >"$output"
+      exit "${FAKE_DIRECT_STATUS:-0}"
+    fi
     if [[ -z "$output" ]]; then
       [[ "$url" == https://media.example/* ]] || {
         printf 'unexpected streaming fixture URL: %s\n' "$url" >&2
         exit 64
       }
-      [[ "${FAKE_DIRECT_FAIL:-false}" != true ]] || exit 22
-      head -c "${FAKE_DIRECT_BYTES:-8192}" /dev/zero
-      exit "${FAKE_DIRECT_STATUS:-0}"
     fi
     case "$url" in
-      *"/releases?per_page=30")
-        source_file="$FIXTURE_DIR/worker-releases.json"
-        ;;
       *"/releases/latest")
         if [[ "${MOCK_CURL_MODE:-general}" == ytdlp ]]; then
           source_file="$FIXTURE_DIR/yt-release.json"
         else
           source_file="$FIXTURE_DIR/full-release.json"
         fi
-        ;;
-      fixture://worker)
-        source_file="$FIXTURE_DIR/worker"
-        ;;
-      fixture://worker-manifest)
-        source_file="$FIXTURE_DIR/worker.manifest.json"
-        ;;
-      fixture://worker-attestation)
-        source_file="$FIXTURE_DIR/worker.attestation.jsonl"
         ;;
       fixture://release-archive)
         source_file="$FIXTURE_DIR/release.tar.gz"
@@ -117,16 +112,19 @@ case "$command_name" in
     ;;
 
   jq)
-    # The deploy tests deliberately need only the release metadata queries
-    # issued by yt-dlp-update.sh. Keeping this tiny avoids a host jq dependency.
+    # The deployment tests use compact, generated JSON fixtures. Supporting
+    # only the updater's fixed queries avoids a host jq dependency.
     args=" $* "
     if [[ "$args" == *".tag_name"* ]]; then
       release_tag="$(sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' "${!#}" | head -n 1)"
-      [[ "$release_tag" =~ ^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$ ]] || exit 1
+      [[ -n "$release_tag" ]] || exit 1
+      if [[ "$args" == *".tag_name | select("* ]]; then
+        [[ "$release_tag" =~ ^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$ ]] || exit 1
+      fi
       printf '%s\n' "$release_tag"
       exit 0
     fi
-    if [[ "$args" == *"--arg n"* ]]; then
+    if [[ "$args" == *"--arg n "* ]]; then
       name=""
       while (( $# > 0 )); do
         if [[ "$1" == --arg && "${2:-}" == n ]]; then name="$3"; break; fi
@@ -138,6 +136,56 @@ case "$command_name" in
         SHA2-256SUMS.sig) printf '%s\n' fixture://yt-signature ;;
         *) exit 1 ;;
       esac
+      exit 0
+    fi
+    if [[ "$args" == *"--arg name"* ]]; then
+      name=""
+      while (( $# > 0 )); do
+        if [[ "$1" == --arg && "${2:-}" == name ]]; then name="$3"; break; fi
+        shift
+      done
+      case "$name" in
+        wotoha-ubuntu-x86_64-musl.tar.gz)
+          source_file="$FIXTURE_DIR/release.tar.gz"
+          asset_url=fixture://release-archive
+          ;;
+        wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
+          source_file="$FIXTURE_DIR/release.tar.gz.sha256"
+          asset_url=fixture://release-checksum
+          ;;
+        wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json)
+          source_file="$FIXTURE_DIR/release.tar.gz.manifest.json"
+          asset_url=fixture://release-manifest
+          ;;
+        wotoha-ubuntu-x86_64-musl.tar.gz.attestation.jsonl)
+          source_file="$FIXTURE_DIR/release.tar.gz.attestation.jsonl"
+          asset_url=fixture://release-attestation
+          ;;
+        *) exit 1 ;;
+      esac
+      if [[ "$args" == *"| length"* ]]; then
+        printf '1\n'
+      elif [[ "$args" == *"| .size"* ]]; then
+        stat --format='%s' "$source_file"
+      elif [[ "$args" == *"| .url"* ]]; then
+        printf '%s\n' "$asset_url"
+      else
+        exit 64
+      fi
+      exit 0
+    fi
+    if [[ "$args" == *".schema_version == 1"* ]]; then
+      [[ "${FAKE_MANIFEST_INVALID:-false}" != true ]] || exit 1
+      grep -Fq '"schema_version":1' "${!#}" \
+        && grep -Fq '"asset":"wotoha-ubuntu-x86_64-musl.tar.gz"' "${!#}"
+      exit
+    fi
+    if [[ "$args" == *".sha256"* ]]; then
+      sed -n 's/.*"sha256":"\([0-9a-f]*\)".*/\1/p' "${!#}"
+      exit 0
+    fi
+    if [[ "$args" == *".commit"* ]]; then
+      sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' "${!#}"
       exit 0
     fi
     printf 'unsupported jq fixture query: %s\n' "$args" >&2
@@ -159,9 +207,31 @@ case "$command_name" in
     ;;
 
   systemctl)
-    if [[ "${1:-}" == "is-active" ]]; then
-      exit 1
-    fi
+    action="${1:-}"
+    state_file="${FAKE_SERVICE_STATE_FILE:-}"
+    case "$action" in
+      is-active)
+        [[ -n "$state_file" && -r "$state_file" && "$(<"$state_file")" == active ]]
+        ;;
+      is-failed)
+        [[ -n "$state_file" && -r "$state_file" && "$(<"$state_file")" == failed ]]
+        ;;
+      restart)
+        [[ -z "${MOCK_LOG:-}" ]] || printf 'systemctl restart %s\n' "${2:-}" >>"$MOCK_LOG"
+        if [[ "${FAKE_RESTART_FAIL:-false}" == true ]]; then
+          [[ -z "$state_file" ]] || printf 'failed\n' >"$state_file"
+          exit 1
+        fi
+        [[ -z "$state_file" ]] || printf 'active\n' >"$state_file"
+        ;;
+      daemon-reload|enable)
+        exit 0
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+
+  sleep)
     exit 0
     ;;
 

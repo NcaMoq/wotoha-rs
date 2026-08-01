@@ -61,6 +61,7 @@ $ninjaPath = Resolve-Tool -Name 'ninja.exe' -Candidates @(
 $curlPath = Resolve-Tool -Name 'curl.exe' -Candidates @(
     (Get-Command curl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
 )
+$curlRetryArguments = @('--retry', '4', '--retry-all-errors', '--retry-delay', '2', '--retry-max-time', '45', '--connect-timeout', '10')
 
 $gpgPath = Resolve-Tool -Name 'gpg.exe' -Candidates @(
     (Get-Command gpg.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1),
@@ -95,7 +96,7 @@ $env:CMAKE_GENERATOR = 'Ninja'
 
 rustup target add $target
 
-cargo zigbuild --release --bin wotoha-app --bin wotoha-youtube-js-worker --target $target --target-dir $targetDir
+cargo zigbuild --locked --release --bin wotoha-app --target $target --target-dir $targetDir
 
 Remove-Item $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
@@ -125,9 +126,9 @@ if ($versions.YTDLP_REPOSITORY -notin $allowedYtDlpRepositories) {
     throw 'YTDLP_REPOSITORY must name an official yt-dlp release repository.'
 }
 $ytDlpBase = "https://github.com/$($versions.YTDLP_REPOSITORY)/releases/download/$($versions.YTDLP_VERSION)"
-Invoke-Checked $curlPath @('--fail', '--silent', '--show-error', '--location', '--retry', '3', '--max-filesize', '134217728', '--remove-on-error', "$ytDlpBase/yt-dlp_linux", '--output', $ytDlp)
-Invoke-Checked $curlPath @('--fail', '--silent', '--show-error', '--location', '--retry', '3', '--max-filesize', '262144', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS", '--output', $ytDlpSums)
-Invoke-Checked $curlPath @('--fail', '--silent', '--show-error', '--location', '--retry', '3', '--max-filesize', '65536', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS.sig", '--output', $ytDlpSignature)
+Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '134217728', '--remove-on-error', "$ytDlpBase/yt-dlp_linux", '--output', $ytDlp))
+Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '262144', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS", '--output', $ytDlpSums))
+Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '65536', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS.sig", '--output', $ytDlpSignature))
 
 $gpgHome = Join-Path $distRoot '.yt-dlp-gnupg'
 Remove-Item $gpgHome -Recurse -Force -ErrorAction SilentlyContinue
@@ -167,7 +168,7 @@ if ($actualYtDlpHash -ne $expectedYtDlpHash) {
 $denoZip = Join-Path $thirdParty 'deno.zip'
 $denoUnpacked = Join-Path $thirdParty 'deno-unpacked'
 $denoUrl = "https://github.com/denoland/deno/releases/download/v$($versions.DENO_VERSION)/deno-x86_64-unknown-linux-gnu.zip"
-Invoke-Checked $curlPath @('--fail', '--silent', '--show-error', '--location', '--retry', '3', '--max-filesize', '134217728', '--remove-on-error', $denoUrl, '--output', $denoZip)
+Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '134217728', '--remove-on-error', $denoUrl, '--output', $denoZip))
 $actualDenoHash = (Get-FileHash $denoZip -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actualDenoHash -ne $versions.DENO_X86_64_LINUX_GNU_SHA256) {
     throw 'Deno archive did not match the pinned checksum.'
@@ -178,7 +179,6 @@ Remove-Item $denoZip -Force
 Remove-Item $denoUnpacked -Recurse -Force
 
 Copy-Item (Join-Path $targetDir "$target\release\wotoha-app") (Join-Path $packageRoot 'bin\wotoha-app')
-Copy-Item (Join-Path $targetDir "$target\release\wotoha-youtube-js-worker") (Join-Path $packageRoot 'bin\wotoha-youtube-js-worker')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha.service') (Join-Path $packageRoot 'deploy\wotoha.service')
 Copy-Item (Join-Path $repoRoot 'deploy\install-ubuntu.sh') (Join-Path $packageRoot 'install-ubuntu.sh')
 Copy-Item (Join-Path $repoRoot 'deploy\install-yt-dlp-bundle.sh') (Join-Path $packageRoot 'install-yt-dlp-bundle.sh')
@@ -190,11 +190,10 @@ Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.service') (Join-Path $packa
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.timer') (Join-Path $packageRoot 'deploy\wotoha-update.timer')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-update.service') (Join-Path $packageRoot 'deploy\yt-dlp-update.service')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-update.timer') (Join-Path $packageRoot 'deploy\yt-dlp-update.timer')
-Copy-Item (Join-Path $repoRoot 'deploy\youtube-clients.json') (Join-Path $packageRoot 'deploy\youtube-clients.json')
-Copy-Item (Join-Path $repoRoot 'deploy\YOUTUBE_WORKER_SEQUENCE') (Join-Path $packageRoot 'deploy\YOUTUBE_WORKER_SEQUENCE')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-public.key') (Join-Path $packageRoot 'deploy\yt-dlp-public.key')
 Copy-Item (Join-Path $repoRoot 'deploy\third-party-versions.env') (Join-Path $packageRoot 'deploy\third-party-versions.env')
 Copy-Item (Join-Path $repoRoot 'docs\ubuntu-deploy.md') (Join-Path $packageRoot 'docs\ubuntu-deploy.md')
+Copy-Item (Join-Path $repoRoot 'docs\youtube-extraction.md') (Join-Path $packageRoot 'docs\youtube-extraction.md')
 
 $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 $deploymentTextFiles = @(
@@ -209,11 +208,9 @@ foreach ($deploymentTextFile in $deploymentTextFiles) {
 }
 
 $binaryHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-app') -Algorithm SHA256).Hash.ToLowerInvariant()
-$workerHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-youtube-js-worker') -Algorithm SHA256).Hash.ToLowerInvariant()
 $denoHash = (Get-FileHash (Join-Path $packageRoot 'third-party\deno') -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -Path (Join-Path $packageRoot 'SHA256SUMS.txt') -Value @(
     "$binaryHash  bin/wotoha-app"
-    "$workerHash  bin/wotoha-youtube-js-worker"
     "$actualYtDlpHash  third-party/yt-dlp"
     "$denoHash  third-party/deno"
 ) -Encoding ascii
@@ -223,6 +220,5 @@ Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
 tar -czf $archivePath -C $distRoot 'wotoha-ubuntu-x86_64-musl'
 
 Write-Output "binary: $(Join-Path $targetDir "$target\release\wotoha-app")"
-Write-Output "worker: $(Join-Path $targetDir "$target\release\wotoha-youtube-js-worker")"
 Write-Output "package: $packageRoot"
 Write-Output "archive: $archivePath"

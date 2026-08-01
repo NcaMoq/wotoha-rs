@@ -29,9 +29,10 @@ for command in curl gpg jq sha256sum stat flock timeout; do command -v "$command
 exec 9>/run/lock/wotoha-ytdlp-update.lock
 flock -n 9 || exit 0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10)
 
 api="https://api.github.com/repos/$repository/releases/latest"
-curl --fail --silent --show-error --location --retry 3 --max-filesize $((4 * 1024 * 1024)) --remove-on-error "$api" -o "$tmp/release.json"
+curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize $((4 * 1024 * 1024)) --remove-on-error "$api" -o "$tmp/release.json"
 tag="$(jq -er '.tag_name | select(type == "string" and test("^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$"))' "$tmp/release.json")"
 installed_repository=""
 installed_tag=""
@@ -46,9 +47,9 @@ if [[ -r "$STATE" ]]; then
   [[ "$tag" < "$installed_tag" ]] && { echo "refusing yt-dlp downgrade from $installed_tag to $tag" >&2; exit 1; }
 fi
 asset_url() { jq -er --arg n "$1" '[.assets[] | select(.name == $n)] | if length == 1 then .[0].browser_download_url else error("missing or duplicate asset") end' "$tmp/release.json"; }
-curl --fail --silent --show-error --location --retry 3 --max-filesize "$MAX_BINARY_BYTES" --remove-on-error "$(asset_url yt-dlp_linux)" -o "$tmp/yt-dlp"
-curl --fail --silent --show-error --location --retry 3 --max-filesize "$MAX_SUM_BYTES" --remove-on-error "$(asset_url SHA2-256SUMS)" -o "$tmp/SHA2-256SUMS"
-curl --fail --silent --show-error --location --retry 3 --max-filesize "$MAX_SIGNATURE_BYTES" --remove-on-error "$(asset_url SHA2-256SUMS.sig)" -o "$tmp/SHA2-256SUMS.sig"
+curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize "$MAX_BINARY_BYTES" --remove-on-error "$(asset_url yt-dlp_linux)" -o "$tmp/yt-dlp"
+curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize "$MAX_SUM_BYTES" --remove-on-error "$(asset_url SHA2-256SUMS)" -o "$tmp/SHA2-256SUMS"
+curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize "$MAX_SIGNATURE_BYTES" --remove-on-error "$(asset_url SHA2-256SUMS.sig)" -o "$tmp/SHA2-256SUMS.sig"
 (( $(stat --format=%s "$tmp/yt-dlp") > 0 && $(stat --format=%s "$tmp/yt-dlp") <= MAX_BINARY_BYTES ))
 gpg_home="$tmp/gnupg"; mkdir -m 0700 "$gpg_home"
 gpg --batch --homedir "$gpg_home" --import "$KEY" >/dev/null 2>&1
@@ -95,11 +96,9 @@ for canary_url in "${canary_urls[@]}"; do
     --format 'bestaudio[protocol^=http]/bestaudio/best' --skip-download \
     --print '%(url)s' "$canary_url" 2>/dev/null | head -n 1)" || true
   [[ "$direct_url" =~ ^https:// ]] || { echo "yt-dlp canary extraction failed: $canary_url" >&2; continue; }
-  set +o pipefail
-  curl --fail --silent --show-error --location --range 0-1023 --max-time 20 "$direct_url" | head -c 4096 >"$tmp/canary.bytes"
-  statuses=("${PIPESTATUS[@]}")
-  set -o pipefail
-  if [[ "${statuses[0]}" == 0 || "${statuses[0]}" == 23 ]] \
+  if curl --fail --silent --show-error --location "${curl_retry[@]}" --remove-on-error \
+    --range 0-1023 --max-time 20 --max-filesize 4096 \
+    --output "$tmp/canary.bytes" "$direct_url" \
     && (( $(stat --format=%s "$tmp/canary.bytes") > 0 && $(stat --format=%s "$tmp/canary.bytes") <= 4096 )); then
     canary_ok=true
     break

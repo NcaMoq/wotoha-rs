@@ -18,7 +18,6 @@ official yt-dlp signature, full key fingerprint, and pinned Deno checksum as rel
 次の成果物が作成されます。
 
 - `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-app`
-- `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-youtube-js-worker`
 - `dist\wotoha-ubuntu-x86_64-musl\`
 - `dist\wotoha-ubuntu-x86_64-musl.tar.gz`
 
@@ -56,7 +55,8 @@ sudo bash ./install-ubuntu.sh
 次の場所へ配置されます。
 
 - `/opt/wotoha/bin/wotoha-app`
-- `/opt/wotoha/bin/wotoha-youtube-js-worker`
+- `/opt/wotoha/bin/yt-dlp`
+- `/opt/wotoha/bin/deno`
 - `/etc/systemd/system/wotoha.service`
 - `/etc/wotoha/wotoha.env`
 - `/var/lib/wotoha`
@@ -113,8 +113,8 @@ tail -f /var/log/wotoha/wotoha-app.runtime.log
 バイナリと検査用摘要値を確認します。
 
 ```bash
-ls -lh /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/wotoha-youtube-js-worker
-sha256sum /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/wotoha-youtube-js-worker
+ls -lh /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/yt-dlp /opt/wotoha/bin/deno
+sha256sum /opt/wotoha/bin/wotoha-app /opt/wotoha/bin/yt-dlp /opt/wotoha/bin/deno
 cat /tmp/wotoha-ubuntu-x86_64-musl/SHA256SUMS.txt
 ```
 
@@ -188,57 +188,7 @@ sudo rm -rf /var/log/wotoha
 sudo systemctl daemon-reload
 ```
 
-## YouTube worker-only updates
-
-The first release containing the worker channel performs one normal bot restart to bootstrap
-`/opt/wotoha/workers` and add these settings to `/etc/wotoha/wotoha.env`:
-
-```dotenv
-WOTOHA_YOUTUBE_JS_WORKER_DIR=/opt/wotoha/workers
-WOTOHA_YOUTUBE_JS_WORKER_ACK=/var/lib/wotoha/youtube-worker-ack
-```
-
-After that bootstrap, `youtube-worker-v*` prereleases update only the isolated Player worker and
-do not restart the Discord bot. Both normal and worker-only updates require GitHub CLI 2.49 or
-newer with `gh attestation verify` support. Ubuntu 24.04's original archive version may be too old;
-install a current GitHub CLI from
-[GitHub's official apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)
-and verify it with:
-
-```bash
-gh version
-gh attestation verify --help | grep deny-self-hosted-runners
-```
-
-The public repository also enforces GitHub Immutable Releases. Release assets are assembled as a
-draft and become immutable when published.
-
-Worker updates are enabled by default. They can be disabled independently in
-`/etc/wotoha/wotoha-update.env`:
-
-```dotenv
-WOTOHA_UPDATE_YOUTUBE_WORKER=false
-```
-
-Inspect the two-phase state without exposing bot credentials:
-
-```bash
-cat /opt/wotoha/workers/current
-cat /opt/wotoha/workers/previous 2>/dev/null || true
-cat /opt/wotoha/workers/candidate 2>/dev/null || true
-cat /opt/wotoha/YOUTUBE_WORKER_SEQUENCE
-cat /var/lib/wotoha-updater/installed-youtube-worker
-cat /var/lib/wotoha/youtube-worker-ack 2>/dev/null || true
-journalctl -u wotoha-update.service --since today
-```
-
-`current` is always the restart-safe known-good worker. `candidate` is executed only by the
-unprivileged bot process under the existing systemd sandbox. It becomes `current` only after a
-candidate-derived GVS/HLS stream is actually readable, the bot returns a matching ACK, and a later
-updater run commits the promotion. The monotonic sequence prevents an older signed worker from
-being reintroduced as a downgrade.
-
-## Phase A bridge from v0.5.29
+## Phase A bridge from v0.5.29 and Phase B finalization
 
 The first migration release is intentionally a bridge release. It must retain the existing
 `wotoha-app`, `wotoha-youtube-js-worker`, `deploy/YOUTUBE_WORKER_SEQUENCE`, and
@@ -265,6 +215,13 @@ The compatibility path `/opt/wotoha/bin/yt-dlp` is a symlink to the managed curr
 existing v0.5.29 `WOTOHA_YTDLP_PATH=/opt/wotoha/bin/yt-dlp` setting remains valid. Custom values in
 `/etc/wotoha/wotoha.env` are not overwritten.
 
+The application always invokes yt-dlp with `--ignore-config`. Tune its bounded provider directly in
+`/etc/wotoha/wotoha.env`: `WOTOHA_YTDLP_TIMEOUT_SECONDS` accepts 5–120 seconds (default 25), and
+`WOTOHA_YTDLP_CONCURRENCY` accepts 1–8 processes (default 2). Optional
+`WOTOHA_YTDLP_COOKIES_FILE` must be an absolute path to an existing regular file with mode `0600`
+(or stricter). The packaged yt-dlp and Deno paths are recommended; absolute administrator overrides
+are accepted but place verification, updates, and compatibility under the administrator's control.
+
 yt-dlp updates are independent of bot releases and bot restarts:
 
 ```bash
@@ -286,6 +243,9 @@ extraction canary has 60 seconds. Canary network calls use a 10-second socket ti
 download retries and two extractor retries. The independent systemd job has a five-minute start
 limit; the general signed-release updater, which also performs first-time yt-dlp/Deno bootstrap,
 has a 15-minute limit. A timeout fails closed without changing the active yt-dlp pointer or state.
+All updater HTTP GETs retry transient errors (including connection and TLS resets) with a 10-second
+connect timeout, fixed delay, and a 45-second retry window; failed file downloads are removed before
+the transaction exits.
 
 Configure the independent updater in `/etc/wotoha/wotoha-update.env`. Quote multiple canary URLs
 because this file is sourced by Bash:
@@ -297,7 +257,15 @@ WOTOHA_YTDLP_CANARY_URLS='https://www.youtube.com/watch?v=H7HmzwI67ec https://ww
 ```
 
 Only after the Phase A release has been observed with a valid `current` pointer, working Deno, and
-a successful `yt-dlp-update.service` run may Phase B ship an application package without the legacy
-worker asset. The Phase A general updater accepts that worker-less package by retaining the already
-installed worker during the transition. Worker files and state are cleaned up only by the later
-Phase B migration, after yt-dlp/Deno canary success.
+a successful `yt-dlp-update.service` run does Phase B ship its worker-less application package. The
+Phase A updater applies that signed package while temporarily retaining the installed worker. The
+new Phase B updater removes the legacy worker on its next same-tag pass, only after the final app
+release is recorded, managed yt-dlp state and digest still validate, and `wotoha.service` is not
+failed. If the service was active, the prior updater transaction recorded the final tag and app
+digest only after its restart stayed active. An inactive service is treated as intentional operator
+state after the signed binary and digest checks pass. Cleanup is idempotent and does not restart an
+active or intentionally inactive yt-dlp-only app.
+
+The cleanup removes only the known native YouTube worker variables, binary, content-addressed
+worker directory, pointers, ACK/state files, sequence file, and `youtube-clients.json`. It does not
+remove `/etc/wotoha/yt-dlp.conf`, cookies, custom `WOTOHA_YTDLP_*` values, or other operator data.

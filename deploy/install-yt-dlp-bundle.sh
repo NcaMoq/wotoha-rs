@@ -67,10 +67,15 @@ for canary_url in "${canary_urls[@]}"; do
     --format 'bestaudio[protocol^=http]/bestaudio/best' --skip-download \
     --print '%(url)s' "$canary_url" 2>/dev/null | head -n1)" || true
   [[ "$direct_url" =~ ^https:// ]] || continue
-  set +o pipefail
-  curl --fail --silent --show-error --location --range 0-1023 --max-time 20 "$direct_url" | head -c 4096 >"$tmp/canary.bytes"
-  statuses=("${PIPESTATUS[@]}"); set -o pipefail
-  if [[ "${statuses[0]}" == 0 || "${statuses[0]}" == 23 ]] && [[ -s "$tmp/canary.bytes" ]] && (( $(stat --format=%s "$tmp/canary.bytes") <= 4096 )); then canary_ok=true; break; fi
+  if curl --fail --silent --show-error --location \
+    --retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10 \
+    --remove-on-error --range 0-1023 --max-time 20 --max-filesize 4096 \
+    --output "$tmp/canary.bytes" "$direct_url" \
+    && [[ -s "$tmp/canary.bytes" ]] \
+    && (( $(stat --format=%s "$tmp/canary.bytes") <= 4096 )); then
+    canary_ok=true
+    break
+  fi
 done
 [[ "$canary_ok" == true ]] || { echo "bundled yt-dlp canaries failed; preserving current" >&2; exit 1; }
 

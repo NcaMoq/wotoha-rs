@@ -6,14 +6,15 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
-  artifact-metadata: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
+
+# This workflow runs only for repository tags. Build caches are namespaced to
+# release jobs; the privileged publish job restores no cache and runs only
+# after both the test and musl build jobs succeed.
 
 jobs:
   test:
@@ -25,9 +26,23 @@ jobs:
         with:
           toolchain: "1.95.0"
           components: rustfmt
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      # Pins below are the immutable commits published at the corresponding
+      # refs/tags/v* in the official github.com/actions repositories.
+      - name: Restore release Cargo registry and git cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          node-version: "24"
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-cargo-home-${{ runner.os }}-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
+      - name: Restore native test target cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target
+          key: release-target-${{ runner.os }}-test-native-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-target-${{ runner.os }}-test-native-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-
       - name: Test deployment scripts
         shell: bash
         run: |
@@ -38,64 +53,53 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test the workspace
         run: cargo test --workspace --locked
-      - name: Lint the isolated JavaScript worker
-        run: cargo clippy --locked -p wotoha-youtube-js-worker --all-targets -- -D warnings
-      - name: Verify worker supervision
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-        run: |
-          cargo build --locked -p wotoha-youtube-js-worker --bin wotoha-youtube-js-worker
-          cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
-          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_hot_swaps_after_atomic_replacement -- --ignored --exact
-          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_promotes_content_addressed_candidate -- --ignored --exact
-      - name: Compare current Player with official EJS
-        shell: bash
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-          WOTOHA_EJS_RUN: ${{ github.workspace }}/target/ejs-reference/run.ts
-        run: |
-          set -euo pipefail
-          mkdir -p target/ejs-reference
-          git -C target/ejs-reference init
-          git -C target/ejs-reference remote add origin https://github.com/yt-dlp/ejs.git
-          git -C target/ejs-reference fetch --depth 1 origin 6f8587bb7009a1fc81038538071d2cb66b8b8ed0
-          git -C target/ejs-reference checkout --detach FETCH_HEAD
-          npm --prefix target/ejs-reference ci
-          node scripts/youtube-differential-canary.mjs
+      - name: Lint the application and media provider
+        run: cargo clippy --locked -p wotoha-app -p wotoha-media --all-targets -- -D warnings
 
   ubuntu-x86_64:
-    needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Restore musl Cargo registry, git, and toolchain cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          node-version: "24"
+          path: ${{ runner.temp }}/cargo-home-musl
+          key: release-cargo-home-${{ runner.os }}-build-musl-rust-1.95.0-${{ hashFiles('Cargo.lock') }}
+      - name: Restore musl target cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ runner.temp }}/cargo-target-musl
+          key: release-target-${{ runner.os }}-build-x86_64-unknown-linux-musl-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            release-target-${{ runner.os }}-build-x86_64-unknown-linux-musl-rust-1.95.0-${{ hashFiles('Cargo.lock') }}-
       - name: Build
         run: |
+          mkdir -p "$RUNNER_TEMP/cargo-home-musl" "$RUNNER_TEMP/cargo-target-musl"
           docker run --rm \
             --volume "$PWD:/work" \
+            --volume "$RUNNER_TEMP/cargo-home-musl:/cargo-home" \
+            --volume "$RUNNER_TEMP/cargo-target-musl:/cargo-target" \
             --workdir /work \
+            --env CARGO_HOME=/cargo-home \
+            --env RUSTUP_HOME=/cargo-home/rustup \
+            --env CARGO_TARGET_DIR=/cargo-target \
             --env WOTOHA_BUILD_VERSION="$GITHUB_REF_NAME" \
             ghcr.io/rust-cross/cargo-zigbuild@sha256:b66e2a5063921aca74fc53248d75d187b7499fe1e076d78eb7d87ab1dbc52f6a \
-            bash -c 'rustup toolchain install 1.95.0 --profile minimal --target x86_64-unknown-linux-musl && apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo +1.95.0 zigbuild --locked --release --bin wotoha-app --bin wotoha-youtube-js-worker --target x86_64-unknown-linux-musl'
-      - name: Exercise exact musl worker protocol
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker
-        run: node scripts/youtube-worker-smoke.mjs
+            bash -c 'rustup toolchain install 1.95.0 --profile minimal --target x86_64-unknown-linux-musl && apt-get update && apt-get install -y --no-install-recommends cmake ninja-build && CMAKE_GENERATOR=Ninja cargo +1.95.0 zigbuild --locked --release --bin wotoha-app --target x86_64-unknown-linux-musl'
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           package="dist/wotoha-ubuntu-x86_64-musl"
           mkdir -p "$package/bin" "$package/deploy" "$package/docs" "$package/third-party"
-          install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-app "$package/bin/wotoha-app"
-          install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker "$package/bin/wotoha-youtube-js-worker"
+          install -m 0755 "$RUNNER_TEMP/cargo-target-musl/x86_64-unknown-linux-musl/release/wotoha-app" "$package/bin/wotoha-app"
           source deploy/third-party-versions.env
+          curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10)
           case "$YTDLP_REPOSITORY" in yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;; *) exit 1 ;; esac
-          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/yt-dlp_linux" -o "$package/third-party/yt-dlp"
-          curl -fsSL --retry 3 --max-filesize $((256 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS" -o "$package/third-party/SHA2-256SUMS"
-          curl -fsSL --retry 3 --max-filesize $((64 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS.sig" -o "$package/third-party/SHA2-256SUMS.sig"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/yt-dlp_linux" -o "$package/third-party/yt-dlp"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((256 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS" -o "$package/third-party/SHA2-256SUMS"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((64 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS.sig" -o "$package/third-party/SHA2-256SUMS.sig"
           install -d -m 0700 "$RUNNER_TEMP/yt-dlp-gnupg"
           gpg --batch --homedir "$RUNNER_TEMP/yt-dlp-gnupg" --import deploy/yt-dlp-public.key
           test "$(gpg --batch --homedir "$RUNNER_TEMP/yt-dlp-gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')" = AC0CBBE6848D6A873464AF4E57CF65933B5A7581
@@ -103,20 +107,20 @@ jobs:
           expected_ytdlp_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$package/third-party/SHA2-256SUMS")"
           test "$expected_ytdlp_digest" = "$(sha256sum "$package/third-party/yt-dlp" | awk '{print $1}')"
           chmod 0755 "$package/third-party/yt-dlp"
-          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$package/third-party/deno.zip"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$package/third-party/deno.zip"
           printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$package/third-party/deno.zip" | sha256sum --check --status
           unzip -q "$package/third-party/deno.zip" -d "$package/third-party/deno-unpacked"
           install -m 0755 "$package/third-party/deno-unpacked/deno" "$package/third-party/deno"
           rm -rf "$package/third-party/deno-unpacked" "$package/third-party/deno.zip"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
           install -m 0755 deploy/install-ubuntu.sh deploy/install-yt-dlp-bundle.sh deploy/wotoha-update.sh deploy/yt-dlp-update.sh "$package/"
-          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/yt-dlp-update.service deploy/yt-dlp-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json deploy/YOUTUBE_WORKER_SEQUENCE deploy/yt-dlp-public.key deploy/third-party-versions.env "$package/deploy/"
-          install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
-          (cd "$package" && sha256sum bin/wotoha-app bin/wotoha-youtube-js-worker third-party/yt-dlp third-party/deno > SHA256SUMS.txt)
+          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/yt-dlp-update.service deploy/yt-dlp-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/yt-dlp-public.key deploy/third-party-versions.env "$package/deploy/"
+          install -m 0644 docs/ubuntu-deploy.md docs/youtube-extraction.md "$package/docs/"
+          (cd "$package" && sha256sum bin/wotoha-app third-party/yt-dlp third-party/deno > SHA256SUMS.txt)
           (cd "$package" && sha256sum --check SHA256SUMS.txt)
-          WOTOHA_YOUTUBE_JS_WORKER="$package/bin/wotoha-youtube-js-worker" \
-            node scripts/youtube-worker-smoke.mjs
-          tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
+          find "$package" -exec touch -h -d '@0' {} +
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
           (cd dist && sha256sum wotoha-ubuntu-x86_64-musl.tar.gz > wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
           digest="$(sha256sum dist/wotoha-ubuntu-x86_64-musl.tar.gz | awk '{print $1}')"
           jq --null-input \
@@ -130,6 +134,51 @@ jobs:
               asset: "wotoha-ubuntu-x86_64-musl.tar.gz",
               sha256: $digest
             }' > dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json
+      - name: Upload verified release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ubuntu-x86_64-release-inputs
+          path: |
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz.sha256
+            dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [test, ubuntu-x86_64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Download verified release inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ubuntu-x86_64-release-inputs
+          path: dist
+      - name: Verify downloaded release inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          archive=wotoha-ubuntu-x86_64-musl.tar.gz
+          sha256sum --check "$archive.sha256"
+          digest="$(sha256sum "$archive" | awk '{print $1}')"
+          jq --exit-status \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            --arg digest "$digest" \
+            '.schema_version == 1
+             and .tag == $tag
+             and .commit == $commit
+             and .asset == "wotoha-ubuntu-x86_64-musl.tar.gz"
+             and .sha256 == $digest' \
+            "$archive.manifest.json" >/dev/null
       - name: Attest release archive
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
         with:

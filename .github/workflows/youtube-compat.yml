@@ -18,43 +18,49 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Verify the managed yt-dlp nightly channel
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.95.0"
+      - name: Test the yt-dlp media provider
+        run: cargo test --locked -p wotoha-media
+      - name: Verify managed yt-dlp and probe playback
         shell: bash
         run: |
           set -euo pipefail
           source deploy/third-party-versions.env
+          curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10)
           case "$YTDLP_REPOSITORY" in yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;; *) exit 1 ;; esac
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
           base="https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION"
-          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "$base/yt-dlp_linux" -o "$tmp/yt-dlp_linux"
-          curl -fsSL --retry 3 --max-filesize $((256 * 1024)) --remove-on-error "$base/SHA2-256SUMS" -o "$tmp/SHA2-256SUMS"
-          curl -fsSL --retry 3 --max-filesize $((64 * 1024)) --remove-on-error "$base/SHA2-256SUMS.sig" -o "$tmp/SHA2-256SUMS.sig"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "$base/yt-dlp_linux" -o "$tmp/yt-dlp"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((256 * 1024)) --remove-on-error "$base/SHA2-256SUMS" -o "$tmp/SHA2-256SUMS"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((64 * 1024)) --remove-on-error "$base/SHA2-256SUMS.sig" -o "$tmp/SHA2-256SUMS.sig"
           install -d -m 0700 "$tmp/gnupg"
           gpg --batch --homedir "$tmp/gnupg" --import deploy/yt-dlp-public.key
           test "$(gpg --batch --homedir "$tmp/gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')" = AC0CBBE6848D6A873464AF4E57CF65933B5A7581
           gpg --batch --homedir "$tmp/gnupg" --verify "$tmp/SHA2-256SUMS.sig" "$tmp/SHA2-256SUMS"
-          (cd "$tmp" && grep -E '^[0-9a-f]{64}  yt-dlp_linux$' SHA2-256SUMS | sha256sum --check --status)
-          chmod 0755 "$tmp/yt-dlp_linux"
-          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$tmp/deno.zip"
+          expected_ytdlp_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$tmp/SHA2-256SUMS")"
+          test "$expected_ytdlp_digest" = "$(sha256sum "$tmp/yt-dlp" | awk '{print $1}')"
+          chmod 0755 "$tmp/yt-dlp"
+          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$tmp/deno.zip"
           printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$tmp/deno.zip" | sha256sum --check --status
           unzip -q "$tmp/deno.zip" -d "$tmp"
+
           canary_ok=false
           for canary_url in \
             'https://www.youtube.com/watch?v=H7HmzwI67ec' \
             'https://www.youtube.com/watch?v=jNQXAC9IVRw'; do
             direct_url="$(timeout --signal=TERM --kill-after=5s 60s \
-              "$tmp/yt-dlp_linux" --ignore-config --no-playlist --no-warnings --no-progress \
+              "$tmp/yt-dlp" --ignore-config --no-playlist --no-warnings --no-progress \
               --socket-timeout 10 --retries 2 --extractor-retries 2 \
               --js-runtimes "deno:$tmp/deno" \
               --format 'bestaudio[protocol^=http]/bestaudio/best' --skip-download \
               --print '%(url)s' "$canary_url" 2>/dev/null | head -n1)" || true
             [[ "$direct_url" =~ ^https:// ]] || continue
-            set +o pipefail
-            curl --fail --silent --show-error --location --range 0-1023 --max-time 20 "$direct_url" | head -c 4096 > "$tmp/canary.bytes"
-            statuses=("${PIPESTATUS[@]}")
-            set -o pipefail
-            if [[ "${statuses[0]}" == 0 || "${statuses[0]}" == 23 ]] \
+            if curl --fail --silent --show-error --location "${curl_retry[@]}" --remove-on-error \
+              --range 0-1023 --max-time 20 --max-filesize 4096 \
+              --output "$tmp/canary.bytes" "$direct_url" \
               && [[ -s "$tmp/canary.bytes" ]] \
               && (( $(stat --format=%s "$tmp/canary.bytes") <= 4096 )); then
               canary_ok=true
@@ -62,50 +68,9 @@ jobs:
             fi
           done
           [[ "$canary_ok" == true ]]
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          toolchain: "1.95.0"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: "24"
-      - name: Test the isolated JavaScript worker
-        run: cargo test --locked -p wotoha-youtube-js-worker
-      - name: Test the YouTube resolver
-        run: cargo test --locked -p wotoha-media
-      - name: Verify official EJS golden vectors
-        run: cargo test --locked -p wotoha-youtube-js-worker matches_official_ejs_golden_vectors -- --ignored --nocapture
-      - name: Verify the current YouTube Player
-        run: cargo test --locked -p wotoha-youtube-js-worker solves_current_live_player -- --ignored --nocapture
-      - name: Build the isolated JavaScript worker
-        run: cargo build --locked -p wotoha-youtube-js-worker --bin wotoha-youtube-js-worker
-      - name: Prepare the pinned official EJS oracle
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p target/ejs-reference
-          git -C target/ejs-reference init
-          git -C target/ejs-reference remote add origin https://github.com/yt-dlp/ejs.git
-          git -C target/ejs-reference fetch --depth 1 origin 6f8587bb7009a1fc81038538071d2cb66b8b8ed0
-          git -C target/ejs-reference checkout --detach FETCH_HEAD
-          npm --prefix target/ejs-reference ci
-      - name: Compare the current Player with official EJS
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-          WOTOHA_EJS_RUN: ${{ github.workspace }}/target/ejs-reference/run.ts
-        run: node scripts/youtube-differential-canary.mjs
-      - name: Verify worker supervision and restart
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-        run: |
-          cargo test --locked -p wotoha-media providers::youtube::tests::isolated_javascript_worker_round_trips_and_restarts -- --ignored --exact
-          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_hot_swaps_after_atomic_replacement -- --ignored --exact
-          cargo test --locked -p wotoha-media providers::youtube::tests::javascript_worker_promotes_content_addressed_candidate -- --ignored --exact
-      - name: Probe a current YouTube track end to end
-        env:
-          WOTOHA_YOUTUBE_JS_WORKER: ${{ github.workspace }}/target/debug/wotoha-youtube-js-worker
-        shell: bash
-        run: |
-          set -euo pipefail
-          output="$(cargo run --locked -p wotoha-app --bin track_probe -- https://www.youtube.com/watch?v=H7HmzwI67ec)"
+
+          output="$(WOTOHA_YTDLP_PATH="$tmp/yt-dlp" WOTOHA_DENO_PATH="$tmp/deno" \
+            cargo run --locked -p wotoha-app --bin track_probe -- \
+            https://www.youtube.com/watch?v=H7HmzwI67ec)"
           printf '%s\n' "$output"
           grep -Fq $'PLAYABLE\t0\tok' <<<"$output"

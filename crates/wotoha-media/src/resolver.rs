@@ -445,7 +445,7 @@ pub enum ResolveError {
     #[error("unsafe playback target for provider {provider_id}: {url}")]
     UnsafePlaybackTarget { provider_id: String, url: String },
     #[error("YouTube extraction failed: {0}")]
-    YouTube(rusty_ytdl::VideoError),
+    YouTube(#[source] crate::providers::youtube_ytdlp::YtDlpError),
 }
 
 #[async_trait]

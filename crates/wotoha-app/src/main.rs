@@ -31,13 +31,6 @@ use wotoha_runtime::{DiscordGateway, SongbirdRuntime, recommended_cache_settings
 use wotoha_voice::PlaybackCoordinator;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument == "--youtube-js-worker")
-    {
-        wotoha_youtube_js_worker::run_worker();
-        return Ok(());
-    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
