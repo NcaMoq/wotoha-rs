@@ -121,7 +121,9 @@ case "$command_name" in
     # issued by yt-dlp-update.sh. Keeping this tiny avoids a host jq dependency.
     args=" $* "
     if [[ "$args" == *".tag_name"* ]]; then
-      sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' "${!#}" | head -n 1
+      release_tag="$(sed -n 's/.*"tag_name":"\([^"]*\)".*/\1/p' "${!#}" | head -n 1)"
+      [[ "$release_tag" =~ ^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$ ]] || exit 1
+      printf '%s\n' "$release_tag"
       exit 0
     fi
     if [[ "$args" == *"--arg n"* ]]; then

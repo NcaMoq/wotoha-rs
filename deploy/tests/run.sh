@@ -86,12 +86,16 @@ rewrite_updater() {
   # Replacing prefixes, rather than binding mounts, keeps this safe on CI and
   # developer machines alike. The production source is never executed here.
   sed \
-    -e "s|/etc/wotoha|$sandbox/etc/wotoha|g" \
-    -e "s|/opt/wotoha|$sandbox/opt/wotoha|g" \
-    -e "s|/var/lib/wotoha-updater|$sandbox/var/lib/wotoha-updater|g" \
-    -e "s|/run/lock|$sandbox/run/lock|g" \
+    -e "s|/etc/wotoha|$sandbox/mock-etc|g" \
+    -e "s|/opt/wotoha|$sandbox/mock-opt|g" \
+    -e "s|/var/lib/wotoha-updater|$sandbox/mock-updater-state|g" \
+    -e "s|/run/lock|$sandbox/mock-locks|g" \
     "$UPDATE" >"$destination"
   chmod 0755 "$destination"
+  for production_path in /opt/wotoha /etc/wotoha /var/lib/wotoha-updater /run/lock; do
+    ! grep -Fq "$production_path" "$destination" \
+      || fail "rewritten updater retained production path: $production_path"
+  done
 }
 
 prepare_case() {
@@ -99,17 +103,27 @@ prepare_case() {
   sandbox="$case_root/root"
   fixture="$case_root/fixture"
   bin="$case_root/bin"
-  mkdir -p "$sandbox/etc/wotoha" "$sandbox/opt/wotoha/bin" \
-    "$sandbox/opt/wotoha/yt-dlp" "$sandbox/var/lib/wotoha-updater" \
-    "$sandbox/run/lock" "$bin"
+  fake_etc="$sandbox/mock-etc"
+  fake_opt="$sandbox/mock-opt"
+  fake_state="$sandbox/mock-updater-state"
+  fake_locks="$sandbox/mock-locks"
+  mkdir -p "$fake_etc" "$fake_opt/bin" "$fake_opt/yt-dlp" \
+    "$fake_state" "$fake_locks" "$bin"
   make_fixture "$fixture"
-  cp "$ROOT/deploy/yt-dlp-public.key" "$sandbox/etc/wotoha/yt-dlp-public.key"
-  cat >"$sandbox/opt/wotoha/bin/deno" <<'EOF'
+  cp "$ROOT/deploy/yt-dlp-public.key" "$fake_etc/yt-dlp-public.key"
+  cat >"$fake_opt/bin/deno" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
-  chmod 0755 "$sandbox/opt/wotoha/bin/deno"
-  for command in curl gpg install jq flock mkdir timeout; do ln -s "$MOCK" "$bin/$command"; done
+  chmod 0755 "$fake_opt/bin/deno"
+  cp "$MOCK" "$bin/mock-command"
+  chmod 0755 "$bin/mock-command"
+  for command in curl gpg install jq flock mkdir timeout; do
+    ln -s mock-command "$bin/$command"
+  done
+  [[ "$(PATH="$bin:$PATH" command -v install)" == "$bin/install" ]] \
+    || fail 'mock install does not take precedence in PATH'
+  [[ -x "$bin/install" ]] || fail 'mock install is not executable'
   rewrite_updater "$sandbox" "$case_root/yt-dlp-update"
 }
 
@@ -120,17 +134,17 @@ run_case() {
 
 old_digest='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 seed_old() {
-  mkdir -p "$sandbox/opt/wotoha/yt-dlp/versions/$old_digest"
-  printf '#!/usr/bin/env bash\nexit 0\n' >"$sandbox/opt/wotoha/yt-dlp/versions/$old_digest/yt-dlp"
-  chmod 0755 "$sandbox/opt/wotoha/yt-dlp/versions/$old_digest/yt-dlp"
-  ln -s "versions/$old_digest/yt-dlp" "$sandbox/opt/wotoha/yt-dlp/current"
-  ln -s "versions/$old_digest/yt-dlp" "$sandbox/opt/wotoha/yt-dlp/previous"
-  printf '%s %s %s\n' yt-dlp/yt-dlp-nightly-builds 2026.01.01.000001 "$old_digest" >"$sandbox/var/lib/wotoha-updater/installed-yt-dlp"
+  mkdir -p "$fake_opt/yt-dlp/versions/$old_digest"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$fake_opt/yt-dlp/versions/$old_digest/yt-dlp"
+  chmod 0755 "$fake_opt/yt-dlp/versions/$old_digest/yt-dlp"
+  ln -s "versions/$old_digest/yt-dlp" "$fake_opt/yt-dlp/current"
+  ln -s "versions/$old_digest/yt-dlp" "$fake_opt/yt-dlp/previous"
+  printf '%s %s %s\n' yt-dlp/yt-dlp-nightly-builds 2026.01.01.000001 "$old_digest" >"$fake_state/installed-yt-dlp"
 }
 assert_old_preserved() {
-  [[ "$(readlink "$sandbox/opt/wotoha/yt-dlp/current")" == "versions/$old_digest/yt-dlp" ]] || fail 'current changed on rejected candidate'
-  [[ "$(readlink "$sandbox/opt/wotoha/yt-dlp/previous")" == "versions/$old_digest/yt-dlp" ]] || fail 'previous changed on rejected candidate'
-  grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.01.01.000001 $old_digest" "$sandbox/var/lib/wotoha-updater/installed-yt-dlp" || fail 'state changed on rejected candidate'
+  [[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$old_digest/yt-dlp" ]] || fail 'current changed on rejected candidate'
+  [[ "$(readlink "$fake_opt/yt-dlp/previous")" == "versions/$old_digest/yt-dlp" ]] || fail 'previous changed on rejected candidate'
+  grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.01.01.000001 $old_digest" "$fake_state/installed-yt-dlp" || fail 'state changed on rejected candidate'
 }
 
 # A bad key, bad signature, bad checksum and an oversized asset must all fail
@@ -175,7 +189,7 @@ assert_old_preserved; pass 'hung yt-dlp extraction times out without changing in
 # rotates previous/current and records state. Interrupted staging files are
 # explicitly discarded and a rerun is harmless.
 prepare_case promote; seed_old
-touch "$sandbox/opt/wotoha/yt-dlp/.current.new" "$sandbox/opt/wotoha/yt-dlp/.previous.new"
+touch "$fake_opt/yt-dlp/.current.new" "$fake_opt/yt-dlp/.previous.new"
 run_case
 new_digest="$(sha256sum "$fixture/yt-dlp" | awk '{print $1}')"
 grep -F -- '--format' "$case_root/yt-dlp.log" >/dev/null \
@@ -185,13 +199,13 @@ grep -F -- '--socket-timeout' "$case_root/yt-dlp.log" >/dev/null \
   && grep -F -- '--retries' "$case_root/yt-dlp.log" >/dev/null \
   && grep -F -- '--extractor-retries' "$case_root/yt-dlp.log" >/dev/null \
   || fail 'yt-dlp canary must bound sockets and retries'
-[[ "$(readlink "$sandbox/opt/wotoha/yt-dlp/current")" == "versions/$new_digest/yt-dlp" ]] || fail 'new current pointer was not promoted'
-[[ "$(readlink "$sandbox/opt/wotoha/yt-dlp/previous")" == "versions/$old_digest/yt-dlp" ]] || fail 'previous pointer was not retained'
-[[ -x "$sandbox/opt/wotoha/yt-dlp/versions/$new_digest/yt-dlp" ]] || fail 'candidate was not installed'
-grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.07.23.234303 $new_digest" "$sandbox/var/lib/wotoha-updater/installed-yt-dlp" || fail 'promotion state was not written'
-[[ ! -e "$sandbox/opt/wotoha/yt-dlp/.current.new" && ! -e "$sandbox/opt/wotoha/yt-dlp/.previous.new" ]] || fail 'stale promotion files remain'
+[[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$new_digest/yt-dlp" ]] || fail 'new current pointer was not promoted'
+[[ "$(readlink "$fake_opt/yt-dlp/previous")" == "versions/$old_digest/yt-dlp" ]] || fail 'previous pointer was not retained'
+[[ -x "$fake_opt/yt-dlp/versions/$new_digest/yt-dlp" ]] || fail 'candidate was not installed'
+grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.07.23.234303 $new_digest" "$fake_state/installed-yt-dlp" || fail 'promotion state was not written'
+[[ ! -e "$fake_opt/yt-dlp/.current.new" && ! -e "$fake_opt/yt-dlp/.previous.new" ]] || fail 'stale promotion files remain'
 run_case
-[[ "$(readlink "$sandbox/opt/wotoha/yt-dlp/current")" == "versions/$new_digest/yt-dlp" ]] || fail 'rerun changed promoted pointer'
+[[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$new_digest/yt-dlp" ]] || fail 'rerun changed promoted pointer'
 pass 'atomic promotion, state recording, and interrupted-rerun recovery'
 
 # These are package contracts exercised by the updater test above where it is
