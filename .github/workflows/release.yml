@@ -229,6 +229,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
             dist/wotoha-ubuntu-x86_64-musl.tar.gz \
             dist/wotoha-ubuntu-x86_64-musl.tar.gz.sha256 \
             dist/wotoha-ubuntu-x86_64-musl.tar.gz.manifest.json \
@@ -236,4 +237,4 @@ jobs:
             --verify-tag \
             --draft \
             --generate-notes
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
