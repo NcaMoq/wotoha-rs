@@ -47,14 +47,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build
         run: |
-          mkdir -p "$RUNNER_TEMP/cargo-home-musl" "$RUNNER_TEMP/cargo-target-musl"
+          mkdir -p "$RUNNER_TEMP/cargo-target-musl"
           docker run --rm \
             --volume "$PWD:/work" \
-            --volume "$RUNNER_TEMP/cargo-home-musl:/cargo-home" \
             --volume "$RUNNER_TEMP/cargo-target-musl:/cargo-target" \
             --workdir /work \
-            --env CARGO_HOME=/cargo-home \
-            --env RUSTUP_HOME=/cargo-home/rustup \
             --env CARGO_TARGET_DIR=/cargo-target \
             --env WOTOHA_BUILD_VERSION="$GITHUB_REF_NAME" \
             ghcr.io/rust-cross/cargo-zigbuild@sha256:b66e2a5063921aca74fc53248d75d187b7499fe1e076d78eb7d87ab1dbc52f6a \
