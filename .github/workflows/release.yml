@@ -28,6 +28,12 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
+      - name: Test deployment scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n deploy/*.sh deploy/tests/*.sh
+          bash deploy/tests/run.sh
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test the workspace
@@ -82,14 +88,31 @@ jobs:
         run: |
           set -euo pipefail
           package="dist/wotoha-ubuntu-x86_64-musl"
-          mkdir -p "$package/bin" "$package/deploy" "$package/docs"
+          mkdir -p "$package/bin" "$package/deploy" "$package/docs" "$package/third-party"
           install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-app "$package/bin/wotoha-app"
           install -m 0755 target/x86_64-unknown-linux-musl/release/wotoha-youtube-js-worker "$package/bin/wotoha-youtube-js-worker"
+          source deploy/third-party-versions.env
+          case "$YTDLP_REPOSITORY" in yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;; *) exit 1 ;; esac
+          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/yt-dlp_linux" -o "$package/third-party/yt-dlp"
+          curl -fsSL --retry 3 --max-filesize $((256 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS" -o "$package/third-party/SHA2-256SUMS"
+          curl -fsSL --retry 3 --max-filesize $((64 * 1024)) --remove-on-error "https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION/SHA2-256SUMS.sig" -o "$package/third-party/SHA2-256SUMS.sig"
+          install -d -m 0700 "$RUNNER_TEMP/yt-dlp-gnupg"
+          gpg --batch --homedir "$RUNNER_TEMP/yt-dlp-gnupg" --import deploy/yt-dlp-public.key
+          test "$(gpg --batch --homedir "$RUNNER_TEMP/yt-dlp-gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')" = AC0CBBE6848D6A873464AF4E57CF65933B5A7581
+          gpg --batch --homedir "$RUNNER_TEMP/yt-dlp-gnupg" --verify "$package/third-party/SHA2-256SUMS.sig" "$package/third-party/SHA2-256SUMS"
+          expected_ytdlp_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$package/third-party/SHA2-256SUMS")"
+          test "$expected_ytdlp_digest" = "$(sha256sum "$package/third-party/yt-dlp" | awk '{print $1}')"
+          chmod 0755 "$package/third-party/yt-dlp"
+          curl -fsSL --retry 3 --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$package/third-party/deno.zip"
+          printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$package/third-party/deno.zip" | sha256sum --check --status
+          unzip -q "$package/third-party/deno.zip" -d "$package/third-party/deno-unpacked"
+          install -m 0755 "$package/third-party/deno-unpacked/deno" "$package/third-party/deno"
+          rm -rf "$package/third-party/deno-unpacked" "$package/third-party/deno.zip"
           printf '%s\n' "$GITHUB_REF_NAME" > "$package/RELEASE_VERSION"
-          install -m 0755 deploy/install-ubuntu.sh deploy/wotoha-update.sh "$package/"
-          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json deploy/YOUTUBE_WORKER_SEQUENCE "$package/deploy/"
+          install -m 0755 deploy/install-ubuntu.sh deploy/install-yt-dlp-bundle.sh deploy/wotoha-update.sh deploy/yt-dlp-update.sh "$package/"
+          install -m 0644 deploy/wotoha.service deploy/wotoha-update.service deploy/wotoha-update.timer deploy/yt-dlp-update.service deploy/yt-dlp-update.timer deploy/wotoha.env.example deploy/wotoha-update.env.example deploy/youtube-clients.json deploy/YOUTUBE_WORKER_SEQUENCE deploy/yt-dlp-public.key deploy/third-party-versions.env "$package/deploy/"
           install -m 0644 docs/ubuntu-deploy.md "$package/docs/"
-          (cd "$package" && sha256sum bin/wotoha-app bin/wotoha-youtube-js-worker > SHA256SUMS.txt)
+          (cd "$package" && sha256sum bin/wotoha-app bin/wotoha-youtube-js-worker third-party/yt-dlp third-party/deno > SHA256SUMS.txt)
           (cd "$package" && sha256sum --check SHA256SUMS.txt)
           WOTOHA_YOUTUBE_JS_WORKER="$package/bin/wotoha-youtube-js-worker" \
             node scripts/youtube-worker-smoke.mjs

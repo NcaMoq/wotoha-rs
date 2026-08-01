@@ -1,23 +1,18 @@
 [Unit]
-Description=Update Wotoha from the latest GitHub release
+Description=Update the managed yt-dlp executable
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/wotoha/bin/wotoha-update
-TimeoutStartSec=15min
-TimeoutStopSec=30s
+ExecStart=/opt/wotoha/bin/yt-dlp-update
+TimeoutStartSec=5min
+TimeoutStopSec=15s
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectClock=true
 ProtectProc=invisible
 RestrictNamespaces=true
 RestrictSUIDSGID=true
@@ -27,7 +22,6 @@ AmbientCapabilities=
 LockPersonality=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-ReadWritePaths=/opt/wotoha /etc/wotoha /var/lib/wotoha /var/lib/wotoha-updater
+ReadWritePaths=/opt/wotoha/yt-dlp /var/lib/wotoha-updater /run/lock
 StateDirectory=wotoha-updater
 UMask=0022
-

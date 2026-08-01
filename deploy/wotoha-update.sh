@@ -444,8 +444,20 @@ if [[ -r "$WORKER_STATE_FILE" && -r "$WORKER_SEQUENCE_FILE" ]]; then
     worker_sequence_initialized=true
   fi
 fi
+ytdlp_ready=false
+if [[ -x /opt/wotoha/bin/yt-dlp ]] \
+  && [[ -x /opt/wotoha/bin/deno ]] \
+  && [[ -x /opt/wotoha/bin/yt-dlp-update ]] \
+  && [[ -L /opt/wotoha/yt-dlp/current ]] \
+  && [[ -r /etc/wotoha/yt-dlp-public.key ]] \
+  && [[ -r /etc/systemd/system/yt-dlp-update.service ]] \
+  && [[ -r /etc/systemd/system/yt-dlp-update.timer ]] \
+  && [[ -r /var/lib/wotoha-updater/installed-yt-dlp ]]; then
+  ytdlp_ready=true
+fi
 if [[ -r "$STATE_FILE" && "$(<"$STATE_FILE")" == "$tag" ]] \
-  && [[ "$worker_sequence_initialized" == true ]]; then
+  && [[ "$worker_sequence_initialized" == true ]] \
+  && [[ "$ytdlp_ready" == true ]]; then
   restart_for_worker_bootstrap
   if [[ "$youtube_clients_changed" == true ]]; then
     echo "wotoha is already at $tag; new YouTube profiles load on the next request"
@@ -539,7 +551,24 @@ if [[ ! -d "$package" ]]; then
   exit 1
 fi
 (cd "$package" && sha256sum --check SHA256SUMS.txt)
-new_worker_sequence="$(tr -d '\r\n' < "$package/deploy/YOUTUBE_WORKER_SEQUENCE")"
+if [[ -x "$package/install-yt-dlp-bundle.sh" ]]; then
+  bash "$package/install-yt-dlp-bundle.sh" "$package"
+  if [[ -r /etc/wotoha/wotoha.env ]]; then
+    grep -q '^WOTOHA_YTDLP_PATH=' /etc/wotoha/wotoha.env \
+      || printf '%s\n' 'WOTOHA_YTDLP_PATH=/opt/wotoha/bin/yt-dlp' >> /etc/wotoha/wotoha.env
+    grep -q '^WOTOHA_DENO_PATH=' /etc/wotoha/wotoha.env \
+      || printf '%s\n' 'WOTOHA_DENO_PATH=/opt/wotoha/bin/deno' >> /etc/wotoha/wotoha.env
+  fi
+  systemctl daemon-reload
+  systemctl enable --now yt-dlp-update.timer
+fi
+if [[ -r "$package/deploy/YOUTUBE_WORKER_SEQUENCE" ]]; then
+  new_worker_sequence="$(tr -d '\r\n' < "$package/deploy/YOUTUBE_WORKER_SEQUENCE")"
+elif [[ -r "$WORKER_STATE_FILE" ]]; then
+  new_worker_sequence="$(worker_state_sequence "$WORKER_STATE_FILE")"
+else
+  new_worker_sequence=1
+fi
 [[ "$new_worker_sequence" =~ ^[1-9][0-9]*$ ]] || {
   echo "release package has an invalid YouTube worker sequence" >&2
   exit 1
@@ -558,6 +587,9 @@ fi
 
 new_binary="$package/bin/wotoha-app"
 new_worker="$package/bin/wotoha-youtube-js-worker"
+if [[ ! -x "$new_worker" ]] && [[ -x "$INSTALL_DIR/wotoha-youtube-js-worker" ]]; then
+  new_worker="$INSTALL_DIR/wotoha-youtube-js-worker"
+fi
 if [[ ! -x "$new_binary" || ! -x "$new_worker" ]]; then
   echo "release archive is missing a required executable" >&2
   exit 1

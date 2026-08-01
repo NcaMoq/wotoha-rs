@@ -19,6 +19,9 @@ install -d -o wotoha -g wotoha -m 0755 /var/lib/wotoha
 install -d -o wotoha -g wotoha -m 0755 /var/log/wotoha
 install -d -o root -g root -m 0755 /var/lib/wotoha-updater
 
+# Bootstrap and canary yt-dlp/Deno before installing or starting any app that may require them.
+bash "$PACKAGE_DIR/install-yt-dlp-bundle.sh" "$PACKAGE_DIR"
+
 install -m 0755 "$PACKAGE_DIR/bin/wotoha-app" /opt/wotoha/bin/wotoha-app
 install -m 0755 "$PACKAGE_DIR/bin/wotoha-youtube-js-worker" /opt/wotoha/bin/wotoha-youtube-js-worker
 worker_digest="$(sha256sum "$PACKAGE_DIR/bin/wotoha-youtube-js-worker" | awk '{print $1}')"
@@ -74,6 +77,12 @@ if ! grep -q '^WOTOHA_YOUTUBE_JS_WORKER_ACK=' /etc/wotoha/wotoha.env; then
   printf '%s\n' 'WOTOHA_YOUTUBE_JS_WORKER_ACK=/var/lib/wotoha/youtube-worker-ack' \
     >> /etc/wotoha/wotoha.env
 fi
+if ! grep -q '^WOTOHA_YTDLP_PATH=' /etc/wotoha/wotoha.env; then
+  printf '%s\n' 'WOTOHA_YTDLP_PATH=/opt/wotoha/bin/yt-dlp' >> /etc/wotoha/wotoha.env
+fi
+if ! grep -q '^WOTOHA_DENO_PATH=' /etc/wotoha/wotoha.env; then
+  printf '%s\n' 'WOTOHA_DENO_PATH=/opt/wotoha/bin/deno' >> /etc/wotoha/wotoha.env
+fi
 
 if [ ! -f /etc/wotoha/wotoha-update.env ]; then
   install -m 0600 "$PACKAGE_DIR/deploy/wotoha-update.env.example" /etc/wotoha/wotoha-update.env
@@ -91,6 +100,7 @@ chown -R wotoha:wotoha /var/lib/wotoha /var/log/wotoha
 systemctl daemon-reload
 systemctl enable wotoha.service
 systemctl enable --now wotoha-update.timer
+systemctl enable --now yt-dlp-update.timer
 
 if ! command -v gh >/dev/null 2>&1 \
   || ! gh attestation verify --help 2>&1 \

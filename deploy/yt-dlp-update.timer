@@ -1,0 +1,12 @@
+[Unit]
+Description=Check every six hours for a verified yt-dlp update
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=yt-dlp-update.service
+
+[Install]
+WantedBy=timers.target

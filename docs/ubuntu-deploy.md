@@ -11,6 +11,10 @@
 powershell -ExecutionPolicy Bypass -File .\deploy\build-ubuntu-musl.ps1
 ```
 
+The manual packager also requires `curl.exe` and GPG. It detects `gpg.exe` on `PATH` or the GPG
+executable bundled with a standard Git for Windows installation. The script verifies the same
+official yt-dlp signature, full key fingerprint, and pinned Deno checksum as release CI.
+
 次の成果物が作成されます。
 
 - `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-app`
@@ -42,7 +46,7 @@ Ubuntu 側で次を実行します。
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates curl jq tar util-linux
+sudo apt install -y ca-certificates coreutils curl gnupg jq tar util-linux
 cd /tmp
 tar -xzf wotoha-ubuntu-x86_64-musl.tar.gz
 cd wotoha-ubuntu-x86_64-musl
@@ -170,9 +174,12 @@ sudo systemctl restart wotoha.service
 ```bash
 sudo systemctl disable --now wotoha.service
 sudo systemctl disable --now wotoha-update.timer
+sudo systemctl disable --now yt-dlp-update.timer
 sudo rm -f /etc/systemd/system/wotoha.service
 sudo rm -f /etc/systemd/system/wotoha-update.service
 sudo rm -f /etc/systemd/system/wotoha-update.timer
+sudo rm -f /etc/systemd/system/yt-dlp-update.service
+sudo rm -f /etc/systemd/system/yt-dlp-update.timer
 sudo rm -rf /opt/wotoha
 sudo rm -rf /etc/wotoha
 sudo rm -rf /var/lib/wotoha
@@ -230,3 +237,67 @@ unprivileged bot process under the existing systemd sandbox. It becomes `current
 candidate-derived GVS/HLS stream is actually readable, the bot returns a matching ACK, and a later
 updater run commits the promotion. The monotonic sequence prevents an older signed worker from
 being reintroduced as a downgrade.
+
+## Phase A bridge from v0.5.29
+
+The first migration release is intentionally a bridge release. It must retain the existing
+`wotoha-app`, `wotoha-youtube-js-worker`, `deploy/YOUTUBE_WORKER_SEQUENCE`, and
+`deploy/youtube-clients.json` package contract so that the updater installed by v0.5.29 can verify
+and apply it. Do not remove the worker files or worker state during Phase A. The bridge advances
+`YOUTUBE_WORKER_SEQUENCE` from production sequence 1 to sequence 2, allowing the v0.5.29 updater to
+accept a reproducibly rebuilt worker even when its digest differs from the installed sequence-1
+binary.
+
+The v0.5.29 updater first installs the bridge application and the new general
+`/opt/wotoha/bin/wotoha-update`. On its next run, the new updater downloads and verifies the same
+GitHub-attested archive again because the managed yt-dlp installation is not ready yet. Before any
+application replacement or restart, it then:
+
+1. verifies the package checksums;
+2. imports the checked-in yt-dlp release key and requires the complete fingerprint
+   `AC0CBBE6848D6A873464AF4E57CF65933B5A7581`;
+3. verifies `SHA2-256SUMS.sig` and the `yt-dlp_linux` digest;
+4. checks the pinned Deno digest;
+5. runs yt-dlp with Deno and tries the two pinned extraction/direct-byte canaries; and
+6. promotes `/opt/wotoha/yt-dlp/current` atomically only after a canary succeeds.
+
+The compatibility path `/opt/wotoha/bin/yt-dlp` is a symlink to the managed current version, so an
+existing v0.5.29 `WOTOHA_YTDLP_PATH=/opt/wotoha/bin/yt-dlp` setting remains valid. Custom values in
+`/etc/wotoha/wotoha.env` are not overwritten.
+
+yt-dlp updates are independent of bot releases and bot restarts:
+
+```bash
+systemctl status yt-dlp-update.timer --no-pager
+sudo systemctl start yt-dlp-update.service
+journalctl -u yt-dlp-update.service --since today
+readlink -f /opt/wotoha/yt-dlp/current
+/opt/wotoha/bin/yt-dlp --version
+/opt/wotoha/bin/deno --version
+```
+
+The timer checks every six hours (with a randomized delay). It follows the official
+`yt-dlp/yt-dlp-nightly-builds` channel by default because upstream recommends nightly builds for
+regular users and YouTube compatibility changes frequently. The only accepted repositories are
+`yt-dlp/yt-dlp-nightly-builds` and the official stable `yt-dlp/yt-dlp` repository.
+
+Every updater yt-dlp subprocess is bounded with GNU `timeout`: version checks have 20 seconds and each
+extraction canary has 60 seconds. Canary network calls use a 10-second socket timeout with two
+download retries and two extractor retries. The independent systemd job has a five-minute start
+limit; the general signed-release updater, which also performs first-time yt-dlp/Deno bootstrap,
+has a 15-minute limit. A timeout fails closed without changing the active yt-dlp pointer or state.
+
+Configure the independent updater in `/etc/wotoha/wotoha-update.env`. Quote multiple canary URLs
+because this file is sourced by Bash:
+
+```dotenv
+WOTOHA_UPDATE_YTDLP=true
+WOTOHA_YTDLP_UPDATE_REPOSITORY=yt-dlp/yt-dlp-nightly-builds
+WOTOHA_YTDLP_CANARY_URLS='https://www.youtube.com/watch?v=H7HmzwI67ec https://www.youtube.com/watch?v=jNQXAC9IVRw'
+```
+
+Only after the Phase A release has been observed with a valid `current` pointer, working Deno, and
+a successful `yt-dlp-update.service` run may Phase B ship an application package without the legacy
+worker asset. The Phase A general updater accepts that worker-less package by retaining the already
+installed worker during the transition. Worker files and state are cleaned up only by the later
+Phase B migration, after yt-dlp/Deno canary success.
