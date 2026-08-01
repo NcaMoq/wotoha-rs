@@ -116,7 +116,21 @@ jobs:
           (cd "$package" && sha256sum --check SHA256SUMS.txt)
           WOTOHA_YOUTUBE_JS_WORKER="$package/bin/wotoha-youtube-js-worker" \
             node scripts/youtube-worker-smoke.mjs
-          tar -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz -C dist wotoha-ubuntu-x86_64-musl
+          # The legacy updater extracts as a capability-restricted root process.
+          # Keep the release portable by never asking tar to restore runner ownership.
+          tar \
+            --sort=name \
+            --mtime='UTC 1970-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf dist/wotoha-ubuntu-x86_64-musl.tar.gz \
+            -C dist wotoha-ubuntu-x86_64-musl
+          if ! tar --list --verbose --numeric-owner --file dist/wotoha-ubuntu-x86_64-musl.tar.gz \
+            | awk '$2 != "0/0" { exit 1 }'; then
+            echo "release archive contains a non-root owner" >&2
+            exit 1
+          fi
           (cd dist && sha256sum wotoha-ubuntu-x86_64-musl.tar.gz > wotoha-ubuntu-x86_64-musl.tar.gz.sha256)
           digest="$(sha256sum dist/wotoha-ubuntu-x86_64-musl.tar.gz | awk '{print $1}')"
           jq --null-input \
