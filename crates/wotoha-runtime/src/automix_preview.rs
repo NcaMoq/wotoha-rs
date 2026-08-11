@@ -3,9 +3,13 @@ use std::time::Duration;
 use songbird::input::{Input, LiveInput};
 use symphonia::core::{audio::SampleBuffer, errors::Error as SymphoniaError};
 use thiserror::Error;
-use wotoha_core::automix::{
-    AutoMixConfig, AutoMixQualityReport, EqTransition, EqTransitionRole, TrackAnalysis,
-    TransitionPlan, automix_mix_gains, plan_guarded_transition,
+use wotoha_core::{
+    automix::{
+        AutoMixConfig, AutoMixPeakGuard, AutoMixQualityReport, EqTransition, EqTransitionRole,
+        TrackAnalysis, TransitionPlan, automix_peak_safe_mix_gains, plan_guarded_transition,
+    },
+    config::LoudnessConfig,
+    loudness::loudness_normalization_gain,
 };
 
 use crate::{
@@ -24,6 +28,8 @@ pub struct AutoMixPreview {
     pub quality: AutoMixQualityReport,
     pub render_metrics: AutoMixPreviewRenderMetrics,
     pub render_issues: Vec<AutoMixPreviewRenderIssue>,
+    pub outgoing_normalization_gain: f32,
+    pub incoming_normalization_gain: f32,
     pub sample_rate: u32,
     pub channels: u16,
     pub wav: Vec<u8>,
@@ -71,10 +77,19 @@ pub(crate) fn render_automix_preview_inputs(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
     config: &AutoMixConfig,
+    loudness: &LoudnessConfig,
 ) -> Result<AutoMixPreview, AutoMixPreviewError> {
     let guarded = plan_guarded_transition(outgoing, incoming, config);
     let plan = guarded.plan;
     let quality = guarded.quality;
+    let outgoing_normalization_gain = loudness_normalization_gain(loudness, Some(outgoing));
+    let incoming_normalization_gain = loudness_normalization_gain(loudness, Some(incoming));
+    let peak_guard = AutoMixPeakGuard::from_analyses_with_base_gains(
+        outgoing,
+        incoming,
+        outgoing_normalization_gain,
+        incoming_normalization_gain,
+    );
     let output_rate = parsed_sample_rate(&outgoing_input)?;
     let output_frames = duration_frames(plan.duration, output_rate).max(1);
     let incoming_source_duration = plan.tempo_envelope.map_or(plan.duration, |envelope| {
@@ -157,7 +172,9 @@ pub(crate) fn render_automix_preview_inputs(
         &incoming.samples,
         PREVIEW_CHANNELS,
         plan.kind,
-        plan.incoming_gain,
+        outgoing_normalization_gain,
+        incoming_normalization_gain,
+        peak_guard,
     );
     let render_metrics = preview_render_metrics(&mixed, output_rate, PREVIEW_CHANNELS);
     let render_issues = preview_render_issues(render_metrics);
@@ -167,6 +184,8 @@ pub(crate) fn render_automix_preview_inputs(
         quality,
         render_metrics,
         render_issues,
+        outgoing_normalization_gain,
+        incoming_normalization_gain,
         sample_rate: output_rate,
         channels: PREVIEW_CHANNELS as u16,
         wav: encode_wav_i16(&mixed, output_rate, PREVIEW_CHANNELS as u16),
@@ -311,7 +330,9 @@ fn automix_mix(
     incoming: &[f32],
     channels: usize,
     kind: wotoha_core::automix::TransitionKind,
-    incoming_gain: f32,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+    peak_guard: AutoMixPeakGuard,
 ) -> Vec<f32> {
     let frames = (outgoing.len() / channels)
         .min(incoming.len() / channels)
@@ -320,8 +341,10 @@ fn automix_mix(
     let mut output = Vec::with_capacity(frames * channels);
     for frame in 0..frames {
         let progress = frame as f32 / last;
-        let (outgoing_gain, incoming_curve_gain) = automix_mix_gains(kind, progress);
-        let incoming_gain = incoming_gain * incoming_curve_gain;
+        let (outgoing_gain, incoming_curve_gain) =
+            automix_peak_safe_mix_gains(kind, progress, peak_guard);
+        let outgoing_gain = outgoing_base_gain * outgoing_gain;
+        let incoming_gain = incoming_base_gain * incoming_curve_gain;
         for channel in 0..channels {
             let index = frame * channels + channel;
             output.push(outgoing[index] * outgoing_gain + incoming[index] * incoming_gain);
@@ -542,6 +565,12 @@ mod tests {
             max_tempo_adjustment: 0.06,
             min_beat_confidence: 0.7,
         };
+        let loudness = LoudnessConfig {
+            enabled: false,
+            target_lufs: -16.0,
+            max_boost_db: 6.0,
+            true_peak_ceiling_dbtp: -2.0,
+        };
 
         let preview = render_automix_preview_inputs(
             outgoing,
@@ -549,6 +578,7 @@ mod tests {
             &outgoing_analysis,
             &incoming_analysis,
             &config,
+            &loudness,
         )
         .unwrap();
 
@@ -560,6 +590,8 @@ mod tests {
         assert!(preview.render_metrics.quietest_to_edge_ratio > 0.25);
         assert!(preview.render_metrics.mid_to_edge_ratio > 0.5);
         assert!(preview.render_metrics.sample_peak_dbfs.is_finite());
+        assert_eq!(preview.outgoing_normalization_gain, 1.0);
+        assert_eq!(preview.incoming_normalization_gain, 1.0);
         assert!(preview.wav.starts_with(b"RIFF"));
         assert!(preview.wav.len() > 44);
     }
@@ -584,6 +616,24 @@ mod tests {
                 AutoMixPreviewRenderIssue::ClippingRisk { .. },
             ]
         ));
+    }
+
+    #[test]
+    fn preview_mix_applies_normalization_gains_once() {
+        let outgoing = vec![1.0, 1.0, 1.0, 1.0];
+        let incoming = vec![1.0, 1.0, 1.0, 1.0];
+        let mixed = automix_mix(
+            &outgoing,
+            &incoming,
+            2,
+            TransitionKind::Crossfade,
+            0.25,
+            0.5,
+            AutoMixPeakGuard::new(0.25, 0.5),
+        );
+
+        assert_eq!(&mixed[..2], &[0.25, 0.25]);
+        assert_eq!(&mixed[2..], &[0.5, 0.5]);
     }
 
     fn beat_analysis(duration: Duration, bpm: f32) -> TrackAnalysis {
@@ -617,6 +667,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: Some(-12.0),
             sample_peak_dbfs: Some(-3.0),
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         }
     }
 

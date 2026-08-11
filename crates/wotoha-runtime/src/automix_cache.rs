@@ -14,7 +14,7 @@ use wotoha_core::{
     automix::{KeyMode, MusicalKey, TrackAnalysis},
 };
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 8;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 9;
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
@@ -288,6 +288,10 @@ struct SerializableAnalysis {
     musical_key: Option<SerializableMusicalKey>,
     rms_dbfs: Option<f32>,
     sample_peak_dbfs: Option<f32>,
+    #[serde(default)]
+    integrated_lufs: Option<f32>,
+    #[serde(default)]
+    true_peak_dbtp: Option<f32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -335,6 +339,8 @@ impl From<&TrackAnalysis> for SerializableAnalysis {
             }),
             rms_dbfs: value.rms_dbfs,
             sample_peak_dbfs: value.sample_peak_dbfs,
+            integrated_lufs: value.integrated_lufs,
+            true_peak_dbtp: value.true_peak_dbtp,
         }
     }
 }
@@ -382,6 +388,8 @@ impl TryFrom<SerializableAnalysis> for TrackAnalysis {
             }),
             rms_dbfs: value.rms_dbfs,
             sample_peak_dbfs: value.sample_peak_dbfs,
+            integrated_lufs: value.integrated_lufs,
+            true_peak_dbtp: value.true_peak_dbtp,
         };
         validate_analysis(&analysis)?;
         Ok(analysis)
@@ -529,6 +537,12 @@ fn validate_analysis(analysis: &TrackAnalysis) -> Result<(), AnalysisCacheError>
         || analysis
             .sample_peak_dbfs
             .is_some_and(|value| !value.is_finite())
+        || analysis
+            .integrated_lufs
+            .is_some_and(|value| !value.is_finite())
+        || analysis
+            .true_peak_dbtp
+            .is_some_and(|value| !value.is_finite())
     {
         return Err(AnalysisCacheError::InvalidAnalysis(
             "level measurements must be finite",
@@ -613,6 +627,8 @@ mod tests {
             }),
             rms_dbfs: Some(-14.2),
             sample_peak_dbfs: Some(-1.0),
+            integrated_lufs: Some(-13.7),
+            true_peak_dbtp: Some(-0.8),
         }
     }
 
@@ -676,6 +692,19 @@ mod tests {
     }
 
     #[test]
+    fn treats_previous_schema_as_a_cache_miss() {
+        let directory = TestDirectory::new();
+        let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
+        let mut record = CachedAnalysis::new(&key, "tempo-v1", &analysis());
+        record.schema_version = ANALYSIS_CACHE_SCHEMA_VERSION - 1;
+        let file = File::create(cache.path_for(&key)).unwrap();
+        serde_json::to_writer(file, &record).unwrap();
+
+        assert_eq!(cache.load(&key).unwrap(), None);
+    }
+
+    #[test]
     fn rejects_invalid_analysis_before_writing() {
         let directory = TestDirectory::new();
         let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
@@ -703,6 +732,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: Some(f32::NAN),
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         };
 
         assert!(matches!(
@@ -724,6 +755,28 @@ mod tests {
             cache.store(&key, &invalid),
             Err(AnalysisCacheError::InvalidAnalysis(_))
         ));
+    }
+
+    #[test]
+    fn rejects_non_finite_loudness_measurements() {
+        let directory = TestDirectory::new();
+        let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
+
+        let mut invalid_loudness = analysis();
+        invalid_loudness.integrated_lufs = Some(f32::NAN);
+        assert!(matches!(
+            cache.store(&key, &invalid_loudness),
+            Err(AnalysisCacheError::InvalidAnalysis(_))
+        ));
+
+        let mut invalid_peak = analysis();
+        invalid_peak.true_peak_dbtp = Some(f32::INFINITY);
+        assert!(matches!(
+            cache.store(&key, &invalid_peak),
+            Err(AnalysisCacheError::InvalidAnalysis(_))
+        ));
+        assert!(!cache.path_for(&key).exists());
     }
 
     #[test]
@@ -756,6 +809,8 @@ mod tests {
             "vocal_activity_rate",
             "energy_profile",
             "energy_profile_rate",
+            "integrated_lufs",
+            "true_peak_dbtp",
         ] {
             object.remove(field);
         }
@@ -768,6 +823,8 @@ mod tests {
         assert_eq!(decoded.outro_start, None);
         assert_eq!(decoded.vocal_activity_rate, 0);
         assert_eq!(decoded.energy_profile_rate, 0);
+        assert_eq!(decoded.integrated_lufs, None);
+        assert_eq!(decoded.true_peak_dbtp, None);
     }
 
     #[test]

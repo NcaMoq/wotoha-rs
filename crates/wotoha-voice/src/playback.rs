@@ -25,11 +25,14 @@ use wotoha_contracts::{
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
-        AutoMixConfig, EqTransition, EqTransitionRole, TempoEnvelope, TrackAnalysis,
-        TransitionKind, TransitionTiming, automix_mix_gains, explain_beatmatch_decision,
-        plan_guarded_transition, plan_transition_timing, transition_score_breakdown,
+        AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TempoEnvelope,
+        TrackAnalysis, TransitionKind, TransitionTiming, automix_peak_safe_mix_gains,
+        explain_beatmatch_decision, plan_guarded_transition, plan_transition_timing,
+        transition_score_breakdown,
     },
+    config::LoudnessConfig,
     debug::append_debug_log,
+    loudness::{interpolate_linear_gain_db, loudness_normalization_gain},
 };
 
 type CompletionSender<ME, RE> = oneshot::Sender<Result<EnqueueOutcome, PlaybackError<ME, RE>>>;
@@ -42,6 +45,8 @@ const TRANSITION_PREPARE_LEAD: std::time::Duration = std::time::Duration::from_s
 const MIN_TRANSITION_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 const MIN_EQUALIZER_TRANSITION: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTOMIX_ANALYSIS_LOOKAHEAD: usize = 4;
+const LOUDNESS_GAIN_RAMP_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+const LOUDNESS_GAIN_RAMP_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
@@ -67,6 +72,7 @@ struct PlaybackCoordinatorInner<M: MediaBackend, R: VoiceRuntime> {
     next_session_id: AtomicU64,
     next_playback_id: AtomicU64,
     automix: AutoMixConfig,
+    loudness: LoudnessConfig,
 }
 
 struct GuildSession<ME, RE>
@@ -97,6 +103,7 @@ where
     prepared_transition: Option<PreparedTransition>,
     current_analysis: Option<TrackAnalysis>,
     current_gain: f32,
+    gain_ramp: Option<(PlaybackId, tokio::task::AbortHandle)>,
     current_tempo: Option<(std::time::Duration, TempoEnvelope)>,
     analysis_by_key: HashMap<String, TrackAnalysis>,
     analysis_in_flight: HashSet<String>,
@@ -124,6 +131,7 @@ struct PreparedTransition {
     start_delay: std::time::Duration,
     incoming_analysis: Option<TrackAnalysis>,
     incoming_gain: f32,
+    peak_guard: AutoMixPeakGuard,
     source_start: std::time::Duration,
     tempo_envelope: Option<TempoEnvelope>,
     outgoing_equalizer_transition: Option<EqTransition>,
@@ -192,6 +200,7 @@ where
             prepared_transition: None,
             current_analysis: None,
             current_gain: 1.0,
+            gain_ramp: None,
             current_tempo: None,
             analysis_by_key: HashMap::new(),
             analysis_in_flight: HashSet::new(),
@@ -209,7 +218,7 @@ where
     R: VoiceRuntime,
 {
     pub fn new(media: M, runtime: R) -> Self {
-        Self::new_with_automix(
+        Self::new_with_automix_and_loudness(
             media,
             runtime,
             AutoMixConfig {
@@ -218,10 +227,35 @@ where
                 max_tempo_adjustment: 0.0,
                 min_beat_confidence: 1.0,
             },
+            LoudnessConfig {
+                enabled: false,
+                target_lufs: -16.0,
+                max_boost_db: 6.0,
+                true_peak_ceiling_dbtp: -2.0,
+            },
         )
     }
 
     pub fn new_with_automix(media: M, runtime: R, automix: AutoMixConfig) -> Self {
+        Self::new_with_automix_and_loudness(
+            media,
+            runtime,
+            automix,
+            LoudnessConfig {
+                enabled: false,
+                target_lufs: -16.0,
+                max_boost_db: 6.0,
+                true_peak_ceiling_dbtp: -2.0,
+            },
+        )
+    }
+
+    pub fn new_with_automix_and_loudness(
+        media: M,
+        runtime: R,
+        automix: AutoMixConfig,
+        loudness: LoudnessConfig,
+    ) -> Self {
         let (events, receiver) = unbounded_channel();
         let playback = Self {
             inner: Arc::new(PlaybackCoordinatorInner {
@@ -232,6 +266,7 @@ where
                 next_session_id: AtomicU64::new(1),
                 next_playback_id: AtomicU64::new(1),
                 automix,
+                loudness,
             }),
         };
         playback.spawn_runtime_event_loop(receiver);
@@ -313,16 +348,23 @@ where
         let analysis_key = track_analysis_key(&request);
         {
             let mut playback = session.playback.lock();
-            if !playback.automix_enabled {
+            if !playback.automix_enabled && !self.inner.loudness.enabled {
                 return;
             }
             if let Some(analysis) = playback.analysis_by_key.get(&analysis_key).cloned() {
-                if playback
+                let request_is_current = playback
                     .logical
                     .current()
-                    .is_some_and(|current| track_analysis_key(current) == analysis_key)
-                {
+                    .is_some_and(|current| track_analysis_key(current) == analysis_key);
+                if request_is_current {
                     playback.current_analysis = Some(analysis);
+                }
+                drop(playback);
+                if request_is_current {
+                    self.spawn_current_loudness_ramp(guild_id, session_id);
+                    if self.automix_enabled(guild_id) {
+                        self.spawn_current_automix_rearm(guild_id, session_id);
+                    }
                 }
                 return;
             }
@@ -342,6 +384,8 @@ where
             if let Some(session) = coordinator.get_session(guild_id)
                 && session.id == session_id
             {
+                let mut rearm_current = false;
+                let mut normalize_current = false;
                 let mut playback = session.playback.lock();
                 playback.analysis_in_flight.remove(&task_key);
                 playback.analysis_tasks.remove(&task_key);
@@ -355,19 +399,30 @@ where
                     .iter()
                     .take(AUTOMIX_ANALYSIS_LOOKAHEAD)
                     .any(|queued| track_analysis_key(queued) == task_key);
-                if playback.automix_enabled
+                if (playback.automix_enabled || coordinator.inner.loudness.enabled)
                     && (request_is_current || request_is_queued_candidate)
                     && let Some(analysis) = analysis
                 {
                     playback.analysis_by_key.insert(task_key, analysis.clone());
                     if request_is_current {
                         playback.current_analysis = Some(analysis);
+                        rearm_current = playback.automix_enabled;
+                        normalize_current = coordinator.inner.loudness.enabled;
                     }
+                }
+                drop(playback);
+                if normalize_current {
+                    coordinator.spawn_current_loudness_ramp(guild_id, session_id);
+                }
+                if rearm_current {
+                    coordinator.spawn_current_automix_rearm(guild_id, session_id);
                 }
             }
         });
         let mut playback = session.playback.lock();
-        if playback.automix_enabled && playback.analysis_in_flight.contains(&analysis_key) {
+        if (playback.automix_enabled || self.inner.loudness.enabled)
+            && playback.analysis_in_flight.contains(&analysis_key)
+        {
             playback.analysis_tasks.insert(analysis_key, task);
             let _ = start_tx.send(());
         } else {
@@ -384,7 +439,7 @@ where
         }
         let requests = {
             let mut playback = session.playback.lock();
-            if !playback.automix_enabled {
+            if !playback.automix_enabled && !self.inner.loudness.enabled {
                 return;
             }
             let requests = playback
@@ -525,18 +580,24 @@ where
     pub async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool> {
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
-        let (enabled, prepared) = {
+        let (enabled, prepared, resume_loudness) = {
             let mut playback = session.playback.lock();
             if playback.automix_enabled {
                 playback.automix_enabled = false;
-                abort_analysis_tasks(&mut playback);
+                if !self.inner.loudness.enabled {
+                    abort_analysis_tasks(&mut playback);
+                }
                 playback.logical.disable_loop();
             }
             let prepared = invalidate_prepared_transition(&mut playback);
-            (playback.logical.toggle_loop(), prepared)
+            let resume_loudness = prepared.is_some();
+            (playback.logical.toggle_loop(), prepared, resume_loudness)
         };
         if let Some(handle) = prepared {
             handle.stop();
+        }
+        if resume_loudness {
+            self.spawn_current_loudness_ramp(guild_id, session.id);
         }
         Some(enabled)
     }
@@ -547,6 +608,7 @@ where
 
         let (was_looping, handle, retiring, fade_abort, prepared) = {
             let mut playback = session.playback.lock();
+            abort_gain_ramp(&mut playback);
             let was_looping = playback.logical.disable_loop();
             let handle = playback.active_handle.take();
             let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
@@ -607,16 +669,17 @@ where
     pub async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
         let session = self.get_session(guild_id)?;
         let _operation = session.operation.lock().await;
-        let (enabled, prepared) = {
+        let (enabled, prepared, resume_loudness) = {
             let mut playback = session.playback.lock();
             playback.automix_enabled = !playback.automix_enabled;
             if playback.automix_enabled {
                 playback.logical.disable_loop();
-            } else {
+            } else if !self.inner.loudness.enabled {
                 abort_analysis_tasks(&mut playback);
             }
             let prepared = invalidate_prepared_transition(&mut playback);
-            (playback.automix_enabled, prepared)
+            let resume_loudness = prepared.is_some();
+            (playback.automix_enabled, prepared, resume_loudness)
         };
         if let Some(handle) = prepared {
             handle.stop();
@@ -624,6 +687,8 @@ where
         if enabled {
             self.spawn_relevant_analyses(guild_id, session.id);
             self.spawn_current_automix_rearm(guild_id, session.id);
+        } else if resume_loudness {
+            self.spawn_current_loudness_ramp(guild_id, session.id);
         }
         Some(enabled)
     }
@@ -635,6 +700,74 @@ where
                 .rearm_current_automix(guild_id, session_id)
                 .await;
         });
+    }
+
+    fn spawn_current_loudness_ramp(&self, guild_id: GuildKey, session_id: u64) {
+        if !self.inner.loudness.enabled {
+            return;
+        }
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        if session.id != session_id {
+            return;
+        }
+
+        let mut playback = session.playback.lock();
+        let (Some(playback_id), Some(handle), Some(analysis)) = (
+            playback.current_playback_id,
+            playback.active_handle.clone(),
+            playback.current_analysis.as_ref(),
+        ) else {
+            return;
+        };
+        if !loudness_ramp_allowed(&playback, playback_id) {
+            return;
+        }
+        let target_gain = loudness_normalization_gain(&self.inner.loudness, Some(analysis));
+        let start_gain = playback.current_gain;
+        if (target_gain - start_gain).abs() <= f32::EPSILON {
+            return;
+        }
+        abort_gain_ramp(&mut playback);
+
+        let coordinator = self.clone();
+        let ramp_task = tokio::spawn(async move {
+            let steps = (LOUDNESS_GAIN_RAMP_DURATION.as_millis()
+                / LOUDNESS_GAIN_RAMP_STEP.as_millis())
+            .max(1) as u32;
+            for step in 1..=steps {
+                tokio::time::sleep(LOUDNESS_GAIN_RAMP_DURATION / steps).await;
+                let Some(session) = coordinator.get_session(guild_id) else {
+                    return;
+                };
+                if session.id != session_id {
+                    return;
+                }
+                let _operation = session.operation.lock().await;
+                let mut playback = session.playback.lock();
+                if !loudness_ramp_allowed(&playback, playback_id) {
+                    return;
+                }
+                let gain =
+                    interpolate_linear_gain_db(start_gain, target_gain, step as f32 / steps as f32);
+                playback.current_gain = gain;
+                handle.set_volume(gain);
+            }
+            if let Some(session) = coordinator.get_session(guild_id)
+                && session.id == session_id
+            {
+                let mut playback = session.playback.lock();
+                if playback
+                    .gain_ramp
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == playback_id)
+                {
+                    playback.gain_ramp = None;
+                }
+            }
+        });
+        playback.gain_ramp = Some((playback_id, ramp_task.abort_handle()));
     }
 
     async fn rearm_current_automix(&self, guild_id: GuildKey, session_id: u64) {
@@ -805,7 +938,7 @@ where
             {
                 let mut playback = session.playback.lock();
                 playback.automix_enabled = snapshot.automix_enabled;
-                if !snapshot.automix_enabled {
+                if !snapshot.automix_enabled && !self.inner.loudness.enabled {
                     abort_analysis_tasks(&mut playback);
                 }
                 playback.logical.disable_loop();
@@ -813,7 +946,7 @@ where
                     playback.logical.toggle_loop();
                 }
             }
-            if snapshot.automix_enabled {
+            if snapshot.automix_enabled || self.inner.loudness.enabled {
                 self.spawn_relevant_analyses(guild_id, session.id);
             }
         }
@@ -831,6 +964,7 @@ where
             let (handle, retiring, fade_abort, prepared, pending) = {
                 let mut playback = session.playback.lock();
                 playback.logical.clear();
+                abort_gain_ramp(&mut playback);
                 let handle = playback.active_handle.take();
                 let retiring = playback.retiring_handle.take().map(|(_, handle)| handle);
                 let fade_abort = playback.fade_abort.take();
@@ -987,12 +1121,18 @@ where
                     mut completion,
                     request,
                 } => match self.play_request(guild_id, session_id, &request, 1.0).await {
-                    Ok(handle) => {
+                    Ok(started) => {
                         {
                             let mut playback = session.playback.lock();
-                            playback.current_playback_id = Some(handle.playback_id);
-                            playback.active_handle = Some(handle.handle);
-                            playback.current_gain = 1.0;
+                            playback.current_playback_id = Some(started.playback_id);
+                            playback.active_handle = Some(started.handle);
+                            playback.current_analysis = started.analysis.clone();
+                            playback.current_gain = started.base_gain;
+                            if let Some(analysis) = started.analysis {
+                                playback
+                                    .analysis_by_key
+                                    .insert(track_analysis_key(&request), analysis);
+                            }
                         }
                         self.spawn_relevant_analyses(guild_id, session_id);
                         if let Some(completion) = completion.take() {
@@ -1088,6 +1228,71 @@ where
             return;
         }
 
+        // A natural end can race the delayed TransitionDue event.  If the
+        // prepared deck still belongs to this outgoing track and the logical
+        // queue has not changed, promote that deck directly instead of
+        // discarding its trimmed cue and starting the same request at zero.
+        let prepared_handoff = {
+            let mut playback = session.playback.lock();
+            let matches_current = playback.current_playback_id == Some(playback_id)
+                && playback.automix_enabled
+                && playback
+                    .prepared_transition
+                    .as_ref()
+                    .is_some_and(|prepared| {
+                        prepared.origin_playback_id == playback_id
+                            && playback.logical.peek_next_track() == Some(&prepared.next)
+                    });
+            if !matches_current {
+                None
+            } else {
+                abort_gain_ramp(&mut playback);
+                let Some(outgoing) = playback.active_handle.clone() else {
+                    return;
+                };
+                let Some(prepared) = playback.prepared_transition.take() else {
+                    return;
+                };
+                playback.active_handle = Some(prepared.incoming.handle.clone());
+                let previous_retiring = playback
+                    .retiring_handle
+                    .replace((playback_id, outgoing.clone()));
+                let incoming_playback_id = prepared.incoming.playback_id;
+                let incoming_gain = prepared.incoming_gain;
+                playback.logical.prepare_next_track();
+                playback.logical.replace_current(prepared.next.clone());
+                playback.current_playback_id = Some(incoming_playback_id);
+                playback.current_analysis = prepared.incoming_analysis.clone();
+                playback.current_gain = incoming_gain;
+                playback.current_tempo = prepared
+                    .tempo_envelope
+                    .map(|envelope| (prepared.source_start, envelope));
+                playback.transition_due = None;
+                Some((prepared, outgoing, previous_retiring))
+            }
+        };
+        if let Some((prepared, outgoing, previous_retiring)) = prepared_handoff {
+            cancel_prepared_equalizer(&prepared, Some(&outgoing));
+            if let Some((_, handle)) = previous_retiring {
+                handle.stop();
+            }
+            outgoing.stop();
+            prepared.incoming.handle.set_volume(prepared.incoming_gain);
+            prepared.incoming.handle.resume();
+            {
+                let mut playback = session.playback.lock();
+                if playback
+                    .retiring_handle
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == playback_id)
+                {
+                    playback.retiring_handle = None;
+                }
+            }
+            self.spawn_relevant_analyses(guild_id, session_id);
+            return;
+        }
+
         info!(
             guild_id = guild_id.get(),
             session_id,
@@ -1104,6 +1309,7 @@ where
                 if playback.current_playback_id != expected_playback_id {
                     return;
                 }
+                abort_gain_ramp(&mut playback);
                 playback.active_handle = None;
                 playback.current_playback_id = None;
                 playback.current_analysis = None;
@@ -1121,13 +1327,20 @@ where
             };
 
             match self.play_request(guild_id, session_id, &next, 1.0).await {
-                Ok(handle) => {
+                Ok(started) => {
                     {
                         let mut playback = session.playback.lock();
                         playback.logical.replace_current(next);
-                        playback.current_playback_id = Some(handle.playback_id);
-                        playback.active_handle = Some(handle.handle);
-                        playback.current_gain = 1.0;
+                        playback.current_playback_id = Some(started.playback_id);
+                        playback.active_handle = Some(started.handle);
+                        playback.current_analysis = started.analysis.clone();
+                        playback.current_gain = started.base_gain;
+                        if let (Some(current), Some(analysis)) =
+                            (playback.logical.current(), started.analysis)
+                        {
+                            let key = track_analysis_key(current);
+                            playback.analysis_by_key.insert(key, analysis);
+                        }
                     }
                     self.spawn_relevant_analyses(guild_id, session_id);
                     return;
@@ -1264,7 +1477,8 @@ where
         let mut timing = timing;
         let mut transition_after = timing.transition_after;
         let mut transition_kind = TransitionKind::Crossfade;
-        let mut incoming_gain = 1.0;
+        let incoming_gain =
+            loudness_normalization_gain(&self.inner.loudness, incoming_analysis.as_ref());
         let mut outgoing_equalizer_transition = None;
         let mut options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
         let guarded_plan = outgoing_analysis
@@ -1273,6 +1487,15 @@ where
             .map(|(outgoing, incoming)| {
                 plan_guarded_transition(outgoing, incoming, &self.inner.automix)
             });
+        if guarded_plan.is_none() {
+            // Without both analyses there is no evidence that an overlap is
+            // safe.  Keep playback continuous at the metadata boundary, but
+            // do not invent a fixed crossfade or transition DSP.
+            transition_kind = TransitionKind::Gapless;
+            transition_after = timing.transition_after.saturating_add(timing.fade_duration);
+            timing.transition_after = transition_after;
+            timing.fade_duration = std::time::Duration::ZERO;
+        }
         if let (Some(guarded), Some(outgoing), Some(incoming)) = (
             guarded_plan.as_ref(),
             outgoing_analysis.as_ref(),
@@ -1322,6 +1545,15 @@ where
                 incoming_intro_confidence = incoming.intro_confidence,
                 outgoing_start_ms = plan.outgoing_start.as_millis(),
                 incoming_start_ms = plan.incoming_start.as_millis(),
+                incoming_cue_selected = plan.incoming_cue_selection.is_some_and(|selection| {
+                    selection.selected_start != selection.default_start
+                }),
+                incoming_cue_default_start_ms = plan
+                    .incoming_cue_selection
+                    .map(|selection| selection.default_start.as_millis()),
+                incoming_cue_candidates_checked = plan
+                    .incoming_cue_selection
+                    .map(|selection| selection.candidates_checked),
                 fade_ms = plan.duration.as_millis(),
                 energy_selected = plan
                     .energy_selection
@@ -1397,10 +1629,17 @@ where
         }
         if let Some(guarded) = &guarded_plan {
             let plan = &guarded.plan;
-            incoming_gain = plan.incoming_gain;
             options.source_start = plan.incoming_start;
             options.tempo_envelope = plan.tempo_envelope;
-            if plan.kind != TransitionKind::Gapless && plan.duration >= MIN_EQUALIZER_TRANSITION {
+            if plan.kind == TransitionKind::Gapless {
+                // A gapless plan is a boundary handoff, not a zero-length
+                // crossfade.  Keep the incoming deck free of transition DSP;
+                // the handoff below will restore its prepared gain directly.
+                transition_kind = TransitionKind::Gapless;
+                timing.fade_duration = std::time::Duration::ZERO;
+                transition_after = plan.outgoing_start;
+                options.equalizer_transition = None;
+            } else if plan.duration >= MIN_EQUALIZER_TRANSITION {
                 let id = incoming_id.get();
                 outgoing_equalizer_transition = Some(EqTransition {
                     id,
@@ -1421,6 +1660,9 @@ where
             }
         }
         let dsp_requested = options.tempo_envelope.is_some();
+        if !dsp_requested {
+            compensate_trimmed_source_events(&mut options);
+        }
         let mut incoming_result = self
             .inner
             .runtime
@@ -1441,6 +1683,7 @@ where
             options.tempo_envelope = None;
             options.equalizer_transition = None;
             outgoing_equalizer_transition = None;
+            compensate_trimmed_source_events(&mut options);
             incoming_result = self
                 .inner
                 .runtime
@@ -1461,6 +1704,8 @@ where
             Ok(handle) => StartedTrack {
                 playback_id: incoming_id,
                 handle,
+                analysis: incoming_analysis.clone(),
+                base_gain: incoming_gain,
             },
             Err(error) => {
                 warn!(guild_id = guild_id.get(), error = %error, "AutoMix runtime prefetch failed");
@@ -1498,8 +1743,21 @@ where
                 && playback.prefetch_generation == generation
                 && playback.transition_due != Some(playback_id)
                 && playback.logical.peek_next_track() == Some(&next);
-            if valid
-                && let Some(previous) = playback.prepared_transition.replace(PreparedTransition {
+            if valid {
+                abort_gain_ramp(&mut playback);
+                let peak_guard = outgoing_analysis
+                    .as_ref()
+                    .zip(incoming_analysis.as_ref())
+                    .map(|(outgoing, incoming)| {
+                        AutoMixPeakGuard::from_analyses_with_base_gains(
+                            outgoing,
+                            incoming,
+                            playback.current_gain,
+                            incoming_gain,
+                        )
+                    })
+                    .unwrap_or_else(AutoMixPeakGuard::unity);
+                if let Some(previous) = playback.prepared_transition.replace(PreparedTransition {
                     origin_playback_id: playback_id,
                     next,
                     incoming: incoming.take().expect("prefetched track is available"),
@@ -1508,13 +1766,14 @@ where
                     start_delay,
                     incoming_analysis,
                     incoming_gain,
+                    peak_guard,
                     source_start: options.source_start,
                     tempo_envelope: dsp_active.then_some(options.tempo_envelope).flatten(),
                     outgoing_equalizer_transition,
-                })
-            {
-                cancel_prepared_equalizer(&previous, playback.active_handle.as_ref());
-                previous.incoming.handle.stop();
+                }) {
+                    cancel_prepared_equalizer(&previous, playback.active_handle.as_ref());
+                    previous.incoming.handle.stop();
+                }
             }
         }
         if let Some(incoming) = incoming {
@@ -1543,19 +1802,23 @@ where
             {
                 return;
             }
-            playback.transition_due = Some(playback_id);
             playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
             let Some(handle) = playback.active_handle.clone() else {
                 return;
             };
             let current_tempo = playback.current_tempo;
-            let Some(prepared) = playback
+            if playback
+                .prepared_transition
+                .as_ref()
+                .is_none_or(|prepared| prepared.origin_playback_id != playback_id)
+            {
+                return;
+            }
+            playback.transition_due = Some(playback_id);
+            let prepared = playback
                 .prepared_transition
                 .as_mut()
-                .filter(|prepared| prepared.origin_playback_id == playback_id)
-            else {
-                return;
-            };
+                .expect("prepared transition was checked above");
             if let Some(transition) = prepared.outgoing_equalizer_transition
                 && !handle.schedule_equalizer_transition(transition)
             {
@@ -1625,6 +1888,7 @@ where
             let previous_retiring = playback
                 .retiring_handle
                 .replace((playback_id, outgoing.clone()));
+            abort_gain_ramp(&mut playback);
             let outgoing_gain = playback.current_gain;
             playback.logical.prepare_next_track();
             playback.logical.replace_current(prepared.next.clone());
@@ -1640,6 +1904,26 @@ where
         if let Some((_, handle)) = previous_retiring {
             handle.stop();
         }
+        if prepared.transition_kind == TransitionKind::Gapless {
+            // The prepared incoming track starts at its audible cue and was
+            // created at zero gain.  A gapless handoff must switch decks at
+            // the boundary without launching a fade task (or EQ automation).
+            outgoing.stop();
+            prepared.incoming.handle.set_volume(prepared.incoming_gain);
+            prepared.incoming.handle.resume();
+            let mut playback = session.playback.lock();
+            if playback
+                .retiring_handle
+                .as_ref()
+                .is_some_and(|(id, _)| *id == playback_id)
+            {
+                playback.retiring_handle = None;
+            }
+            drop(playback);
+            drop(_operation);
+            self.spawn_relevant_analyses(guild_id, session_id);
+            return;
+        }
         self.spawn_relevant_analyses(guild_id, session_id);
         prepared.incoming.handle.resume();
 
@@ -1652,6 +1936,7 @@ where
                 prepared.transition_kind,
                 outgoing_gain,
                 prepared.incoming_gain,
+                prepared.peak_guard,
             )
             .await;
             outgoing.stop();
@@ -1666,6 +1951,8 @@ where
                 {
                     playback.retiring_handle = None;
                 }
+                drop(playback);
+                coordinator.spawn_current_loudness_ramp(guild_id, session_id);
             }
         });
         session.playback.lock().fade_abort = Some(fade_task.abort_handle());
@@ -1702,6 +1989,32 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
+        let analysis_key = track_analysis_key(&prepared);
+        let analysis_enabled = self
+            .get_session(guild_id)
+            .filter(|session| session.id == session_id)
+            .is_some_and(|session| {
+                session.playback.lock().automix_enabled || self.inner.loudness.enabled
+            });
+        let cached_analysis = analysis_enabled
+            .then(|| {
+                self.get_session(guild_id)
+                    .filter(|session| session.id == session_id)
+                    .and_then(|session| {
+                        session
+                            .playback
+                            .lock()
+                            .analysis_by_key
+                            .get(&analysis_key)
+                            .cloned()
+                    })
+                    .or_else(|| self.inner.runtime.cached_track_analysis(&prepared))
+            })
+            .flatten();
+        let normalization_gain =
+            loudness_normalization_gain(&self.inner.loudness, cached_analysis.as_ref());
+        let effective_initial_gain = initial_gain * normalization_gain;
+
         info!(
             guild_id = guild_id.get(),
             session_id,
@@ -1722,7 +2035,7 @@ where
                 track_start_options(
                     &self.inner.automix,
                     prepared.metadata.duration,
-                    initial_gain,
+                    effective_initial_gain,
                 ),
             )
             .await
@@ -1754,6 +2067,8 @@ where
         Ok(StartedTrack {
             playback_id,
             handle,
+            analysis: cached_analysis,
+            base_gain: effective_initial_gain,
         })
     }
 }
@@ -1785,6 +2100,18 @@ fn track_start_options(
         equalizer_enabled: config.enabled,
         equalizer_transition: None,
     }
+}
+
+fn compensate_trimmed_source_events(options: &mut TrackStartOptions) {
+    if options.tempo_envelope.is_some() || options.source_start.is_zero() {
+        return;
+    }
+    options.prefetch_after = options
+        .prefetch_after
+        .map(|position| position.saturating_sub(options.source_start));
+    options.transition_after = options
+        .transition_after
+        .map(|position| position.saturating_sub(options.source_start));
 }
 
 fn transition_event_after(timing: TransitionTiming) -> std::time::Duration {
@@ -1822,13 +2149,15 @@ async fn run_automix_fade(
     kind: TransitionKind,
     outgoing_base_gain: f32,
     incoming_base_gain: f32,
+    peak_guard: AutoMixPeakGuard,
 ) {
     let steps = (duration.as_millis() / 50).clamp(1, 200) as u32;
     let interval = duration / steps;
     for step in 1..=steps {
         tokio::time::sleep(interval).await;
         let progress = step as f32 / steps as f32;
-        let (outgoing_gain, incoming_gain) = automix_mix_gains(kind, progress);
+        let (outgoing_gain, incoming_gain) =
+            automix_peak_safe_mix_gains(kind, progress, peak_guard);
         outgoing.set_volume(outgoing_base_gain * outgoing_gain);
         incoming.set_volume(incoming_base_gain * incoming_gain);
     }
@@ -1837,6 +2166,8 @@ async fn run_automix_fade(
 struct StartedTrack {
     playback_id: PlaybackId,
     handle: Arc<dyn RuntimeTrackHandle>,
+    analysis: Option<TrackAnalysis>,
+    base_gain: f32,
 }
 
 #[async_trait]
@@ -2129,6 +2460,31 @@ where
     playback.analysis_in_flight.clear();
 }
 
+fn loudness_ramp_allowed<ME, RE>(
+    playback: &PlaybackRuntime<ME, RE>,
+    playback_id: PlaybackId,
+) -> bool
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    playback.current_playback_id == Some(playback_id)
+        && playback.active_handle.is_some()
+        && playback.retiring_handle.is_none()
+        && playback.prepared_transition.is_none()
+        && playback.transition_due.is_none()
+}
+
+fn abort_gain_ramp<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>)
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    if let Some((_, abort)) = playback.gain_ramp.take() {
+        abort.abort();
+    }
+}
+
 fn drain_pending<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>) -> Vec<CompletionSender<ME, RE>>
 where
     ME: std::error::Error + Send + Sync + 'static,
@@ -2170,7 +2526,7 @@ where
 mod tests {
     use super::{
         GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
-        track_start_options,
+        run_automix_fade, track_start_options,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -2181,7 +2537,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
     use tokio::{
         sync::{Notify, oneshot},
@@ -2196,9 +2552,10 @@ mod tests {
     use wotoha_core::{
         PreparedSource, TrackMetadata, TrackRequest,
         automix::{
-            AutoMixConfig, EqTransition, EqTransitionRole, TrackAnalysis, TransitionKind,
-            automix_mix_gains,
+            AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TrackAnalysis,
+            TransitionKind, automix_mix_gains, automix_peak_safe_mix_gains,
         },
+        config::LoudnessConfig,
     };
 
     type TestPlayback = PlaybackCoordinator<MockMedia, MockRuntime>;
@@ -2425,6 +2782,7 @@ mod tests {
         played: Mutex<Vec<PlayedTrack>>,
         play_failures: Mutex<HashMap<String, TestRuntimeError>>,
         analyses: Mutex<HashMap<String, TrackAnalysis>>,
+        cached_analyses: Mutex<HashMap<String, TrackAnalysis>>,
         analysis_blockers: Mutex<HashMap<String, oneshot::Receiver<()>>>,
         analysis_calls: Mutex<Vec<String>>,
         start_options: Mutex<Vec<(String, TrackStartOptions)>>,
@@ -2462,6 +2820,13 @@ mod tests {
 
         fn analyze_with(&self, key: &str, analysis: TrackAnalysis) {
             self.state.analyses.lock().insert(key.to_owned(), analysis);
+        }
+
+        fn cache_analysis_with(&self, key: &str, analysis: TrackAnalysis) {
+            self.state
+                .cached_analyses
+                .lock()
+                .insert(key.to_owned(), analysis);
         }
 
         fn block_analysis(&self, key: &str) -> oneshot::Sender<()> {
@@ -2671,6 +3036,14 @@ mod tests {
                 .get(request.canonical_key.as_ref())
                 .cloned()
         }
+
+        fn cached_track_analysis(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+            self.state
+                .cached_analyses
+                .lock()
+                .get(request.canonical_key.as_ref())
+                .cloned()
+        }
     }
 
     fn track_request(key: &str) -> TrackRequest {
@@ -2704,6 +3077,35 @@ mod tests {
         }
     }
 
+    fn loudness_config() -> LoudnessConfig {
+        LoudnessConfig {
+            enabled: true,
+            target_lufs: -16.0,
+            max_boost_db: 6.0,
+            true_peak_ceiling_dbtp: -2.0,
+        }
+    }
+
+    fn disabled_automix_config() -> AutoMixConfig {
+        AutoMixConfig {
+            enabled: false,
+            crossfade: Duration::ZERO,
+            max_tempo_adjustment: 0.0,
+            min_beat_confidence: 1.0,
+        }
+    }
+
+    fn loudness_analysis(
+        duration: Duration,
+        integrated_lufs: f32,
+        true_peak_dbtp: Option<f32>,
+    ) -> TrackAnalysis {
+        let mut analysis = TrackAnalysis::unanalyzed(duration);
+        analysis.integrated_lufs = Some(integrated_lufs);
+        analysis.true_peak_dbtp = true_peak_dbtp;
+        analysis
+    }
+
     fn beat_analysis(duration: Duration, bpm: f32) -> TrackAnalysis {
         let bins = (duration.as_secs() as usize).saturating_mul(4);
         TrackAnalysis {
@@ -2729,7 +3131,23 @@ mod tests {
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         }
+    }
+
+    fn vocal_gapless_analysis(
+        duration: Duration,
+        audible_start: Duration,
+        audible_end: Duration,
+    ) -> TrackAnalysis {
+        let mut analysis = beat_analysis(duration, 120.0);
+        let bins = (duration.as_secs_f64() * 4.0).ceil() as usize;
+        analysis.audible_start = audible_start;
+        analysis.audible_end = audible_end;
+        analysis.vocal_activity = vec![u8::MAX; bins];
+        analysis.vocal_activity_confidences = vec![u8::MAX; bins];
+        analysis
     }
 
     fn spawn_enqueue(
@@ -2788,6 +3206,441 @@ mod tests {
         assert!(playback.automix_enabled(GuildKey::new(1)));
         assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
         assert!(!playback.automix_enabled(GuildKey::new(1)));
+    }
+
+    #[tokio::test]
+    async fn disabled_loudness_preserves_unity_and_does_not_start_analysis() {
+        let guild_id = GuildKey::new(200);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.cache_analysis_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new(media.clone(), runtime.clone());
+        media.resolve_with("track", Ok(track_request("track")));
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+
+        let options = runtime.start_options();
+        assert_eq!(options[0].1.initial_gain, 1.0);
+        assert!(runtime.analysis_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn loudness_starts_analysis_when_automix_is_disabled() {
+        let guild_id = GuildKey::new(201);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.analyze_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            disabled_automix_config(),
+            loudness_config(),
+        );
+        media.resolve_with("track", Ok(track_request("track")));
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+        runtime.wait_for_analysis_count(1).await;
+
+        assert_eq!(runtime.analysis_calls(), vec!["track"]);
+        assert!(!playback.automix_enabled(guild_id));
+    }
+
+    #[tokio::test]
+    async fn cached_loudness_is_applied_to_initial_gain_once() {
+        let guild_id = GuildKey::new(202);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.cache_analysis_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            disabled_automix_config(),
+            loudness_config(),
+        );
+        media.resolve_with("track", Ok(track_request("track")));
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+
+        let expected = 10.0_f32.powf(-6.0 / 20.0);
+        let options = runtime.start_options();
+        assert!((options[0].1.initial_gain - expected).abs() < 0.0001);
+        let playback_id = runtime.played()[0].playback_id;
+        assert_eq!(
+            runtime
+                .volumes()
+                .into_iter()
+                .filter(|(id, _)| *id == playback_id)
+                .count(),
+            1
+        );
+        assert!(runtime.analysis_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_loudness_analysis_ramps_for_two_seconds_in_db() {
+        let guild_id = GuildKey::new(203);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.analyze_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            disabled_automix_config(),
+            loudness_config(),
+        );
+        media.resolve_with("track", Ok(track_request("track")));
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+        runtime.wait_for_analysis_count(1).await;
+        let playback_id = runtime.played()[0].playback_id;
+        let started = Instant::now();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if runtime
+                    .volumes()
+                    .iter()
+                    .filter(|(id, _)| *id == playback_id)
+                    .count()
+                    >= 41
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loudness ramp did not complete");
+
+        let gains = runtime
+            .volumes()
+            .into_iter()
+            .filter_map(|(id, gain)| (id == playback_id).then_some(gain))
+            .collect::<Vec<_>>();
+        let expected = 10.0_f32.powf(-6.0 / 20.0);
+        assert!(started.elapsed() >= Duration::from_millis(1_800));
+        assert_eq!(gains[0], 1.0);
+        assert!((gains[20] - 10.0_f32.powf(-3.0 / 20.0)).abs() < 0.01);
+        assert!((gains.last().unwrap() - expected).abs() < 0.0001);
+        assert!(gains.windows(2).all(|pair| pair[1] <= pair[0]));
+    }
+
+    #[tokio::test]
+    async fn transition_due_freezes_late_loudness_gain() {
+        let guild_id = GuildKey::new(204);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let release = runtime.block_analysis("track");
+        runtime.analyze_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            disabled_automix_config(),
+            loudness_config(),
+        );
+        media.resolve_with("track", Ok(track_request("track")));
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+        runtime.wait_for_analysis_count(1).await;
+        let played = runtime.played()[0].clone();
+        {
+            let session = playback.get_session(guild_id).unwrap();
+            session.playback.lock().transition_due = Some(played.playback_id);
+        }
+        release.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let gains = runtime
+            .volumes()
+            .into_iter()
+            .filter(|(id, _)| *id == played.playback_id)
+            .collect::<Vec<_>>();
+        assert_eq!(gains, vec![(played.playback_id, 1.0)]);
+    }
+
+    #[tokio::test]
+    async fn transition_without_prepared_deck_does_not_freeze_late_loudness_gain() {
+        let guild_id = GuildKey::new(207);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let release = runtime.block_analysis("track");
+        runtime.analyze_with(
+            "track",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+            loudness_config(),
+        );
+        media.resolve_with(
+            "track",
+            Ok(track_request_with_duration(
+                "track",
+                Some(Duration::from_secs(30)),
+            )),
+        );
+
+        playback.enqueue_impl(guild_id, "track").await.unwrap();
+        runtime.wait_for_analysis_count(1).await;
+        let played = runtime.played()[0].clone();
+        playback
+            .transition(guild_id, played.session_id, played.playback_id)
+            .await;
+        assert_eq!(
+            playback
+                .get_session(guild_id)
+                .unwrap()
+                .playback
+                .lock()
+                .transition_due,
+            None
+        );
+
+        release.send(()).unwrap();
+        let expected = 10.0_f32.powf(-6.0 / 20.0);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let gain = playback
+                    .get_session(guild_id)
+                    .unwrap()
+                    .playback
+                    .lock()
+                    .current_gain;
+                if (gain - expected).abs() < 0.0001 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late loudness ramp stayed frozen without a prepared deck");
+    }
+
+    #[tokio::test]
+    async fn cancelling_prepared_transition_resumes_partial_loudness_ramp() {
+        let guild_id = GuildKey::new(208);
+        let duration = Duration::from_secs(30);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let release = runtime.block_analysis("first");
+        let mut first_analysis = beat_analysis(duration, 120.0);
+        first_analysis.integrated_lufs = Some(-10.0);
+        let second_analysis = beat_analysis(duration, 120.0);
+        runtime.analyze_with("first", first_analysis);
+        runtime.analyze_with("second", second_analysis);
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+            loudness_config(),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        let first = runtime.played()[0].clone();
+        release.send(()).unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let gain = playback
+                    .get_session(guild_id)
+                    .unwrap()
+                    .playback
+                    .lock()
+                    .current_gain;
+                if gain < 0.99 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late loudness ramp did not start");
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        {
+            let session = playback.get_session(guild_id).unwrap();
+            let state = session.playback.lock();
+            assert!(state.prepared_transition.is_some());
+            assert!(state.gain_ramp.is_none());
+        }
+
+        assert_eq!(playback.toggle_loop(guild_id).await, Some(true));
+        let expected = 10.0_f32.powf(-6.0 / 20.0);
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let gain = playback
+                    .get_session(guild_id)
+                    .unwrap()
+                    .playback
+                    .lock()
+                    .current_gain;
+                if (gain - expected).abs() < 0.0001 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("loudness ramp did not resume after transition cancellation");
+    }
+
+    #[tokio::test]
+    async fn stale_loudness_ramp_cannot_change_the_next_track() {
+        let guild_id = GuildKey::new(205);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.analyze_with(
+            "first",
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
+        );
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            disabled_automix_config(),
+            loudness_config(),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request(key)));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .advance(
+                guild_id,
+                first.session_id,
+                first.playback_id,
+                TrackEndReason::Completed,
+            )
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].playback_id;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let second_gains = runtime
+            .volumes()
+            .into_iter()
+            .filter_map(|(id, gain)| (id == second).then_some(gain))
+            .collect::<Vec<_>>();
+        assert_eq!(second_gains, vec![1.0]);
+        let session = playback.get_session(guild_id).unwrap();
+        assert_eq!(session.playback.lock().current_gain, 1.0);
+    }
+
+    #[tokio::test]
+    async fn automix_fade_applies_each_deck_base_gain_exactly_once() {
+        for (offset, kind) in [TransitionKind::Crossfade, TransitionKind::BeatMatched]
+            .into_iter()
+            .enumerate()
+        {
+            let state = Arc::new(MockRuntimeState::default());
+            let outgoing_id = PlaybackId::new(300 + offset as u64 * 2);
+            let incoming_id = PlaybackId::new(outgoing_id.get() + 1);
+            let outgoing: Arc<dyn RuntimeTrackHandle> = Arc::new(MockTrackHandle {
+                playback_id: outgoing_id,
+                state: state.clone(),
+            });
+            let incoming: Arc<dyn RuntimeTrackHandle> = Arc::new(MockTrackHandle {
+                playback_id: incoming_id,
+                state: state.clone(),
+            });
+            let guard = AutoMixPeakGuard::new(0.25, 0.5);
+
+            run_automix_fade(
+                outgoing,
+                incoming,
+                Duration::from_millis(100),
+                kind,
+                0.25,
+                0.5,
+                guard,
+            )
+            .await;
+
+            let incoming_gains = state
+                .volumes
+                .lock()
+                .iter()
+                .filter_map(|(id, gain)| (*id == incoming_id).then_some(*gain))
+                .collect::<Vec<_>>();
+            let (_, midpoint_curve) = automix_peak_safe_mix_gains(kind, 0.5, guard);
+            assert!((incoming_gains[0] - 0.5 * midpoint_curve).abs() < 0.0001);
+            assert!((incoming_gains[1] - 0.5).abs() < 0.0001);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_gapless_handoff_applies_incoming_normalization_once() {
+        let guild_id = GuildKey::new(206);
+        let duration = Duration::from_secs(30);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        runtime.analyze_with("second", loudness_analysis(duration, -10.0, None));
+        let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+            loudness_config(),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].playback_id;
+        let expected = 10.0_f32.powf(-6.0 / 20.0);
+        {
+            let session = playback.get_session(guild_id).unwrap();
+            let state = session.playback.lock();
+            let prepared = state.prepared_transition.as_ref().unwrap();
+            assert_eq!(prepared.transition_kind, TransitionKind::Gapless);
+            assert!((prepared.incoming_gain - expected).abs() < 0.0001);
+        }
+
+        runtime.set_position(first.playback_id, duration);
+        playback
+            .transition(guild_id, first.session_id, first.playback_id)
+            .await;
+
+        let gains = runtime
+            .volumes()
+            .into_iter()
+            .filter_map(|(id, gain)| (id == second).then_some(gain))
+            .collect::<Vec<_>>();
+        assert_eq!(gains.len(), 2);
+        assert_eq!(gains[0], 0.0);
+        assert!((gains[1] - expected).abs() < 0.0001);
+        let session = playback.get_session(guild_id).unwrap();
+        assert!((session.playback.lock().current_gain - expected).abs() < 0.0001);
     }
 
     #[test]
@@ -3423,28 +4276,27 @@ mod tests {
         let guild_id = GuildKey::new(12);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(4);
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
             runtime.clone(),
-            automix_config(Duration::from_millis(20)),
+            automix_config(Duration::from_secs(2)),
         );
         media.resolve_with(
             "first",
-            Ok(track_request_with_duration(
-                "first",
-                Some(Duration::from_secs(1)),
-            )),
+            Ok(track_request_with_duration("first", Some(duration))),
         );
         media.resolve_with(
             "second",
-            Ok(track_request_with_duration(
-                "second",
-                Some(Duration::from_secs(1)),
-            )),
+            Ok(track_request_with_duration("second", Some(duration))),
         );
+        runtime.analyze_with("first", TrackAnalysis::unanalyzed(duration));
+        runtime.analyze_with("second", TrackAnalysis::unanalyzed(duration));
 
         playback.enqueue_impl(guild_id, "first").await.unwrap();
         playback.enqueue_impl(guild_id, "second").await.unwrap();
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
         let first = runtime.played()[0].clone();
         first
             .events
@@ -3467,7 +4319,7 @@ mod tests {
             })
             .unwrap();
 
-        timeout(Duration::from_secs(2), async {
+        timeout(Duration::from_secs(4), async {
             while !runtime.stopped().contains(&first.playback_id) {
                 tokio::task::yield_now().await;
             }
@@ -3490,6 +4342,234 @@ mod tests {
         let preview = playback.queue_preview(guild_id, 8).unwrap();
         assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
         assert_eq!(preview.total_queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn automix_gapless_guard_handoffs_at_audible_boundary_without_fade() {
+        let guild_id = GuildKey::new(133);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(180);
+        let audible_start = Duration::from_secs(2);
+        let audible_end = Duration::from_secs(170);
+        runtime.analyze_with(
+            "first",
+            vocal_gapless_analysis(duration, audible_start, audible_end),
+        );
+        runtime.analyze_with(
+            "second",
+            vocal_gapless_analysis(duration, audible_start, audible_end),
+        );
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+
+        let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+
+        let second = runtime.played()[1].clone();
+        let second_options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(second_options.source_start, audible_start);
+        assert_eq!(second_options.prefetch_after, Some(Duration::from_secs(95)));
+        assert_eq!(
+            second_options.transition_after,
+            Some(Duration::from_secs(110))
+        );
+        assert!(second_options.tempo_envelope.is_none());
+        assert!(second_options.equalizer_enabled);
+        assert!(second_options.equalizer_transition.is_none());
+
+        {
+            let session = playback
+                .get_session(guild_id)
+                .expect("playback session missing");
+            let state = session.playback.lock();
+            let prepared = state
+                .prepared_transition
+                .as_ref()
+                .expect("gapless transition was not prepared");
+            assert_eq!(prepared.transition_kind, TransitionKind::Gapless);
+            assert_eq!(prepared.source_start, audible_start);
+            assert_eq!(prepared.timing.transition_after, audible_end);
+            assert_eq!(prepared.timing.fade_duration, Duration::ZERO);
+        }
+        assert!(runtime.equalizer_schedules().is_empty());
+
+        let volumes_before = runtime.volumes();
+        runtime.set_position(first.playback_id, audible_end);
+        timeout(
+            Duration::from_secs(1),
+            playback.transition(guild_id, first.session_id, first.playback_id),
+        )
+        .await
+        .expect("gapless handoff waited past the audible boundary");
+
+        assert!(runtime.stopped().contains(&first.playback_id));
+        assert_eq!(runtime.resumed(), vec![second.playback_id]);
+        let volumes_after = runtime.volumes();
+        assert_eq!(volumes_after.len(), volumes_before.len() + 1);
+        assert_eq!(
+            volumes_after.last().copied(),
+            Some((second.playback_id, 1.0))
+        );
+        assert!(runtime.equalizer_schedules().is_empty());
+        assert!(
+            playback
+                .get_session(guild_id)
+                .expect("playback session missing")
+                .playback
+                .lock()
+                .retiring_handle
+                .is_none()
+        );
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
+        assert_eq!(preview.total_queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn advance_reuses_prepared_gapless_deck_after_outgoing_end() {
+        let guild_id = GuildKey::new(134);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(180);
+        let audible_start = Duration::from_secs(2);
+        let audible_end = Duration::from_secs(170);
+        runtime.analyze_with(
+            "first",
+            vocal_gapless_analysis(duration, audible_start, audible_end),
+        );
+        runtime.analyze_with(
+            "second",
+            vocal_gapless_analysis(duration, audible_start, audible_end),
+        );
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+
+        let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].clone();
+        let second_options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(second_options.source_start, audible_start);
+
+        playback
+            .advance(
+                guild_id,
+                first.session_id,
+                first.playback_id,
+                TrackEndReason::Completed,
+            )
+            .await;
+
+        assert_eq!(runtime.played().len(), 2);
+        assert!(runtime.stopped().contains(&first.playback_id));
+        assert_eq!(runtime.resumed(), vec![second.playback_id]);
+        assert_eq!(
+            runtime
+                .start_options()
+                .into_iter()
+                .filter(|(key, _)| key == "second")
+                .count(),
+            1
+        );
+        assert!(playback.skip(guild_id).await.is_some());
+        assert!(runtime.stopped().contains(&second.playback_id));
+        let preview = playback.queue_preview(guild_id, 8).unwrap();
+        assert_eq!(preview.current().unwrap().metadata.title.as_ref(), "second");
+        assert_eq!(preview.total_queued(), 0);
+    }
+
+    #[tokio::test]
+    async fn automix_missing_analysis_falls_back_to_metadata_gapless_without_eq() {
+        let guild_id = GuildKey::new(135);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        let first = runtime.played()[0].clone();
+
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].clone();
+        let second_options = runtime
+            .start_options()
+            .into_iter()
+            .find(|(key, _)| key == "second")
+            .expect("second track options")
+            .1;
+        assert_eq!(second_options.source_start, Duration::ZERO);
+        assert!(second_options.equalizer_enabled);
+        assert!(second_options.equalizer_transition.is_none());
+        assert!(second_options.tempo_envelope.is_none());
+
+        {
+            let session = playback
+                .get_session(guild_id)
+                .expect("playback session missing");
+            let state = session.playback.lock();
+            let prepared = state
+                .prepared_transition
+                .as_ref()
+                .expect("metadata fallback was not prepared");
+            assert_eq!(prepared.transition_kind, TransitionKind::Gapless);
+            assert_eq!(prepared.timing.transition_after, duration);
+            assert_eq!(prepared.timing.fade_duration, Duration::ZERO);
+        }
+        assert!(runtime.equalizer_schedules().is_empty());
+
+        runtime.set_position(first.playback_id, duration);
+        timeout(
+            Duration::from_secs(1),
+            playback.transition(guild_id, first.session_id, first.playback_id),
+        )
+        .await
+        .expect("metadata Gapless fallback did not hand off");
+        assert!(runtime.stopped().contains(&first.playback_id));
+        assert_eq!(runtime.resumed(), vec![second.playback_id]);
+        assert!(runtime.equalizer_schedules().is_empty());
     }
 
     #[tokio::test]
@@ -3521,6 +4601,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         };
         runtime.analyze_with("first", analysis.clone());
         runtime.analyze_with("second", analysis);
@@ -3632,29 +4714,16 @@ mod tests {
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
         let duration = Duration::from_secs(30);
-        let analysis = |bpm| TrackAnalysis {
-            duration,
-            audible_start: Duration::ZERO,
-            audible_end: duration,
-            intro_end: None,
-            intro_confidence: 0.0,
-            outro_start: None,
-            outro_confidence: 0.0,
-            vocal_activity: Vec::new(),
-            vocal_activity_confidences: Vec::new(),
-            vocal_activity_rate: 0,
-            energy_profile: Vec::new(),
-            energy_profile_rate: 0,
-            bpm: Some(bpm),
-            beat_confidence: 1.0,
-            first_beat: Some(Duration::ZERO),
-            beat_markers: Vec::new(),
-            beat_marker_confidences: Vec::new(),
-            first_downbeat: Some(Duration::ZERO),
-            downbeat_confidence: 1.0,
-            musical_key: None,
-            rms_dbfs: None,
-            sample_peak_dbfs: None,
+        let analysis = |bpm| {
+            let mut analysis = beat_analysis(duration, bpm);
+            let beat_interval = Duration::from_secs_f64(60.0 / f64::from(bpm));
+            let mut marker = Duration::ZERO;
+            while marker <= duration {
+                analysis.beat_markers.push(marker);
+                marker += beat_interval;
+            }
+            analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
+            analysis
         };
         runtime.analyze_with("first", analysis(120.0));
         runtime.analyze_with("second", analysis(124.0));
@@ -3916,29 +4985,19 @@ mod tests {
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
         let duration = Duration::from_secs(30);
-        let analysis = |bpm, first_beat| TrackAnalysis {
-            duration,
-            audible_start: Duration::ZERO,
-            audible_end: duration,
-            intro_end: None,
-            intro_confidence: 0.0,
-            outro_start: None,
-            outro_confidence: 0.0,
-            vocal_activity: Vec::new(),
-            vocal_activity_confidences: Vec::new(),
-            vocal_activity_rate: 0,
-            energy_profile: Vec::new(),
-            energy_profile_rate: 0,
-            bpm: Some(bpm),
-            beat_confidence: 1.0,
-            first_beat: Some(first_beat),
-            beat_markers: Vec::new(),
-            beat_marker_confidences: Vec::new(),
-            first_downbeat: None,
-            downbeat_confidence: 0.0,
-            musical_key: None,
-            rms_dbfs: None,
-            sample_peak_dbfs: None,
+        let analysis = |bpm, first_beat| {
+            let mut analysis = beat_analysis(duration, bpm);
+            analysis.first_beat = Some(first_beat);
+            analysis.first_downbeat = None;
+            analysis.downbeat_confidence = 0.0;
+            let beat_interval = Duration::from_secs_f64(60.0 / f64::from(bpm));
+            let mut marker = first_beat;
+            while marker <= duration {
+                analysis.beat_markers.push(marker);
+                marker += beat_interval;
+            }
+            analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
+            analysis
         };
         runtime.analyze_with("first", analysis(120.0, Duration::ZERO));
         runtime.analyze_with("second", analysis(124.0, Duration::from_millis(50)));
@@ -3975,9 +5034,17 @@ mod tests {
         assert!(attempts[0].tempo_envelope.is_some());
         assert!(attempts[0].equalizer_transition.is_some());
         assert_eq!(attempts[0].source_start, Duration::from_millis(50));
+        assert_eq!(
+            attempts[0].transition_after,
+            Some(Duration::from_millis(500))
+        );
         assert!(attempts[1].tempo_envelope.is_none());
         assert!(attempts[1].equalizer_transition.is_none());
         assert_eq!(attempts[1].source_start, Duration::from_millis(50));
+        assert_eq!(
+            attempts[1].transition_after,
+            Some(Duration::from_millis(450))
+        );
     }
 
     #[tokio::test]
@@ -4009,6 +5076,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         };
         runtime.analyze_with("first", analysis(Duration::ZERO));
         runtime.analyze_with("second", analysis(Duration::from_millis(50)));
@@ -4069,6 +5138,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         };
         runtime.analyze_with("first", analysis.clone());
         runtime.analyze_with("second", analysis);
@@ -4138,6 +5209,53 @@ mod tests {
         })
         .await
         .expect("analyzed audible end did not rearm the current AutoMix transition");
+    }
+
+    #[tokio::test]
+    async fn late_current_analysis_rearms_inside_the_audible_prefetch_window() {
+        let guild_id = GuildKey::new(137);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let release = runtime.block_analysis("first");
+        let metadata_duration = Duration::from_secs(200);
+        let audible_end = Duration::from_secs(100);
+        let mut analysis = beat_analysis(metadata_duration, 120.0);
+        analysis.audible_end = audible_end;
+        runtime.analyze_with("first", analysis.clone());
+        runtime.analyze_with("second", analysis);
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(
+                key,
+                Ok(track_request_with_duration(key, Some(metadata_duration))),
+            );
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        let first = runtime.played()[0].clone();
+        timeout(Duration::from_secs(2), async {
+            while !runtime.analysis_calls().iter().any(|key| key == "first") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("current analysis did not start");
+        runtime.set_position(first.playback_id, Duration::from_millis(91_900));
+        release.send(()).expect("analysis blocker release failed");
+
+        runtime.wait_for_play_count(2).await;
+        let second = runtime.played()[1].clone();
+        timeout(Duration::from_secs(2), async {
+            while !runtime.resumed().contains(&second.playback_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late current analysis did not rearm AutoMix");
+        assert_eq!(runtime.played().len(), 2);
     }
 
     #[tokio::test]

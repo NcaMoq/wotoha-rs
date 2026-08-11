@@ -9,6 +9,10 @@ const DEFAULT_LOG_FILE: &str = "wotoha-app.runtime.log";
 const DEFAULT_RUST_LOG: &str = "info,wotoha_debug=info";
 const DEFAULT_LOG_ANSI: bool = false;
 const DEFAULT_PLAYBACK_VOLUME: f32 = 0.10;
+const DEFAULT_LOUDNESS_NORMALIZATION_ENABLED: bool = true;
+const DEFAULT_LOUDNESS_TARGET_LUFS: f32 = -16.0;
+const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 6.0;
+const DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP: f32 = -2.0;
 const DEFAULT_MAX_QUEUE_LEN: usize = 512;
 const DEFAULT_MAX_PENDING_ENQUEUES: usize = 64;
 const DEFAULT_AUTOMIX_ENABLED: bool = true;
@@ -43,9 +47,18 @@ impl LogConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlaybackConfig {
     pub default_volume: f32,
+    pub loudness: LoudnessConfig,
     pub max_queue_len: usize,
     pub max_pending_enqueues: usize,
     pub automix: AutoMixConfig,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoudnessConfig {
+    pub enabled: bool,
+    pub target_lufs: f32,
+    pub max_boost_db: f32,
+    pub true_peak_ceiling_dbtp: f32,
 }
 
 impl BotConfig {
@@ -94,6 +107,32 @@ impl BotConfig {
             0.0,
             MAX_PLAYBACK_VOLUME,
         )?;
+        let loudness_enabled = read_optional_bool(
+            &get,
+            "WOTOHA_LOUDNESS_NORMALIZATION_ENABLED",
+            DEFAULT_LOUDNESS_NORMALIZATION_ENABLED,
+        )?;
+        let loudness_target_lufs = read_optional_f32(
+            &get,
+            "WOTOHA_LOUDNESS_TARGET_LUFS",
+            DEFAULT_LOUDNESS_TARGET_LUFS,
+            -24.0,
+            -8.0,
+        )?;
+        let loudness_max_boost_db = read_optional_f32(
+            &get,
+            "WOTOHA_LOUDNESS_MAX_BOOST_DB",
+            DEFAULT_LOUDNESS_MAX_BOOST_DB,
+            0.0,
+            12.0,
+        )?;
+        let loudness_true_peak_ceiling_dbtp = read_optional_f32(
+            &get,
+            "WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP",
+            DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP,
+            -6.0,
+            0.0,
+        )?;
         let automix_enabled =
             read_optional_bool(&get, "WOTOHA_AUTOMIX_ENABLED", DEFAULT_AUTOMIX_ENABLED)?;
         let automix_crossfade_seconds = read_optional_f32(
@@ -128,6 +167,12 @@ impl BotConfig {
             },
             playback: PlaybackConfig {
                 default_volume,
+                loudness: LoudnessConfig {
+                    enabled: loudness_enabled,
+                    target_lufs: loudness_target_lufs,
+                    max_boost_db: loudness_max_boost_db,
+                    true_peak_ceiling_dbtp: loudness_true_peak_ceiling_dbtp,
+                },
                 max_queue_len,
                 max_pending_enqueues,
                 automix: AutoMixConfig {
@@ -319,6 +364,10 @@ mod tests {
         assert_eq!(config.logging.rust_log, "info,wotoha_debug=info");
         assert!(!config.logging.ansi);
         assert_eq!(config.playback.default_volume, 0.10);
+        assert!(config.playback.loudness.enabled);
+        assert_eq!(config.playback.loudness.target_lufs, -16.0);
+        assert_eq!(config.playback.loudness.max_boost_db, 6.0);
+        assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -2.0);
         assert_eq!(config.playback.max_queue_len, 512);
         assert_eq!(config.playback.max_pending_enqueues, 64);
         assert!(config.playback.automix.enabled);
@@ -334,6 +383,10 @@ mod tests {
             ("RUST_LOG", "warn,wotoha=debug"),
             ("WOTOHA_LOG_ANSI", "true"),
             ("WOTOHA_DEFAULT_VOLUME", "0.25"),
+            ("WOTOHA_LOUDNESS_NORMALIZATION_ENABLED", "false"),
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "-18.5"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "4.5"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "-1.5"),
             ("WOTOHA_MAX_QUEUE_LEN", "256"),
             ("WOTOHA_MAX_PENDING_ENQUEUES", "32"),
             ("WOTOHA_AUTOMIX_ENABLED", "false"),
@@ -352,6 +405,10 @@ mod tests {
         assert_eq!(config.logging.rust_log, "warn,wotoha=debug");
         assert!(config.logging.ansi);
         assert_eq!(config.playback.default_volume, 0.25);
+        assert!(!config.playback.loudness.enabled);
+        assert_eq!(config.playback.loudness.target_lufs, -18.5);
+        assert_eq!(config.playback.loudness.max_boost_db, 4.5);
+        assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -1.5);
         assert_eq!(config.playback.max_queue_len, 256);
         assert_eq!(config.playback.max_pending_enqueues, 32);
         assert!(!config.playback.automix.enabled);
@@ -389,6 +446,105 @@ mod tests {
             load_from(&[("DISCORD_TOKEN", "token"), ("WOTOHA_DEFAULT_VOLUME", "nan")]).unwrap_err();
 
         assert!(matches!(error, ConfigError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn accepts_loudness_range_boundaries() {
+        let minimums = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "-24"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "0"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "-6"),
+        ])
+        .unwrap();
+
+        assert_eq!(minimums.playback.loudness.target_lufs, -24.0);
+        assert_eq!(minimums.playback.loudness.max_boost_db, 0.0);
+        assert_eq!(minimums.playback.loudness.true_peak_ceiling_dbtp, -6.0);
+
+        let maximums = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "-8"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "12"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "0"),
+        ])
+        .unwrap();
+
+        assert_eq!(maximums.playback.loudness.target_lufs, -8.0);
+        assert_eq!(maximums.playback.loudness.max_boost_db, 12.0);
+        assert_eq!(maximums.playback.loudness.true_peak_ceiling_dbtp, 0.0);
+    }
+
+    #[test]
+    fn rejects_invalid_loudness_boolean() {
+        let error = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_NORMALIZATION_ENABLED", "sometimes"),
+        ])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::InvalidBool {
+                name: "WOTOHA_LOUDNESS_NORMALIZATION_ENABLED",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_and_non_numeric_loudness_values() {
+        let error = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", " "),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Empty {
+                name: "WOTOHA_LOUDNESS_TARGET_LUFS"
+            }
+        ));
+
+        let error = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "loud"),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidNumber {
+                name: "WOTOHA_LOUDNESS_MAX_BOOST_DB",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_non_finite_loudness_values() {
+        for (name, value) in [
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "NaN"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "inf"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "-inf"),
+        ] {
+            let error = load_from(&[("DISCORD_TOKEN", "token"), (name, value)]).unwrap_err();
+            assert!(matches!(error, ConfigError::OutOfRange { .. }));
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_loudness_values() {
+        for (name, value) in [
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "-24.1"),
+            ("WOTOHA_LOUDNESS_TARGET_LUFS", "-7.9"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "-0.1"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "12.1"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "-6.1"),
+            ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "0.1"),
+        ] {
+            let error = load_from(&[("DISCORD_TOKEN", "token"), (name, value)]).unwrap_err();
+            assert!(matches!(error, ConfigError::OutOfRange { .. }));
+        }
     }
 
     #[test]

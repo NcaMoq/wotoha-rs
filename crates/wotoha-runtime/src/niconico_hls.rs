@@ -30,14 +30,25 @@ pub struct NiconicoHlsRequest {
     client: Client,
     playlist_url: String,
     headers: HeaderMap,
+    cancellation: Option<CancellationToken>,
 }
 
 impl NiconicoHlsRequest {
     pub fn new(client: Client, playlist_url: String, headers: HeaderMap) -> Self {
+        Self::new_with_cancellation(client, playlist_url, headers, None)
+    }
+
+    pub(crate) fn new_with_cancellation(
+        client: Client,
+        playlist_url: String,
+        headers: HeaderMap,
+        cancellation: Option<CancellationToken>,
+    ) -> Self {
         Self {
             client,
             playlist_url,
             headers,
+            cancellation,
         }
     }
 
@@ -94,7 +105,15 @@ impl NiconicoHlsRequest {
                 key_cache.insert(encryption.key_url.clone(), key);
             }
         }
-        Ok(spawn_source_forwarder(client, playlist, key_cache))
+        let source = spawn_source_forwarder(client, playlist, key_cache);
+        if let Some(cancellation) = self.cancellation.clone() {
+            let source_cancellation = source.cancellation.clone();
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                source_cancellation.cancel();
+            });
+        }
+        Ok(source)
     }
 }
 

@@ -11,6 +11,7 @@ bytes = "1.10.1"
 cipher = "0.4.4"
 cbc = "0.1.2"
 dashmap.workspace = true
+ebur128 = "=0.1.10"
 futures.workspace = true
 hls_m3u8 = "0.4.1"
 patricia_tree = "0.8.0"

@@ -324,8 +324,8 @@ mod tests {
     use super::*;
     use symphonia::core::audio::{Channels, SignalSpec};
     use wotoha_core::automix::{
-        AutoMixConfig, EqTransitionRole, TrackAnalysis, TransitionKind, automix_mix_gains,
-        plan_transition,
+        AutoMixConfig, AutoMixPeakGuard, EqTransitionRole, TrackAnalysis, TransitionKind,
+        automix_peak_safe_mix_gains, plan_transition,
     };
 
     fn outgoing(start: Duration) -> EqTransition {
@@ -468,7 +468,14 @@ mod tests {
             OutputTimeline::stretched(plan.incoming_start, envelope),
         );
 
-        let mixed = automix_mix(&outgoing_samples, &incoming_samples, plan.kind);
+        let peak_guard = AutoMixPeakGuard::from_analyses(&outgoing, &incoming, plan.incoming_gain);
+        let mixed = automix_mix(
+            &outgoing_samples,
+            &incoming_samples,
+            plan.kind,
+            plan.incoming_gain,
+            peak_guard,
+        );
         let continuity_window = Duration::from_millis(500);
         let start_rms = window_rms(&mixed, SAMPLE_RATE, continuity_window);
         let mid_rms = window_rms_at(&mixed, SAMPLE_RATE, plan.duration / 2, continuity_window);
@@ -531,6 +538,8 @@ mod tests {
             musical_key: None,
             rms_dbfs: Some(-12.0),
             sample_peak_dbfs: Some(-3.0),
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         }
     }
 
@@ -565,7 +574,13 @@ mod tests {
         kick + musical_bed
     }
 
-    fn automix_mix(outgoing: &[f32], incoming: &[f32], kind: TransitionKind) -> Vec<f32> {
+    fn automix_mix(
+        outgoing: &[f32],
+        incoming: &[f32],
+        kind: TransitionKind,
+        incoming_base_gain: f32,
+        peak_guard: AutoMixPeakGuard,
+    ) -> Vec<f32> {
         let last = outgoing.len().saturating_sub(1).max(1) as f32;
         outgoing
             .iter()
@@ -573,8 +588,9 @@ mod tests {
             .enumerate()
             .map(|(index, (outgoing, incoming))| {
                 let progress = index as f32 / last;
-                let (outgoing_gain, incoming_gain) = automix_mix_gains(kind, progress);
-                outgoing * outgoing_gain + incoming * incoming_gain
+                let (outgoing_gain, incoming_gain) =
+                    automix_peak_safe_mix_gains(kind, progress, peak_guard);
+                outgoing * outgoing_gain + incoming * incoming_base_gain * incoming_gain
             })
             .collect()
     }

@@ -8,6 +8,8 @@ use wotoha_contracts::VoiceRuntime;
 use wotoha_core::{
     TrackRequest,
     automix::{AutoMixConfig, TrackAnalysis, plan_guarded_transition, transition_score_breakdown},
+    config::LoudnessConfig,
+    loudness::loudness_normalization_gain,
 };
 use wotoha_media::MediaResolver;
 use wotoha_runtime::SongbirdRuntime;
@@ -146,7 +148,7 @@ fn print_analysis(index: usize, analysis: Option<&TrackAnalysis>) {
         return;
     };
     println!(
-        "ANALYSIS\t{index}\tok\tduration_ms={}\taudible_start_ms={}\taudible_end_ms={}\tbpm={}\tbeat_confidence={:.3}\tkick_coverage={:.3}\tintro_ms={}\toutro_ms={}\trms_dbfs={}\tpeak_dbfs={}",
+        "ANALYSIS\t{index}\tok\tduration_ms={}\taudible_start_ms={}\taudible_end_ms={}\tbpm={}\tbeat_confidence={:.3}\tkick_coverage={:.3}\tintro_ms={}\toutro_ms={}\trms_dbfs={}\tpeak_dbfs={}\tintegrated_lufs={}\ttrue_peak_dbtp={}",
         analysis.duration.as_millis(),
         analysis.audible_start.as_millis(),
         analysis.audible_end.as_millis(),
@@ -157,11 +159,14 @@ fn print_analysis(index: usize, analysis: Option<&TrackAnalysis>) {
         format_optional_duration_ms(analysis.outro_start),
         format_optional_f32(analysis.rms_dbfs),
         format_optional_f32(analysis.sample_peak_dbfs),
+        format_optional_f32(analysis.integrated_lufs),
+        format_optional_f32(analysis.true_peak_dbtp),
     );
 }
 
 fn print_automix_plans(tracks: &[PreparedProbe]) {
     let config = automix_probe_config();
+    let loudness = loudness_probe_config();
     for pair in tracks.windows(2) {
         let [outgoing, incoming] = pair else {
             continue;
@@ -184,8 +189,12 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
         let plan = &guarded.plan;
         let quality = &guarded.quality;
         let score_breakdown = transition_score_breakdown(quality);
+        let outgoing_normalization_gain =
+            loudness_normalization_gain(&loudness, Some(outgoing_analysis));
+        let incoming_normalization_gain =
+            loudness_normalization_gain(&loudness, Some(incoming_analysis));
         println!(
-            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\ttransition_score={}\tscore_energy_balance_penalty={}\tscore_vocal_penalty={}\tscore_short_mix_penalty={}\tscore_energy_step_penalty={}\tscore_handoff_energy_penalty={}\tscore_handoff_ownership_penalty={}\tscore_tempo_smoothness_penalty={}\tscore_phrase_strength_penalty={}\tscore_structure_usage_penalty={}\tscore_harmonic_overlap_penalty={}\tharmonic_compatibility={}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
+            "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tincoming_cue_selected={}\tincoming_cue_default_start_ms={}\tincoming_cue_candidates_checked={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\toutgoing_normalization_gain={:.3}\tincoming_normalization_gain={:.3}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\ttransition_score={}\tscore_energy_balance_penalty={}\tscore_vocal_penalty={}\tscore_short_mix_penalty={}\tscore_energy_step_penalty={}\tscore_handoff_energy_penalty={}\tscore_handoff_ownership_penalty={}\tscore_tempo_smoothness_penalty={}\tscore_phrase_strength_penalty={}\tscore_structure_usage_penalty={}\tscore_harmonic_overlap_penalty={}\tharmonic_compatibility={}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
             outgoing.index,
             incoming.index,
             track_key(outgoing),
@@ -202,10 +211,22 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
             plan.kind,
             plan.outgoing_start.as_millis(),
             plan.incoming_start.as_millis(),
+            plan.incoming_cue_selection
+                .is_some_and(|selection| selection.selected_start != selection.default_start),
+            format_optional_duration_ms(
+                plan.incoming_cue_selection
+                    .map(|selection| selection.default_start),
+            ),
+            plan.incoming_cue_selection.map_or_else(
+                || "-".to_owned(),
+                |selection| selection.candidates_checked.to_string()
+            ),
             plan.duration.as_millis(),
             plan.incoming_tempo_ratio,
             plan.tempo_envelope
                 .map_or(plan.incoming_tempo_ratio, |envelope| envelope.mix_end_speed),
+            outgoing_normalization_gain,
+            incoming_normalization_gain,
             plan.incoming_gain,
             quality.is_ok(),
             quality.issues,
@@ -278,12 +299,13 @@ async fn render_preview(
             outgoing_analysis,
             incoming_analysis,
             &automix_probe_config(),
+            &loudness_probe_config(),
         )
         .await?;
     let bytes = preview.wav.len();
     std::fs::write(path, &preview.wav)?;
     println!(
-        "AUTOMIX_PREVIEW\t{}\t{}\tok\tpath={}\tsample_rate={}\tchannels={}\tbytes={}\tkind={:?}\tquality_ok={}\trender_ok={}\trender_issues={:?}\tstart_rms_dbfs={:.2}\tmid_rms_dbfs={:.2}\tend_rms_dbfs={:.2}\tquietest_window_rms_dbfs={:.2}\tquietest_to_edge_ratio={:.3}\tmid_to_edge_ratio={:.3}\tsample_peak_dbfs={:.2}",
+        "AUTOMIX_PREVIEW\t{}\t{}\tok\tpath={}\tsample_rate={}\tchannels={}\tbytes={}\tkind={:?}\tquality_ok={}\trender_ok={}\trender_issues={:?}\toutgoing_normalization_gain={:.3}\tincoming_normalization_gain={:.3}\tstart_rms_dbfs={:.2}\tmid_rms_dbfs={:.2}\tend_rms_dbfs={:.2}\tquietest_window_rms_dbfs={:.2}\tquietest_to_edge_ratio={:.3}\tmid_to_edge_ratio={:.3}\tsample_peak_dbfs={:.2}",
         outgoing.index,
         incoming.index,
         path.display(),
@@ -294,6 +316,8 @@ async fn render_preview(
         preview.quality.is_ok(),
         preview.render_issues.is_empty(),
         preview.render_issues,
+        preview.outgoing_normalization_gain,
+        preview.incoming_normalization_gain,
         preview.render_metrics.start_rms_dbfs,
         preview.render_metrics.mid_rms_dbfs,
         preview.render_metrics.end_rms_dbfs,
@@ -318,6 +342,15 @@ fn automix_probe_config() -> AutoMixConfig {
         crossfade: Duration::from_secs(8),
         max_tempo_adjustment: 0.06,
         min_beat_confidence: 0.7,
+    }
+}
+
+fn loudness_probe_config() -> LoudnessConfig {
+    LoudnessConfig {
+        enabled: true,
+        target_lufs: -16.0,
+        max_boost_db: 6.0,
+        true_peak_ceiling_dbtp: -2.0,
     }
 }
 

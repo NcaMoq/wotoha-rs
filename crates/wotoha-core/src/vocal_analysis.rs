@@ -57,7 +57,7 @@ impl VocalActivityAnalyzer {
             downsample_sum: 0.0,
             downsample_count: 0,
             voiced_samples: Vec::with_capacity(
-                (VOICING_RATE / u32::from(VOCAL_ACTIVITY_RATE)) as usize + 1,
+                (sample_rate.min(VOICING_RATE) / u32::from(VOCAL_ACTIVITY_RATE)) as usize + 1,
             ),
             raw: Vec::new(),
         })
@@ -72,7 +72,11 @@ impl VocalActivityAnalyzer {
 
         self.downsample_sum += vocal;
         self.downsample_count += 1;
-        self.downsample_phase += VOICING_RATE as u64;
+        // Do not try to upsample when the source rate is below the voicing
+        // analysis rate. In that case each source sample is already the most
+        // detailed sample we can provide to the voicing metrics.
+        let voicing_rate = self.sample_rate.min(VOICING_RATE);
+        self.downsample_phase += u64::from(voicing_rate);
         if self.downsample_phase >= self.sample_rate as u64 {
             self.downsample_phase -= self.sample_rate as u64;
             self.voiced_samples
@@ -160,12 +164,13 @@ impl VocalActivityAnalyzer {
         let vocal_ratio = vocal_rms / full_rms.max(1.0e-7);
         let vocal_mean_square = self.vocal_energy as f32 / self.frames as f32;
         let crest = self.peak * self.peak / vocal_mean_square.max(1.0e-9);
+        let voicing_rate = self.sample_rate.min(VOICING_RATE);
         self.raw.push(RawBin {
             full_rms,
             vocal_ratio,
-            voicing: voicing_strength(&self.voiced_samples, VOICING_RATE),
-            modulation: amplitude_modulation(&self.voiced_samples, VOICING_RATE),
-            activity_duty: activity_duty(&self.voiced_samples, VOICING_RATE),
+            voicing: voicing_strength(&self.voiced_samples, voicing_rate),
+            modulation: amplitude_modulation(&self.voiced_samples, voicing_rate),
+            activity_duty: activity_duty(&self.voiced_samples, voicing_rate),
             zero_crossing_rate: zero_crossing_rate(&self.voiced_samples),
             crest,
         });
@@ -429,5 +434,44 @@ mod tests {
             profile.activity.iter().all(|risk| *risk < 140),
             "{profile:?}"
         );
+    }
+
+    #[test]
+    fn downsample_phase_does_not_accumulate_when_source_is_below_voicing_rate() {
+        let rate = 1_000;
+        let mut analyzer = VocalActivityAnalyzer::new(rate).unwrap();
+        for _ in 0..100 {
+            analyzer.push(0.25);
+        }
+
+        assert_eq!(analyzer.downsample_phase, 0);
+        assert_eq!(analyzer.downsample_count, 0);
+        assert_eq!(analyzer.voiced_samples.len(), 100);
+    }
+
+    #[test]
+    fn downsample_phase_is_stable_at_voicing_rate_boundary() {
+        let rate = VOICING_RATE;
+        let mut analyzer = VocalActivityAnalyzer::new(rate).unwrap();
+        for _ in 0..100 {
+            analyzer.push(0.25);
+        }
+
+        assert_eq!(analyzer.downsample_phase, 0);
+        assert_eq!(analyzer.downsample_count, 0);
+        assert_eq!(analyzer.voiced_samples.len(), 100);
+    }
+
+    #[test]
+    fn downsample_phase_preserves_48khz_timing() {
+        let rate = 48_000;
+        let mut analyzer = VocalActivityAnalyzer::new(rate).unwrap();
+        for _ in 0..25 {
+            analyzer.push(0.25);
+        }
+
+        assert_eq!(analyzer.downsample_phase, u64::from(VOICING_RATE));
+        assert_eq!(analyzer.downsample_count, 1);
+        assert_eq!(analyzer.voiced_samples.len(), 1);
     }
 }

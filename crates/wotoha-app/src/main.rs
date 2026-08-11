@@ -82,10 +82,11 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let playback_runtime =
         ConfiguredVoiceRuntime::new(playback_runtime, config.playback.default_volume);
     append_debug_log("main: playback runtime created");
-    let playback = PlaybackCoordinator::new_with_automix(
+    let playback = PlaybackCoordinator::new_with_automix_and_loudness(
         resolver,
         playback_runtime.clone(),
         config.playback.automix.clone(),
+        config.playback.loudness.clone(),
     );
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
@@ -220,6 +221,13 @@ where
         request: &TrackRequest,
     ) -> Option<wotoha_core::automix::TrackAnalysis> {
         self.inner.analyze_track(request).await
+    }
+
+    fn cached_track_analysis(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<wotoha_core::automix::TrackAnalysis> {
+        self.inner.cached_track_analysis(request)
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -655,7 +663,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredPlayback, ConfiguredPlaybackError, ConfiguredTrackHandle, PendingReservation,
+        ConfiguredPlayback, ConfiguredPlaybackError, ConfiguredTrackHandle, ConfiguredVoiceRuntime,
+        PendingReservation,
     };
     use async_trait::async_trait;
     use std::{
@@ -668,13 +677,14 @@ mod tests {
         time::Duration,
     };
     use wotoha_contracts::{
-        ChannelKey, EnqueueOutcome, GuildKey, PlaybackService, RuntimeTrackHandle, UserKey,
-        VoiceActionAccess, VoicePeerSnapshot, VoiceUpdateDecision,
+        ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackService, RuntimeEventSink,
+        RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess, VoicePeerSnapshot,
+        VoiceRuntime, VoiceUpdateDecision,
     };
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
         automix::{AutoMixConfig, EqTransition, EqTransitionRole},
-        config::PlaybackConfig,
+        config::{LoudnessConfig, PlaybackConfig},
     };
 
     #[derive(Clone, Default)]
@@ -790,9 +800,60 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct MockVoiceRuntime {
+        start_options: Arc<Mutex<Vec<TrackStartOptions>>>,
+        volumes: Arc<Mutex<Vec<f32>>>,
+    }
+
+    #[async_trait]
+    impl VoiceRuntime for MockVoiceRuntime {
+        type Error = MockPlaybackError;
+
+        async fn play_track(
+            &self,
+            _guild_id: GuildKey,
+            _session_id: u64,
+            _playback_id: PlaybackId,
+            _request: &TrackRequest,
+            _events: RuntimeEventSink,
+        ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+            Ok(Arc::new(MockTrackHandle {
+                stopped: Arc::default(),
+                volumes: self.volumes.clone(),
+                equalizer_transitions: Arc::default(),
+                cancelled_equalizers: Arc::default(),
+            }))
+        }
+
+        async fn play_track_with_options(
+            &self,
+            guild_id: GuildKey,
+            session_id: u64,
+            playback_id: PlaybackId,
+            request: &TrackRequest,
+            events: RuntimeEventSink,
+            options: TrackStartOptions,
+        ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
+            self.start_options.lock().unwrap().push(options);
+            self.play_track(guild_id, session_id, playback_id, request, events)
+                .await
+        }
+
+        async fn disconnect_guild(&self, _guild_id: GuildKey) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
     fn playback_config(max_queue_len: usize, max_pending_enqueues: usize) -> PlaybackConfig {
         PlaybackConfig {
             default_volume: 0.25,
+            loudness: LoudnessConfig {
+                enabled: true,
+                target_lufs: -16.0,
+                max_boost_db: 6.0,
+                true_peak_ceiling_dbtp: -2.0,
+            },
             max_queue_len,
             max_pending_enqueues,
             automix: AutoMixConfig {
@@ -880,6 +941,31 @@ mod tests {
 
         assert_eq!(*volumes.lock().unwrap(), vec![0.1]);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_voice_runtime_composes_master_and_track_gain_once() {
+        let inner = MockVoiceRuntime::default();
+        let runtime = ConfiguredVoiceRuntime::new(inner.clone(), 0.25);
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let handle = runtime
+            .play_track_with_options(
+                GuildKey::new(1),
+                1,
+                PlaybackId::new(1),
+                &track_request("track"),
+                events,
+                TrackStartOptions {
+                    initial_gain: 0.5,
+                    ..TrackStartOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(inner.start_options.lock().unwrap()[0].initial_gain, 0.125);
+        handle.set_volume(0.5);
+        assert_eq!(*inner.volumes.lock().unwrap(), vec![0.125]);
     }
 
     #[test]

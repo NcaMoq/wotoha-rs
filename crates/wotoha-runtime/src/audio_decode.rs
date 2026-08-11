@@ -1,5 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
+use ebur128::{EbuR128, Mode};
 use songbird::input::{Input, LiveInput};
 use symphonia::core::{audio::SampleBuffer, errors::Error};
 use wotoha_core::{
@@ -12,8 +16,94 @@ use wotoha_core::{
 const ANALYSIS_RATE: u32 = 1_000;
 const TONAL_RATE: u32 = 11_025;
 const STRUCTURE_RATE: u32 = 4;
-const MAX_ANALYSIS_SECONDS: usize = 30 * 60;
+pub(crate) const MAX_ANALYSIS_DURATION: Duration = Duration::from_secs(30 * 60);
+const MAX_ANALYSIS_SECONDS: usize = MAX_ANALYSIS_DURATION.as_secs() as usize;
 const MAX_TONAL_SECONDS: usize = 6 * 60;
+
+struct LoudnessMeasurement {
+    analyzer: Option<EbuR128>,
+    layout: Option<(u32, u32)>,
+    failed: bool,
+}
+
+impl LoudnessMeasurement {
+    fn new() -> Self {
+        Self {
+            analyzer: None,
+            layout: None,
+            failed: false,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32], channels: usize, sample_rate: u32) {
+        if self.failed || samples.iter().any(|sample| !sample.is_finite()) {
+            self.invalidate();
+            return;
+        }
+
+        let Ok(channels) = u32::try_from(channels) else {
+            self.invalidate();
+            return;
+        };
+        let layout = (channels, sample_rate);
+        if self.layout.is_some_and(|configured| configured != layout) {
+            self.invalidate();
+            return;
+        }
+        if self.analyzer.is_none() {
+            let Ok(analyzer) = EbuR128::new(channels, sample_rate, Mode::I | Mode::TRUE_PEAK)
+            else {
+                self.invalidate();
+                return;
+            };
+            self.analyzer = Some(analyzer);
+            self.layout = Some(layout);
+        }
+        if self
+            .analyzer
+            .as_mut()
+            .is_none_or(|analyzer| analyzer.add_frames_f32(samples).is_err())
+        {
+            self.invalidate();
+        }
+    }
+
+    fn finish(self) -> (Option<f32>, Option<f32>) {
+        if self.failed {
+            return (None, None);
+        }
+        let (Some(analyzer), Some((channels, _))) = (self.analyzer, self.layout) else {
+            return (None, None);
+        };
+
+        let integrated_lufs = analyzer
+            .loudness_global()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|value| value as f32)
+            .filter(|value| value.is_finite());
+
+        let mut maximum_true_peak = 0.0_f64;
+        for channel in 0..channels {
+            let Ok(peak) = analyzer.true_peak(channel) else {
+                return (integrated_lufs, None);
+            };
+            if !peak.is_finite() || peak < 0.0 {
+                return (integrated_lufs, None);
+            }
+            maximum_true_peak = maximum_true_peak.max(peak);
+        }
+        let true_peak_dbtp = (maximum_true_peak > f64::EPSILON)
+            .then(|| (20.0 * maximum_true_peak.log10()) as f32)
+            .filter(|value| value.is_finite());
+        (integrated_lufs, true_peak_dbtp)
+    }
+
+    fn invalidate(&mut self) {
+        self.analyzer = None;
+        self.failed = true;
+    }
+}
 
 #[cfg(test)]
 pub(crate) fn analyze_input(input: Input) -> Option<TrackAnalysis> {
@@ -59,6 +149,7 @@ fn analyze_input_with_limit(
     let mut sum_squares = 0.0_f64;
     let mut loudness_samples = 0_u64;
     let mut sample_peak = 0.0_f32;
+    let mut loudness = LoudnessMeasurement::new();
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return None;
@@ -92,13 +183,34 @@ fn analyze_input_with_limit(
         }
         let mut buffer = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
         buffer.copy_interleaved_ref(decoded);
-        for sample in buffer.samples() {
+        let decoded_samples = buffer.samples();
+        loudness.push(decoded_samples, channels, source_rate);
+        // A malformed decoder sample must not poison the existing structural
+        // analyzers. Loudness is invalidated for the whole track above, while
+        // the remaining analysis can continue with silence at that position.
+        let sanitized_samples = decoded_samples
+            .iter()
+            .any(|sample| !sample.is_finite())
+            .then(|| {
+                decoded_samples
+                    .iter()
+                    .map(|sample| {
+                        if sample.is_finite() {
+                            *sample
+                        } else {
+                            f32::default()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let samples = sanitized_samples.as_deref().unwrap_or(decoded_samples);
+        for sample in samples {
             let sample = *sample;
             sum_squares += f64::from(sample) * f64::from(sample);
             loudness_samples = loudness_samples.saturating_add(1);
             sample_peak = sample_peak.max(sample.abs());
         }
-        for frame in buffer.samples().chunks(channels) {
+        for frame in samples.chunks(channels) {
             let sample = frame
                 .iter()
                 .copied()
@@ -167,6 +279,7 @@ fn analyze_input_with_limit(
     if sample_peak > f32::EPSILON {
         analysis.sample_peak_dbfs = Some(20.0 * sample_peak.log10());
     }
+    (analysis.integrated_lufs, analysis.true_peak_dbtp) = loudness.finish();
     Some(analysis)
 }
 
@@ -293,6 +406,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decoded_silence_has_no_loudness_or_true_peak_measurement() {
+        let input = Input::from(mono_wav(16_000, &vec![0; 32_000]));
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        let analysis = analyze_input(playable).expect("silent WAV should still be analyzed");
+
+        assert_eq!(analysis.integrated_lufs, None);
+        assert_eq!(analysis.true_peak_dbtp, None);
+    }
+
+    #[tokio::test]
     async fn rejects_audio_longer_than_the_analysis_limit() {
         let input = Input::from(click_track_wav());
         let playable = input
@@ -336,6 +463,93 @@ mod tests {
             .expect("sample peak should be measured");
         assert!(rms < peak);
         assert!(peak <= 0.01);
+        assert!(
+            analysis
+                .integrated_lufs
+                .is_some_and(|loudness| loudness.is_finite()),
+            "{analysis:?}"
+        );
+        assert!(
+            analysis.true_peak_dbtp.is_some_and(|peak| peak.is_finite()),
+            "{analysis:?}"
+        );
+    }
+
+    #[test]
+    fn integrated_loudness_tracks_amplitude_in_decibels() {
+        let full_scale = measure_tone(1.0);
+        let half_scale = measure_tone(0.5);
+        let difference = half_scale.0.unwrap() - full_scale.0.unwrap();
+
+        assert!(
+            (difference + 6.020_6).abs() < 0.05,
+            "difference={difference}"
+        );
+        assert!(half_scale.1.is_some_and(|peak| peak.is_finite()));
+    }
+
+    #[test]
+    fn stereo_interleaving_reports_the_maximum_true_peak_across_channels() {
+        const SAMPLE_RATE: u32 = 48_000;
+        const SECONDS: usize = 3;
+        let samples = (0..SAMPLE_RATE as usize * SECONDS)
+            .flat_map(|index| {
+                let phase = std::f32::consts::TAU * 1_000.0 * index as f32 / SAMPLE_RATE as f32;
+                [0.1 * phase.sin(), 0.8 * phase.sin()]
+            })
+            .collect::<Vec<_>>();
+        let mut measurement = LoudnessMeasurement::new();
+        measurement.push(&samples, 2, SAMPLE_RATE);
+
+        let (integrated_lufs, true_peak_dbtp) = measurement.finish();
+        assert!(integrated_lufs.is_some_and(|value| value.is_finite()));
+        let true_peak_dbtp = true_peak_dbtp.expect("stereo true peak");
+        assert!(
+            (-2.1..=-1.8).contains(&true_peak_dbtp),
+            "true_peak_dbtp={true_peak_dbtp}"
+        );
+    }
+
+    #[test]
+    fn changing_channel_layout_invalidates_loudness_measurements() {
+        let mut measurement = LoudnessMeasurement::new();
+        measurement.push(&vec![0.25; 48_000], 1, 48_000);
+        measurement.push(&vec![0.25; 96_000], 2, 48_000);
+
+        assert_eq!(measurement.finish(), (None, None));
+    }
+
+    #[test]
+    fn silence_has_no_loudness_or_true_peak_measurement() {
+        let mut measurement = LoudnessMeasurement::new();
+        measurement.push(&vec![0.0; 48_000], 1, 48_000);
+
+        assert_eq!(measurement.finish(), (None, None));
+    }
+
+    #[test]
+    fn non_finite_input_invalidates_measurements_without_panicking() {
+        let mut samples = vec![0.0; 48_000];
+        samples[24_000] = f32::NAN;
+        let mut measurement = LoudnessMeasurement::new();
+        measurement.push(&samples, 1, 48_000);
+        measurement.push(&vec![0.25; 48_000], 1, 48_000);
+
+        assert_eq!(measurement.finish(), (None, None));
+    }
+
+    fn measure_tone(amplitude: f32) -> (Option<f32>, Option<f32>) {
+        const SAMPLE_RATE: u32 = 48_000;
+        const SECONDS: usize = 3;
+        let samples = (0..SAMPLE_RATE as usize * SECONDS)
+            .map(|index| {
+                amplitude
+                    * (std::f32::consts::TAU * 1_000.0 * index as f32 / SAMPLE_RATE as f32).sin()
+            })
+            .collect::<Vec<_>>();
+        let mut measurement = LoudnessMeasurement::new();
+        measurement.push(&samples, 1, SAMPLE_RATE);
+        measurement.finish()
     }
 
     fn click_track_wav() -> Vec<u8> {

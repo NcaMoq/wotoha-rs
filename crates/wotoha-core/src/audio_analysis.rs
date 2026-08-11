@@ -174,6 +174,8 @@ pub fn analyze_mono_pcm_with_low_band(
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         });
     };
     let audible_start_block = first / block;
@@ -216,6 +218,8 @@ pub fn analyze_mono_pcm_with_low_band(
             musical_key: None,
             rms_dbfs: None,
             sample_peak_dbfs: None,
+            integrated_lufs: None,
+            true_peak_dbtp: None,
         });
     }
     let beat_lag_blocks = beat_lag.round().max(1.0) as usize;
@@ -250,6 +254,8 @@ pub fn analyze_mono_pcm_with_low_band(
         musical_key: None,
         rms_dbfs: None,
         sample_peak_dbfs: None,
+        integrated_lufs: None,
+        true_peak_dbtp: None,
     })
 }
 

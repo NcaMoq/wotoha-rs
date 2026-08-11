@@ -27,6 +27,7 @@ use songbird::{
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, GuildKey, PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle,
@@ -35,13 +36,14 @@ use wotoha_contracts::{
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
     automix::{AutoMixConfig, TrackAnalysis},
+    config::LoudnessConfig,
     debug::append_debug_log,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
 };
 
 use crate::{
     AnalysisCache, AnalysisCacheKey,
-    audio_decode::analyze_input_with_cancel,
+    audio_decode::{MAX_ANALYSIS_DURATION, analyze_input_with_cancel},
     automix_preview::{AutoMixPreview, AutoMixPreviewError, render_automix_preview_inputs},
     niconico_hls::NiconicoHlsRequest,
     ranged_http::RangedHttpRequest,
@@ -72,11 +74,15 @@ const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
 
-struct CancelAnalysisOnDrop(Arc<AtomicBool>);
+struct CancelAnalysisOnDrop {
+    cancelled: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+}
 
 impl Drop for CancelAnalysisOnDrop {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
     }
 }
 
@@ -139,7 +145,7 @@ impl SongbirdRuntime {
                     std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| ".wotoha-analysis".into()),
-                    "pcm-onset-chroma-level-v9",
+                    "pcm-onset-chroma-level-loudness-v10",
                 )
                 .expect("static analyzer version is valid"),
             ),
@@ -262,6 +268,7 @@ impl SongbirdRuntime {
         outgoing_analysis: &TrackAnalysis,
         incoming_analysis: &TrackAnalysis,
         config: &AutoMixConfig,
+        loudness: &LoudnessConfig,
     ) -> Result<AutoMixPreview, AutoMixPreviewError> {
         let outgoing_input = build_input(
             self.stream_client(outgoing.provider_id.as_ref())
@@ -288,6 +295,7 @@ impl SongbirdRuntime {
             outgoing_analysis,
             incoming_analysis,
             config,
+            loudness,
         )
     }
 
@@ -571,23 +579,28 @@ impl VoiceRuntime for SongbirdRuntime {
     }
 
     async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        if !analysis_source_supported(request) {
+            return None;
+        }
         let key = AnalysisCacheKey::from_request(request).ok()?;
         if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
             return Some(analysis);
         }
-        if !matches!(request.prepared, PreparedSource::Http { .. }) {
-            return None;
-        }
         let cancelled = Arc::new(AtomicBool::new(false));
-        let cancel_on_drop = CancelAnalysisOnDrop(cancelled.clone());
+        let cancellation = CancellationToken::new();
+        let cancel_on_drop = CancelAnalysisOnDrop {
+            cancelled: cancelled.clone(),
+            cancellation: cancellation.clone(),
+        };
         let analysis = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
             let _permit = self.analysis_limit.acquire().await.ok()?;
             if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
                 return Some(analysis);
             }
-            let input = build_input(
+            let input = build_input_with_cancellation(
                 self.stream_client(request.provider_id.as_ref()).ok()?,
                 request,
+                Some(cancellation.clone()),
             )
             .ok()?
             .make_playable_async(get_codec_registry(), get_probe())
@@ -603,6 +616,14 @@ impl VoiceRuntime for SongbirdRuntime {
         drop(cancel_on_drop);
         let _ = self.analysis_cache.store(&key, &analysis);
         Some(analysis)
+    }
+
+    fn cached_track_analysis(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        if !analysis_source_supported(request) {
+            return None;
+        }
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        self.analysis_cache.load(&key).ok().flatten()
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -631,6 +652,14 @@ impl VoiceGatewayRuntime for SongbirdRuntime {
 pub fn build_input(
     client: &Client,
     request: &TrackRequest,
+) -> Result<songbird::input::Input, SongbirdRuntimeError> {
+    build_input_with_cancellation(client, request, None)
+}
+
+fn build_input_with_cancellation(
+    client: &Client,
+    request: &TrackRequest,
+    cancellation: Option<CancellationToken>,
 ) -> Result<songbird::input::Input, SongbirdRuntimeError> {
     match &request.prepared {
         PreparedSource::Http {
@@ -671,20 +700,34 @@ pub fn build_input(
             validate_prepared_source_url(request.provider_id.as_ref(), playlist_url.as_ref())?;
             let headers = build_headers(headers)?;
             if request.provider_id.as_ref() == "niconico" {
-                Ok(
-                    NiconicoHlsRequest::new(client.clone(), playlist_url.to_string(), headers)
-                        .into(),
+                Ok(NiconicoHlsRequest::new_with_cancellation(
+                    client.clone(),
+                    playlist_url.to_string(),
+                    headers,
+                    cancellation,
                 )
+                .into())
             } else {
-                Ok(ValidatedHlsRequest::new(
+                Ok(ValidatedHlsRequest::new_with_cancellation(
                     client.clone(),
                     request.provider_id.to_string(),
                     playlist_url.to_string(),
                     headers,
+                    cancellation,
                 )
                 .into())
             }
         }
+    }
+}
+
+fn analysis_source_supported(request: &TrackRequest) -> bool {
+    match request.prepared {
+        PreparedSource::Http { .. } => true,
+        PreparedSource::Hls { .. } => request
+            .metadata
+            .duration
+            .is_some_and(|duration| !duration.is_zero() && duration <= MAX_ANALYSIS_DURATION),
     }
 }
 
@@ -1021,13 +1064,40 @@ impl VoiceEventHandler for TrackErrorLogger {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use reqwest::Client;
     use wotoha_core::{PreparedHeader, PreparedSource, TrackMetadata, TrackRequest};
 
     use super::{
-        SongbirdRuntimeError, TrackEndReason, TrackLifecycle, build_input,
-        should_use_ranged_request,
+        MAX_ANALYSIS_DURATION, SongbirdRuntimeError, TrackEndReason, TrackLifecycle,
+        analysis_source_supported, build_input, should_use_ranged_request,
     };
+
+    fn request_with_source(prepared: PreparedSource) -> TrackRequest {
+        request_with_source_and_duration(prepared, None)
+    }
+
+    fn request_with_source_and_duration(
+        prepared: PreparedSource,
+        duration: Option<Duration>,
+    ) -> TrackRequest {
+        TrackRequest::new(
+            "youtube",
+            "video-id",
+            "https://www.youtube.com/watch?v=video-id",
+            "https://www.youtube.com/watch?v=video-id",
+            "https://www.youtube.com/watch?v=video-id",
+            prepared,
+            TrackMetadata::new(
+                "title",
+                "author",
+                "https://www.youtube.com/watch?v=video-id",
+                None,
+                duration,
+            ),
+        )
+    }
 
     #[test]
     fn only_enables_ranged_requests_with_known_content_length() {
@@ -1060,26 +1130,12 @@ mod tests {
     #[test]
     fn rejects_disallowed_prepared_http_url_before_playback() {
         let client = Client::new();
-        let request = TrackRequest::new(
-            "youtube",
-            "video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            PreparedSource::http(
-                "https://example.com/audio.webm",
-                Vec::<PreparedHeader>::new().into_boxed_slice(),
-                None,
-                None,
-            ),
-            TrackMetadata::new(
-                "title",
-                "author",
-                "https://www.youtube.com/watch?v=video-id",
-                None,
-                None,
-            ),
-        );
+        let request = request_with_source(PreparedSource::http(
+            "https://example.com/audio.webm",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
 
         let error = match build_input(&client, &request) {
             Ok(_) => panic!("disallowed prepared URL was accepted"),
@@ -1095,26 +1151,102 @@ mod tests {
     #[test]
     fn accepts_allowed_prepared_http_url_before_playback() {
         let client = Client::new();
-        let request = TrackRequest::new(
-            "youtube",
-            "video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            "https://www.youtube.com/watch?v=video-id",
-            PreparedSource::http(
-                "https://manifest.googlevideo.com/videoplayback",
+        let request = request_with_source(PreparedSource::http(
+            "https://manifest.googlevideo.com/videoplayback",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
+
+        assert!(build_input(&client, &request).is_ok());
+    }
+
+    #[test]
+    fn analysis_accepts_http_and_hls_sources() {
+        let http = request_with_source(PreparedSource::http(
+            "https://manifest.googlevideo.com/videoplayback",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
+        let hls = request_with_source_and_duration(
+            PreparedSource::hls(
+                "https://manifest.googlevideo.com/hls/playlist.m3u8",
                 Vec::<PreparedHeader>::new().into_boxed_slice(),
                 None,
-                None,
             ),
-            TrackMetadata::new(
-                "title",
-                "author",
-                "https://www.youtube.com/watch?v=video-id",
-                None,
-                None,
-            ),
+            Some(Duration::from_secs(5 * 60)),
         );
+
+        assert!(analysis_source_supported(&http));
+        assert!(analysis_source_supported(&hls));
+    }
+
+    #[test]
+    fn analysis_rejects_hls_without_finite_duration() {
+        let hls = request_with_source(PreparedSource::hls(
+            "https://manifest.googlevideo.com/hls/playlist.m3u8",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+        ));
+
+        assert!(!analysis_source_supported(&hls));
+    }
+
+    #[test]
+    fn analysis_rejects_hls_over_analysis_duration_limit() {
+        let hls = request_with_source_and_duration(
+            PreparedSource::hls(
+                "https://manifest.googlevideo.com/hls/playlist.m3u8",
+                Vec::<PreparedHeader>::new().into_boxed_slice(),
+                None,
+            ),
+            Some(MAX_ANALYSIS_DURATION + Duration::from_secs(1)),
+        );
+
+        assert!(!analysis_source_supported(&hls));
+    }
+
+    #[test]
+    fn analysis_keeps_http_sources_without_duration_eligible() {
+        let http = request_with_source(PreparedSource::http(
+            "https://manifest.googlevideo.com/videoplayback",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
+
+        assert!(analysis_source_supported(&http));
+    }
+
+    #[test]
+    fn rejects_disallowed_prepared_hls_url_before_playback() {
+        let client = Client::new();
+        let request = request_with_source(PreparedSource::hls(
+            "https://example.com/audio.m3u8",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+        ));
+
+        let error = match build_input(&client, &request) {
+            Ok(_) => panic!("disallowed prepared HLS URL was accepted"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            SongbirdRuntimeError::DisallowedPreparedUrl { .. }
+        ));
+    }
+
+    #[test]
+    fn accepts_allowed_prepared_hls_url_before_playback() {
+        let client = Client::new();
+        let request = request_with_source(PreparedSource::hls(
+            "https://manifest.googlevideo.com/hls/playlist.m3u8",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+        ));
 
         assert!(build_input(&client, &request).is_ok());
     }

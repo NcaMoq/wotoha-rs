@@ -16,6 +16,7 @@ use tokio::{
         watch,
     },
 };
+use tokio_util::sync::CancellationToken;
 use url::ParseError;
 
 use crate::hls_security::{filtered_headers, validate_provider_url};
@@ -35,6 +36,7 @@ pub struct ValidatedHlsRequest {
     provider_id: String,
     playlist_url: String,
     headers: HeaderMap,
+    cancellation: Option<CancellationToken>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,11 +57,22 @@ impl ValidatedHlsRequest {
         playlist_url: String,
         headers: HeaderMap,
     ) -> Self {
+        Self::new_with_cancellation(client, provider_id, playlist_url, headers, None)
+    }
+
+    pub(crate) fn new_with_cancellation(
+        client: Client,
+        provider_id: impl Into<String>,
+        playlist_url: String,
+        headers: HeaderMap,
+        cancellation: Option<CancellationToken>,
+    ) -> Self {
         Self {
             client,
             provider_id: provider_id.into(),
             playlist_url,
             headers,
+            cancellation,
         }
     }
 
@@ -95,6 +108,13 @@ impl ValidatedHlsRequest {
             )
             .await;
         });
+        if let Some(cancellation) = self.cancellation.clone() {
+            let stop_tx = stop_tx.clone();
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                request_stop(&stop_tx);
+            });
+        }
 
         Ok(ValidatedHlsAsyncSource {
             stream: reader,

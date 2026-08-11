@@ -59,6 +59,10 @@ The following work still needs to happen:
 - `WOTOHA_LOG_FILE`: file name created under `WOTOHA_LOG_DIR`. Directory separators are rejected.
 - `WOTOHA_LOG_ANSI`: `true` enables ANSI color sequences in stdout and the file writer; keep `false` for systemd logs.
 - `WOTOHA_DEFAULT_VOLUME`: playback volume value, accepted range `0.0..=2.0`.
+- `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED`: enables per-track loudness normalization; defaults to `true`.
+- `WOTOHA_LOUDNESS_TARGET_LUFS`: integrated loudness target, accepted range `-24.0..=-8.0` LUFS; defaults to `-16.0`.
+- `WOTOHA_LOUDNESS_MAX_BOOST_DB`: maximum normalization boost, accepted range `0.0..=12.0` dB; defaults to `6.0`.
+- `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP`: true-peak ceiling, accepted range `-6.0..=0.0` dBTP; defaults to `-2.0`.
 - `WOTOHA_MAX_QUEUE_LEN`: guild queue limit value, accepted range `1..=512`.
 - `WOTOHA_MAX_PENDING_ENQUEUES`: pending enqueue limit value, accepted range `1..=64`. It cannot exceed `WOTOHA_MAX_QUEUE_LEN`.
 

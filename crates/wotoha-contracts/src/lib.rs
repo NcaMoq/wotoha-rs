@@ -247,6 +247,11 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Returns an already-cached analysis without starting decode work.
+    fn cached_track_analysis(&self, _request: &TrackRequest) -> Option<TrackAnalysis> {
+        None
+    }
+
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error>;
 }
 
