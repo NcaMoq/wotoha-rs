@@ -24,6 +24,11 @@ const MAX_SKIPPED_INTRO_VOCAL_RISK: f32 = 0.2;
 const MAX_SHORTER_TRANSITION_SEARCH: Duration = Duration::from_secs(8);
 const MIN_NATURAL_MIX_OVERLAP: Duration = Duration::from_secs(4);
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
+/// The analysis profile is an instantaneous, band-averaged proxy and reads
+/// materially lower than the preview's windowed RMS for healthy transitions.
+/// Reserve blocking for a roughly 14 dB analysis-profile collapse; shallower
+/// movement remains a scoring concern and is verified by the rendered preview.
+const MIN_SAFE_MIX_ENERGY_RATIO: f32 = 0.20;
 const MAX_INCOMING_CUE_CANDIDATES: usize = 96;
 const MIN_TRUSTED_BPM: f32 = 20.0;
 const MAX_TRUSTED_BPM: f32 = 300.0;
@@ -523,6 +528,9 @@ pub enum AutoMixQualityIssue {
     DualVocalOverlapTooHigh {
         max_risk: f32,
     },
+    MixEnergyDipTooDeep {
+        min_ratio: f32,
+    },
 }
 
 impl AutoMixQualityIssue {
@@ -540,6 +548,7 @@ impl AutoMixQualityIssue {
                 | Self::PhrasePhaseDriftTooLarge { .. }
                 | Self::PhraseHandoffPhaseDriftTooLarge { .. }
                 | Self::DualVocalOverlapTooHigh { .. }
+                | Self::MixEnergyDipTooDeep { .. }
         )
     }
 }
@@ -1027,8 +1036,26 @@ pub fn plan_guarded_transition(
     incoming: &TrackAnalysis,
     config: &AutoMixConfig,
 ) -> GuardedTransitionPlan {
+    plan_guarded_transition_with_base_gains(outgoing, incoming, config, 1.0, 1.0)
+}
+
+/// Plans and guards a transition using the same per-deck gains that playback
+/// will apply before its mix curve.
+pub fn plan_guarded_transition_with_base_gains(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> GuardedTransitionPlan {
     let plan = plan_transition(outgoing, incoming, config);
-    let quality = evaluate_transition_quality(outgoing, incoming, &plan);
+    let quality = evaluate_transition_quality_with_base_gains(
+        outgoing,
+        incoming,
+        &plan,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
     if !quality.has_blocking_issue() {
         return GuardedTransitionPlan {
             plan,
@@ -1039,7 +1066,29 @@ pub fn plan_guarded_transition(
     }
 
     let fallback = conservative_crossfade_plan(outgoing, incoming, config);
-    let fallback_quality = evaluate_transition_quality(outgoing, incoming, &fallback);
+    let fallback_quality = evaluate_transition_quality_with_base_gains(
+        outgoing,
+        incoming,
+        &fallback,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
+    if fallback_quality.has_blocking_issue() {
+        let fallback = gapless_plan(outgoing, incoming);
+        let fallback_quality = evaluate_transition_quality_with_base_gains(
+            outgoing,
+            incoming,
+            &fallback,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
+        return GuardedTransitionPlan {
+            plan: fallback,
+            quality: fallback_quality,
+            rejected_plan: Some(plan),
+            rejected_quality: Some(quality),
+        };
+    }
     GuardedTransitionPlan {
         plan: fallback,
         quality: fallback_quality,
@@ -1118,6 +1167,19 @@ pub fn evaluate_transition_quality(
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
 ) -> AutoMixQualityReport {
+    evaluate_transition_quality_with_base_gains(outgoing, incoming, plan, 1.0, 1.0)
+}
+
+/// Evaluates the rendered transition model after each deck's persistent base
+/// gain (for example loudness normalization) and before the shared master
+/// volume.
+pub fn evaluate_transition_quality_with_base_gains(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> AutoMixQualityReport {
     let mut issues = Vec::new();
     let mut beat_pairs_checked = 0;
     let mut max_beat_phase_error = None;
@@ -1179,7 +1241,13 @@ pub fn evaluate_transition_quality(
             }
         }
 
-        let vocal_overlap = dual_vocal_overlap_report(outgoing, incoming, plan);
+        let vocal_overlap = dual_vocal_overlap_report(
+            outgoing,
+            incoming,
+            plan,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         vocal_overlap_samples_checked = vocal_overlap.samples;
         max_dual_vocal_risk = vocal_overlap.max_risk;
         if let Some(max_risk) = max_dual_vocal_risk
@@ -1188,13 +1256,24 @@ pub fn evaluate_transition_quality(
             issues.push(AutoMixQualityIssue::DualVocalOverlapTooHigh { max_risk });
         }
 
-        let energy = transition_energy_report(outgoing, incoming, plan);
+        let energy = transition_energy_report(
+            outgoing,
+            incoming,
+            plan,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         energy_samples_checked = energy.samples;
         min_mix_energy_ratio = energy.min_ratio;
         max_mix_energy_ratio = energy.max_ratio;
         max_mix_energy_step = energy.max_step;
         handoff_mix_energy_ratio = energy.handoff_ratio;
         handoff_incoming_mix_share = energy.handoff_incoming_share;
+        if let Some(min_ratio) = min_mix_energy_ratio
+            && mix_energy_dip_is_blocking(min_ratio)
+        {
+            issues.push(AutoMixQualityIssue::MixEnergyDipTooDeep { min_ratio });
+        }
     }
 
     if plan.kind == TransitionKind::BeatMatched {
@@ -1929,6 +2008,8 @@ fn dual_vocal_overlap_report(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
 ) -> DualVocalOverlapReport {
     const SAMPLES: u32 = 32;
     if plan.kind == TransitionKind::Gapless || plan.duration.is_zero() {
@@ -1944,9 +2025,24 @@ fn dual_vocal_overlap_report(
         };
     }
 
+    let outgoing_base_gain = finite_nonnegative_gain(outgoing_base_gain);
+    let incoming_base_gain = finite_nonnegative_gain(
+        finite_nonnegative_gain(incoming_base_gain) * finite_nonnegative_gain(plan.incoming_gain),
+    );
     let mut samples = 0;
     let mut max_risk = None;
-    let peak_guard = AutoMixPeakGuard::from_analyses(outgoing, incoming, plan.incoming_gain);
+    let peak_guard = AutoMixPeakGuard::from_analyses_with_base_gains(
+        outgoing,
+        incoming,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
+    // Vocal collision is a relative masking risk, so a common loudness target
+    // must not make it disappear. Only the balance between decks belongs in
+    // this metric; the absolute gains remain relevant to the peak guard above.
+    let vocal_gain_reference = outgoing_base_gain.max(incoming_base_gain).max(1.0e-6);
+    let outgoing_vocal_gain = outgoing_base_gain / vocal_gain_reference;
+    let incoming_vocal_gain = incoming_base_gain / vocal_gain_reference;
     for index in 0..=SAMPLES {
         let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
         let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
@@ -1982,10 +2078,11 @@ fn dual_vocal_overlap_report(
         .gains_at(incoming_position);
         let outgoing_risk = effective_vocal_risk(outgoing, outgoing_position)
             * outgoing_mix_gain
+            * outgoing_vocal_gain
             * vocal_band_gain(outgoing_eq);
         let incoming_risk = effective_vocal_risk(incoming, incoming_position)
             * incoming_mix_gain
-            * plan.incoming_gain
+            * incoming_vocal_gain
             * vocal_band_gain(incoming_eq);
         let risk = outgoing_risk.min(incoming_risk);
         samples += 1;
@@ -2012,6 +2109,8 @@ fn transition_energy_report(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
 ) -> TransitionEnergyReport {
     const SAMPLES: u32 = 32;
     if plan.kind == TransitionKind::Gapless || plan.duration.is_zero() {
@@ -2024,13 +2123,18 @@ fn transition_energy_report(
             handoff_incoming_share: None,
         };
     }
-    let outgoing_reference = energy_at(outgoing, plan.outgoing_start);
+    let outgoing_base_gain = finite_nonnegative_gain(outgoing_base_gain);
+    let incoming_base_gain = finite_nonnegative_gain(
+        finite_nonnegative_gain(incoming_base_gain) * finite_nonnegative_gain(plan.incoming_gain),
+    );
+    let outgoing_reference =
+        energy_at(outgoing, plan.outgoing_start).map(|energy| energy * outgoing_base_gain);
     let incoming_reference = energy_at(
         incoming,
         plan.incoming_start
             .saturating_add(incoming_mix_source(plan)),
     )
-    .map(|energy| energy * plan.incoming_gain);
+    .map(|energy| energy * incoming_base_gain);
     let Some(reference) = outgoing_reference
         .zip(incoming_reference)
         .map(|(outgoing, incoming)| outgoing.max(incoming).max(1.0e-6))
@@ -2052,7 +2156,12 @@ fn transition_energy_report(
     let mut max_step = 0.0_f32;
     let mut handoff_incoming_share = f32::INFINITY;
     let mut handoff_share_samples = 0;
-    let peak_guard = AutoMixPeakGuard::from_analyses(outgoing, incoming, plan.incoming_gain);
+    let peak_guard = AutoMixPeakGuard::from_analyses_with_base_gains(
+        outgoing,
+        incoming,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
     for index in 0..=SAMPLES {
         let elapsed = plan.duration.mul_f64(f64::from(index) / f64::from(SAMPLES));
         let outgoing_position = plan.outgoing_start.saturating_add(elapsed);
@@ -2085,9 +2194,10 @@ fn transition_energy_report(
             harmonic_compatibility: plan.harmonic_compatibility,
         }
         .gains_at(incoming_position);
-        let outgoing_level = outgoing_energy * outgoing_mix_gain * full_band_gain(outgoing_eq);
+        let outgoing_level =
+            outgoing_energy * outgoing_mix_gain * outgoing_base_gain * full_band_gain(outgoing_eq);
         let incoming_level =
-            incoming_energy * incoming_mix_gain * plan.incoming_gain * full_band_gain(incoming_eq);
+            incoming_energy * incoming_mix_gain * incoming_base_gain * full_band_gain(incoming_eq);
         let combined = (outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level))
             .sqrt()
             / reference;
@@ -2315,10 +2425,22 @@ fn transition_start_energy_score(
         energy_selection: None,
     };
     let quality = evaluate_transition_quality(outgoing, incoming, &plan);
-    if quality.has_blocking_issue() {
+    if quality.issues.iter().any(|issue| {
+        issue.blocks_automatic_transition()
+            && !matches!(issue, AutoMixQualityIssue::MixEnergyDipTooDeep { .. })
+    }) {
         return None;
     }
-    transition_start_score(&quality).map(|score| (outgoing_start, score))
+    let unsafe_energy_penalty = if quality
+        .issues
+        .iter()
+        .any(|issue| matches!(issue, AutoMixQualityIssue::MixEnergyDipTooDeep { .. }))
+    {
+        1_000.0
+    } else {
+        0.0
+    };
+    transition_start_score(&quality).map(|score| (outgoing_start, score + unsafe_energy_penalty))
 }
 
 pub fn transition_score_breakdown(quality: &AutoMixQualityReport) -> Option<AutoMixScoreBreakdown> {
@@ -2429,6 +2551,10 @@ fn energy_balance_score(quality: &AutoMixQualityReport) -> Option<f32> {
     let buildup_penalty = (max_ratio - 1.15).max(0.0) * 2.0;
     let movement_penalty = min_ratio.ln().abs() * 0.15 + max_ratio.ln().abs() * 0.05;
     Some(dip_penalty + buildup_penalty + movement_penalty)
+}
+
+fn mix_energy_dip_is_blocking(min_ratio: f32) -> bool {
+    min_ratio.is_finite() && min_ratio < MIN_SAFE_MIX_ENERGY_RATIO
 }
 
 fn has_energy_profile(analysis: &TrackAnalysis) -> bool {
@@ -4658,6 +4784,46 @@ mod tests {
     }
 
     #[test]
+    fn guarded_transition_rechecks_an_unsafe_crossfade_fallback_before_using_gapless() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        for marker in &mut incoming.beat_markers {
+            *marker += Duration::from_millis(250);
+        }
+        set_energy_ranges(&mut outgoing, -18.0, &[(175.0, 177.0, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(5.0, 7.0, -42.0)]);
+        let config = config();
+        let fallback = conservative_crossfade_plan(&outgoing, &incoming, &config);
+        let fallback_quality = evaluate_transition_quality(&outgoing, &incoming, &fallback);
+
+        assert_eq!(fallback.kind, TransitionKind::Crossfade);
+        assert!(
+            fallback_quality.issues.iter().any(|issue| matches!(
+                issue,
+                AutoMixQualityIssue::MixEnergyDipTooDeep { min_ratio }
+                    if *min_ratio < MIN_SAFE_MIX_ENERGY_RATIO
+            )),
+            "fallback={fallback:?} quality={fallback_quality:?}"
+        );
+
+        let guarded = plan_guarded_transition(&outgoing, &incoming, &config);
+
+        assert_eq!(guarded.plan.kind, TransitionKind::Gapless, "{guarded:?}");
+        assert!(guarded.quality.is_ok(), "{guarded:?}");
+        assert_eq!(
+            guarded.rejected_plan.as_ref().map(|plan| plan.kind),
+            Some(TransitionKind::BeatMatched)
+        );
+        assert!(
+            guarded
+                .rejected_quality
+                .as_ref()
+                .is_some_and(AutoMixQualityReport::has_blocking_issue),
+            "{guarded:?}"
+        );
+    }
+
+    #[test]
     fn corrects_small_tempo_differences_that_would_drift_during_the_mix() {
         let plan = plan_transition(&analyzed(120.0), &analyzed(120.3), &config());
         let envelope = plan
@@ -5180,6 +5346,148 @@ mod tests {
         assert!(
             report.min_mix_energy_ratio.unwrap() < 0.2,
             "report={report:?}"
+        );
+        assert!(
+            report.issues.iter().any(|issue| matches!(
+                issue,
+                AutoMixQualityIssue::MixEnergyDipTooDeep { min_ratio }
+                    if *min_ratio < MIN_SAFE_MIX_ENERGY_RATIO
+            )),
+            "report={report:?}"
+        );
+        assert!(report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn normalization_base_gains_are_part_of_energy_quality() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        outgoing.duration = Duration::from_secs(10);
+        outgoing.audible_end = Duration::from_secs(9);
+        incoming.duration = Duration::from_secs(10);
+        incoming.audible_end = Duration::from_secs(9);
+        set_energy_ranges(&mut outgoing, -6.0, &[]);
+        set_energy_ranges(&mut incoming, -18.0, &[]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(1),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        let unity = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        let normalized =
+            evaluate_transition_quality_with_base_gains(&outgoing, &incoming, &plan, 0.25, 1.0);
+
+        assert!(
+            unity
+                .min_mix_energy_ratio
+                .is_some_and(|ratio| (0.24..0.27).contains(&ratio)),
+            "unity={unity:?}"
+        );
+        assert!(!unity.has_blocking_issue(), "unity={unity:?}");
+        assert!(
+            normalized.min_mix_energy_ratio.unwrap() > 0.65,
+            "normalized={normalized:?}"
+        );
+        assert!(
+            !normalized.has_blocking_issue(),
+            "normalized={normalized:?}"
+        );
+    }
+
+    #[test]
+    fn healthy_b_like_crossfade_is_kept_above_the_analysis_drop_threshold() {
+        let mut outgoing = analyzed(90.0);
+        let mut incoming = analyzed(140.0);
+        set_energy_ranges(&mut outgoing, -6.0, &[]);
+        set_energy_ranges(&mut incoming, -16.5, &[]);
+
+        let guarded =
+            plan_guarded_transition_with_base_gains(&outgoing, &incoming, &config(), 0.367, 0.348);
+
+        assert_eq!(guarded.plan.kind, TransitionKind::Crossfade, "{guarded:?}");
+        assert!(guarded.rejected_plan.is_none(), "{guarded:?}");
+        assert!(guarded.rejected_quality.is_none(), "{guarded:?}");
+        let min_ratio = guarded
+            .quality
+            .min_mix_energy_ratio
+            .expect("energy quality ratio");
+        assert!((min_ratio - 0.284_295_53).abs() < 0.01, "{guarded:?}");
+        assert!(min_ratio < 0.30, "fixture must cover the old cutoff");
+        assert!(!guarded.quality.has_blocking_issue(), "{guarded:?}");
+    }
+
+    #[test]
+    fn analysis_drop_threshold_blocks_only_values_strictly_below_the_boundary() {
+        assert!(mix_energy_dip_is_blocking(0.187_062_43));
+        assert!(!mix_energy_dip_is_blocking(0.284_295_53));
+        assert!(mix_energy_dip_is_blocking(0.199));
+        assert!(!mix_energy_dip_is_blocking(MIN_SAFE_MIX_ENERGY_RATIO));
+        assert!(!mix_energy_dip_is_blocking(0.201));
+        assert!(!mix_energy_dip_is_blocking(f32::NAN));
+        assert!(!mix_energy_dip_is_blocking(f32::INFINITY));
+    }
+
+    #[test]
+    fn planner_finds_a_safe_alternative_to_an_audible_normalized_energy_dip() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        outgoing.duration = Duration::from_secs(10);
+        outgoing.audible_end = Duration::from_secs(9);
+        incoming.duration = Duration::from_secs(10);
+        incoming.audible_end = Duration::from_secs(9);
+        outgoing
+            .beat_markers
+            .retain(|marker| *marker <= outgoing.audible_end);
+        incoming
+            .beat_markers
+            .retain(|marker| *marker <= incoming.audible_end);
+        set_energy_ranges(&mut outgoing, -12.0, &[(1.25, 8.75, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(1.25, 8.75, -48.0)]);
+        let mut config = config();
+        config.crossfade = Duration::from_secs(8);
+        let unsafe_plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(1),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let unsafe_quality = evaluate_transition_quality_with_base_gains(
+            &outgoing,
+            &incoming,
+            &unsafe_plan,
+            0.348,
+            0.611,
+        );
+
+        let guarded =
+            plan_guarded_transition_with_base_gains(&outgoing, &incoming, &config, 0.348, 0.611);
+
+        assert!(
+            unsafe_quality.has_blocking_issue(),
+            "unsafe={unsafe_quality:?}"
+        );
+        assert!(guarded.plan.duration < unsafe_plan.duration, "{guarded:?}");
+        assert!(!guarded.quality.has_blocking_issue(), "{guarded:?}");
+        assert!(
+            guarded
+                .quality
+                .min_mix_energy_ratio
+                .is_some_and(|ratio| ratio >= MIN_SAFE_MIX_ENERGY_RATIO),
+            "{guarded:?}"
         );
     }
 

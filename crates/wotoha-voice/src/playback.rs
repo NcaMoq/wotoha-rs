@@ -27,8 +27,8 @@ use wotoha_core::{
     automix::{
         AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TempoEnvelope,
         TrackAnalysis, TransitionKind, TransitionTiming, automix_peak_safe_mix_gains,
-        explain_beatmatch_decision, plan_guarded_transition, plan_transition_timing,
-        transition_score_breakdown,
+        explain_beatmatch_decision, plan_guarded_transition_with_base_gains,
+        plan_transition_timing, transition_score_breakdown,
     },
     config::LoudnessConfig,
     debug::append_debug_log,
@@ -1479,13 +1479,21 @@ where
         let mut transition_kind = TransitionKind::Crossfade;
         let incoming_gain =
             loudness_normalization_gain(&self.inner.loudness, incoming_analysis.as_ref());
+        let outgoing_gain =
+            loudness_normalization_gain(&self.inner.loudness, outgoing_analysis.as_ref());
         let mut outgoing_equalizer_transition = None;
         let mut options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
         let guarded_plan = outgoing_analysis
             .as_ref()
             .zip(incoming_analysis.as_ref())
             .map(|(outgoing, incoming)| {
-                plan_guarded_transition(outgoing, incoming, &self.inner.automix)
+                plan_guarded_transition_with_base_gains(
+                    outgoing,
+                    incoming,
+                    &self.inner.automix,
+                    outgoing_gain,
+                    incoming_gain,
+                )
             });
         if guarded_plan.is_none() {
             // Without both analyses there is no evidence that an overlap is

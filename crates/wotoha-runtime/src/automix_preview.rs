@@ -7,7 +7,7 @@ use wotoha_core::{
     automix::{
         AutoMixConfig, AutoMixPeakGuard, AutoMixQualityReport, EqTransition, EqTransitionRole,
         TrackAnalysis, TransitionKind, TransitionPlan, automix_peak_safe_mix_gains,
-        plan_guarded_transition,
+        plan_guarded_transition_with_base_gains,
     },
     config::LoudnessConfig,
     loudness::loudness_normalization_gain,
@@ -81,11 +81,17 @@ pub(crate) fn render_automix_preview_inputs(
     config: &AutoMixConfig,
     loudness: &LoudnessConfig,
 ) -> Result<AutoMixPreview, AutoMixPreviewError> {
-    let guarded = plan_guarded_transition(outgoing, incoming, config);
-    let plan = guarded.plan;
-    let quality = guarded.quality;
     let outgoing_normalization_gain = loudness_normalization_gain(loudness, Some(outgoing));
     let incoming_normalization_gain = loudness_normalization_gain(loudness, Some(incoming));
+    let guarded = plan_guarded_transition_with_base_gains(
+        outgoing,
+        incoming,
+        config,
+        outgoing_normalization_gain,
+        incoming_normalization_gain,
+    );
+    let plan = guarded.plan;
+    let quality = guarded.quality;
     let output_rate = parsed_sample_rate(&outgoing_input)?;
 
     if plan.kind == TransitionKind::Gapless {

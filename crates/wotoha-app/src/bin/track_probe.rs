@@ -7,7 +7,10 @@ use songbird::Songbird;
 use wotoha_contracts::VoiceRuntime;
 use wotoha_core::{
     TrackRequest,
-    automix::{AutoMixConfig, TrackAnalysis, plan_guarded_transition, transition_score_breakdown},
+    automix::{
+        AutoMixConfig, TrackAnalysis, plan_guarded_transition_with_base_gains,
+        transition_score_breakdown,
+    },
     config::LoudnessConfig,
     loudness::loudness_normalization_gain,
 };
@@ -185,14 +188,20 @@ fn print_automix_plans(tracks: &[PreparedProbe]) {
             );
             continue;
         };
-        let guarded = plan_guarded_transition(outgoing_analysis, incoming_analysis, &config);
-        let plan = &guarded.plan;
-        let quality = &guarded.quality;
-        let score_breakdown = transition_score_breakdown(quality);
         let outgoing_normalization_gain =
             loudness_normalization_gain(&loudness, Some(outgoing_analysis));
         let incoming_normalization_gain =
             loudness_normalization_gain(&loudness, Some(incoming_analysis));
+        let guarded = plan_guarded_transition_with_base_gains(
+            outgoing_analysis,
+            incoming_analysis,
+            &config,
+            outgoing_normalization_gain,
+            incoming_normalization_gain,
+        );
+        let plan = &guarded.plan;
+        let quality = &guarded.quality;
+        let score_breakdown = transition_score_breakdown(quality);
         println!(
             "AUTOMIX_PLAN\t{}\t{}\tok\toutgoing_key={}\tincoming_key={}\tguarded={}\trejected_kind={}\trejected_quality_issues={}\tkind={:?}\toutgoing_start_ms={}\tincoming_start_ms={}\tincoming_cue_selected={}\tincoming_cue_default_start_ms={}\tincoming_cue_candidates_checked={}\tfade_ms={}\ttempo_ratio={:.6}\ttempo_end_ratio={:.6}\toutgoing_normalization_gain={:.3}\tincoming_normalization_gain={:.3}\tincoming_gain={:.3}\tquality_ok={}\tquality_issues={:?}\ttransition_score={}\tscore_energy_balance_penalty={}\tscore_vocal_penalty={}\tscore_short_mix_penalty={}\tscore_energy_step_penalty={}\tscore_handoff_energy_penalty={}\tscore_handoff_ownership_penalty={}\tscore_tempo_smoothness_penalty={}\tscore_phrase_strength_penalty={}\tscore_structure_usage_penalty={}\tscore_harmonic_overlap_penalty={}\tharmonic_compatibility={}\tbeat_pairs_checked={}\tmax_beat_phase_error_ms={}\thandoff_beat_phase_error_ms={}\tdownbeat_pairs_checked={}\tmax_downbeat_phase_error_ms={}\thandoff_downbeat_phase_error_ms={}\tphrase_pairs_checked={}\tmax_phrase_phase_error_ms={}\thandoff_phrase_phase_error_ms={}\tlow_handoff_min={}\tlow_handoff_max={}\tvocal_overlap_samples_checked={}\tmax_dual_vocal_risk={}\tenergy_samples_checked={}\tmin_mix_energy_ratio={}\tmax_mix_energy_ratio={}",
             outgoing.index,
