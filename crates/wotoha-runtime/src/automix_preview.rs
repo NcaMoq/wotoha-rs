@@ -6,7 +6,8 @@ use thiserror::Error;
 use wotoha_core::{
     automix::{
         AutoMixConfig, AutoMixPeakGuard, AutoMixQualityReport, EqTransition, EqTransitionRole,
-        TrackAnalysis, TransitionPlan, automix_peak_safe_mix_gains, plan_guarded_transition,
+        TrackAnalysis, TransitionKind, TransitionPlan, automix_peak_safe_mix_gains,
+        plan_guarded_transition,
     },
     config::LoudnessConfig,
     loudness::loudness_normalization_gain,
@@ -19,6 +20,7 @@ use crate::{
 
 const PREVIEW_CHANNELS: usize = 2;
 const TEMPO_PREVIEW_PADDING: Duration = Duration::from_secs(1);
+const GAPLESS_PREVIEW_SIDE: Duration = Duration::from_secs(4);
 const MIN_PREVIEW_QUIETEST_TO_EDGE_RATIO: f32 = 0.35;
 const MIN_PREVIEW_MID_TO_EDGE_RATIO: f32 = 0.60;
 const MAX_PREVIEW_SAMPLE_PEAK_DBFS: f32 = -0.01;
@@ -84,13 +86,28 @@ pub(crate) fn render_automix_preview_inputs(
     let quality = guarded.quality;
     let outgoing_normalization_gain = loudness_normalization_gain(loudness, Some(outgoing));
     let incoming_normalization_gain = loudness_normalization_gain(loudness, Some(incoming));
+    let output_rate = parsed_sample_rate(&outgoing_input)?;
+
+    if plan.kind == TransitionKind::Gapless {
+        return render_gapless_preview_inputs(
+            outgoing_input,
+            incoming_input,
+            outgoing,
+            incoming,
+            plan,
+            quality,
+            outgoing_normalization_gain,
+            incoming_normalization_gain,
+            output_rate,
+        );
+    }
+
     let peak_guard = AutoMixPeakGuard::from_analyses_with_base_gains(
         outgoing,
         incoming,
         outgoing_normalization_gain,
         incoming_normalization_gain,
     );
-    let output_rate = parsed_sample_rate(&outgoing_input)?;
     let output_frames = duration_frames(plan.duration, output_rate).max(1);
     let incoming_source_duration = plan.tempo_envelope.map_or(plan.duration, |envelope| {
         envelope.source_elapsed(plan.duration)
@@ -192,6 +209,99 @@ pub(crate) fn render_automix_preview_inputs(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_gapless_preview_inputs(
+    outgoing_input: Input,
+    incoming_input: Input,
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: TransitionPlan,
+    quality: AutoMixQualityReport,
+    outgoing_normalization_gain: f32,
+    incoming_normalization_gain: f32,
+    output_rate: u32,
+) -> Result<AutoMixPreview, AutoMixPreviewError> {
+    let (outgoing_start, outgoing_duration) = gapless_outgoing_segment(&plan, outgoing);
+    let (incoming_start, incoming_duration) = gapless_incoming_segment(&plan, incoming);
+
+    let mut outgoing = decode_segment(
+        outgoing_input,
+        outgoing_start,
+        outgoing_duration,
+        PREVIEW_CHANNELS,
+    )?;
+    if outgoing.sample_rate != output_rate {
+        outgoing.samples = resample_interleaved(
+            &outgoing.samples,
+            outgoing.sample_rate,
+            output_rate,
+            PREVIEW_CHANNELS,
+        );
+    }
+    apply_linear_gain(&mut outgoing.samples, outgoing_normalization_gain);
+
+    let mut incoming = decode_segment(
+        incoming_input,
+        incoming_start,
+        incoming_duration,
+        PREVIEW_CHANNELS,
+    )?;
+    if incoming.sample_rate != output_rate {
+        incoming.samples = resample_interleaved(
+            &incoming.samples,
+            incoming.sample_rate,
+            output_rate,
+            PREVIEW_CHANNELS,
+        );
+    }
+    apply_linear_gain(&mut incoming.samples, incoming_normalization_gain);
+
+    let mut rendered = outgoing.samples;
+    rendered.reserve(incoming.samples.len());
+    rendered.extend_from_slice(&incoming.samples);
+    let render_metrics = preview_render_metrics(&rendered, output_rate, PREVIEW_CHANNELS);
+    let render_issues = preview_render_issues(render_metrics);
+
+    Ok(AutoMixPreview {
+        plan,
+        quality,
+        render_metrics,
+        render_issues,
+        outgoing_normalization_gain,
+        incoming_normalization_gain,
+        sample_rate: output_rate,
+        channels: PREVIEW_CHANNELS as u16,
+        wav: encode_wav_i16(&rendered, output_rate, PREVIEW_CHANNELS as u16),
+    })
+}
+
+fn gapless_outgoing_segment(
+    plan: &TransitionPlan,
+    analysis: &TrackAnalysis,
+) -> (Duration, Duration) {
+    let boundary = plan.outgoing_start.min(analysis.duration);
+    let duration = boundary.min(GAPLESS_PREVIEW_SIDE);
+    (boundary.saturating_sub(duration), duration)
+}
+
+fn gapless_incoming_segment(
+    plan: &TransitionPlan,
+    analysis: &TrackAnalysis,
+) -> (Duration, Duration) {
+    let start = plan.incoming_start.min(analysis.duration);
+    let duration = analysis
+        .duration
+        .saturating_sub(start)
+        .min(GAPLESS_PREVIEW_SIDE);
+    (start, duration)
+}
+
+fn apply_linear_gain(samples: &mut [f32], gain: f32) {
+    for sample in samples {
+        *sample *= gain;
+    }
+}
+
 struct DecodedSegment {
     samples: Vec<f32>,
     sample_rate: u32,
@@ -222,8 +332,11 @@ fn decode_segment(
         .codec_params()
         .sample_rate
         .ok_or(AutoMixPreviewError::MissingSampleRate)?;
+    if duration.is_zero() {
+        return Err(AutoMixPreviewError::SegmentUnavailable);
+    }
     let skip_frames = duration_frames(source_start, sample_rate);
-    let needed_frames = duration_frames(duration, sample_rate);
+    let needed_frames = duration_frames(duration, sample_rate).max(1);
     let mut skipped = 0_usize;
     let mut output = Vec::with_capacity(needed_frames.saturating_mul(output_channels));
     let mut normalized = Vec::new();
@@ -596,6 +709,104 @@ mod tests {
         assert!(preview.wav.len() > 44);
     }
 
+    #[tokio::test]
+    async fn gapless_preview_concatenates_normalized_boundary_audio() {
+        let sample_rate = 8_000;
+        let duration = Duration::from_secs(1);
+        let outgoing = Input::from(constant_wav(sample_rate, duration, 0.8))
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .unwrap();
+        let incoming = Input::from(constant_wav(sample_rate, duration, 0.8))
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .unwrap();
+        let mut outgoing_analysis = beat_analysis(duration, 120.0);
+        outgoing_analysis.integrated_lufs = Some(-9.9794);
+        outgoing_analysis.true_peak_dbtp = Some(-1.0);
+        let mut incoming_analysis = beat_analysis(duration, 120.0);
+        incoming_analysis.integrated_lufs = Some(-3.9588);
+        incoming_analysis.true_peak_dbtp = Some(-1.0);
+        let config = AutoMixConfig {
+            enabled: false,
+            crossfade: Duration::from_secs(4),
+            max_tempo_adjustment: 0.06,
+            min_beat_confidence: 0.7,
+        };
+        let loudness = LoudnessConfig {
+            enabled: true,
+            target_lufs: -16.0,
+            max_boost_db: 6.0,
+            true_peak_ceiling_dbtp: -2.0,
+        };
+
+        let preview = render_automix_preview_inputs(
+            outgoing,
+            incoming,
+            &outgoing_analysis,
+            &incoming_analysis,
+            &config,
+            &loudness,
+        )
+        .unwrap();
+
+        assert_eq!(preview.plan.kind, TransitionKind::Gapless);
+        assert_eq!(preview.plan.duration, Duration::ZERO);
+        assert_eq!(preview.sample_rate, sample_rate);
+        assert_eq!(preview.channels, PREVIEW_CHANNELS as u16);
+        assert!((preview.outgoing_normalization_gain - 0.5).abs() < 0.0001);
+        assert!((preview.incoming_normalization_gain - 0.25).abs() < 0.0001);
+
+        let pcm = preview
+            .wav
+            .get(44..)
+            .unwrap()
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let side_samples = sample_rate as usize * PREVIEW_CHANNELS;
+        assert_eq!(pcm.len(), side_samples * 2);
+        let expected_outgoing = (0.8 * 0.5 * f32::from(i16::MAX)) as i16;
+        let expected_incoming = (0.8 * 0.25 * f32::from(i16::MAX)) as i16;
+        assert!((pcm[side_samples - 1] - expected_outgoing).abs() <= 2);
+        assert!((pcm[side_samples] - expected_incoming).abs() <= 2);
+        assert!(rms_i16(&pcm[..side_samples]) > 1_000.0);
+        assert!(rms_i16(&pcm[side_samples..]) > 1_000.0);
+        assert!(preview.render_metrics.start_rms_dbfs.is_finite());
+        assert!(preview.render_metrics.end_rms_dbfs.is_finite());
+        assert!(preview.render_metrics.sample_peak_dbfs.is_finite());
+        assert!(preview.render_issues.is_empty());
+    }
+
+    #[test]
+    fn gapless_preview_ranges_clamp_to_extremely_short_tracks() {
+        let mut outgoing = beat_analysis(Duration::from_millis(5), 120.0);
+        outgoing.audible_end = Duration::from_millis(20);
+        let mut incoming = beat_analysis(Duration::from_millis(5), 120.0);
+        incoming.audible_start = Duration::from_millis(4);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Gapless,
+            outgoing_start: outgoing.audible_end,
+            incoming_start: incoming.audible_start,
+            incoming_cue_selection: None,
+            duration: Duration::ZERO,
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        assert_eq!(
+            gapless_outgoing_segment(&plan, &outgoing),
+            (Duration::ZERO, Duration::from_millis(5))
+        );
+        assert_eq!(
+            gapless_incoming_segment(&plan, &incoming),
+            (Duration::from_millis(4), Duration::from_millis(1))
+        );
+    }
+
     #[test]
     fn render_issues_classify_gap_drop_and_clipping() {
         let issues = preview_render_issues(AutoMixPreviewRenderMetrics {
@@ -686,5 +897,19 @@ mod tests {
             })
             .collect::<Vec<_>>();
         encode_wav_i16(&samples, sample_rate, 1)
+    }
+
+    fn constant_wav(sample_rate: u32, duration: Duration, amplitude: f32) -> Vec<u8> {
+        let samples = vec![amplitude; duration_frames(duration, sample_rate)];
+        encode_wav_i16(&samples, sample_rate, 1)
+    }
+
+    fn rms_i16(samples: &[i16]) -> f32 {
+        (samples
+            .iter()
+            .map(|sample| f32::from(*sample).powi(2))
+            .sum::<f32>()
+            / samples.len() as f32)
+            .sqrt()
     }
 }
