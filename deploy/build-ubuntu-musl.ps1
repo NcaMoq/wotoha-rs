@@ -6,6 +6,8 @@ $targetDir = Join-Path $repoRoot 'target\ubuntu-musl'
 $distRoot = Join-Path $repoRoot 'dist'
 $packageRoot = Join-Path $distRoot 'wotoha-ubuntu-x86_64-musl'
 $archivePath = Join-Path $distRoot 'wotoha-ubuntu-x86_64-musl.tar.gz'
+$portableRoot = Join-Path $distRoot 'wotoha-linux-x86_64-musl'
+$portableArchivePath = Join-Path $distRoot 'wotoha-linux-x86_64-musl.tar.gz'
 
 function Resolve-Tool {
     param(
@@ -29,17 +31,75 @@ function Resolve-Tool {
     throw "$Name was not found."
 }
 
-function Invoke-Checked {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$FilePath,
-        [Parameter(Mandatory = $true)]
-        [string[]]$ArgumentList
-    )
-
-    & $FilePath @ArgumentList
+function Assert-NativeSuccess {
+    param([Parameter(Mandatory = $true)][string]$Description)
     if ($LASTEXITCODE -ne 0) {
-        throw "$FilePath failed with exit code $LASTEXITCODE."
+        throw "$Description failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Write-InternalChecksums {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $checksumPath = Join-Path $Root 'SHA256SUMS.txt'
+    $lines = @(Get-ChildItem -LiteralPath $Root -Recurse -File | Where-Object {
+        $_.FullName -ne $checksumPath
+    } | ForEach-Object {
+        $relative = $_.FullName.Substring($Root.Length).TrimStart('\', '/').Replace('\', '/')
+        $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        [pscustomobject]@{ Relative = $relative; Line = "$hash  $relative" }
+    } | Sort-Object Relative | Select-Object -ExpandProperty Line)
+    if ($lines.Count -eq 0) {
+        throw "No regular files were found beneath $Root."
+    }
+    [System.IO.File]::WriteAllText(
+        $checksumPath,
+        (($lines -join "`n") + "`n"),
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+}
+
+function New-LinuxArchive {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Archive,
+        [Parameter(Mandatory = $true)][string[]]$ExecutablePaths
+    )
+    $stage = Join-Path $distRoot ('.git-archive-' + [guid]::NewGuid().ToString('N'))
+    $stageFull = [System.IO.Path]::GetFullPath($stage)
+    $distFull = [System.IO.Path]::GetFullPath($distRoot).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $stageFull.StartsWith($distFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Refusing to create an archive staging directory outside dist.'
+    }
+    New-Item -ItemType Directory -Path $stageFull | Out-Null
+    try {
+        $rootName = Split-Path -Leaf $Root
+        Copy-Item -LiteralPath $Root -Destination $stageFull -Recurse
+        & $gitPath -C $stageFull init --quiet
+        Assert-NativeSuccess 'temporary archive repository initialization'
+        & $gitPath -C $stageFull config core.autocrlf false
+        Assert-NativeSuccess 'temporary archive line-ending configuration'
+        $emptyAttributes = Join-Path $stageFull '.git\info\attributes'
+        [System.IO.File]::WriteAllText($emptyAttributes, '', (New-Object System.Text.UTF8Encoding($false)))
+        & $gitPath -C $stageFull config core.attributesFile $emptyAttributes
+        Assert-NativeSuccess 'temporary archive attribute configuration'
+        & $gitPath -C $stageFull add --all -- $rootName
+        Assert-NativeSuccess 'temporary archive index creation'
+        foreach ($relative in $ExecutablePaths) {
+            & $gitPath -C $stageFull update-index --chmod=+x -- "$rootName/$relative"
+            Assert-NativeSuccess "archive executable mode for $relative"
+        }
+        $tree = (& $gitPath -C $stageFull write-tree).Trim()
+        Assert-NativeSuccess 'temporary archive tree creation'
+        if ($tree -notmatch '^[0-9a-f]{40,64}$') {
+            throw 'git write-tree returned an invalid object ID.'
+        }
+        & $gitPath -C $stageFull archive --format=tar.gz "--output=$Archive" $tree
+        Assert-NativeSuccess "archive creation for $rootName"
+    }
+    finally {
+        if (Test-Path -LiteralPath $stageFull) {
+            Remove-Item -LiteralPath $stageFull -Recurse -Force
+        }
     }
 }
 
@@ -57,33 +117,7 @@ $ninjaPath = Resolve-Tool -Name 'ninja.exe' -Candidates @(
     (Get-Command ninja.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1),
     (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe\ninja.exe')
 )
-
-$curlPath = Resolve-Tool -Name 'curl.exe' -Candidates @(
-    (Get-Command curl.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
-)
-$curlRetryArguments = @('--retry', '4', '--retry-all-errors', '--retry-delay', '2', '--retry-max-time', '45', '--connect-timeout', '10')
-
-$gpgPath = Resolve-Tool -Name 'gpg.exe' -Candidates @(
-    (Get-Command gpg.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1),
-    (Join-Path $env:ProgramFiles 'Git\usr\bin\gpg.exe')
-)
-
-$gitGpgPath = Join-Path $env:ProgramFiles 'Git\usr\bin\gpg.exe'
-$usingGitForWindowsGpg = (Resolve-Path $gpgPath).Path -eq (Resolve-Path $gitGpgPath -ErrorAction SilentlyContinue).Path
-function Convert-ToGpgPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
-
-    $fullPath = [System.IO.Path]::GetFullPath($Path)
-    if (-not $usingGitForWindowsGpg) {
-        return $fullPath
-    }
-    $drive = $fullPath.Substring(0, 1).ToLowerInvariant()
-    $remainder = $fullPath.Substring(3).Replace('\', '/')
-    return "/$drive/$remainder"
-}
+$gitPath = (Get-Command git -ErrorAction Stop).Source
 
 $env:PATH = @(
     (Split-Path -Parent $zigPath),
@@ -95,10 +129,13 @@ $env:PATH = @(
 $env:CMAKE_GENERATOR = 'Ninja'
 
 rustup target add $target
+Assert-NativeSuccess 'rustup target add'
 
 cargo zigbuild --locked --release --bin wotoha-app --target $target --target-dir $targetDir
+Assert-NativeSuccess 'cargo zigbuild'
 
 Remove-Item $packageRoot -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item $portableRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'bin') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $packageRoot 'deploy') | Out-Null
@@ -118,65 +155,19 @@ foreach ($requiredVersion in @('YTDLP_REPOSITORY', 'YTDLP_VERSION', 'DENO_VERSIO
 }
 
 $thirdParty = Join-Path $packageRoot 'third-party'
-$ytDlp = Join-Path $thirdParty 'yt-dlp'
-$ytDlpSums = Join-Path $thirdParty 'SHA2-256SUMS'
-$ytDlpSignature = Join-Path $thirdParty 'SHA2-256SUMS.sig'
 $allowedYtDlpRepositories = @('yt-dlp/yt-dlp', 'yt-dlp/yt-dlp-nightly-builds')
 if ($versions.YTDLP_REPOSITORY -notin $allowedYtDlpRepositories) {
     throw 'YTDLP_REPOSITORY must name an official yt-dlp release repository.'
 }
-$ytDlpBase = "https://github.com/$($versions.YTDLP_REPOSITORY)/releases/download/$($versions.YTDLP_VERSION)"
-Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '134217728', '--remove-on-error', "$ytDlpBase/yt-dlp_linux", '--output', $ytDlp))
-Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '262144', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS", '--output', $ytDlpSums))
-Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '65536', '--remove-on-error', "$ytDlpBase/SHA2-256SUMS.sig", '--output', $ytDlpSignature))
-
-$gpgHome = Join-Path $distRoot '.yt-dlp-gnupg'
-Remove-Item $gpgHome -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $gpgHome | Out-Null
-try {
-    $publicKey = Join-Path $repoRoot 'deploy\yt-dlp-public.key'
-    $gpgHomeArgument = Convert-ToGpgPath $gpgHome
-    $publicKeyArgument = Convert-ToGpgPath $publicKey
-    $ytDlpSignatureArgument = Convert-ToGpgPath $ytDlpSignature
-    $ytDlpSumsArgument = Convert-ToGpgPath $ytDlpSums
-    Invoke-Checked $gpgPath @('--batch', '--homedir', $gpgHomeArgument, '--import', $publicKeyArgument)
-    $fingerprintOutput = & $gpgPath --batch --homedir $gpgHomeArgument --with-colons --fingerprint
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Unable to read the imported yt-dlp signing key fingerprint.'
-    }
-    $fingerprint = $fingerprintOutput | Where-Object { $_ -like 'fpr:*' } | Select-Object -First 1
-    $fingerprint = ($fingerprint -split ':')[9]
-    if ($fingerprint -ne 'AC0CBBE6848D6A873464AF4E57CF65933B5A7581') {
-        throw "Unexpected yt-dlp signing key fingerprint: $fingerprint"
-    }
-    Invoke-Checked $gpgPath @('--batch', '--homedir', $gpgHomeArgument, '--verify', $ytDlpSignatureArgument, $ytDlpSumsArgument)
+if ($versions.YTDLP_VERSION -notmatch '^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$') {
+    throw 'YTDLP_VERSION is not a release tag.'
 }
-finally {
-    Remove-Item $gpgHome -Recurse -Force -ErrorAction SilentlyContinue
+if ($versions.DENO_VERSION -notmatch '^[0-9]+[.][0-9]+[.][0-9]+$') {
+    throw 'DENO_VERSION is not a release version.'
 }
-
-$ytDlpChecksumMatches = @(Get-Content $ytDlpSums | Where-Object { $_ -match '^([0-9a-f]{64})  yt-dlp_linux$' })
-if ($ytDlpChecksumMatches.Count -ne 1) {
-    throw 'The signed yt-dlp checksum file did not contain exactly one yt-dlp_linux entry.'
+if ($versions.DENO_X86_64_LINUX_GNU_SHA256 -notmatch '^[0-9a-f]{64}$') {
+    throw 'Deno digest is not lowercase SHA-256.'
 }
-$expectedYtDlpHash = ([regex]::Match($ytDlpChecksumMatches[0], '^([0-9a-f]{64})')).Groups[1].Value
-$actualYtDlpHash = (Get-FileHash $ytDlp -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualYtDlpHash -ne $expectedYtDlpHash) {
-    throw 'yt-dlp did not match its signed checksum.'
-}
-
-$denoZip = Join-Path $thirdParty 'deno.zip'
-$denoUnpacked = Join-Path $thirdParty 'deno-unpacked'
-$denoUrl = "https://github.com/denoland/deno/releases/download/v$($versions.DENO_VERSION)/deno-x86_64-unknown-linux-gnu.zip"
-Invoke-Checked $curlPath (@('--fail', '--silent', '--show-error', '--location') + $curlRetryArguments + @('--max-filesize', '134217728', '--remove-on-error', $denoUrl, '--output', $denoZip))
-$actualDenoHash = (Get-FileHash $denoZip -Algorithm SHA256).Hash.ToLowerInvariant()
-if ($actualDenoHash -ne $versions.DENO_X86_64_LINUX_GNU_SHA256) {
-    throw 'Deno archive did not match the pinned checksum.'
-}
-Expand-Archive -LiteralPath $denoZip -DestinationPath $denoUnpacked -Force
-Move-Item (Join-Path $denoUnpacked 'deno') (Join-Path $thirdParty 'deno')
-Remove-Item $denoZip -Force
-Remove-Item $denoUnpacked -Recurse -Force
 
 Copy-Item (Join-Path $targetDir "$target\release\wotoha-app") (Join-Path $packageRoot 'bin\wotoha-app')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha.service') (Join-Path $packageRoot 'deploy\wotoha.service')
@@ -194,8 +185,88 @@ Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-public.key') (Join-Path $packageRo
 Copy-Item (Join-Path $repoRoot 'deploy\third-party-versions.env') (Join-Path $packageRoot 'deploy\third-party-versions.env')
 Copy-Item (Join-Path $repoRoot 'docs\ubuntu-deploy.md') (Join-Path $packageRoot 'docs\ubuntu-deploy.md')
 Copy-Item (Join-Path $repoRoot 'docs\youtube-extraction.md') (Join-Path $packageRoot 'docs\youtube-extraction.md')
-
+Copy-Item (Join-Path $repoRoot 'LICENSE') (Join-Path $packageRoot 'LICENSE')
+Copy-Item (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md')
 $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+$rustNotices = Join-Path $thirdParty 'rust'
+New-Item -ItemType Directory -Force -Path $rustNotices | Out-Null
+Copy-Item (Join-Path $repoRoot 'Cargo.lock') (Join-Path $rustNotices 'Cargo.lock')
+$cargoMetadataJson = & cargo metadata --locked --format-version 1
+Assert-NativeSuccess 'cargo metadata for the license inventory'
+$cargoMetadata = $cargoMetadataJson | ConvertFrom-Json
+$licensePackages = @($cargoMetadata.packages | ForEach-Object {
+    if ([string]::IsNullOrWhiteSpace($_.license) -and [string]::IsNullOrWhiteSpace($_.license_file)) {
+        throw "Cargo package $($_.name) $($_.version) has no declared license information."
+    }
+    [ordered]@{
+        name = $_.name
+        version = $_.version
+        source = $_.source
+        license = $_.license
+        license_file = if ($_.license_file) { Split-Path -Leaf $_.license_file } else { $null }
+        repository = $_.repository
+    }
+} | Sort-Object { $_.name }, { $_.version }, { $_.source })
+$licenseInventory = [ordered]@{
+    schema_version = 1
+    generated_from = 'Cargo.lock'
+    target = $target
+    packages = $licensePackages
+} | ConvertTo-Json -Depth 5
+[System.IO.File]::WriteAllText(
+    (Join-Path $rustNotices 'license-inventory.json'),
+    $licenseInventory,
+    $utf8WithoutBom
+)
+$licenseBundlePath = Join-Path $targetDir 'THIRD_PARTY_LICENSES.html'
+$cargoAboutVersion = (& cargo about --version | Out-String).Trim()
+Assert-NativeSuccess 'cargo-about version check'
+if ($cargoAboutVersion -notmatch '(^| )cargo-about 0[.]9[.]1($| )') {
+    throw "cargo-about 0.9.1 is required; found: $cargoAboutVersion"
+}
+& cargo about generate --frozen --fail --workspace `
+    --config (Join-Path $repoRoot 'deploy\release-about.toml') `
+    --output-file $licenseBundlePath `
+    (Join-Path $repoRoot 'deploy\third-party-licenses.hbs')
+Assert-NativeSuccess 'cargo-about third-party license generation'
+$licenseBundleText = if (Test-Path -LiteralPath $licenseBundlePath) {
+    [System.IO.File]::ReadAllText($licenseBundlePath)
+} else {
+    ''
+}
+if (-not $licenseBundleText.Contains('Wotoha third-party Rust licenses') -or
+    -not $licenseBundleText.Contains('Used by:') -or
+    -not $licenseBundleText.Contains('https://crates.io/crates/')) {
+    throw 'cargo-about produced an empty or unexpected third-party license bundle.'
+}
+Copy-Item $licenseBundlePath (Join-Path $rustNotices 'THIRD_PARTY_LICENSES.html')
+$attributions = New-Object System.Text.StringBuilder
+[void]$attributions.Append("Wotoha third-party Rust attributions`n")
+[void]$attributions.Append("Generated from standalone COPYRIGHT and NOTICE files in the locked dependency graph.`n")
+foreach ($cargoPackage in @($cargoMetadata.packages | Sort-Object { $_.name }, { $_.version }, { $_.source })) {
+    $packageDirectory = Split-Path -Parent $cargoPackage.manifest_path
+    if (-not (Test-Path -LiteralPath $packageDirectory -PathType Container)) {
+        throw "Cargo package source is unavailable: $($cargoPackage.name) $($cargoPackage.version)"
+    }
+    foreach ($attributionFile in @(Get-ChildItem -LiteralPath $packageDirectory -File | Where-Object {
+        $_.Name -match '^(COPYRIGHT|NOTICE)([.-].*)?$'
+    } | Sort-Object Name)) {
+        [void]$attributions.Append(
+            "`n===== $($cargoPackage.name) $($cargoPackage.version) -- $($attributionFile.Name) =====`n"
+        )
+        $attributionText = [System.IO.File]::ReadAllText($attributionFile.FullName).Replace("`r`n", "`n").Replace("`r", "`n")
+        [void]$attributions.Append($attributionText)
+        if (-not $attributionText.EndsWith("`n")) {
+            [void]$attributions.Append("`n")
+        }
+    }
+}
+[System.IO.File]::WriteAllText(
+    (Join-Path $rustNotices 'THIRD_PARTY_ATTRIBUTIONS.txt'),
+    $attributions.ToString(),
+    $utf8WithoutBom
+)
+
 $deploymentTextFiles = @(
     (Join-Path $packageRoot 'install-ubuntu.sh'),
     (Join-Path $packageRoot 'install-yt-dlp-bundle.sh'),
@@ -207,18 +278,41 @@ foreach ($deploymentTextFile in $deploymentTextFiles) {
     [System.IO.File]::WriteAllText($deploymentTextFile, $content, $utf8WithoutBom)
 }
 
-$binaryHash = (Get-FileHash (Join-Path $packageRoot 'bin\wotoha-app') -Algorithm SHA256).Hash.ToLowerInvariant()
-$denoHash = (Get-FileHash (Join-Path $packageRoot 'third-party\deno') -Algorithm SHA256).Hash.ToLowerInvariant()
-Set-Content -Path (Join-Path $packageRoot 'SHA256SUMS.txt') -Value @(
-    "$binaryHash  bin/wotoha-app"
-    "$actualYtDlpHash  third-party/yt-dlp"
-    "$denoHash  third-party/deno"
-) -Encoding ascii
-Set-Content -Path (Join-Path $packageRoot 'RELEASE_VERSION') -Value 'manual' -Encoding ascii
+[System.IO.File]::WriteAllText(
+    (Join-Path $packageRoot 'RELEASE_VERSION'),
+    "manual`n",
+    $utf8WithoutBom
+)
 
 Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
-tar -czf $archivePath -C $distRoot 'wotoha-ubuntu-x86_64-musl'
+Remove-Item $portableArchivePath -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $portableRoot | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $portableRoot 'bin') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $portableRoot 'third-party\rust') | Out-Null
+Copy-Item (Join-Path $packageRoot 'bin\wotoha-app') (Join-Path $portableRoot 'bin\wotoha-app')
+Copy-Item (Join-Path $packageRoot 'LICENSE') (Join-Path $portableRoot 'LICENSE')
+Copy-Item (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $portableRoot 'THIRD_PARTY_NOTICES.md')
+Copy-Item (Join-Path $packageRoot 'RELEASE_VERSION') (Join-Path $portableRoot 'RELEASE_VERSION')
+Copy-Item (Join-Path $rustNotices 'Cargo.lock') (Join-Path $portableRoot 'third-party\rust\Cargo.lock')
+Copy-Item (Join-Path $rustNotices 'license-inventory.json') (Join-Path $portableRoot 'third-party\rust\license-inventory.json')
+Copy-Item (Join-Path $rustNotices 'THIRD_PARTY_LICENSES.html') (Join-Path $portableRoot 'third-party\rust\THIRD_PARTY_LICENSES.html')
+Copy-Item (Join-Path $rustNotices 'THIRD_PARTY_ATTRIBUTIONS.txt') (Join-Path $portableRoot 'third-party\rust\THIRD_PARTY_ATTRIBUTIONS.txt')
+
+Write-InternalChecksums $packageRoot
+Write-InternalChecksums $portableRoot
+New-LinuxArchive -Root $packageRoot -Archive $archivePath -ExecutablePaths @(
+    'bin/wotoha-app',
+    'install-ubuntu.sh',
+    'install-yt-dlp-bundle.sh',
+    'wotoha-update.sh',
+    'yt-dlp-update.sh'
+)
+New-LinuxArchive -Root $portableRoot -Archive $portableArchivePath -ExecutablePaths @(
+    'bin/wotoha-app'
+)
 
 Write-Output "binary: $(Join-Path $targetDir "$target\release\wotoha-app")"
 Write-Output "package: $packageRoot"
 Write-Output "archive: $archivePath"
+Write-Output "portable package: $portableRoot"
+Write-Output "portable archive: $portableArchivePath"

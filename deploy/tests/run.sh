@@ -12,6 +12,7 @@ INSTALL_BUNDLE="$ROOT/deploy/install-yt-dlp-bundle.sh"
 APP_UPDATE="$ROOT/deploy/wotoha-update.sh"
 INSTALL_UBUNTU="$ROOT/deploy/install-ubuntu.sh"
 MOCK="$ROOT/deploy/tests/mock-command.sh"
+RELEASE_COMPLIANCE="$ROOT/deploy/tests/release-compliance.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -23,7 +24,9 @@ require() {
   command -v "$1" >/dev/null 2>&1 || fail "test prerequisite is missing: $1"
 }
 for cmd in bash sha256sum stat sed awk mktemp tar grep cmp readlink; do require "$cmd"; done
-bash -n "$UPDATE" "$INSTALL_BUNDLE" "$APP_UPDATE" "$INSTALL_UBUNTU" "$MOCK" "$0"
+bash -n "$UPDATE" "$INSTALL_BUNDLE" "$APP_UPDATE" "$INSTALL_UBUNTU" "$MOCK" \
+  "$RELEASE_COMPLIANCE" "$0"
+bash "$RELEASE_COMPLIANCE"
 
 # The extraction process and its network operations need independent bounds;
 # the service deadline is the final backstop for the whole transaction.
@@ -125,7 +128,7 @@ EOF
   chmod 0755 "$fake_opt/bin/deno"
   cp "$MOCK" "$bin/mock-command"
   chmod 0755 "$bin/mock-command"
-  for command in curl gpg install jq flock mkdir timeout; do
+  for command in curl gpg install jq flock mkdir mv timeout; do
     ln -s mock-command "$bin/$command"
   done
   [[ "$(PATH="$bin:$PATH" command -v install)" == "$bin/install" ]] \
@@ -173,6 +176,10 @@ prepare_case signature; seed_old
 expect_fail env FAKE_GPG_VERIFY_STATUS=1 PATH="$bin:$PATH" FIXTURE_DIR="$fixture" MOCK_CURL_MODE=ytdlp "$case_root/yt-dlp-update"
 assert_old_preserved; pass 'bad signed checksum fails closed'
 
+prepare_case validsig; seed_old
+expect_fail env FAKE_GPG_VALIDSIG_FINGERPRINT=BAD PATH="$bin:$PATH" FIXTURE_DIR="$fixture" MOCK_CURL_MODE=ytdlp "$case_root/yt-dlp-update"
+assert_old_preserved; pass 'signature from an unexpected primary key fails closed'
+
 prepare_case checksum; seed_old
 printf '%064d  yt-dlp_linux\n' 0 >"$fixture/SHA2-256SUMS"
 expect_fail run_case
@@ -191,6 +198,12 @@ expect_fail env FAKE_YTDLP_EXTRACT_HANG=true FAKE_YTDLP_HANG_STARTED="$case_root
   PATH="$bin:$PATH" FIXTURE_DIR="$fixture" MOCK_CURL_MODE=ytdlp "$case_root/yt-dlp-update"
 [[ -s "$case_root/hang.started" ]] || fail 'timeout fixture never entered the extraction hang'
 assert_old_preserved; pass 'hung yt-dlp extraction times out without changing installed state'
+
+prepare_case promotion-rollback; seed_old
+expect_fail env FAKE_MV_FAIL_SUFFIX=installed-yt-dlp PATH="$bin:$PATH" \
+  FIXTURE_DIR="$fixture" MOCK_CURL_MODE=ytdlp "$case_root/yt-dlp-update"
+assert_old_preserved
+pass 'yt-dlp updater restores pointers and state after a promotion commit failure'
 
 # Successful canary installs content-addressed payload first, then atomically
 # rotates previous/current and records state. Interrupted staging files are
@@ -215,6 +228,141 @@ run_case
 [[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$new_digest/yt-dlp" ]] || fail 'rerun changed promoted pointer'
 pass 'atomic promotion, state recording, and interrupted-rerun recovery'
 
+# The updater-compatible release no longer redistributes yt-dlp or Deno. Its
+# compatibility entry point downloads the pinned upstream assets, validates
+# them, runs the same canary, and only then promotes them.
+rewrite_bundle_bootstrap() {
+  local sandbox="$1" destination="$2"
+  sed \
+    -e "s|/etc/wotoha|$sandbox/mock-etc|g" \
+    -e "s|/opt/wotoha|$sandbox/mock-opt|g" \
+    -e "s|/var/lib/wotoha-updater|$sandbox/mock-updater-state|g" \
+    -e "s|/run/lock|$sandbox/mock-locks|g" \
+    "$INSTALL_BUNDLE" >"$destination"
+  chmod 0755 "$destination"
+  for production_path in /opt/wotoha /etc/wotoha /var/lib/wotoha-updater /run/lock; do
+    ! grep -Fq "$production_path" "$destination" \
+      || fail "rewritten runtime bootstrap retained production path: $production_path"
+  done
+}
+
+prepare_bootstrap_case() {
+  case_root="$work/bootstrap-$1"
+  sandbox="$case_root/root"
+  fixture="$case_root/fixture"
+  bin="$case_root/bin"
+  fake_etc="$sandbox/mock-etc"
+  fake_opt="$sandbox/mock-opt"
+  fake_state="$sandbox/mock-updater-state"
+  fake_locks="$sandbox/mock-locks"
+  package="$case_root/package"
+  mock_log="$case_root/mock.log"
+  mkdir -p "$fake_etc" "$fake_opt/bin" "$fake_state" "$fake_locks" \
+    "$fixture" "$bin" "$package/deploy"
+  make_fixture "$fixture"
+  printf 'signature fixture\n' >"$fixture/SHA2-256SUMS.sig"
+  cat >"$fixture/deno" <<'EOF'
+#!/usr/bin/env bash
+printf 'deno 2.9.4\n'
+printf 'v8 fixture\n'
+printf 'typescript fixture\n'
+EOF
+  chmod 0755 "$fixture/deno"
+  printf 'fixture Deno archive\n' >"$fixture/deno.zip"
+  deno_fixture_digest="$(sha256sum "$fixture/deno.zip" | awk '{print $1}')"
+  cat >"$package/deploy/third-party-versions.env" <<EOF
+YTDLP_REPOSITORY=yt-dlp/yt-dlp-nightly-builds
+YTDLP_VERSION=2026.07.23.234303
+DENO_VERSION=2.9.4
+DENO_X86_64_LINUX_GNU_SHA256=$deno_fixture_digest
+EOF
+  cp "$ROOT/deploy/yt-dlp-public.key" "$package/deploy/yt-dlp-public.key"
+  cp "$ROOT/deploy/yt-dlp-update.service" "$package/deploy/yt-dlp-update.service"
+  cp "$ROOT/deploy/yt-dlp-update.timer" "$package/deploy/yt-dlp-update.timer"
+  cp "$UPDATE" "$package/yt-dlp-update.sh"
+  chmod 0755 "$package/yt-dlp-update.sh"
+  (cd "$package" && sha256sum deploy/third-party-versions.env \
+    deploy/yt-dlp-public.key deploy/yt-dlp-update.service deploy/yt-dlp-update.timer \
+    yt-dlp-update.sh > SHA256SUMS.txt)
+  rewrite_bundle_bootstrap "$sandbox" "$case_root/install-yt-dlp-bundle"
+  cp "$MOCK" "$bin/mock-command"
+  chmod 0755 "$bin/mock-command"
+  for command in curl gpg install mv systemctl flock timeout unzip; do
+    ln -s mock-command "$bin/$command"
+  done
+}
+
+run_bootstrap_case() {
+  PATH="$bin:$PATH" FIXTURE_DIR="$fixture" MOCK_LOG="$mock_log" \
+    FAKE_YTDLP_LOG="$case_root/yt-dlp.log" \
+    "$case_root/install-yt-dlp-bundle" "$package"
+}
+
+prepare_bootstrap_case signature
+expect_fail env FAKE_GPG_VERIFY_STATUS=1 PATH="$bin:$PATH" FIXTURE_DIR="$fixture" \
+  "$case_root/install-yt-dlp-bundle" "$package"
+[[ ! -e "$fake_opt/yt-dlp/current" && ! -e "$fake_opt/bin/deno" ]] \
+  || fail 'failed bootstrap changed installed runtimes'
+pass 'runtime bootstrap rejects a bad signed yt-dlp checksum before installation'
+
+prepare_bootstrap_case validsig
+expect_fail env FAKE_GPG_VALIDSIG_FINGERPRINT=BAD PATH="$bin:$PATH" FIXTURE_DIR="$fixture" \
+  "$case_root/install-yt-dlp-bundle" "$package"
+[[ ! -e "$fake_opt/yt-dlp/current" && ! -e "$fake_opt/bin/deno" ]] \
+  || fail 'wrong signature primary key changed installed runtimes'
+pass 'runtime bootstrap rejects a signature from an unexpected primary key'
+
+prepare_bootstrap_case deno-digest
+sed -i 's/^DENO_X86_64_LINUX_GNU_SHA256=.*/DENO_X86_64_LINUX_GNU_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/' \
+  "$package/deploy/third-party-versions.env"
+(cd "$package" && sha256sum deploy/third-party-versions.env \
+  deploy/yt-dlp-public.key deploy/yt-dlp-update.service deploy/yt-dlp-update.timer \
+  yt-dlp-update.sh > SHA256SUMS.txt)
+expect_fail env PATH="$bin:$PATH" FIXTURE_DIR="$fixture" \
+  "$case_root/install-yt-dlp-bundle" "$package"
+[[ ! -e "$fake_opt/yt-dlp/current" && ! -e "$fake_opt/bin/deno" ]] \
+  || fail 'bad Deno digest changed installed runtimes'
+pass 'runtime bootstrap rejects Deno that does not match the packaged pin'
+
+prepare_bootstrap_case promotion-rollback
+old_bootstrap_digest=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+mkdir -p "$fake_opt/yt-dlp/versions/$old_bootstrap_digest"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" old-yt-dlp\n' \
+  > "$fake_opt/yt-dlp/versions/$old_bootstrap_digest/yt-dlp"
+chmod 0755 "$fake_opt/yt-dlp/versions/$old_bootstrap_digest/yt-dlp"
+ln -s "versions/$old_bootstrap_digest/yt-dlp" "$fake_opt/yt-dlp/current"
+ln -s ../yt-dlp/current "$fake_opt/bin/yt-dlp"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" old-deno\n' > "$fake_opt/bin/deno"
+chmod 0755 "$fake_opt/bin/deno"
+printf 'yt-dlp/yt-dlp-nightly-builds 2026.07.22.000000 %s\n' "$old_bootstrap_digest" \
+  > "$fake_state/installed-yt-dlp"
+expect_fail env FAKE_MV_FAIL_SUFFIX=installed-yt-dlp PATH="$bin:$PATH" \
+  FIXTURE_DIR="$fixture" MOCK_LOG="$mock_log" FAKE_YTDLP_LOG="$case_root/yt-dlp.log" \
+  "$case_root/install-yt-dlp-bundle" "$package"
+[[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$old_bootstrap_digest/yt-dlp" ]] \
+  || fail 'failed bootstrap promotion did not restore the current yt-dlp pointer'
+[[ "$(readlink "$fake_opt/bin/yt-dlp")" == ../yt-dlp/current ]] \
+  || fail 'failed bootstrap promotion did not restore the compatibility pointer'
+[[ "$($fake_opt/bin/deno)" == old-deno ]] \
+  || fail 'failed bootstrap promotion did not restore Deno'
+grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.07.22.000000 $old_bootstrap_digest" \
+  "$fake_state/installed-yt-dlp" || fail 'failed bootstrap promotion did not restore state'
+pass 'runtime bootstrap rolls back Deno, pointers, and state after a commit failure'
+
+prepare_bootstrap_case promote
+run_bootstrap_case
+bootstrap_digest="$(sha256sum "$fixture/yt-dlp" | awk '{print $1}')"
+[[ "$(readlink "$fake_opt/yt-dlp/current")" == "versions/$bootstrap_digest/yt-dlp" ]] \
+  || fail 'runtime bootstrap did not promote verified yt-dlp'
+[[ -x "$fake_opt/bin/deno" ]] || fail 'runtime bootstrap did not install verified Deno'
+grep -Fqx "yt-dlp/yt-dlp-nightly-builds 2026.07.23.234303 $bootstrap_digest" \
+  "$fake_state/installed-yt-dlp" || fail 'runtime bootstrap did not record pinned state'
+grep -Fq 'github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/2026.07.23.234303/yt-dlp_linux' \
+  "$mock_log" || fail 'runtime bootstrap did not fetch yt-dlp from the pinned official release'
+grep -Fq 'github.com/denoland/deno/releases/download/v2.9.4/deno-x86_64-unknown-linux-gnu.zip' \
+  "$mock_log" || fail 'runtime bootstrap did not fetch Deno from the pinned official release'
+pass 'runtime-free package bootstraps pinned, verified upstream yt-dlp and Deno'
+
 # The final general updater is exercised against a complete workerless release
 # archive. Like the yt-dlp cases above, all absolute paths are rewritten into a
 # disposable root before the script is run.
@@ -235,21 +383,21 @@ rewrite_general_updater() {
 }
 
 make_general_fixture() {
-  local tag="$1" package="$fixture/wotoha-ubuntu-x86_64-musl" archive_digest
-  mkdir -p "$package/bin" "$package/third-party"
+  local tag="$1" package="$fixture/wotoha-ubuntu-x86_64-musl" archive_digest archive_size
+  mkdir -p "$package/bin"
   cat >"$package/bin/wotoha-app" <<'EOF'
 #!/usr/bin/env bash
 printf 'phase-b-final\n'
 EOF
-  cat >"$package/third-party/yt-dlp" <<'EOF'
+  cat >"$fixture/bootstrap-yt-dlp" <<'EOF'
 #!/usr/bin/env bash
 printf '2026.07.23.234303\n'
 EOF
-  cat >"$package/third-party/deno" <<'EOF'
+  cat >"$fixture/bootstrap-deno" <<'EOF'
 #!/usr/bin/env bash
 printf 'deno 2.4.5\n'
 EOF
-  chmod 0755 "$package/bin/wotoha-app" "$package/third-party/yt-dlp" "$package/third-party/deno"
+  chmod 0755 "$package/bin/wotoha-app" "$fixture/bootstrap-yt-dlp" "$fixture/bootstrap-deno"
   cp "$APP_UPDATE" "$package/wotoha-update.sh"
   chmod 0755 "$package/wotoha-update.sh"
   cat >"$package/install-yt-dlp-bundle.sh" <<EOF
@@ -260,23 +408,24 @@ package="\${1:?missing package}"
 install_dir="$sandbox/mock-opt/bin"
 ytdlp_root="$sandbox/mock-opt/yt-dlp"
 state_dir="$sandbox/mock-updater-state"
-digest="\$(sha256sum "\$package/third-party/yt-dlp" | awk '{print \$1}')"
+digest="\$(sha256sum "$fixture/bootstrap-yt-dlp" | awk '{print \$1}')"
 mkdir -p "\$install_dir" "\$ytdlp_root/versions/\$digest" "\$state_dir"
-cp "\$package/third-party/yt-dlp" "\$ytdlp_root/versions/\$digest/yt-dlp"
+cp "$fixture/bootstrap-yt-dlp" "\$ytdlp_root/versions/\$digest/yt-dlp"
 chmod 0755 "\$ytdlp_root/versions/\$digest/yt-dlp"
 ln -sfn "versions/\$digest/yt-dlp" "\$ytdlp_root/current"
 ln -sfn ../yt-dlp/current "\$install_dir/yt-dlp"
-cp "\$package/third-party/deno" "\$install_dir/deno"
+cp "$fixture/bootstrap-deno" "\$install_dir/deno"
 chmod 0755 "\$install_dir/deno"
 printf '%s %s %s\n' yt-dlp/yt-dlp-nightly-builds 2026.07.23.234303 "\$digest" >"\$state_dir/installed-yt-dlp"
 EOF
   chmod 0755 "$package/install-yt-dlp-bundle.sh"
-  (cd "$package" && sha256sum bin/wotoha-app third-party/yt-dlp third-party/deno > SHA256SUMS.txt)
+  (cd "$package" && sha256sum bin/wotoha-app > SHA256SUMS.txt)
   tar -czf "$fixture/release.tar.gz" -C "$fixture" wotoha-ubuntu-x86_64-musl
   archive_digest="$(sha256sum "$fixture/release.tar.gz" | awk '{print $1}')"
+  archive_size="$(stat --format='%s' "$fixture/release.tar.gz")"
   printf '%s  %s\n' "$archive_digest" wotoha-ubuntu-x86_64-musl.tar.gz >"$fixture/release.tar.gz.sha256"
-  printf '{"schema_version":1,"tag":"%s","commit":"%040d","asset":"wotoha-ubuntu-x86_64-musl.tar.gz","sha256":"%s"}\n' \
-    "$tag" 1 "$archive_digest" >"$fixture/release.tar.gz.manifest.json"
+  printf '{"schema_version":1,"tag":"%s","commit":"%040d","asset":"wotoha-ubuntu-x86_64-musl.tar.gz","sha256":"%s","size":%s}\n' \
+    "$tag" 1 "$archive_digest" "$archive_size" >"$fixture/release.tar.gz.manifest.json"
   printf '{"attestation":"fixture"}\n' >"$fixture/release.tar.gz.attestation.jsonl"
   printf '{"tag_name":"%s","assets":[]}\n' "$tag" >"$fixture/full-release.json"
 }
@@ -350,13 +499,13 @@ seed_final_application() {
 
 seed_valid_ytdlp() {
   local digest
-  digest="$(sha256sum "$fixture/wotoha-ubuntu-x86_64-musl/third-party/yt-dlp" | awk '{print $1}')"
+  digest="$(sha256sum "$fixture/bootstrap-yt-dlp" | awk '{print $1}')"
   mkdir -p "$fake_opt/yt-dlp/versions/$digest"
-  cp "$fixture/wotoha-ubuntu-x86_64-musl/third-party/yt-dlp" "$fake_opt/yt-dlp/versions/$digest/yt-dlp"
+  cp "$fixture/bootstrap-yt-dlp" "$fake_opt/yt-dlp/versions/$digest/yt-dlp"
   chmod 0755 "$fake_opt/yt-dlp/versions/$digest/yt-dlp"
   ln -s "versions/$digest/yt-dlp" "$fake_opt/yt-dlp/current"
   ln -s ../yt-dlp/current "$fake_opt/bin/yt-dlp"
-  cp "$fixture/wotoha-ubuntu-x86_64-musl/third-party/deno" "$fake_opt/bin/deno"
+  cp "$fixture/bootstrap-deno" "$fake_opt/bin/deno"
   chmod 0755 "$fake_opt/bin/deno"
   printf '%s %s %s\n' yt-dlp/yt-dlp-nightly-builds 2026.07.23.234303 "$digest" >"$fake_state/installed-yt-dlp"
 }
@@ -423,6 +572,14 @@ grep -Fqx v0.5.30 "$fake_state/installed-release" || fail 'yt-dlp failure change
 [[ "$("$fake_opt/bin/wotoha-app")" == phase-a-old ]] || fail 'yt-dlp failure changed the application'
 pass 'yt-dlp bootstrap failure preserves the app and all legacy state'
 
+prepare_general_case manifest-size; seed_old_application; seed_legacy_state
+sed -i -E 's/"size":[0-9]+/"size":1/' "$fixture/release.tar.gz.manifest.json"
+expect_fail run_general_case
+assert_legacy_present
+grep -Fqx v0.5.30 "$fake_state/installed-release" || fail 'manifest size failure changed release state'
+[[ "$("$fake_opt/bin/wotoha-app")" == phase-a-old ]] || fail 'manifest size failure changed the application'
+pass 'manifest archive size mismatch fails before installation'
+
 prepare_general_case app-failure; seed_old_application; seed_legacy_state
 expect_fail env PATH="$bin:$PATH" FIXTURE_DIR="$fixture" MOCK_CURL_MODE=general MOCK_LOG="$mock_log" \
   FAKE_SERVICE_STATE_FILE="$service_state" FAKE_RESTART_FAIL=true "$case_root/wotoha-update"
@@ -462,7 +619,9 @@ tar -tzf "$fixture/release.tar.gz" >"$archive_listing"
 ! grep -Eq '(wotoha-youtube-js-worker|YOUTUBE_WORKER_SEQUENCE|youtube-clients[.]json|workers/)' "$archive_listing" \
   || fail 'Phase-B archive still contains native worker assets'
 (cd "$fixture/wotoha-ubuntu-x86_64-musl" && sha256sum --check SHA256SUMS.txt)
-pass 'Phase-B archive is workerless and its application/yt-dlp/Deno hashes verify'
+! grep -Eq '/third-party/(yt-dlp|deno|SHA2-256SUMS)' "$archive_listing" \
+  || fail 'Phase-B archive redistributes a third-party runtime payload'
+pass 'Phase-B archive is workerless, runtime-free, and its application hash verifies'
 
 ! grep -Fq 'releases?per_page=30' "$APP_UPDATE" || fail 'general updater still polls worker releases'
 [[ "$(grep -c 'youtube-worker-candidate-tag' "$APP_UPDATE")" == 2 ]] \

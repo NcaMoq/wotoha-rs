@@ -24,12 +24,37 @@ case "$repository" in
   yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;;
   *) echo "WOTOHA_YTDLP_UPDATE_REPOSITORY must name an official yt-dlp release repository" >&2; exit 2 ;;
 esac
-for command in curl gpg jq sha256sum stat flock timeout; do command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }; done
+for command in awk chmod cp curl dirname flock gpg head install jq ln mkdir mktemp mv readlink rm sha256sum stat timeout; do command -v "$command" >/dev/null || { echo "missing $command" >&2; exit 1; }; done
 [[ -r "$KEY" ]] || { echo "yt-dlp signing key is missing" >&2; exit 1; }
 exec 9>/run/lock/wotoha-ytdlp-update.lock
 flock -n 9 || exit 0
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10)
+tmp="$(mktemp -d)"
+promotion_started=false
+restore_snapshot() {
+  local path="$1" snapshot="$2"
+  rm -f -- "$path"
+  if [[ -e "$tmp/rollback/$snapshot" || -L "$tmp/rollback/$snapshot" ]]; then
+    cp -a -- "$tmp/rollback/$snapshot" "$path"
+  fi
+}
+rollback_promotion() {
+  set +e
+  echo 'yt-dlp promotion failed; restoring previous pointers and state' >&2
+  restore_snapshot "$CURRENT" current
+  restore_snapshot "$PREVIOUS" previous
+  restore_snapshot "$STATE" state
+}
+cleanup() {
+  local status=$?
+  [[ "$promotion_started" != true ]] || rollback_promotion
+  rm -f "$ROOT/.current.new" "$ROOT/.previous.new" "$STATE.new"
+  [[ -z "${candidate_new:-}" ]] || rm -rf "$candidate_new"
+  rm -rf "$tmp"
+  return "$status"
+}
+trap cleanup EXIT
+curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 \
+  --connect-timeout 10 --max-time 180)
 
 api="https://api.github.com/repos/$repository/releases/latest"
 curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize $((4 * 1024 * 1024)) --remove-on-error "$api" -o "$tmp/release.json"
@@ -53,9 +78,24 @@ curl --fail --silent --show-error --location "${curl_retry[@]}" --max-filesize "
 (( $(stat --format=%s "$tmp/yt-dlp") > 0 && $(stat --format=%s "$tmp/yt-dlp") <= MAX_BINARY_BYTES ))
 gpg_home="$tmp/gnupg"; mkdir -m 0700 "$gpg_home"
 gpg --batch --homedir "$gpg_home" --import "$KEY" >/dev/null 2>&1
-fingerprint="$(gpg --batch --homedir "$gpg_home" --with-colons --fingerprint | awk -F: '$1 == "fpr" { print $10; exit }')"
-[[ "$fingerprint" == "$EXPECTED_KEY_FINGERPRINT" ]] || { echo "unexpected yt-dlp signing key fingerprint" >&2; exit 1; }
-gpg --batch --homedir "$gpg_home" --verify "$tmp/SHA2-256SUMS.sig" "$tmp/SHA2-256SUMS" >/dev/null 2>&1
+mapfile -t imported_fingerprints < <(gpg --batch --homedir "$gpg_home" --with-colons --fingerprint \
+  | awk -F: '$1 == "fpr" {print $10}')
+expected_key_present=false
+for fingerprint in "${imported_fingerprints[@]}"; do
+  [[ "$fingerprint" == "$EXPECTED_KEY_FINGERPRINT" ]] && expected_key_present=true
+done
+[[ "$expected_key_present" == true ]] || { echo "unexpected yt-dlp signing key fingerprint" >&2; exit 1; }
+if ! verify_status="$(gpg --batch --homedir "$gpg_home" --status-fd 1 --verify \
+  "$tmp/SHA2-256SUMS.sig" "$tmp/SHA2-256SUMS" 2>/dev/null)"; then
+  echo "yt-dlp checksum signature verification failed" >&2
+  exit 1
+fi
+mapfile -t valid_primary_fingerprints < <(awk '
+  $1 == "[GNUPG:]" && $2 == "VALIDSIG" {print (NF >= 12 ? $12 : $3)}
+' <<<"$verify_status")
+[[ ${#valid_primary_fingerprints[@]} -eq 1 \
+    && "${valid_primary_fingerprints[0]}" == "$EXPECTED_KEY_FINGERPRINT" ]] \
+  || { echo "yt-dlp checksum signature used an unexpected primary key" >&2; exit 1; }
 digest="$(sha256sum "$tmp/yt-dlp" | awk '{print $1}')"
 [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
 expected_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$tmp/SHA2-256SUMS")"
@@ -68,7 +108,7 @@ if [[ -n "$installed_tag" && "$tag" == "$installed_tag" && "$digest" != "$instal
   exit 1
 fi
 candidate="$VERSIONS/$digest"
-install -d -o root -g root -m 0755 "$VERSIONS"
+install -d -o root -g root -m 0755 "$VERSIONS" "$(dirname "$STATE")"
 if [[ -x "$candidate/yt-dlp" ]]; then
   [[ "$(sha256sum "$candidate/yt-dlp" | awk '{print $1}')" == "$digest" ]] || {
     echo "installed yt-dlp version has an unexpected digest" >&2
@@ -106,10 +146,32 @@ for canary_url in "${canary_urls[@]}"; do
   echo "yt-dlp direct-byte canary failed: $canary_url" >&2
 done
 [[ "$canary_ok" == true ]] || { echo "all pinned yt-dlp canaries failed; keeping current" >&2; exit 1; }
-[[ -L "$CURRENT" && "$(readlink "$CURRENT")" == "versions/$digest/yt-dlp" ]] && exit 0
-rm -f "$ROOT/.current.new" "$ROOT/.previous.new"
+if [[ -L "$CURRENT" && "$(readlink "$CURRENT")" == "versions/$digest/yt-dlp" ]]; then
+  printf '%s %s %s\n' "$repository" "$tag" "$digest" > "$STATE.new"
+  chmod 0644 "$STATE.new"
+  mv -f "$STATE.new" "$STATE"
+  exit 0
+fi
+for active_path in "$CURRENT" "$PREVIOUS" "$STATE"; do
+  [[ ! -d "$active_path" || -L "$active_path" ]] \
+    || { echo "refusing to replace unexpected directory: $active_path" >&2; exit 1; }
+done
+mkdir -m 0700 "$tmp/rollback"
+for snapshot_spec in "$CURRENT:current" "$PREVIOUS:previous" "$STATE:state"; do
+  active_path="${snapshot_spec%:*}"
+  snapshot="${snapshot_spec##*:}"
+  if [[ -e "$active_path" || -L "$active_path" ]]; then
+    cp -a -- "$active_path" "$tmp/rollback/$snapshot"
+  fi
+done
+rm -f "$ROOT/.current.new" "$ROOT/.previous.new" "$STATE.new"
 ln -s "versions/$digest/yt-dlp" "$ROOT/.current.new"
-if [[ -L "$CURRENT" ]]; then ln -s "$(readlink "$CURRENT")" "$ROOT/.previous.new"; mv -Tf "$ROOT/.previous.new" "$PREVIOUS"; fi
+if [[ -L "$CURRENT" ]]; then ln -s "$(readlink "$CURRENT")" "$ROOT/.previous.new"; fi
+printf '%s %s %s\n' "$repository" "$tag" "$digest" > "$STATE.new"
+chmod 0644 "$STATE.new"
+promotion_started=true
+if [[ -L "$ROOT/.previous.new" ]]; then mv -Tf "$ROOT/.previous.new" "$PREVIOUS"; fi
 mv -Tf "$ROOT/.current.new" "$CURRENT"
-printf '%s %s %s\n' "$repository" "$tag" "$digest" > "$STATE.new"; chmod 0644 "$STATE.new"; mv -f "$STATE.new" "$STATE"
+mv -f "$STATE.new" "$STATE"
+promotion_started=false
 echo "promoted verified yt-dlp $tag ($digest) without restarting wotoha"

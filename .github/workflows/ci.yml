@@ -26,6 +26,24 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Verify workspace package licensing
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+
+          metadata = json.load(sys.stdin)
+          workspace_members = set(metadata["workspace_members"])
+          unlicensed = [
+              package["name"]
+              for package in metadata["packages"]
+              if package["id"] in workspace_members and not package.get("license")
+          ]
+          if unlicensed:
+              raise SystemExit(
+                  "Workspace packages without a license: " + ", ".join(unlicensed)
+              )
+          '
       - name: Test deployment updater safety
         run: |
           bash -n deploy/*.sh deploy/tests/*.sh

@@ -3,6 +3,76 @@
 この手順は `x86_64` の Ubuntu Server を対象にしています。
 配布物は `x86_64-unknown-linux-musl` で作成した静的バイナリです。
 
+## 公式Releaseを展開前に検証する
+
+公式のアーカイブを導入する場合は、展開や `sudo` による実行より先に、公開済みの
+チェックサム、manifest、GitHub Artifact Attestation をすべて検証します。`latest` のような
+変動するURLではなく、GitHub Releasesで公開されている特定の安定版タグを `TAG` に指定してください。
+この手順には `gh attestation verify` と `--deny-self-hosted-runners` を使える最新の
+[GitHub CLI](https://github.com/cli/cli#installation) が必要です。GitHub CLIはリンク先の
+公式手順で別途導入し、通常のUbuntuパッケージは次で導入します。
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates coreutils curl gnupg jq tar unzip util-linux
+```
+
+次の `vX.Y.Z` を導入したい公開タグへ置き換えます。すべてのコマンドが成功するまで、
+アーカイブを展開したり、含まれるスクリプトを実行したりしないでください。
+アーカイブ、`.sha256`、`.manifest.json`、`.intoto.jsonl` の4ファイルがすべてAssetsに
+あるReleaseだけを選びます。この一式がない過去のReleaseは、この検証手順には対応していません。
+
+```bash
+(
+set -euo pipefail
+REPO=NcaMoq/wotoha-rs
+TAG=vX.Y.Z
+ASSET=wotoha-ubuntu-x86_64-musl.tar.gz
+MANIFEST=wotoha-ubuntu-x86_64-musl.manifest.json
+BUNDLE=wotoha-ubuntu-x86_64-musl.intoto.jsonl
+cd /tmp
+BASE="https://github.com/$REPO/releases/download/$TAG"
+
+for FILE in "$ASSET" "$ASSET.sha256" "$MANIFEST" "$BUNDLE"; do
+  curl --fail --location --remote-name "$BASE/$FILE"
+done
+
+gh attestation verify --help | grep -q -- '--deny-self-hosted-runners'
+gh attestation verify "$MANIFEST" \
+  --bundle "$BUNDLE" --repo "$REPO" \
+  --signer-workflow "$REPO/.github/workflows/release.yml" \
+  --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
+COMMIT="$(jq -er '.commit | select(type == "string" and test("^[0-9a-f]{40}$"))' "$MANIFEST")"
+DIGEST="$(sha256sum "$ASSET" | awk '{print $1}')"
+SIZE="$(stat --format=%s "$ASSET")"
+jq --exit-status --arg tag "$TAG" --arg commit "$COMMIT" \
+  --arg asset "$ASSET" --arg digest "$DIGEST" --argjson size "$SIZE" '
+  .schema_version == 1 and .tag == $tag and .commit == $commit
+  and .asset == $asset and .sha256 == $digest and .size == $size
+' "$MANIFEST" >/dev/null
+for SUBJECT in "$ASSET" "$MANIFEST"; do
+  gh attestation verify "$SUBJECT" \
+    --bundle "$BUNDLE" --repo "$REPO" \
+    --signer-workflow "$REPO/.github/workflows/release.yml" \
+    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
+    --deny-self-hosted-runners
+done
+sha256sum --check --strict "$ASSET.sha256"
+)
+```
+
+検証後にアーカイブを展開したら、トップレベルの `LICENSE` と
+`THIRD_PARTY_NOTICES.md`、ならびに `third-party/rust/THIRD_PARTY_LICENSES.html` と
+`third-party/rust/THIRD_PARTY_ATTRIBUTIONS.txt` を確認してください。Wotoha のプロジェクト
+コードは MIT License であり、同梱する第三者コンポーネントにはそれぞれのライセンスと
+通知条件が適用されます。配布とソース入手先の詳細はリポジトリの
+[第三者通知](../THIRD_PARTY_NOTICES.md) を参照してください。
+
+この検証は、認証済みのmanifestに記録された `COMMIT`、SHA-256、サイズがローカルの
+アーカイブと一致し、アーカイブとmanifestの両方がこのリポジトリのrelease workflowから
+GitHub-hosted runnerで生成されたことを確認します。`.sha256` は追加の整合性確認であり、
+単体ではプロベナンスを証明しません。
+
 ## 1. Windows 側で Ubuntu 用の配布物を作成する
 
 リポジトリ直下で次を実行します。
@@ -11,20 +81,26 @@
 powershell -ExecutionPolicy Bypass -File .\deploy\build-ubuntu-musl.ps1
 ```
 
-The manual packager also requires `curl.exe` and GPG. It detects `gpg.exe` on `PATH` or the GPG
-executable bundled with a standard Git for Windows installation. The script verifies the same
-official yt-dlp signature, full key fingerprint, and pinned Deno checksum as release CI.
+The manual packager does not download or package yt-dlp or Deno. It produces the same
+runtime-free updater-compatible and portable archive layouts as release CI; the target host
+retrieves the pinned runtimes directly from their official release repositories during install.
+It is not a GitHub Release asset and does not have GitHub Artifact Attestation; use it only when
+you have built and transferred the source yourself. Use the preceding procedure for an official
+release archive.
 
 次の成果物が作成されます。
 
 - `target\ubuntu-musl\x86_64-unknown-linux-musl\release\wotoha-app`
 - `dist\wotoha-ubuntu-x86_64-musl\`
 - `dist\wotoha-ubuntu-x86_64-musl.tar.gz`
+- `dist\wotoha-linux-x86_64-musl\`
+- `dist\wotoha-linux-x86_64-musl.tar.gz`
 
 初回は構築用の道具を入れます。
 
 ```powershell
 cargo install cargo-zigbuild
+cargo install cargo-about --version 0.9.1 --locked --features cli
 winget install --id zig.zig -e --accept-source-agreements --accept-package-agreements
 winget install --id Kitware.CMake -e --accept-source-agreements --accept-package-agreements
 winget install --id Ninja-build.Ninja -e --accept-source-agreements --accept-package-agreements
@@ -41,16 +117,23 @@ scp .\dist\wotoha-ubuntu-x86_64-musl.tar.gz user@your-server:/tmp/
 
 ## 3. Ubuntu Server で展開して導入する
 
-Ubuntu 側で次を実行します。
+公式Releaseのアーカイブでは、上の検証が完了してから次を実行します。自分でビルドした
+アーカイブでは、信頼できる自分のビルド成果物だけを転送していることを確認してください。
 
 ```bash
 sudo apt update
-sudo apt install -y ca-certificates coreutils curl gnupg jq tar util-linux
+sudo apt install -y ca-certificates coreutils curl gnupg jq tar unzip util-linux
 cd /tmp
 tar -xzf wotoha-ubuntu-x86_64-musl.tar.gz
 cd wotoha-ubuntu-x86_64-musl
 sudo bash ./install-ubuntu.sh
 ```
+
+The release archive contains Wotoha and its installer scripts, not yt-dlp or Deno binaries. Before
+installing Wotoha, the installer downloads the pinned upstream releases directly from their official
+GitHub repositories. It verifies the complete yt-dlp signing-key fingerprint and signed checksum,
+the pinned Deno SHA-256 digest, reported versions, and extraction/direct-media-byte canaries; only
+then does it atomically promote the managed executables.
 
 次の場所へ配置されます。
 
@@ -128,11 +211,13 @@ cat /tmp/wotoha-ubuntu-x86_64-musl/SHA256SUMS.txt
 
 インストーラーは `wotoha-update.timer` を有効化します。15分間隔（最大2分のランダム遅延付き）でGitHub Releasesを確認し、新しい正式リリースがあれば次の処理を行います。
 
-1. 配布アーカイブとSHA-256ファイルをダウンロード
-2. アーカイブとバイナリのSHA-256を検証
-3. バイナリを原子的に差し替え
-4. Botが実行中だった場合だけ再起動
-5. 起動に失敗した場合は直前のバイナリへロールバック
+1. 配布アーカイブ、`.sha256`、manifest、Artifact Attestation bundleをダウンロード
+2. manifestのArtifact Attestationを、リポジトリ、release workflow、タグ、GitHub-hosted runnerのポリシーで検証
+3. manifestのタグ、commit、asset名、SHA-256、サイズを検査し、ローカルアーカイブのSHA-256とサイズが一致することを確認
+4. アーカイブとmanifestの両方のArtifact Attestationを、manifestのcommitまで固定して検証し、`.sha256` とアーカイブ内のチェックサムも検証
+5. 固定されたyt-dlp/Denoを検証・導入してから、バイナリを原子的に差し替え
+6. Botが実行中だった場合だけ再起動
+7. 起動に失敗した場合は直前のバイナリへロールバック
 
 状態とログは次のコマンドで確認できます。
 
@@ -210,12 +295,13 @@ GitHub-attested archive again because the managed yt-dlp installation is not rea
 application replacement or restart, it then:
 
 1. verifies the package checksums;
-2. imports the checked-in yt-dlp release key and requires the complete fingerprint
+2. downloads the pinned yt-dlp and Deno assets directly from their official release repositories;
+3. imports the checked-in yt-dlp release key and requires the complete fingerprint
    `AC0CBBE6848D6A873464AF4E57CF65933B5A7581`;
-3. verifies `SHA2-256SUMS.sig` and the `yt-dlp_linux` digest;
-4. checks the pinned Deno digest;
-5. runs yt-dlp with Deno and tries the two pinned extraction/direct-byte canaries; and
-6. promotes `/opt/wotoha/yt-dlp/current` atomically only after a canary succeeds.
+4. verifies `SHA2-256SUMS.sig`, its primary signing-key fingerprint, and the `yt-dlp_linux` digest;
+5. checks the pinned Deno digest and both reported runtime versions;
+6. runs yt-dlp with Deno and tries the two pinned extraction/direct-byte canaries; and
+7. promotes `/opt/wotoha/yt-dlp/current` atomically only after a canary succeeds.
 
 The compatibility path `/opt/wotoha/bin/yt-dlp` is a symlink to the managed current version, so an
 existing v0.5.29 `WOTOHA_YTDLP_PATH=/opt/wotoha/bin/yt-dlp` setting remains valid. Custom values in
@@ -225,7 +311,7 @@ The application always invokes yt-dlp with `--ignore-config`. Tune its bounded p
 `/etc/wotoha/wotoha.env`: `WOTOHA_YTDLP_TIMEOUT_SECONDS` accepts 5–120 seconds (default 25), and
 `WOTOHA_YTDLP_CONCURRENCY` accepts 1–8 processes (default 2). Optional
 `WOTOHA_YTDLP_COOKIES_FILE` must be an absolute path to an existing regular file with mode `0600`
-(or stricter). The packaged yt-dlp and Deno paths are recommended; absolute administrator overrides
+(or stricter). The managed yt-dlp and Deno paths are recommended; absolute administrator overrides
 are accepted but place verification, updates, and compatibility under the administrator's control.
 
 yt-dlp updates are independent of bot releases and bot restarts:

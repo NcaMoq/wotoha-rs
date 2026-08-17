@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Wotoha third-party Rust licenses</title>
+  <style>
+    body { font-family: sans-serif; max-width: 72rem; margin: 2rem auto; padding: 0 1rem; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #ccc; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Wotoha third-party Rust licenses</h1>
+  <p>Generated from the locked dependency graph by cargo-about.</p>
+  {{#each licenses}}
+  <section>
+    <h2 id="{{id}}">{{name}}</h2>
+    <p>Used by:</p>
+    <ul>
+      {{#each used_by}}
+      <li><a href="https://crates.io/crates/{{crate.name}}/{{crate.version}}">{{crate.name}} {{crate.version}}</a>{{#if crate.repository}} — <a href="{{crate.repository}}">upstream repository</a>{{/if}}</li>
+      {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>

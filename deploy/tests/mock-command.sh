@@ -81,6 +81,19 @@ case "$command_name" in
       fixture://yt-signature)
         source_file="$FIXTURE_DIR/SHA2-256SUMS.sig"
         ;;
+      https://github.com/yt-dlp/*/releases/download/*/yt-dlp_linux)
+        [[ "${FAKE_YTDLP_OVERSIZE:-false}" != true ]] || exit 63
+        source_file="$FIXTURE_DIR/yt-dlp"
+        ;;
+      https://github.com/yt-dlp/*/releases/download/*/SHA2-256SUMS)
+        source_file="$FIXTURE_DIR/SHA2-256SUMS"
+        ;;
+      https://github.com/yt-dlp/*/releases/download/*/SHA2-256SUMS.sig)
+        source_file="$FIXTURE_DIR/SHA2-256SUMS.sig"
+        ;;
+      https://github.com/denoland/deno/releases/download/*/deno-x86_64-unknown-linux-gnu.zip)
+        source_file="$FIXTURE_DIR/deno.zip"
+        ;;
       *)
         printf 'unexpected fixture URL: %s\n' "$url" >&2
         exit 64
@@ -106,6 +119,11 @@ case "$command_name" in
       exit 0
     fi
     if [[ " $* " == *" --verify "* ]]; then
+      if [[ " $* " == *" --status-fd "* && "${FAKE_GPG_VERIFY_STATUS:-0}" == 0 ]]; then
+        printf '[GNUPG:] VALIDSIG %s 2026-07-23 1750000000 0 4 0 1 10 00 %s\n' \
+          "${FAKE_GPG_SIGNING_FINGERPRINT:-AC0CBBE6848D6A873464AF4E57CF65933B5A7581}" \
+          "${FAKE_GPG_VALIDSIG_FINGERPRINT:-AC0CBBE6848D6A873464AF4E57CF65933B5A7581}"
+      fi
       exit "${FAKE_GPG_VERIFY_STATUS:-0}"
     fi
     exit 0
@@ -177,7 +195,8 @@ case "$command_name" in
     if [[ "$args" == *".schema_version == 1"* ]]; then
       [[ "${FAKE_MANIFEST_INVALID:-false}" != true ]] || exit 1
       grep -Fq '"schema_version":1' "${!#}" \
-        && grep -Fq '"asset":"wotoha-ubuntu-x86_64-musl.tar.gz"' "${!#}"
+        && grep -Fq '"asset":"wotoha-ubuntu-x86_64-musl.tar.gz"' "${!#}" \
+        && grep -Eq '"size":[1-9][0-9]*' "${!#}"
       exit
     fi
     if [[ "$args" == *".sha256"* ]]; then
@@ -186,6 +205,10 @@ case "$command_name" in
     fi
     if [[ "$args" == *".commit"* ]]; then
       sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p' "${!#}"
+      exit 0
+    fi
+    if [[ "$args" == *".size"* ]]; then
+      sed -n 's/.*"size":\([0-9]*\).*/\1/p' "${!#}"
       exit 0
     fi
     printf 'unsupported jq fixture query: %s\n' "$args" >&2
@@ -269,6 +292,14 @@ case "$command_name" in
     fi
     ;;
 
+  mv)
+    destination="${!#}"
+    if [[ -n "${FAKE_MV_FAIL_SUFFIX:-}" && "$destination" == *"$FAKE_MV_FAIL_SUFFIX" ]]; then
+      exit 1
+    fi
+    /usr/bin/mv "$@"
+    ;;
+
   flock)
     exit 0
     ;;
@@ -315,6 +346,20 @@ case "$command_name" in
       exit 124
     fi
     exec "$@"
+    ;;
+
+  unzip)
+    destination=""
+    while (( $# > 0 )); do
+      case "$1" in
+        -d) destination="${2:?missing unzip destination}"; shift 2 ;;
+        -*) shift ;;
+        *) shift ;;
+      esac
+    done
+    [[ -n "$destination" && -x "${FIXTURE_DIR:?}/deno" ]]
+    mkdir -p "$destination"
+    cp "$FIXTURE_DIR/deno" "$destination/deno"
     ;;
 
   *)

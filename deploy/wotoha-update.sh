@@ -230,12 +230,18 @@ if ! jq --exit-status --arg tag "$tag" --arg asset "$ASSET" '
   and .asset == $asset
   and (.sha256 | type == "string" and test("^[0-9a-f]{64}$"))
   and (.commit | type == "string" and test("^[0-9a-f]{40}$"))
+  and (.size | (type == "number") and (. > 0) and (. == floor))
 ' "$release_manifest" >/dev/null; then
   echo "release archive manifest was invalid" >&2
   exit 1
 fi
 release_digest="$(jq --raw-output '.sha256' "$release_manifest")"
 release_commit="$(jq --raw-output '.commit' "$release_manifest")"
+release_size="$(jq --raw-output '.size' "$release_manifest")"
+[[ "$(stat --format='%s' "$archive")" == "$release_size" ]] || {
+  echo "release archive size did not match its manifest" >&2
+  exit 1
+}
 [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$release_digest" ]] || {
   echo "release archive digest did not match its manifest" >&2
   exit 1
