@@ -192,6 +192,46 @@ impl MediaResolver {
         result
     }
 
+    /// Resolve the source again, bypassing metadata and prepared-playback caches.
+    ///
+    /// This is intentionally explicit: callers handling a provider response such as 403 or
+    /// 410 must not retry the same signed URL through `resolve`, whose normal cache is designed
+    /// for ordinary playback.  The new request is still stored so subsequent normal callers can
+    /// use it.
+    pub async fn resolve_fresh(&self, source_url: &str) -> Result<TrackRequest, ResolveError> {
+        if !is_allowed_track_url(source_url) {
+            return Err(ResolveError::UnsupportedSource(source_url.to_owned()));
+        }
+
+        let gate = self
+            .inner
+            .inflight
+            .entry(source_url.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = gate.lock().await;
+        let _permit = self
+            .inner
+            .probe_slots
+            .acquire()
+            .await
+            .expect("media probe semaphore should stay open");
+
+        let result = match self.probe_with_fallback(source_url).await {
+            Ok(request) => match validate_prepared_request(&request) {
+                Ok(()) => {
+                    self.store_request(source_url, &request);
+                    self.store_prepared_request(&request);
+                    Ok(request)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        self.inner.inflight.remove(source_url);
+        result
+    }
+
     pub async fn prepare_playback(
         &self,
         request: &TrackRequest,
@@ -242,6 +282,46 @@ impl MediaResolver {
                 .remove(request.canonical_key.as_ref());
             result
         }
+    }
+
+    /// Refresh playback even when the canonical key has a live prepared-cache entry.
+    ///
+    /// This is used only after an acquisition failure.  It deliberately calls the provider
+    /// refresh/probe path instead of allowing `prepare_playback` to return the failed signed URL
+    /// from cache.
+    pub async fn prepare_playback_fresh(
+        &self,
+        request: &TrackRequest,
+    ) -> Result<TrackRequest, ResolveError> {
+        let gate = self
+            .inner
+            .prepare_inflight
+            .entry(request.canonical_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = gate.lock().await;
+        let _permit = self
+            .inner
+            .probe_slots
+            .acquire()
+            .await
+            .expect("media probe semaphore should stay open");
+
+        let result = match self.refresh_request(request).await {
+            Ok(refreshed) => match validate_prepared_request(&refreshed) {
+                Ok(()) => {
+                    self.store_request(request.requested_url.as_ref(), &refreshed);
+                    self.store_prepared_request(&refreshed);
+                    Ok(refreshed)
+                }
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        self.inner
+            .prepare_inflight
+            .remove(request.canonical_key.as_ref());
+        result
     }
 
     fn lookup_cached_request(&self, source_url: &str) -> Option<TrackRequest> {

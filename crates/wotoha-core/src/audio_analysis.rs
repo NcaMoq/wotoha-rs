@@ -10,6 +10,10 @@ const MIN_KICK_TRACK_CONFIDENCE: f32 = 0.35;
 const MIN_KICK_ENERGY_RATIO: f32 = 0.015;
 const MIN_KICK_MARKER_CONFIDENCE: f32 = 0.25;
 const MIN_KICK_FIRST_CONFIDENCE: f32 = 0.1;
+const MIN_STABLE_KICK_GRID_MARKERS: usize = 4;
+const MIN_BOUNDARY_KICK_SUPPORT: f32 = 0.08;
+const MIN_BOUNDARY_GLOBAL_SUPPORT: f32 = 0.12;
+const PREDICTED_MARKER_CONFIDENCE_CAP: f32 = 0.2;
 const STRUCTURE_BINS_PER_SECOND: u32 = 4;
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 
@@ -144,8 +148,19 @@ pub fn analyze_mono_pcm_with_low_band(
     });
     let selected_tempo = if kick_reliable {
         match (low_tempo, full_tempo) {
-            (Some(low), Some(full)) if (low.0 / full.0 - 1.0).abs() <= 0.03 => Some(full),
-            (low, _) => low,
+            // Agreement alone is not evidence that the full-band result has
+            // the better phase. Prefer the kick tuple on a tie so loud hats
+            // cannot replace a stronger four-on-the-floor grid merely by
+            // landing within the tempo tolerance.
+            (Some(low), Some(full)) if (low.0 / full.0 - 1.0).abs() <= 0.03 => {
+                if full.1 > low.1 {
+                    Some(full)
+                } else {
+                    Some(low)
+                }
+            }
+            (Some(low), _) => Some(low),
+            (None, full) => full,
         }
     } else {
         full_tempo
@@ -640,28 +655,74 @@ fn estimate_beat_markers(
     else {
         return (Vec::new(), Vec::new());
     };
-    candidates[first..]
+    let last = candidates
+        .iter()
+        .rposition(|(_, _, strength, confidence)| {
+            if kick_reliable {
+                *confidence >= MIN_KICK_MARKER_CONFIDENCE
+            } else {
+                *strength >= reference * 0.1
+            }
+        })
+        .unwrap_or(first);
+    let stable_grid = candidates[first..=last]
+        .iter()
+        .filter(|(_, _, strength, confidence)| {
+            if kick_reliable {
+                *confidence >= MIN_KICK_MARKER_CONFIDENCE
+            } else {
+                *strength >= reference * 0.1
+            }
+        })
+        .count()
+        >= MIN_STABLE_KICK_GRID_MARKERS;
+
+    candidates
         .iter()
         .enumerate()
-        .map(
+        .filter_map(
             |(candidate_index, (predicted, detected, strength, confidence))| {
+                let required_confidence = if candidate_index == first {
+                    MIN_KICK_FIRST_CONFIDENCE
+                } else {
+                    MIN_KICK_MARKER_CONFIDENCE
+                };
                 let should_snap = if kick_reliable {
-                    *confidence
-                        >= if candidate_index == 0 {
-                            MIN_KICK_FIRST_CONFIDENCE
-                        } else {
-                            MIN_KICK_MARKER_CONFIDENCE
-                        }
+                    *confidence >= required_confidence
                 } else {
                     *strength >= reference * 0.1
                 };
-                (
-                    if should_snap { *detected } else { *predicted },
-                    *confidence,
-                )
+                let outside_stable_grid = candidate_index < first || candidate_index > last;
+                let boundary_supported = if kick_reliable {
+                    *strength >= reference * MIN_BOUNDARY_KICK_SUPPORT
+                } else {
+                    *strength >= reference * MIN_BOUNDARY_GLOBAL_SUPPORT
+                };
+                if outside_stable_grid && (!stable_grid || !boundary_supported) {
+                    return None;
+                }
+
+                let predicted_confidence = if kick_reliable {
+                    (*confidence * 0.35).clamp(
+                        MIN_KICK_FIRST_CONFIDENCE * 0.25,
+                        PREDICTED_MARKER_CONFIDENCE_CAP,
+                    )
+                } else {
+                    0.0
+                };
+                let use_detected = should_snap || (outside_stable_grid && boundary_supported);
+                let confidence = if should_snap {
+                    *confidence
+                } else {
+                    predicted_confidence
+                };
+                Some((
+                    if use_detected { *detected } else { *predicted },
+                    confidence,
+                ))
             },
         )
-        .filter(|(position, _)| *position <= audible_end)
+        .filter(|(position, _)| *position + 1 >= audible_start && *position <= audible_end)
         .fold(
             (Vec::new(), Vec::new()),
             |(mut markers, mut confidences), (position, confidence)| {
@@ -914,6 +975,73 @@ mod tests {
     }
 
     #[test]
+    fn stronger_kick_grid_wins_over_a_weaker_nearby_full_band_tempo() {
+        let sample_rate = 16_000;
+        let mut samples = vec![0.0; sample_rate as usize * 24];
+        for beat in 0..44 {
+            add_burst(
+                &mut samples,
+                sample_rate,
+                1.0 + beat as f32 * 0.5,
+                80.0,
+                0.07,
+                0.3,
+            );
+        }
+        // A quieter, slightly faster hat loop is within the historical 3%
+        // shortcut, but must not replace the stronger kick tuple.
+        let hat_interval = 60.0 / 122.4;
+        for hat in 0..45 {
+            add_burst(
+                &mut samples,
+                sample_rate,
+                1.05 + hat as f32 * hat_interval,
+                3_200.0,
+                0.012,
+                0.18,
+            );
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        assert!((analysis.bpm.unwrap() - 120.0).abs() < 0.7, "{analysis:?}");
+        assert!(
+            analysis
+                .first_beat
+                .unwrap()
+                .abs_diff(Duration::from_secs(1))
+                < Duration::from_millis(30),
+            "{analysis:?}"
+        );
+    }
+
+    #[test]
+    fn extended_kicks_are_marked_at_the_audible_intro_and_outro_boundaries() {
+        let sample_rate = 16_000;
+        let mut samples = vec![0.0; sample_rate as usize * 24];
+        let first_kick = 0.2_f32;
+        let last_kick = 23.2_f32;
+        let mut beat = first_kick;
+        while beat <= last_kick {
+            add_burst(&mut samples, sample_rate, beat, 80.0, 0.07, 0.32);
+            beat += 0.5;
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        let first = *analysis.beat_markers.first().expect("intro kick marker");
+        let last = *analysis.beat_markers.last().expect("outro kick marker");
+        assert!(
+            first.abs_diff(Duration::from_millis(200)) < Duration::from_millis(35),
+            "{analysis:?}"
+        );
+        assert!(
+            last.abs_diff(Duration::from_millis(23_200)) < Duration::from_millis(35),
+            "{analysis:?}"
+        );
+        assert!(analysis.beat_marker_confidences[0] >= MIN_KICK_MARKER_CONFIDENCE);
+        assert!(*analysis.beat_marker_confidences.last().unwrap() >= MIN_KICK_MARKER_CONFIDENCE);
+    }
+
+    #[test]
     fn missing_kick_keeps_grid_marker_with_lower_confidence() {
         let sample_rate = 16_000;
         let mut samples = vec![0.0; sample_rate as usize * 20];
@@ -966,6 +1094,27 @@ mod tests {
                 .beat_marker_confidences
                 .iter()
                 .all(|value| *value < 0.2)
+        );
+    }
+
+    #[test]
+    fn nonperiodic_low_band_bursts_do_not_create_trusted_markers() {
+        let sample_rate = 16_000;
+        let mut samples = vec![0.0; sample_rate as usize * 20];
+        for beat in [
+            0.2, 0.91, 1.73, 2.04, 3.36, 4.88, 5.13, 6.92, 8.27, 8.71, 10.45, 12.84, 13.11, 15.63,
+            16.18, 18.7,
+        ] {
+            add_burst(&mut samples, sample_rate, beat, 80.0, 0.05, 0.35);
+        }
+
+        let analysis = analyze_mono_pcm(&samples, sample_rate).unwrap();
+        assert!(
+            analysis
+                .beat_marker_confidences
+                .iter()
+                .all(|confidence| *confidence < MIN_PHASE_MARKER_CONFIDENCE_FOR_TEST),
+            "{analysis:?}"
         );
     }
 

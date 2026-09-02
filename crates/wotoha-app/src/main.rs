@@ -15,9 +15,10 @@ use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackRestartSnapshot, PlaybackService,
-    RuntimeEventSink, RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess,
-    VoiceGatewayEvent, VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, PlaybackId,
+    PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink, RuntimeTrackHandle,
+    TrackStartOptions, TransitionArmResult, UserKey, VoiceActionAccess, VoiceGatewayEvent,
+    VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_control::ControlService;
 use wotoha_core::{
@@ -216,6 +217,29 @@ where
         )))
     }
 
+    async fn arm_transition(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        outgoing_playback_id: PlaybackId,
+        incoming_playback_id: PlaybackId,
+        target_position: Duration,
+        generation: u64,
+        events: RuntimeEventSink,
+    ) -> TransitionArmResult {
+        self.inner
+            .arm_transition(
+                guild_id,
+                session_id,
+                outgoing_playback_id,
+                incoming_playback_id,
+                target_position,
+                generation,
+                events,
+            )
+            .await
+    }
+
     async fn analyze_track(
         &self,
         request: &TrackRequest,
@@ -276,6 +300,14 @@ impl RuntimeTrackHandle for ConfiguredTrackHandle {
     fn set_volume(&self, volume: f32) {
         self.inner
             .set_volume((self.default_volume * volume).clamp(0.0, 2.0));
+    }
+
+    fn frame_scheduled_transition_support(&self) -> FrameScheduledTransitionSupport {
+        self.inner.frame_scheduled_transition_support()
+    }
+
+    fn arm_shared_output_frame(&self) -> bool {
+        self.inner.arm_shared_output_frame()
     }
 
     fn pause(&self) {

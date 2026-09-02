@@ -2,10 +2,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -17,21 +17,24 @@ use reqwest::{
 use serenity::all::{ChannelId, GuildId};
 use songbird::{
     Songbird,
+    constants::TIMESTEP_LENGTH,
     error::JoinError,
     events::{Event, EventContext, EventData, EventHandler as VoiceEventHandler, TrackEvent},
     input::{
-        HttpRequest, MakePlayableError,
+        MakePlayableError,
         codecs::{get_codec_registry, get_probe},
     },
-    tracks::{PlayMode, Track, TrackHandle},
+    tracks::{PlayMode, ReadyState, Track, TrackHandle},
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wotoha_contracts::{
-    ChannelKey, GuildKey, PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle,
-    TrackEndReason, TrackStartOptions, VoiceGatewayEvent, VoiceGatewayRuntime, VoiceRuntime,
+    ChannelKey, FrameScheduledTransitionSupport, GuildKey, PlaybackId, PlaybackRuntimeEvent,
+    RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
+    TransitionArmFailureKind, TransitionArmResult, VoiceGatewayEvent, VoiceGatewayRuntime,
+    VoiceRuntime,
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
@@ -43,8 +46,14 @@ use wotoha_core::{
 
 use crate::{
     AnalysisCache, AnalysisCacheKey,
-    audio_decode::{MAX_ANALYSIS_DURATION, analyze_input_with_cancel},
-    automix_preview::{AutoMixPreview, AutoMixPreviewError, render_automix_preview_inputs},
+    audio_decode::{
+        AnalysisBackend, AnalysisOutcome, MAX_ANALYSIS_DURATION, analyze_input_with_cancel_outcome,
+    },
+    automix_cache::{ANALYSIS_CACHE_ANALYZER_VERSION, ANALYSIS_CACHE_CLASSICAL_ANALYZER_VERSION},
+    automix_preview::{
+        AutoMixPreview, AutoMixPreviewError, render_automix_preview_inputs_with_cancel,
+    },
+    cancellable_http::CancellableHttpRequest,
     niconico_hls::NiconicoHlsRequest,
     ranged_http::RangedHttpRequest,
     tempo_stretch::{
@@ -73,10 +82,43 @@ const STREAM_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
+// A classical fallback is deliberately process-local and short-lived. This
+// bounds retries after a transient model failure while allowing a newly
+// available embedded model to upgrade the same source on the next attempt.
+const CLASSICAL_FALLBACK_RETRY_TTL: Duration = Duration::from_secs(60);
 
 struct CancelAnalysisOnDrop {
     cancelled: Arc<AtomicBool>,
     cancellation: CancellationToken,
+}
+
+struct CancelPreviewOnDrop {
+    cancelled: Arc<AtomicBool>,
+    cancellation: CancellationToken,
+    armed: bool,
+}
+
+impl CancelPreviewOnDrop {
+    fn new(cancelled: Arc<AtomicBool>, cancellation: CancellationToken) -> Self {
+        Self {
+            cancelled,
+            cancellation,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelPreviewOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::Release);
+            self.cancellation.cancel();
+        }
+    }
 }
 
 impl Drop for CancelAnalysisOnDrop {
@@ -91,7 +133,28 @@ pub struct SongbirdRuntime {
     manager: Arc<Songbird>,
     stream_clients: Arc<HashMap<&'static str, Client>>,
     analysis_cache: Arc<AnalysisCache>,
+    classical_cache: Arc<AnalysisCache>,
+    classical_fallbacks: Arc<Mutex<HashMap<AnalysisCacheKey, ClassicalFallback>>>,
     analysis_limit: Arc<Semaphore>,
+    tracks: Arc<Mutex<HashMap<TrackIdentity, Weak<SongbirdTrackHandle>>>>,
+}
+
+struct ClassicalFallback {
+    stored_at: Instant,
+    analysis: TrackAnalysis,
+}
+
+impl ClassicalFallback {
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.stored_at) < CLASSICAL_FALLBACK_RETRY_TTL
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TrackIdentity {
+    guild_id: GuildKey,
+    session_id: u64,
+    playback_id: PlaybackId,
 }
 
 struct RegisterTrackParams<'a> {
@@ -118,6 +181,8 @@ pub enum SongbirdRuntimeError {
     InvalidHeaderValue(String),
     #[error("failed to attach track end listener: {0}")]
     TrackEvent(String),
+    #[error("failed to ready audio track before arming: {0}")]
+    TrackReady(String),
     #[error("resolved source is not playable: {0}")]
     MakePlayable(String),
     #[error("failed to initialize tempo-matched playback: {0}")]
@@ -137,19 +202,26 @@ impl SongbirdRuntime {
             .map(|provider_id| build_stream_client(provider_id).map(|client| (provider_id, client)))
             .collect::<Result<HashMap<_, _>, _>>()?;
 
+        let cache_root = std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ".wotoha-analysis".into());
         Ok(Self {
             manager,
             stream_clients: Arc::new(stream_clients),
             analysis_cache: Arc::new(
+                AnalysisCache::new(cache_root.clone(), ANALYSIS_CACHE_ANALYZER_VERSION)
+                    .expect("static analyzer version is valid"),
+            ),
+            classical_cache: Arc::new(
                 AnalysisCache::new(
-                    std::env::var_os("WOTOHA_ANALYSIS_CACHE_DIR")
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| ".wotoha-analysis".into()),
-                    "pcm-onset-chroma-level-loudness-v10",
+                    cache_root.join("classical"),
+                    ANALYSIS_CACHE_CLASSICAL_ANALYZER_VERSION,
                 )
                 .expect("static analyzer version is valid"),
             ),
+            classical_fallbacks: Arc::new(Mutex::new(HashMap::new())),
             analysis_limit: Arc::new(Semaphore::new(2)),
+            tracks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -270,33 +342,54 @@ impl SongbirdRuntime {
         config: &AutoMixConfig,
         loudness: &LoudnessConfig,
     ) -> Result<AutoMixPreview, AutoMixPreviewError> {
-        let outgoing_input = build_input(
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let mut cancel_on_drop = CancelPreviewOnDrop::new(cancelled.clone(), cancellation.clone());
+
+        let outgoing_input = build_input_with_cancellation(
             self.stream_client(outgoing.provider_id.as_ref())
                 .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?,
             outgoing,
+            Some(cancellation.clone()),
         )
         .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?
         .make_playable_async(get_codec_registry(), get_probe())
         .await
         .map_err(|error| AutoMixPreviewError::MakePlayable(error.to_string()))?;
-        let incoming_input = build_input(
+        let incoming_input = build_input_with_cancellation(
             self.stream_client(incoming.provider_id.as_ref())
                 .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?,
             incoming,
+            Some(cancellation.clone()),
         )
         .map_err(|error| AutoMixPreviewError::Source(error.to_string()))?
         .make_playable_async(get_codec_registry(), get_probe())
         .await
         .map_err(|error| AutoMixPreviewError::MakePlayable(error.to_string()))?;
 
-        render_automix_preview_inputs(
-            outgoing_input,
-            incoming_input,
-            outgoing_analysis,
-            incoming_analysis,
-            config,
-            loudness,
-        )
+        let worker_cancelled = cancelled.clone();
+        let outgoing_analysis = outgoing_analysis.clone();
+        let incoming_analysis = incoming_analysis.clone();
+        let config = config.clone();
+        let loudness = loudness.clone();
+        let rendered = tokio::task::spawn_blocking(move || {
+            render_automix_preview_inputs_with_cancel(
+                outgoing_input,
+                incoming_input,
+                &outgoing_analysis,
+                &incoming_analysis,
+                &config,
+                &loudness,
+                &worker_cancelled,
+            )
+        })
+        .await
+        .map_err(|error| {
+            AutoMixPreviewError::Source(format!("preview worker failed: {error}"))
+        })??;
+        cancellation.cancel();
+        cancel_on_drop.disarm();
+        Ok(rendered)
     }
 
     pub fn paired() -> Result<(Self, Arc<Songbird>), SongbirdRuntimeError> {
@@ -370,6 +463,12 @@ impl SongbirdRuntime {
         };
         let transition_events = events.clone();
         let prefetch_events = events.clone();
+        let frame_slot = Arc::new(Mutex::new(None));
+        let identity = TrackIdentity {
+            guild_id,
+            session_id,
+            playback_id,
+        };
         let handle = {
             let mut call = call_lock.lock().await;
             append_debug_log(format!(
@@ -418,6 +517,19 @@ impl SongbirdRuntime {
                     Duration::ZERO,
                 );
             }
+            // This cheap local timer is inert for ordinary playback.  When a
+            // prepared deck is armed, it is the mixer-clock boundary that
+            // starts the incoming deck; no host position/sleep round trip is
+            // involved at the audible handoff.
+            track.events.add_event(
+                EventData::new(
+                    Event::Periodic(TIMESTEP_LENGTH, None),
+                    TargetFrameTransitionNotifier {
+                        slot: frame_slot.clone(),
+                    },
+                ),
+                Duration::ZERO,
+            );
             call.play(track)
         };
         let lifecycle = Arc::new(TrackLifecycle::default());
@@ -432,6 +544,7 @@ impl SongbirdRuntime {
                     playback_id,
                     events,
                     lifecycle: lifecycle.clone(),
+                    frame_slot: frame_slot.clone(),
                 },
             )?;
             handle.add_event(
@@ -457,6 +570,7 @@ impl SongbirdRuntime {
                     canonical_key: request.canonical_key.to_string(),
                     events: error_events,
                     lifecycle: lifecycle.clone(),
+                    frame_slot: frame_slot.clone(),
                 },
             )?;
             Ok(())
@@ -465,21 +579,38 @@ impl SongbirdRuntime {
             let _ = handle.stop();
             return Err(SongbirdRuntimeError::TrackEvent(error.to_string()));
         }
+        // `Track::pause()` prevents audio from being mixed, but it does not
+        // itself guarantee that the input has crossed Songbird's lazy
+        // initialisation boundary.  Ready the decoder before handing a
+        // prepared deck to the playback coordinator.  This also makes a
+        // failed/underflowing source visible while the outgoing deck is still
+        // active, so BeatMatched is never claimed for an unready deck.
+        if let Err(error) = handle.make_playable_async().await {
+            let _ = handle.stop();
+            return Err(SongbirdRuntimeError::TrackReady(error.to_string()));
+        }
         append_debug_log(format!(
-            "runtime: play_track handle registered guild_id={} session_id={} playback_id={} paused={}",
+            "runtime: play_track handle registered guild_id={} session_id={} playback_id={} paused={} ready=true",
             guild_id.get(),
             session_id,
             playback_id.get(),
             start_paused
         ));
 
-        Ok(Arc::new(SongbirdTrackHandle {
+        let concrete = Arc::new(SongbirdTrackHandle {
             handle,
             lifecycle,
             source_start: options.source_start,
             stretch_timeline,
             equalizer,
-        }))
+            identity,
+            frame_slot,
+            registry: Arc::downgrade(&self.tracks),
+        });
+        if let Ok(mut tracks) = self.tracks.lock() {
+            tracks.insert(identity, Arc::downgrade(&concrete));
+        }
+        Ok(concrete)
     }
 }
 
@@ -578,44 +709,82 @@ impl VoiceRuntime for SongbirdRuntime {
         .await
     }
 
-    async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
-        if !analysis_source_supported(request) {
-            return None;
-        }
-        let key = AnalysisCacheKey::from_request(request).ok()?;
-        if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
-            return Some(analysis);
-        }
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let cancellation = CancellationToken::new();
-        let cancel_on_drop = CancelAnalysisOnDrop {
-            cancelled: cancelled.clone(),
-            cancellation: cancellation.clone(),
+    async fn arm_transition(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        outgoing_playback_id: PlaybackId,
+        incoming_playback_id: PlaybackId,
+        target_position: Duration,
+        generation: u64,
+        events: RuntimeEventSink,
+    ) -> TransitionArmResult {
+        let outgoing_identity = TrackIdentity {
+            guild_id,
+            session_id,
+            playback_id: outgoing_playback_id,
         };
-        let analysis = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
-            let _permit = self.analysis_limit.acquire().await.ok()?;
-            if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
-                return Some(analysis);
-            }
-            let input = build_input_with_cancellation(
-                self.stream_client(request.provider_id.as_ref()).ok()?,
-                request,
-                Some(cancellation.clone()),
-            )
-            .ok()?
-            .make_playable_async(get_codec_registry(), get_probe())
+        let incoming_identity = TrackIdentity {
+            guild_id,
+            session_id,
+            playback_id: incoming_playback_id,
+        };
+        let (Some(outgoing), Some(incoming)) =
+            (self.track(outgoing_identity), self.track(incoming_identity))
+        else {
+            return TransitionArmResult::IdentityMismatch;
+        };
+        let (Ok(outgoing_state), Ok(incoming_state)) = (
+            outgoing.handle.get_info().await,
+            incoming.handle.get_info().await,
+        ) else {
+            return TransitionArmResult::Underflow;
+        };
+        if incoming_state.ready != ReadyState::Playable {
+            return TransitionArmResult::NotReady;
+        }
+        if outgoing_state.playing != PlayMode::Play {
+            return TransitionArmResult::DeadlineMissed;
+        }
+        let target_track_position = outgoing.track_position_for_source(target_position);
+        // The periodic event fires one tick early and its Play command is
+        // consumed on the following mixer tick.  Refuse an arm that cannot
+        // reserve both of those ticks; this prevents a late arm from being
+        // mislabeled BeatMatched.
+        let current_frame = frame_for(outgoing_state.position);
+        let target_frame = frame_for(target_track_position);
+        if target_frame <= current_frame.saturating_add(2) {
+            return TransitionArmResult::DeadlineMissed;
+        }
+        let trigger_frame = target_frame.saturating_sub(1);
+        let mut slot = match outgoing.frame_slot.lock() {
+            Ok(slot) => slot,
+            Err(_) => return TransitionArmResult::Underflow,
+        };
+        if slot.is_some() {
+            return TransitionArmResult::IdentityMismatch;
+        }
+        *slot = Some(ArmedFrameTransition {
+            guild_id,
+            session_id,
+            outgoing_playback_id,
+            incoming_playback_id,
+            generation,
+            target_position,
+            target_frame,
+            trigger_frame,
+            last_observed_frame: current_frame,
+            incoming: incoming.handle.clone(),
+            events,
+            pending: None,
+        });
+        TransitionArmResult::Armed { target_frame }
+    }
+
+    async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        self.analyze_track_with_backend(request)
             .await
-            .ok()?;
-            let worker_cancelled = cancelled.clone();
-            tokio::task::spawn_blocking(move || analyze_input_with_cancel(input, &worker_cancelled))
-                .await
-                .ok()?
-        })
-        .await
-        .ok()??;
-        drop(cancel_on_drop);
-        let _ = self.analysis_cache.store(&key, &analysis);
-        Some(analysis)
+            .map(|outcome| outcome.analysis)
     }
 
     fn cached_track_analysis(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
@@ -631,6 +800,160 @@ impl VoiceRuntime for SongbirdRuntime {
             Ok(()) | Err(JoinError::NoCall) => Ok(()),
             Err(error) => Err(SongbirdRuntimeError::Disconnect(error.to_string())),
         }
+    }
+}
+
+impl SongbirdRuntime {
+    /// Analyze a track while preserving the backend/provenance needed by
+    /// callers that enforce a fresh neural-analysis gate.
+    pub async fn analyze_track_with_backend(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<AnalysisOutcome> {
+        self.analyze_track_with_backend_mode(request, false).await
+    }
+
+    /// Analyze a newly-resolved playback request without reusing an earlier analysis result.
+    ///
+    /// Corpus acquisition retries deliberately obtain a fresh signed source URL.  A provider
+    /// can keep the same canonical key, so the ordinary method would otherwise report a cache
+    /// hit after a prior cycle and prevent the strict fresh-neural gate from observing the new
+    /// attempt.  Cancellation and result storage remain identical to the ordinary path.
+    pub async fn analyze_track_with_backend_fresh(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<AnalysisOutcome> {
+        self.analyze_track_with_backend_mode(request, true).await
+    }
+
+    async fn analyze_track_with_backend_mode(
+        &self,
+        request: &TrackRequest,
+        bypass_cache: bool,
+    ) -> Option<AnalysisOutcome> {
+        if !analysis_source_supported(request) {
+            return None;
+        }
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        if !bypass_cache {
+            if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+                return Some(AnalysisOutcome {
+                    analysis,
+                    backend: AnalysisBackend::CachedNeural,
+                });
+            }
+            // This directory has a distinct analyzer identity and is written only
+            // for permanent neural ineligibility. A transient model failure never
+            // reaches disk, so a later model retry can upgrade the same source.
+            if let Ok(Some(analysis)) = self.classical_cache.load(&key) {
+                return Some(AnalysisOutcome {
+                    analysis,
+                    backend: AnalysisBackend::CachedClassicalPermanentIneligible,
+                });
+            }
+            if let Some(analysis) = self.classical_fallback(&key) {
+                return Some(AnalysisOutcome {
+                    analysis,
+                    backend: AnalysisBackend::CachedClassicalTransientFailure,
+                });
+            }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = CancellationToken::new();
+        let cancel_on_drop = CancelAnalysisOnDrop {
+            cancelled: cancelled.clone(),
+            cancellation: cancellation.clone(),
+        };
+        let outcome = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
+            let _permit = self.analysis_limit.acquire().await.ok()?;
+            if !bypass_cache {
+                if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+                    return Some(AnalysisOutcome {
+                        analysis,
+                        backend: AnalysisBackend::CachedNeural,
+                    });
+                }
+                if let Ok(Some(analysis)) = self.classical_cache.load(&key) {
+                    return Some(AnalysisOutcome {
+                        analysis,
+                        backend: AnalysisBackend::CachedClassicalPermanentIneligible,
+                    });
+                }
+                if let Some(analysis) = self.classical_fallback(&key) {
+                    return Some(AnalysisOutcome {
+                        analysis,
+                        backend: AnalysisBackend::CachedClassicalTransientFailure,
+                    });
+                }
+            }
+            let input = build_input_with_cancellation(
+                self.stream_client(request.provider_id.as_ref()).ok()?,
+                request,
+                Some(cancellation.clone()),
+            )
+            .ok()?
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .ok()?;
+            let worker_cancelled = cancelled.clone();
+            tokio::task::spawn_blocking(move || {
+                analyze_input_with_cancel_outcome(input, &worker_cancelled)
+            })
+            .await
+            .ok()?
+        })
+        .await
+        .ok()??;
+        drop(cancel_on_drop);
+        self.store_analysis_outcome(&key, &outcome);
+        Some(outcome)
+    }
+
+    fn store_analysis_outcome(&self, key: &AnalysisCacheKey, outcome: &AnalysisOutcome) {
+        match outcome.backend {
+            AnalysisBackend::Neural => {
+                if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
+                    fallbacks.remove(key);
+                }
+                let _ = self.analysis_cache.store(key, &outcome.analysis);
+            }
+            AnalysisBackend::ClassicalPermanentIneligible => {
+                if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
+                    fallbacks.remove(key);
+                }
+                let _ = self.classical_cache.store(key, &outcome.analysis);
+            }
+            AnalysisBackend::ClassicalTransientFailure => {
+                if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
+                    fallbacks.insert(
+                        key.clone(),
+                        ClassicalFallback {
+                            stored_at: Instant::now(),
+                            analysis: outcome.analysis.clone(),
+                        },
+                    );
+                }
+            }
+            AnalysisBackend::CachedNeural | AnalysisBackend::CachedClassicalPermanentIneligible => {
+            }
+            AnalysisBackend::CachedClassicalTransientFailure => {}
+        }
+    }
+
+    fn classical_fallback(&self, key: &AnalysisCacheKey) -> Option<TrackAnalysis> {
+        let mut fallbacks = self.classical_fallbacks.lock().ok()?;
+        let fallback = fallbacks.get(key)?;
+        if fallback.is_fresh_at(Instant::now()) {
+            return Some(fallback.analysis.clone());
+        }
+        fallbacks.remove(key);
+        None
+    }
+
+    fn track(&self, identity: TrackIdentity) -> Option<Arc<SongbirdTrackHandle>> {
+        let mut tracks = self.tracks.lock().ok()?;
+        tracks.retain(|_, handle| handle.strong_count() != 0);
+        tracks.get(&identity).and_then(Weak::upgrade)
     }
 }
 
@@ -676,20 +999,25 @@ fn build_input_with_cancellation(
                 (*content_length, *range_chunk_size)
                 && should_use_ranged_request(Some(content_length), Some(range_chunk_size))
             {
-                Ok(RangedHttpRequest::new_with_headers(
+                Ok(RangedHttpRequest::new_with_headers_and_cancellation(
                     client.clone(),
                     stream_url.to_string(),
                     headers,
                     Some(content_length),
                     range_chunk_size,
                     *range_mode,
+                    cancellation,
                 )
                 .into())
             } else {
-                let mut input =
-                    HttpRequest::new_with_headers(client.clone(), stream_url.to_string(), headers);
-                input.content_length = *content_length;
-                Ok(input.into())
+                Ok(CancellableHttpRequest::new_with_headers(
+                    client.clone(),
+                    stream_url.to_string(),
+                    headers,
+                    *content_length,
+                    cancellation,
+                )
+                .into())
             }
         }
         PreparedSource::Hls {
@@ -822,17 +1150,47 @@ struct SongbirdTrackHandle {
     source_start: Duration,
     stretch_timeline: Option<StretchTimeline>,
     equalizer: EqualizerControl,
+    identity: TrackIdentity,
+    frame_slot: Arc<Mutex<Option<ArmedFrameTransition>>>,
+    registry: Weak<Mutex<HashMap<TrackIdentity, Weak<SongbirdTrackHandle>>>>,
+}
+
+struct ArmedFrameTransition {
+    guild_id: GuildKey,
+    session_id: u64,
+    outgoing_playback_id: PlaybackId,
+    incoming_playback_id: PlaybackId,
+    generation: u64,
+    target_position: Duration,
+    target_frame: u64,
+    trigger_frame: u64,
+    last_observed_frame: u64,
+    incoming: TrackHandle,
+    events: RuntimeEventSink,
+    pending: Option<Arc<AtomicU8>>,
 }
 
 #[async_trait]
 impl RuntimeTrackHandle for SongbirdTrackHandle {
     fn stop(&self) {
         self.lifecycle.request_stop();
+        if let Ok(mut slot) = self.frame_slot.lock() {
+            *slot = None;
+        }
+        if let Some(registry) = self.registry.upgrade()
+            && let Ok(mut tracks) = registry.lock()
+        {
+            tracks.remove(&self.identity);
+        }
         let _ = self.handle.stop();
     }
 
     fn set_volume(&self, volume: f32) {
         let _ = self.handle.set_volume(volume);
+    }
+
+    fn frame_scheduled_transition_support(&self) -> FrameScheduledTransitionSupport {
+        FrameScheduledTransitionSupport::TrackPositionDelayedEvent
     }
 
     fn pause(&self) {
@@ -870,6 +1228,23 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
     }
 }
 
+impl SongbirdTrackHandle {
+    fn track_position_for_source(&self, source_position: Duration) -> Duration {
+        self.stretch_timeline.map_or_else(
+            || source_position.saturating_sub(self.source_start),
+            |timeline| {
+                timeline
+                    .envelope
+                    .output_elapsed(source_position.saturating_sub(timeline.source_start))
+            },
+        )
+    }
+}
+
+fn frame_for(position: Duration) -> u64 {
+    (position.as_nanos() / TIMESTEP_LENGTH.as_nanos()).min(u128::from(u64::MAX)) as u64
+}
+
 fn stretched_event_delay(source_position: Duration, timeline: Option<StretchTimeline>) -> Duration {
     timeline.map_or(source_position, |timeline| {
         timeline
@@ -884,11 +1259,15 @@ struct TrackEndNotifier {
     playback_id: PlaybackId,
     events: RuntimeEventSink,
     lifecycle: Arc<TrackLifecycle>,
+    frame_slot: Arc<Mutex<Option<ArmedFrameTransition>>>,
 }
 
 #[serenity::async_trait]
 impl VoiceEventHandler for TrackEndNotifier {
     async fn act(&self, _ctx: &EventContext<'_>) -> Option<Event> {
+        if let Ok(mut slot) = self.frame_slot.lock() {
+            *slot = None;
+        }
         let reason = self.lifecycle.finish_reason()?;
         append_debug_log(format!(
             "runtime: track end guild_id={} session_id={} playback_id={} reason={reason:?}",
@@ -928,6 +1307,202 @@ struct TrackPrefetchNotifier {
     session_id: u64,
     playback_id: PlaybackId,
     events: RuntimeEventSink,
+}
+
+const FRAME_START_PENDING: u8 = 1;
+const FRAME_START_STARTED: u8 = 2;
+const FRAME_START_FAILED: u8 = 3;
+
+struct TargetFrameTransitionNotifier {
+    slot: Arc<Mutex<Option<ArmedFrameTransition>>>,
+}
+
+#[serenity::async_trait]
+impl VoiceEventHandler for TargetFrameTransitionNotifier {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        // Songbird's mixer drains track commands, mixes one quantum, and
+        // advances TrackState.position before the event runner processes its
+        // Periodic event.  Consequently this position is the just-completed
+        // mixer tick.  Queueing Play here is consumed by the next command
+        // drain, so the trigger is intentionally one quantum before target.
+        let EventContext::Track([(state, _)]) = ctx else {
+            return None;
+        };
+        let mut slot = match self.slot.lock() {
+            Ok(slot) => slot,
+            Err(_) => return None,
+        };
+        let armed = slot.as_mut()?;
+        let current_frame = frame_for(state.position);
+        if current_frame < armed.last_observed_frame {
+            let _ = armed
+                .events
+                .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                    guild_id: armed.guild_id,
+                    session_id: armed.session_id,
+                    outgoing_playback_id: armed.outgoing_playback_id,
+                    incoming_playback_id: armed.incoming_playback_id,
+                    generation: armed.generation,
+                    target_position: armed.target_position,
+                    target_frame: armed.target_frame,
+                    actual_frame: Some(current_frame),
+                    skew_ms: Some(current_frame.abs_diff(armed.target_frame) * 20),
+                    underflow: false,
+                    failure_kind: TransitionArmFailureKind::IdentityMismatch,
+                    reason: "outgoing source position moved backwards while armed".into(),
+                });
+            *slot = None;
+            return None;
+        }
+        armed.last_observed_frame = current_frame;
+
+        if let Some(pending) = &armed.pending {
+            match pending.load(Ordering::Acquire) {
+                FRAME_START_STARTED => {
+                    let actual_frame = current_frame;
+                    let skew_ms = actual_frame.abs_diff(armed.target_frame) * 20;
+                    if skew_ms > 35 {
+                        let _ = armed
+                            .events
+                            .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                                guild_id: armed.guild_id,
+                                session_id: armed.session_id,
+                                outgoing_playback_id: armed.outgoing_playback_id,
+                                incoming_playback_id: armed.incoming_playback_id,
+                                generation: armed.generation,
+                                target_position: armed.target_position,
+                                target_frame: armed.target_frame,
+                                actual_frame: Some(actual_frame),
+                                skew_ms: Some(skew_ms),
+                                underflow: false,
+                                failure_kind: TransitionArmFailureKind::StartedLate,
+                                reason: "target-frame start exceeded skew budget".into(),
+                            });
+                    } else {
+                        let _ = armed.events.send(PlaybackRuntimeEvent::TransitionStarted {
+                            guild_id: armed.guild_id,
+                            session_id: armed.session_id,
+                            outgoing_playback_id: armed.outgoing_playback_id,
+                            incoming_playback_id: armed.incoming_playback_id,
+                            generation: armed.generation,
+                            target_position: armed.target_position,
+                            target_frame: armed.target_frame,
+                            actual_frame,
+                        });
+                    }
+                    *slot = None;
+                }
+                FRAME_START_FAILED => {
+                    let actual_frame = current_frame;
+                    let _ = armed
+                        .events
+                        .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                            guild_id: armed.guild_id,
+                            session_id: armed.session_id,
+                            outgoing_playback_id: armed.outgoing_playback_id,
+                            incoming_playback_id: armed.incoming_playback_id,
+                            generation: armed.generation,
+                            target_position: armed.target_position,
+                            target_frame: armed.target_frame,
+                            actual_frame: Some(actual_frame),
+                            skew_ms: Some(actual_frame.abs_diff(armed.target_frame) * 20),
+                            underflow: true,
+                            failure_kind: TransitionArmFailureKind::ActionFailed,
+                            reason: "incoming deck was not playable at target frame".into(),
+                        });
+                    *slot = None;
+                }
+                _ if current_frame > armed.target_frame.saturating_add(1) => {
+                    let _ = armed
+                        .events
+                        .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                            guild_id: armed.guild_id,
+                            session_id: armed.session_id,
+                            outgoing_playback_id: armed.outgoing_playback_id,
+                            incoming_playback_id: armed.incoming_playback_id,
+                            generation: armed.generation,
+                            target_position: armed.target_position,
+                            target_frame: armed.target_frame,
+                            actual_frame: Some(current_frame),
+                            skew_ms: Some(current_frame.abs_diff(armed.target_frame) * 20),
+                            underflow: false,
+                            failure_kind: TransitionArmFailureKind::DeadlineMissed,
+                            reason: "target-frame start missed its deadline".into(),
+                        });
+                    *slot = None;
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        if current_frame > armed.target_frame.saturating_add(1) {
+            let _ = armed
+                .events
+                .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                    guild_id: armed.guild_id,
+                    session_id: armed.session_id,
+                    outgoing_playback_id: armed.outgoing_playback_id,
+                    incoming_playback_id: armed.incoming_playback_id,
+                    generation: armed.generation,
+                    target_position: armed.target_position,
+                    target_frame: armed.target_frame,
+                    actual_frame: Some(current_frame),
+                    skew_ms: Some(current_frame.abs_diff(armed.target_frame) * 20),
+                    underflow: false,
+                    failure_kind: TransitionArmFailureKind::DeadlineMissed,
+                    reason: "target-frame arm was observed late".into(),
+                });
+            *slot = None;
+            return None;
+        }
+        if current_frame < armed.trigger_frame {
+            return None;
+        }
+
+        let pending = Arc::new(AtomicU8::new(FRAME_START_PENDING));
+        let status = pending.clone();
+        let action_result = armed.incoming.action(move |view| {
+            if view.ready == ReadyState::Playable
+                && !matches!(
+                    view.playing,
+                    PlayMode::Stop | PlayMode::End | PlayMode::Errored(_)
+                )
+            {
+                // `TrackHandle::action` executes on the mixer thread.  The
+                // state mutation is therefore consumed by this same runtime
+                // clock, and the first incoming PCM frame is mixed on the
+                // following 20 ms tick.
+                *view.playing = PlayMode::Play;
+                status.store(FRAME_START_STARTED, Ordering::Release);
+            } else {
+                status.store(FRAME_START_FAILED, Ordering::Release);
+            }
+            None
+        });
+        if action_result.is_err() {
+            let _ = armed
+                .events
+                .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                    guild_id: armed.guild_id,
+                    session_id: armed.session_id,
+                    outgoing_playback_id: armed.outgoing_playback_id,
+                    incoming_playback_id: armed.incoming_playback_id,
+                    generation: armed.generation,
+                    target_position: armed.target_position,
+                    target_frame: armed.target_frame,
+                    actual_frame: Some(current_frame),
+                    skew_ms: Some(current_frame.abs_diff(armed.target_frame) * 20),
+                    underflow: false,
+                    failure_kind: TransitionArmFailureKind::ActionFailed,
+                    reason: "incoming deck command queue was closed".into(),
+                });
+            *slot = None;
+        } else {
+            armed.pending = Some(pending);
+        }
+        None
+    }
 }
 
 #[serenity::async_trait]
@@ -1001,11 +1576,248 @@ struct TrackErrorLogger {
     canonical_key: String,
     events: RuntimeEventSink,
     lifecycle: Arc<TrackLifecycle>,
+    frame_slot: Arc<Mutex<Option<ArmedFrameTransition>>>,
+}
+
+#[cfg(test)]
+mod frame_scheduler_tests {
+    use std::time::Duration;
+
+    const QUANTUM: u64 = 20;
+    const MAX_SKEW_MS: u64 = 35;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct ArmKey {
+        outgoing: u64,
+        outgoing_generation: u64,
+        incoming: u64,
+        incoming_generation: u64,
+        token: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TickResult {
+        Wait,
+        Enqueued,
+        Started { actual_frame: u64, skew_ms: u64 },
+        Failure(&'static str),
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TickScheduler {
+        key: ArmKey,
+        target_frame: u64,
+        armed: bool,
+        enqueued: bool,
+        cancelled: bool,
+        last_frame: u64,
+    }
+
+    impl TickScheduler {
+        fn arm(key: ArmKey, current_frame: u64, target_frame: u64) -> Result<Self, &'static str> {
+            if target_frame <= current_frame.saturating_add(2) {
+                return Err("deadline");
+            }
+            Ok(Self {
+                key,
+                target_frame,
+                armed: true,
+                enqueued: false,
+                cancelled: false,
+                last_frame: current_frame,
+            })
+        }
+
+        fn cancel(&mut self) {
+            self.cancelled = true;
+            self.armed = false;
+        }
+
+        fn tick(
+            &mut self,
+            key: ArmKey,
+            current_frame: u64,
+            ready: bool,
+            action_ok: bool,
+        ) -> TickResult {
+            if self.cancelled || !self.armed {
+                return TickResult::Failure("cancelled");
+            }
+            if key != self.key {
+                self.armed = false;
+                return TickResult::Failure("identity");
+            }
+            if current_frame < self.last_frame {
+                self.armed = false;
+                return TickResult::Failure("backward");
+            }
+            self.last_frame = current_frame;
+            if self.enqueued {
+                self.armed = false;
+                let skew_ms = current_frame
+                    .abs_diff(self.target_frame)
+                    .saturating_mul(QUANTUM);
+                return if skew_ms > MAX_SKEW_MS {
+                    TickResult::Failure("late")
+                } else {
+                    TickResult::Started {
+                        actual_frame: current_frame,
+                        skew_ms,
+                    }
+                };
+            }
+            if current_frame > self.target_frame.saturating_add(1) {
+                self.armed = false;
+                return TickResult::Failure("late");
+            }
+            if current_frame.saturating_add(1) < self.target_frame {
+                return TickResult::Wait;
+            }
+            if !ready {
+                self.armed = false;
+                return TickResult::Failure("not-ready");
+            }
+            if !action_ok {
+                self.armed = false;
+                return TickResult::Failure("action");
+            }
+            self.enqueued = true;
+            TickResult::Enqueued
+        }
+    }
+
+    fn key() -> ArmKey {
+        ArmKey {
+            outgoing: 1,
+            outgoing_generation: 2,
+            incoming: 3,
+            incoming_generation: 4,
+            token: 5,
+        }
+    }
+
+    #[test]
+    fn sixty_second_lookahead_never_starts_early() {
+        let target = 60_000 / QUANTUM;
+        let k = key();
+        let mut scheduler = TickScheduler::arm(k, 0, target).unwrap();
+        for frame in 0..target.saturating_sub(1) {
+            assert_eq!(scheduler.tick(k, frame, true, true), TickResult::Wait);
+        }
+        assert!(!scheduler.enqueued);
+        assert_eq!(
+            scheduler.tick(k, target - 1, true, true),
+            TickResult::Enqueued
+        );
+        assert_eq!(
+            scheduler.tick(k, target, true, true),
+            TickResult::Started {
+                actual_frame: target,
+                skew_ms: 0
+            }
+        );
+    }
+
+    #[test]
+    fn one_quantum_late_is_within_budget_and_two_is_failure() {
+        let k = key();
+        let target = 300;
+        let mut one_late = TickScheduler::arm(k, 0, target).unwrap();
+        assert_eq!(one_late.tick(k, target, true, true), TickResult::Enqueued);
+        assert_eq!(
+            one_late.tick(k, target + 1, true, true),
+            TickResult::Started {
+                actual_frame: target + 1,
+                skew_ms: 20
+            }
+        );
+        let mut two_late = TickScheduler::arm(k, 0, target).unwrap();
+        assert_eq!(
+            two_late.tick(k, target + 2, true, true),
+            TickResult::Failure("late")
+        );
+    }
+
+    #[test]
+    fn stale_identity_cancel_reorder_readiness_and_action_fail_without_start() {
+        let k = key();
+        let stale = ArmKey { incoming: 9, ..k };
+        let mut scheduler = TickScheduler::arm(k, 0, 100).unwrap();
+        assert_eq!(
+            scheduler.tick(stale, 99, true, true),
+            TickResult::Failure("identity")
+        );
+        for stale in [
+            ArmKey { outgoing: 8, ..k },
+            ArmKey {
+                outgoing_generation: 8,
+                ..k
+            },
+            ArmKey {
+                incoming_generation: 8,
+                ..k
+            },
+            ArmKey { token: 8, ..k },
+        ] {
+            let mut scheduler = TickScheduler::arm(k, 0, 100).unwrap();
+            assert_eq!(
+                scheduler.tick(stale, 99, true, true),
+                TickResult::Failure("identity")
+            );
+        }
+        let mut not_ready = TickScheduler::arm(k, 0, 100).unwrap();
+        assert_eq!(
+            not_ready.tick(k, 99, false, true),
+            TickResult::Failure("not-ready")
+        );
+        let mut action_failed = TickScheduler::arm(k, 0, 100).unwrap();
+        assert_eq!(
+            action_failed.tick(k, 99, true, false),
+            TickResult::Failure("action")
+        );
+        let mut cancelled = TickScheduler::arm(k, 0, 100).unwrap();
+        cancelled.cancel();
+        assert_eq!(
+            cancelled.tick(k, 99, true, true),
+            TickResult::Failure("cancelled")
+        );
+        let mut duplicate = TickScheduler::arm(k, 0, 100).unwrap();
+        assert_eq!(duplicate.tick(k, 99, true, true), TickResult::Enqueued);
+        assert_eq!(
+            duplicate.tick(k, 99, true, true),
+            TickResult::Started {
+                actual_frame: 99,
+                skew_ms: 20
+            }
+        );
+        assert_eq!(
+            duplicate.tick(k, 100, true, true),
+            TickResult::Failure("cancelled")
+        );
+        let mut backwards = TickScheduler::arm(k, 0, 100).unwrap();
+        assert_eq!(backwards.tick(k, 50, true, true), TickResult::Wait);
+        assert_eq!(
+            backwards.tick(k, 49, true, true),
+            TickResult::Failure("backward")
+        );
+    }
+
+    #[test]
+    fn arm_after_deadline_is_rejected_without_floating_point_accumulation() {
+        let target = Duration::from_secs(60).as_millis() as u64 / QUANTUM;
+        assert!(matches!(
+            TickScheduler::arm(key(), target - 2, target),
+            Err("deadline")
+        ));
+    }
 }
 
 #[serenity::async_trait]
 impl VoiceEventHandler for TrackErrorLogger {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let Ok(mut slot) = self.frame_slot.lock() {
+            *slot = None;
+        }
         if !self.lifecycle.mark_error() {
             return None;
         }
@@ -1064,14 +1876,17 @@ impl VoiceEventHandler for TrackErrorLogger {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use reqwest::Client;
+    use songbird::Songbird;
     use wotoha_core::{PreparedHeader, PreparedSource, TrackMetadata, TrackRequest};
 
     use super::{
-        MAX_ANALYSIS_DURATION, SongbirdRuntimeError, TrackEndReason, TrackLifecycle,
-        analysis_source_supported, build_input, should_use_ranged_request,
+        AnalysisBackend, AnalysisCacheKey, AnalysisOutcome, CLASSICAL_FALLBACK_RETRY_TTL,
+        ClassicalFallback, MAX_ANALYSIS_DURATION, SongbirdRuntime, SongbirdRuntimeError,
+        TrackEndReason, TrackLifecycle, analysis_source_supported, build_input,
+        should_use_ranged_request,
     };
 
     fn request_with_source(prepared: PreparedSource) -> TrackRequest {
@@ -1125,6 +1940,49 @@ mod tests {
         assert!(lifecycle.mark_error());
         assert_eq!(lifecycle.finish_reason(), None);
         assert!(!lifecycle.mark_error());
+    }
+
+    #[test]
+    fn transient_classical_fallback_expires_for_a_neural_upgrade() {
+        let stored_at = Instant::now();
+        let fallback = ClassicalFallback {
+            stored_at,
+            analysis: wotoha_core::automix::TrackAnalysis::unanalyzed(Duration::from_secs(1)),
+        };
+        assert!(fallback.is_fresh_at(stored_at + CLASSICAL_FALLBACK_RETRY_TTL / 2));
+        assert!(
+            !fallback
+                .is_fresh_at(stored_at + CLASSICAL_FALLBACK_RETRY_TTL + Duration::from_nanos(1))
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_fallback_cache_hit_reports_distinct_backend() {
+        let runtime = SongbirdRuntime::new(Songbird::serenity()).unwrap();
+        let request = request_with_source(PreparedSource::http(
+            "https://manifest.googlevideo.com/videoplayback",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
+        let key = AnalysisCacheKey::from_request(&request).unwrap();
+        let fresh = AnalysisOutcome {
+            analysis: wotoha_core::automix::TrackAnalysis::unanalyzed(Duration::from_secs(1)),
+            backend: AnalysisBackend::ClassicalTransientFailure,
+        };
+        assert_eq!(fresh.backend, AnalysisBackend::ClassicalTransientFailure);
+        runtime.store_analysis_outcome(&key, &fresh);
+
+        let outcome = runtime
+            .analyze_track_with_backend(&request)
+            .await
+            .expect("fresh in-memory fallback should be returned");
+        assert_eq!(
+            outcome.backend,
+            AnalysisBackend::CachedClassicalTransientFailure
+        );
+        assert_ne!(outcome.backend, AnalysisBackend::ClassicalTransientFailure);
+        assert!(!outcome.backend.is_fresh_neural());
     }
 
     #[test]

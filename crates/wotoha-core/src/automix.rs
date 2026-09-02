@@ -17,10 +17,11 @@ const MAX_ENERGY_START_CANDIDATES: usize = 96;
 const MIN_MARKER_BACKED_BEAT_CONFIDENCE: f32 = 0.45;
 const MIN_MARKER_BACKED_KICK_COVERAGE: f32 = 0.55;
 const MIN_MARKER_BACKED_KICK_MARKERS: usize = 8;
-const MAX_AUDIBLE_PICKUP: Duration = Duration::from_millis(100);
+const MAX_INCOMING_PICKUP_BEATS: u32 = 32;
 const MAX_LOW_ENERGY_INTRO_SKIP: Duration = Duration::from_secs(8);
 const MAX_STRUCTURED_INTRO_SKIP: Duration = Duration::from_secs(16);
 const MAX_SKIPPED_INTRO_VOCAL_RISK: f32 = 0.2;
+const MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE: f32 = 0.6;
 const MAX_SHORTER_TRANSITION_SEARCH: Duration = Duration::from_secs(8);
 const MIN_NATURAL_MIX_OVERLAP: Duration = Duration::from_secs(4);
 const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
@@ -29,6 +30,20 @@ const MIN_ENERGY_PROFILE_DBFS: f32 = -80.0;
 /// Reserve blocking for a roughly 14 dB analysis-profile collapse; shallower
 /// movement remains a scoring concern and is verified by the rendered preview.
 const MIN_SAFE_MIX_ENERGY_RATIO: f32 = 0.20;
+const MIN_BLOCKING_ENERGY_GAP: Duration = Duration::from_millis(500);
+const MIN_ENERGY_WINDOW: Duration = Duration::from_millis(500);
+const ENERGY_REFERENCE_RADIUS: Duration = Duration::from_secs(2);
+const MAX_ENERGY_REFERENCE_SAMPLES: usize = 64;
+const MAX_PHASE_MARKER_PAIRS: usize = 128;
+const MIN_BEAT_PHASE_PAIRS: usize = 8;
+const MIN_BEAT_PHASE_COVERAGE: f32 = 0.65;
+const MIN_DOWNBEAT_PHASE_PAIRS: usize = 2;
+const MIN_PHRASE_PHASE_PAIRS: usize = 1;
+// Treat only a very deep, simultaneous source dip as an unavoidable
+// structural break. A merely deep (-42 dBFS-style) dip remains actionable
+// when a normal source reference is available nearby.
+const MIN_STRUCTURAL_BREAK_RATIO: f32 = 0.05;
+const MAX_STRUCTURAL_BREAK_DURATION: Duration = Duration::from_secs(4);
 const MAX_INCOMING_CUE_CANDIDATES: usize = 96;
 const MIN_TRUSTED_BPM: f32 = 20.0;
 const MAX_TRUSTED_BPM: f32 = 300.0;
@@ -184,12 +199,22 @@ impl TrackAnalysis {
     }
 
     pub fn trusted_kick_coverage(&self) -> f32 {
-        if self.beat_marker_confidences.is_empty() {
+        // Marker confidence is a per-observation field.  A short/missing
+        // vector must not inherit the global beat confidence: doing so would
+        // turn an untrusted marker cache into a trusted cue source.
+        if self.beat_markers.is_empty()
+            || self.beat_marker_confidences.len() != self.beat_markers.len()
+        {
             return 0.0;
         }
         self.beat_marker_confidences
             .iter()
-            .filter(|confidence| **confidence >= MIN_PHASE_MARKER_CONFIDENCE)
+            .filter(|confidence| {
+                let value = **confidence;
+                value.is_finite()
+                    && (0.0..=1.0).contains(&value)
+                    && value >= MIN_PHASE_MARKER_CONFIDENCE
+            })
             .count() as f32
             / self.beat_marker_confidences.len() as f32
     }
@@ -199,7 +224,7 @@ impl TrackAnalysis {
         let Some(grid) = self.beat_grid() else {
             return Vec::new();
         };
-        if grid.downbeat_confidence < 0.25 {
+        if grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE {
             return Vec::new();
         }
         let mut cues = Vec::new();
@@ -436,6 +461,9 @@ pub struct AutoMixQualityReport {
     pub issues: Vec<AutoMixQualityIssue>,
     pub overlap: Duration,
     pub beat_pairs_checked: usize,
+    /// Fraction of the expected beat-pair slots in the overlap backed by
+    /// observed, trusted markers.  `None` means no valid BPM-derived grid.
+    pub beat_phase_coverage: Option<f32>,
     pub max_beat_phase_error: Option<Duration>,
     pub handoff_beat_phase_error: Option<Duration>,
     pub downbeat_pairs_checked: usize,
@@ -501,6 +529,7 @@ pub enum AutoMixQualityIssue {
         expected: Duration,
     },
     BeatPhaseUnverified,
+    DownbeatPhaseUnverified,
     BeatPhaseDriftTooLarge {
         max_error: Duration,
     },
@@ -541,6 +570,7 @@ impl AutoMixQualityIssue {
                 | Self::OutgoingOverlapMissesAudibleEnd { .. }
                 | Self::IncomingOverlapExceedsAudibleEnd { .. }
                 | Self::BeatPhaseUnverified
+                | Self::DownbeatPhaseUnverified
                 | Self::BeatPhaseDriftTooLarge { .. }
                 | Self::BeatHandoffPhaseDriftTooLarge { .. }
                 | Self::DownbeatPhaseDriftTooLarge { .. }
@@ -774,7 +804,10 @@ pub fn plan_transition(
     }
 
     let harmonic_compatibility = harmonic_compatibility(outgoing, incoming);
-    if let Some(tempo_curve) = compatible_tempo_curve(outgoing, incoming, config) {
+    if has_trusted_marker_evidence(outgoing)
+        && has_trusted_marker_evidence(incoming)
+        && let Some(tempo_curve) = compatible_tempo_curve(outgoing, incoming, config)
+    {
         let mut best_plan = None;
         let mut best_score = f32::INFINITY;
         let incoming_candidates = safe_incoming_beat_starts(incoming);
@@ -882,7 +915,7 @@ fn plan_transition_with_incoming_start(
         .then(|| {
             let target = outgoing.audible_end.saturating_sub(target_duration);
             (harmonic_compatibility.is_none_or(|score| score >= 0.5)
-                && incoming.downbeat_confidence >= 0.25
+                && incoming.downbeat_confidence >= MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
                 && incoming.first_downbeat.is_some())
             .then(|| {
                 align_to_strongest_matching_phrase_phase(
@@ -1065,6 +1098,50 @@ pub fn plan_guarded_transition_with_base_gains(
         };
     }
 
+    let conservative = conservative_guarded_transition_with_base_gains(
+        outgoing,
+        incoming,
+        config,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
+    GuardedTransitionPlan {
+        plan: conservative.plan,
+        quality: conservative.quality,
+        rejected_plan: Some(plan),
+        rejected_quality: Some(quality),
+    }
+}
+
+/// Plans a guarded transition while explicitly excluding beat matching.
+///
+/// Runtime callers that need a deterministic non-beatmatched fallback can use
+/// this helper without mutating the analyses or weakening the beat evidence.
+/// It applies the same conservative-crossfade and quality gates as the normal
+/// guarded planner, then uses a gapless handoff when that fallback is unsafe.
+pub fn plan_guarded_non_beatmatched_transition_with_base_gains(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> GuardedTransitionPlan {
+    conservative_guarded_transition_with_base_gains(
+        outgoing,
+        incoming,
+        config,
+        outgoing_base_gain,
+        incoming_base_gain,
+    )
+}
+
+fn conservative_guarded_transition_with_base_gains(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> GuardedTransitionPlan {
     let fallback = conservative_crossfade_plan(outgoing, incoming, config);
     let fallback_quality = evaluate_transition_quality_with_base_gains(
         outgoing,
@@ -1073,27 +1150,28 @@ pub fn plan_guarded_transition_with_base_gains(
         outgoing_base_gain,
         incoming_base_gain,
     );
-    if fallback_quality.has_blocking_issue() {
-        let fallback = gapless_plan(outgoing, incoming);
-        let fallback_quality = evaluate_transition_quality_with_base_gains(
-            outgoing,
-            incoming,
-            &fallback,
-            outgoing_base_gain,
-            incoming_base_gain,
-        );
+    if !fallback_quality.has_blocking_issue() {
         return GuardedTransitionPlan {
             plan: fallback,
             quality: fallback_quality,
-            rejected_plan: Some(plan),
-            rejected_quality: Some(quality),
+            rejected_plan: None,
+            rejected_quality: None,
         };
     }
+
+    let gapless = gapless_plan(outgoing, incoming);
+    let gapless_quality = evaluate_transition_quality_with_base_gains(
+        outgoing,
+        incoming,
+        &gapless,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
     GuardedTransitionPlan {
-        plan: fallback,
-        quality: fallback_quality,
-        rejected_plan: Some(plan),
-        rejected_quality: Some(quality),
+        plan: gapless,
+        quality: gapless_quality,
+        rejected_plan: Some(fallback),
+        rejected_quality: Some(fallback_quality),
     }
 }
 
@@ -1110,7 +1188,14 @@ fn transition_plan_score(
     };
     transition_start_score(&quality)
         .or_else(|| quality.is_ok().then_some(0.0))
-        .map(|score| score + blocking_penalty)
+        .map(|score| {
+            let marker_penalty = if plan.kind == TransitionKind::BeatMatched {
+                marker_evidence_penalty(outgoing, incoming, &quality)
+            } else {
+                0.0
+            };
+            score + blocking_penalty + marker_penalty
+        })
 }
 
 pub fn explain_beatmatch_decision(
@@ -1132,14 +1217,14 @@ pub fn explain_beatmatch_decision(
     {
         return AutoMixBeatMatchDecision::QualityGuarded;
     }
-    if safe_incoming_beat_start(incoming).is_none() {
-        return AutoMixBeatMatchDecision::NoTrustedIncomingBeatStart;
-    }
     if !tempo_alignment_confident(outgoing, config.min_beat_confidence) {
         return AutoMixBeatMatchDecision::OutgoingTempoConfidenceTooLow;
     }
     if !tempo_alignment_confident(incoming, config.min_beat_confidence) {
         return AutoMixBeatMatchDecision::IncomingTempoConfidenceTooLow;
+    }
+    if safe_incoming_beat_start(incoming).is_none() {
+        return AutoMixBeatMatchDecision::NoTrustedIncomingBeatStart;
     }
 
     let (Some(outgoing_bpm), Some(incoming_bpm)) = (outgoing.bpm, incoming.bpm) else {
@@ -1182,6 +1267,7 @@ pub fn evaluate_transition_quality_with_base_gains(
 ) -> AutoMixQualityReport {
     let mut issues = Vec::new();
     let mut beat_pairs_checked = 0;
+    let mut beat_phase_coverage = None;
     let mut max_beat_phase_error = None;
     let mut handoff_beat_phase_error = None;
     let mut downbeat_pairs_checked = 0;
@@ -1271,6 +1357,7 @@ pub fn evaluate_transition_quality_with_base_gains(
         handoff_incoming_mix_share = energy.handoff_incoming_share;
         if let Some(min_ratio) = min_mix_energy_ratio
             && mix_energy_dip_is_blocking(min_ratio)
+            && energy.longest_blocking_gap >= MIN_BLOCKING_ENERGY_GAP
         {
             issues.push(AutoMixQualityIssue::MixEnergyDipTooDeep { min_ratio });
         }
@@ -1279,6 +1366,7 @@ pub fn evaluate_transition_quality_with_base_gains(
     if plan.kind == TransitionKind::BeatMatched {
         let phase = beat_phase_report(outgoing, incoming, plan);
         beat_pairs_checked = phase.pairs;
+        beat_phase_coverage = phase.coverage;
         max_beat_phase_error = phase.max_error;
         match phase.max_error {
             Some(max_error) if max_error > MAX_BEATMATCH_PHASE_ERROR => {
@@ -1301,6 +1389,13 @@ pub fn evaluate_transition_quality_with_base_gains(
             && max_error > MAX_DOWNBEAT_PHASE_ERROR
         {
             issues.push(AutoMixQualityIssue::DownbeatPhaseDriftTooLarge { max_error });
+        } else if actionable_downbeat_confidence(outgoing)
+            && actionable_downbeat_confidence(incoming)
+            && downbeat_phase.max_error.is_none()
+        {
+            // Actionable phase metadata without a corresponding observed
+            // marker pair is not evidence of a safe downbeat handoff.
+            issues.push(AutoMixQualityIssue::DownbeatPhaseUnverified);
         }
         handoff_downbeat_phase_error = downbeat_handoff_phase_error(outgoing, incoming, plan);
         if let Some(error) = handoff_downbeat_phase_error
@@ -1333,6 +1428,7 @@ pub fn evaluate_transition_quality_with_base_gains(
         issues,
         overlap: plan.duration,
         beat_pairs_checked,
+        beat_phase_coverage,
         max_beat_phase_error,
         handoff_beat_phase_error,
         downbeat_pairs_checked,
@@ -1382,7 +1478,23 @@ fn tempo_speed_step(envelope: Option<TempoEnvelope>) -> Option<f32> {
 #[derive(Clone, Copy)]
 struct BeatPhaseReport {
     pairs: usize,
+    coverage: Option<f32>,
     max_error: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+struct BeatAlignmentEvidence {
+    phase: BeatPhaseReport,
+    handoff_error: Option<Duration>,
+}
+
+#[derive(Clone, Copy)]
+struct ObservedMarkerPair {
+    outgoing_index: usize,
+    incoming_index: usize,
+    outgoing: Duration,
+    incoming: Duration,
+    error: Duration,
 }
 
 fn beat_phase_report(
@@ -1390,34 +1502,170 @@ fn beat_phase_report(
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
 ) -> BeatPhaseReport {
+    beat_alignment_evidence(outgoing, incoming, plan).phase
+}
+
+fn beat_alignment_evidence(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> BeatAlignmentEvidence {
+    let marker_pairs = observed_marker_pairs(outgoing, incoming, plan);
+    let pairs = marker_pairs.len();
+    let coverage = beat_phase_coverage(outgoing, incoming, plan, pairs);
+    let max_error = (pairs >= MIN_BEAT_PHASE_PAIRS
+        && coverage.is_some_and(|coverage| coverage >= MIN_BEAT_PHASE_COVERAGE))
+    .then(|| marker_pairs.iter().map(|pair| pair.error).max())
+    .flatten();
     let outgoing_end = plan.outgoing_start.saturating_add(plan.duration);
     let incoming_end = plan
         .incoming_start
         .saturating_add(incoming_mix_source(plan));
-    let outgoing_beats = beat_positions_between(outgoing, plan.outgoing_start, outgoing_end);
-    let incoming_beats = beat_positions_between(incoming, plan.incoming_start, incoming_end);
-    let mut pairs = 0;
-    let mut max_error = None;
+    let handoff_error = marker_pairs.last().and_then(|pair| {
+        let outgoing_tolerance = beat_interval(outgoing)?.div_f64(2.0);
+        let incoming_tolerance = beat_interval(incoming)?.div_f64(2.0);
+        (pair.outgoing.abs_diff(outgoing_end) <= outgoing_tolerance
+            && pair.incoming.abs_diff(incoming_end) <= incoming_tolerance)
+            .then_some(pair.error)
+    });
+    BeatAlignmentEvidence {
+        phase: BeatPhaseReport {
+            pairs,
+            coverage,
+            max_error,
+        },
+        handoff_error,
+    }
+}
 
-    for outgoing_beat in outgoing_beats {
+fn beat_phase_coverage(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+    observed_pairs: usize,
+) -> Option<f32> {
+    let outgoing_interval = beat_interval(outgoing)?;
+    let (outgoing_stride, _) = beat_family_strides(outgoing, incoming, plan);
+    let expected_pair_interval = outgoing_interval.mul_f64(outgoing_stride as f64);
+    let expected_pairs = (plan.duration.as_secs_f64() / expected_pair_interval.as_secs_f64())
+        .ceil()
+        .max(1.0);
+    let coverage = observed_pairs as f64 / expected_pairs;
+    coverage.is_finite().then_some((coverage as f32).min(1.0))
+}
+
+fn observed_marker_pairs(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> Vec<ObservedMarkerPair> {
+    if plan.duration.is_zero() {
+        return Vec::new();
+    }
+    let outgoing_end = plan.outgoing_start.saturating_add(plan.duration);
+    let incoming_end = plan
+        .incoming_start
+        .saturating_add(incoming_mix_source(plan));
+    let Some(outgoing_anchor) = marker_anchor_index(outgoing, plan.outgoing_start) else {
+        return Vec::new();
+    };
+    let Some(incoming_anchor) = marker_anchor_index(incoming, plan.incoming_start) else {
+        return Vec::new();
+    };
+    let (outgoing_stride, incoming_stride) = beat_family_strides(outgoing, incoming, plan);
+    let mut marker_pairs = Vec::new();
+    let mut step = 0_usize;
+    while marker_pairs.len() < MAX_PHASE_MARKER_PAIRS {
+        let Some(outgoing_index) =
+            outgoing_anchor.checked_add(step.saturating_mul(outgoing_stride))
+        else {
+            break;
+        };
+        let Some(incoming_index) =
+            incoming_anchor.checked_add(step.saturating_mul(incoming_stride))
+        else {
+            break;
+        };
+        let (Some(&outgoing_beat), Some(&incoming_beat)) = (
+            outgoing.beat_markers.get(outgoing_index),
+            incoming.beat_markers.get(incoming_index),
+        ) else {
+            break;
+        };
+        if outgoing_beat > outgoing_end || incoming_beat > incoming_end {
+            break;
+        }
         let output_elapsed = outgoing_beat.saturating_sub(plan.outgoing_start);
         let incoming_position = plan
             .incoming_start
             .saturating_add(incoming_source_elapsed(plan, output_elapsed));
-        let Some(error) = incoming_beats
-            .iter()
-            .map(|beat| beat.abs_diff(incoming_position))
-            .min()
-        else {
+        let error = incoming_beat.abs_diff(incoming_position);
+        if !marker_is_trusted(outgoing, outgoing_index)
+            || !marker_is_trusted(incoming, incoming_index)
+        {
+            step += 1;
             continue;
-        };
-        pairs += 1;
-        max_error = Some(max_error.map_or(error, |current: Duration| current.max(error)));
+        }
+        marker_pairs.push(ObservedMarkerPair {
+            outgoing_index,
+            incoming_index,
+            outgoing: outgoing_beat,
+            incoming: incoming_beat,
+            error,
+        });
+        step += 1;
     }
+    marker_pairs
+}
 
-    BeatPhaseReport {
-        pairs,
-        max_error: (pairs > 0).then_some(max_error).flatten(),
+fn marker_anchor_index(analysis: &TrackAnalysis, position: Duration) -> Option<usize> {
+    analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, _)| marker_is_trusted(analysis, *index))
+        .min_by_key(|(_, marker)| marker.abs_diff(position))
+        .filter(|(_, marker)| marker.abs_diff(position) <= marker_snap_tolerance(analysis))
+        .map(|(index, _)| index)
+}
+
+fn trusted_marker_position(analysis: &TrackAnalysis, position: Duration) -> bool {
+    analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .enumerate()
+        .any(|(index, marker)| marker == position && marker_is_trusted(analysis, index))
+}
+
+fn beat_family_strides(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+) -> (usize, usize) {
+    beat_family_strides_for_speed(outgoing, incoming, plan.incoming_tempo_ratio)
+}
+
+fn beat_family_strides_for_speed(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    incoming_speed: f32,
+) -> (usize, usize) {
+    let Some(outgoing_bpm) = outgoing.bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0) else {
+        return (1, 1);
+    };
+    let Some(incoming_bpm) = incoming.bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0) else {
+        return (1, 1);
+    };
+    let effective_incoming = incoming_bpm * incoming_speed;
+    let ratio = effective_incoming / outgoing_bpm;
+    if (1.5..=2.5).contains(&ratio) {
+        (1, 2)
+    } else if (0.4..=0.75).contains(&ratio) {
+        (2, 1)
+    } else {
+        (1, 1)
     }
 }
 
@@ -1426,37 +1674,7 @@ fn downbeat_phase_report(
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
 ) -> BeatPhaseReport {
-    let outgoing_end = plan.outgoing_start.saturating_add(plan.duration);
-    let incoming_end = plan
-        .incoming_start
-        .saturating_add(incoming_mix_source(plan));
-    let outgoing_downbeats =
-        downbeat_positions_between(outgoing, plan.outgoing_start, outgoing_end);
-    let incoming_downbeats =
-        downbeat_positions_between(incoming, plan.incoming_start, incoming_end);
-    let mut pairs = 0;
-    let mut max_error = None;
-
-    for outgoing_downbeat in outgoing_downbeats {
-        let output_elapsed = outgoing_downbeat.saturating_sub(plan.outgoing_start);
-        let incoming_position = plan
-            .incoming_start
-            .saturating_add(incoming_source_elapsed(plan, output_elapsed));
-        let Some(error) = incoming_downbeats
-            .iter()
-            .map(|downbeat| downbeat.abs_diff(incoming_position))
-            .min()
-        else {
-            continue;
-        };
-        pairs += 1;
-        max_error = Some(max_error.map_or(error, |current: Duration| current.max(error)));
-    }
-
-    BeatPhaseReport {
-        pairs,
-        max_error: (pairs > 0).then_some(max_error).flatten(),
-    }
+    observed_phase_report(outgoing, incoming, plan, 4, MIN_DOWNBEAT_PHASE_PAIRS)
 }
 
 fn phrase_phase_report(
@@ -1465,37 +1683,85 @@ fn phrase_phase_report(
     plan: &TransitionPlan,
     length: PhraseLength,
 ) -> BeatPhaseReport {
-    let outgoing_end = plan.outgoing_start.saturating_add(plan.duration);
-    let incoming_end = plan
-        .incoming_start
-        .saturating_add(incoming_mix_source(plan));
-    let outgoing_phrases =
-        phrase_positions_between(outgoing, plan.outgoing_start, outgoing_end, length);
-    let incoming_phrases =
-        phrase_positions_between(incoming, plan.incoming_start, incoming_end, length);
-    let mut pairs = 0;
-    let mut max_error = None;
+    observed_phase_report(
+        outgoing,
+        incoming,
+        plan,
+        4_u32.saturating_mul(length.bars()),
+        MIN_PHRASE_PHASE_PAIRS,
+    )
+}
 
-    for outgoing_phrase in outgoing_phrases {
-        let output_elapsed = outgoing_phrase.saturating_sub(plan.outgoing_start);
-        let incoming_position = plan
-            .incoming_start
-            .saturating_add(incoming_source_elapsed(plan, output_elapsed));
-        let Some(error) = incoming_phrases
-            .iter()
-            .map(|phrase| phrase.abs_diff(incoming_position))
-            .min()
-        else {
-            continue;
+fn observed_phase_report(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    plan: &TransitionPlan,
+    cycle_beats: u32,
+    minimum_pairs: usize,
+) -> BeatPhaseReport {
+    if cycle_beats == 0
+        || !actionable_downbeat_confidence(outgoing)
+        || !actionable_downbeat_confidence(incoming)
+    {
+        return BeatPhaseReport {
+            pairs: 0,
+            coverage: None,
+            max_error: None,
         };
-        pairs += 1;
-        max_error = Some(max_error.map_or(error, |current: Duration| current.max(error)));
     }
-
+    let marker_pairs = observed_marker_pairs(outgoing, incoming, plan);
+    let pairs = marker_pairs
+        .iter()
+        .filter(|pair| {
+            marker_is_near_cycle_boundary(outgoing, pair.outgoing_index, cycle_beats)
+                && marker_is_near_cycle_boundary(incoming, pair.incoming_index, cycle_beats)
+        })
+        .collect::<Vec<_>>();
+    let max_error = (pairs.len() >= minimum_pairs)
+        .then(|| pairs.iter().map(|pair| pair.error).max())
+        .flatten();
     BeatPhaseReport {
-        pairs,
-        max_error: (pairs > 0).then_some(max_error).flatten(),
+        pairs: pairs.len(),
+        coverage: None,
+        max_error,
     }
+}
+
+fn actionable_downbeat_confidence(analysis: &TrackAnalysis) -> bool {
+    analysis.downbeat_confidence.is_finite()
+        && analysis.downbeat_confidence >= MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+}
+
+fn marker_is_near_cycle_boundary(
+    analysis: &TrackAnalysis,
+    marker_index: usize,
+    cycle_beats: u32,
+) -> bool {
+    if cycle_beats == 0 || !marker_is_trusted(analysis, marker_index) {
+        return false;
+    }
+    // Phase is a property of the observed marker ordinal, not of an
+    // extrapolated first_downbeat+BPM clock.  The latter accumulates local
+    // tempo drift over long tracks and can mark every real phrase marker as
+    // unverified even when the two decks have a stable observed alignment.
+    let Some(first_downbeat) = analysis.first_downbeat else {
+        return false;
+    };
+    let Some(origin_index) = analysis
+        .beat_markers
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(index, marker)| {
+            marker_is_trusted(analysis, *index)
+                && marker.abs_diff(first_downbeat) <= marker_snap_tolerance(analysis)
+        })
+        .min_by_key(|(_, marker)| marker.abs_diff(first_downbeat))
+        .map(|(index, _)| index)
+    else {
+        return false;
+    };
+    marker_index.abs_diff(origin_index) % cycle_beats as usize == 0
 }
 
 fn beat_handoff_phase_error(
@@ -1503,64 +1769,7 @@ fn beat_handoff_phase_error(
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
 ) -> Option<Duration> {
-    if let Some(error) = beat_marker_handoff_phase_error(outgoing, incoming, plan) {
-        return Some(error);
-    }
-
-    if outgoing.beat_confidence < MIN_PHASE_MARKER_CONFIDENCE
-        || incoming.beat_confidence < MIN_PHASE_MARKER_CONFIDENCE
-    {
-        return None;
-    }
-    let outgoing_first = beat_phase_anchor(outgoing)?;
-    let incoming_first = beat_phase_anchor(incoming)?;
-    let outgoing_interval = beat_interval(outgoing)?;
-    let incoming_interval = beat_interval(incoming)?;
-
-    handoff_cycle_phase_error(
-        outgoing_first,
-        outgoing_interval,
-        incoming_first,
-        incoming_interval,
-        plan,
-    )
-}
-
-fn beat_marker_handoff_phase_error(
-    outgoing: &TrackAnalysis,
-    incoming: &TrackAnalysis,
-    plan: &TransitionPlan,
-) -> Option<Duration> {
-    let outgoing_handoff = plan.outgoing_start.saturating_add(plan.duration);
-    let incoming_handoff = plan
-        .incoming_start
-        .saturating_add(incoming_mix_source(plan));
-    let outgoing_markers =
-        trusted_beat_markers_between(outgoing, plan.outgoing_start, outgoing_handoff);
-    let incoming_markers =
-        trusted_beat_markers_between(incoming, plan.incoming_start, incoming_handoff);
-    if outgoing_markers.is_empty() || incoming_markers.is_empty() {
-        return None;
-    }
-    let outgoing_marker = outgoing_markers
-        .iter()
-        .copied()
-        .min_by_key(|marker| marker.abs_diff(outgoing_handoff))?;
-    let endpoint_tolerance = beat_interval(outgoing)
-        .map(|interval| interval.div_f64(2.0))
-        .unwrap_or(MAX_BEATMATCH_PHASE_ERROR);
-    if outgoing_marker.abs_diff(outgoing_handoff) > endpoint_tolerance {
-        return None;
-    }
-
-    let output_elapsed = outgoing_marker.saturating_sub(plan.outgoing_start);
-    let incoming_position = plan
-        .incoming_start
-        .saturating_add(incoming_source_elapsed(plan, output_elapsed));
-    incoming_markers
-        .iter()
-        .map(|marker| marker.abs_diff(incoming_position))
-        .min()
+    beat_alignment_evidence(outgoing, incoming, plan).handoff_error
 }
 
 fn downbeat_handoff_phase_error(
@@ -1568,18 +1777,7 @@ fn downbeat_handoff_phase_error(
     incoming: &TrackAnalysis,
     plan: &TransitionPlan,
 ) -> Option<Duration> {
-    let outgoing_grid = outgoing.beat_grid()?;
-    let incoming_grid = incoming.beat_grid()?;
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
-        return None;
-    }
-    handoff_cycle_phase_error(
-        outgoing_grid.first_downbeat,
-        bar_interval(outgoing_grid)?,
-        incoming_grid.first_downbeat,
-        bar_interval(incoming_grid)?,
-        plan,
-    )
+    observed_phase_handoff_error(outgoing, incoming, plan, 4, MIN_DOWNBEAT_PHASE_PAIRS)
 }
 
 fn phrase_handoff_phase_error(
@@ -1588,43 +1786,56 @@ fn phrase_handoff_phase_error(
     plan: &TransitionPlan,
     length: PhraseLength,
 ) -> Option<Duration> {
-    let outgoing_grid = outgoing.beat_grid()?;
-    let incoming_grid = incoming.beat_grid()?;
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
-        return None;
-    }
-    let outgoing_interval = phrase_interval(outgoing_grid, length);
-    let incoming_interval = phrase_interval(incoming_grid, length);
-    if outgoing_interval.is_zero() || incoming_interval.is_zero() {
-        return None;
-    }
-    handoff_cycle_phase_error(
-        outgoing_grid.first_downbeat,
-        outgoing_interval,
-        incoming_grid.first_downbeat,
-        incoming_interval,
+    observed_phase_handoff_error(
+        outgoing,
+        incoming,
         plan,
+        4_u32.saturating_mul(length.bars()),
+        MIN_PHRASE_PHASE_PAIRS,
     )
 }
 
-fn handoff_cycle_phase_error(
-    outgoing_first: Duration,
-    outgoing_interval: Duration,
-    incoming_first: Duration,
-    incoming_interval: Duration,
+fn observed_phase_handoff_error(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
     plan: &TransitionPlan,
+    cycle_beats: u32,
+    minimum_pairs: usize,
 ) -> Option<Duration> {
-    let outgoing_handoff = plan.outgoing_start.saturating_add(plan.duration);
-    let incoming_handoff = plan
+    if !actionable_downbeat_confidence(outgoing) || !actionable_downbeat_confidence(incoming) {
+        return None;
+    }
+    let outgoing_interval = beat_interval(outgoing)?.mul_f64(f64::from(cycle_beats));
+    let incoming_interval = beat_interval(incoming)?.mul_f64(f64::from(cycle_beats));
+    let outgoing_end = plan.outgoing_start.saturating_add(plan.duration);
+    let incoming_end = plan
         .incoming_start
         .saturating_add(incoming_mix_source(plan));
-    let incoming_interval = closest_cycle_interval_family(outgoing_interval, incoming_interval)
-        .unwrap_or(incoming_interval);
-    let outgoing_phase = cycle_phase_fraction(outgoing_handoff, outgoing_first, outgoing_interval)?;
-    let incoming_phase = cycle_phase_fraction(incoming_handoff, incoming_first, incoming_interval)?;
-    let delta = (outgoing_phase - incoming_phase).abs();
-    let wrapped_delta = delta.min(1.0 - delta);
-    Some(outgoing_interval.mul_f64(wrapped_delta))
+    let phase_pairs = observed_marker_pairs(outgoing, incoming, plan)
+        .into_iter()
+        .filter(|pair| {
+            marker_is_near_cycle_boundary(outgoing, pair.outgoing_index, cycle_beats)
+                && marker_is_near_cycle_boundary(incoming, pair.incoming_index, cycle_beats)
+        })
+        .collect::<Vec<_>>();
+    (phase_pairs.len() >= minimum_pairs)
+        .then(|| {
+            phase_pairs
+                .into_iter()
+                .rev()
+                .find(|pair| {
+                    pair.outgoing.abs_diff(outgoing_end)
+                        <= beat_interval(outgoing)
+                            .unwrap_or(outgoing_interval)
+                            .div_f64(2.0)
+                        && pair.incoming.abs_diff(incoming_end)
+                            <= beat_interval(incoming)
+                                .unwrap_or(incoming_interval)
+                                .div_f64(2.0)
+                })
+                .map(|pair| pair.error)
+        })
+        .flatten()
 }
 
 fn strongest_phrase_boundary_bars(
@@ -1655,62 +1866,14 @@ fn phrase_start_phase_error(
     plan: &TransitionPlan,
     length: PhraseLength,
 ) -> Option<Duration> {
-    let outgoing_grid = outgoing.beat_grid()?;
-    let incoming_grid = incoming.beat_grid()?;
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
-        return None;
-    }
-    let outgoing_interval = phrase_interval(outgoing_grid, length);
-    let incoming_interval = phrase_interval(incoming_grid, length);
-    if outgoing_interval.is_zero() || incoming_interval.is_zero() {
-        return None;
-    }
-    cycle_phase_error(
-        plan.outgoing_start,
-        outgoing_grid.first_downbeat,
-        outgoing_interval,
-        plan.incoming_start,
-        incoming_grid.first_downbeat,
-        incoming_interval,
+    observed_phase_report(
+        outgoing,
+        incoming,
+        plan,
+        4_u32.saturating_mul(length.bars()),
+        MIN_PHRASE_PHASE_PAIRS,
     )
-}
-
-fn cycle_phase_error(
-    outgoing_position: Duration,
-    outgoing_first: Duration,
-    outgoing_interval: Duration,
-    incoming_position: Duration,
-    incoming_first: Duration,
-    incoming_interval: Duration,
-) -> Option<Duration> {
-    let incoming_interval = closest_cycle_interval_family(outgoing_interval, incoming_interval)
-        .unwrap_or(incoming_interval);
-    let outgoing_phase =
-        cycle_phase_fraction(outgoing_position, outgoing_first, outgoing_interval)?;
-    let incoming_phase =
-        cycle_phase_fraction(incoming_position, incoming_first, incoming_interval)?;
-    let delta = (outgoing_phase - incoming_phase).abs();
-    let wrapped_delta = delta.min(1.0 - delta);
-    Some(outgoing_interval.mul_f64(wrapped_delta))
-}
-
-fn closest_cycle_interval_family(
-    outgoing_interval: Duration,
-    incoming_interval: Duration,
-) -> Option<Duration> {
-    if outgoing_interval.is_zero() || incoming_interval.is_zero() {
-        return None;
-    }
-    let outgoing = outgoing_interval.as_secs_f64();
-    let incoming = incoming_interval.as_secs_f64();
-    if !outgoing.is_finite() || !incoming.is_finite() || outgoing <= 0.0 || incoming <= 0.0 {
-        return None;
-    }
-    [incoming, incoming * 2.0, incoming * 0.5]
-        .into_iter()
-        .filter(|candidate| candidate.is_finite() && *candidate > 0.0)
-        .min_by(|left, right| (left - outgoing).abs().total_cmp(&(right - outgoing).abs()))
-        .map(Duration::from_secs_f64)
+    .max_error
 }
 
 fn phrase_phase_is_actionable(
@@ -1719,12 +1882,18 @@ fn phrase_phase_is_actionable(
     plan: &TransitionPlan,
     length: PhraseLength,
 ) -> bool {
+    if plan.harmonic_compatibility.is_some_and(|score| score < 0.5) {
+        return false;
+    }
     let Some(outgoing_grid) = outgoing.beat_grid() else {
         return false;
     };
     let Some(incoming_grid) = incoming.beat_grid() else {
         return false;
     };
+    if !actionable_downbeat_confidence(outgoing) || !actionable_downbeat_confidence(incoming) {
+        return false;
+    }
     let outgoing_phrase = phrase_interval(outgoing_grid, length);
     let incoming_phrase = phrase_interval(incoming_grid, length);
     if outgoing_phrase.is_zero() || incoming_phrase.is_zero() {
@@ -1732,58 +1901,6 @@ fn phrase_phase_is_actionable(
     }
     let minimum_overlap = outgoing_phrase.min(incoming_phrase).div_f64(2.0);
     plan.duration >= minimum_overlap
-}
-
-fn beat_positions_between(
-    analysis: &TrackAnalysis,
-    start: Duration,
-    end: Duration,
-) -> Vec<Duration> {
-    if end <= start {
-        return Vec::new();
-    }
-
-    let markers = trusted_beat_markers_between(analysis, start, end);
-    if !markers.is_empty() {
-        return markers;
-    }
-
-    let Some(bpm) = analysis.bpm else {
-        return Vec::new();
-    };
-    if bpm <= 0.0 || !bpm.is_finite() || analysis.beat_confidence < MIN_PHASE_MARKER_CONFIDENCE {
-        return Vec::new();
-    }
-    let Some(interval) = beat_interval_from_bpm(bpm) else {
-        return Vec::new();
-    };
-
-    let mut beat = align_to_global_beat_at_or_after(start, analysis);
-    let mut beats = Vec::new();
-    while beat <= end {
-        beats.push(beat);
-        beat += interval;
-    }
-    beats
-}
-
-fn trusted_beat_markers_between(
-    analysis: &TrackAnalysis,
-    start: Duration,
-    end: Duration,
-) -> Vec<Duration> {
-    analysis
-        .beat_markers
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(index, beat)| {
-            *beat >= start
-                && *beat <= end
-                && marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
-        })
-        .map(|(_, beat)| beat)
-        .collect()
 }
 
 fn trusted_beat_markers_between_limited(
@@ -1807,10 +1924,7 @@ fn trusted_beat_markers_between_limited(
         .take(MAX_INCOMING_CUE_CANDIDATES)
         .enumerate()
     {
-        if beat >= start
-            && beat <= end
-            && marker_confidence(analysis, index) >= MIN_PHASE_MARKER_CONFIDENCE
-        {
+        if beat >= start && beat <= end && marker_is_trusted(analysis, index) {
             markers.push(beat);
             if markers.len() >= limit {
                 break;
@@ -1818,14 +1932,6 @@ fn trusted_beat_markers_between_limited(
         }
     }
     markers
-}
-
-fn downbeat_positions_between(
-    analysis: &TrackAnalysis,
-    start: Duration,
-    end: Duration,
-) -> Vec<Duration> {
-    downbeat_positions_between_limited(analysis, start, end, usize::MAX)
 }
 
 fn downbeat_positions_between_limited(
@@ -1840,7 +1946,7 @@ fn downbeat_positions_between_limited(
     let Some(grid) = analysis.beat_grid() else {
         return Vec::new();
     };
-    if grid.downbeat_confidence < 0.25 {
+    if grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE {
         return Vec::new();
     }
 
@@ -1850,38 +1956,6 @@ fn downbeat_positions_between_limited(
     }
 
     cycle_positions_between_limited(grid.first_downbeat, interval, start, end, limit)
-}
-
-fn phrase_positions_between(
-    analysis: &TrackAnalysis,
-    start: Duration,
-    end: Duration,
-    length: PhraseLength,
-) -> Vec<Duration> {
-    if end <= start {
-        return Vec::new();
-    }
-    let Some(grid) = analysis.beat_grid() else {
-        return Vec::new();
-    };
-    if grid.downbeat_confidence < 0.25 {
-        return Vec::new();
-    }
-    let interval = phrase_interval(grid, length);
-    if interval.is_zero() {
-        return Vec::new();
-    }
-
-    cycle_positions_between(grid.first_downbeat, interval, start, end)
-}
-
-fn cycle_positions_between(
-    first: Duration,
-    interval: Duration,
-    start: Duration,
-    end: Duration,
-) -> Vec<Duration> {
-    cycle_positions_between_limited(first, interval, start, end, usize::MAX)
 }
 
 fn cycle_positions_between_limited(
@@ -1933,34 +2007,6 @@ fn beat_interval(analysis: &TrackAnalysis) -> Option<Duration> {
         return None;
     }
     beat_interval_from_bpm(bpm)
-}
-
-fn beat_phase_anchor(analysis: &TrackAnalysis) -> Option<Duration> {
-    analysis
-        .beat_markers
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(index, beat)| {
-            *beat >= analysis.audible_start
-                && marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
-        })
-        .map(|(_, beat)| beat)
-        .min()
-        .or_else(|| {
-            analysis
-                .beat_markers
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(index, _)| {
-                    marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
-                })
-                .map(|(_, beat)| beat)
-                .min()
-        })
-        .or(analysis.first_beat)
-        .or(analysis.first_downbeat)
 }
 
 fn low_handoff_range(plan: &TransitionPlan) -> (Option<f32>, Option<f32>) {
@@ -2101,6 +2147,7 @@ struct TransitionEnergyReport {
     min_ratio: Option<f32>,
     max_ratio: Option<f32>,
     max_step: Option<f32>,
+    longest_blocking_gap: Duration,
     handoff_ratio: Option<f32>,
     handoff_incoming_share: Option<f32>,
 }
@@ -2119,6 +2166,7 @@ fn transition_energy_report(
             min_ratio: None,
             max_ratio: None,
             max_step: None,
+            longest_blocking_gap: Duration::ZERO,
             handoff_ratio: None,
             handoff_incoming_share: None,
         };
@@ -2127,35 +2175,59 @@ fn transition_energy_report(
     let incoming_base_gain = finite_nonnegative_gain(
         finite_nonnegative_gain(incoming_base_gain) * finite_nonnegative_gain(plan.incoming_gain),
     );
-    let outgoing_reference =
-        energy_at(outgoing, plan.outgoing_start).map(|energy| energy * outgoing_base_gain);
-    let incoming_reference = energy_at(
+    // Edge windows can both land inside a quiet bar and make the whole mix
+    // look healthy after normalization. Derive each deck's reference from a
+    // bounded source-available region around the planned overlap instead.
+    // The 75th percentile ignores isolated spikes while still retaining a
+    // nearby normal-energy floor when a meaningful portion of the source is
+    // available around a sustained, avoidable gap.
+    let outgoing_reference = robust_energy_reference(
+        outgoing,
+        plan.outgoing_start,
+        plan.outgoing_start.saturating_add(plan.duration),
+    )
+    .map(|energy| energy * outgoing_base_gain);
+    let incoming_reference = robust_energy_reference(
         incoming,
+        plan.incoming_start,
         plan.incoming_start
             .saturating_add(incoming_mix_source(plan)),
     )
     .map(|energy| energy * incoming_base_gain);
-    let Some(reference) = outgoing_reference
+    let Some((outgoing_reference, incoming_reference)) = outgoing_reference
         .zip(incoming_reference)
-        .map(|(outgoing, incoming)| outgoing.max(incoming).max(1.0e-6))
+        .filter(|(outgoing, incoming)| {
+            outgoing.is_finite()
+                && incoming.is_finite()
+                && *outgoing >= 0.0
+                && *incoming >= 0.0
+                && (*outgoing).max(*incoming) > 1.0e-6
+        })
     else {
         return TransitionEnergyReport {
             samples: 0,
             min_ratio: None,
             max_ratio: None,
             max_step: None,
+            longest_blocking_gap: Duration::ZERO,
             handoff_ratio: None,
             handoff_incoming_share: None,
         };
     };
+    let reference = outgoing_reference.max(incoming_reference).max(1.0e-6);
 
     let mut samples = 0;
+    let mut actionable_samples = 0;
     let mut min_ratio = f32::INFINITY;
     let mut max_ratio = f32::NEG_INFINITY;
     let mut previous_ratio: Option<f32> = None;
     let mut max_step = 0.0_f32;
     let mut handoff_incoming_share = f32::INFINITY;
     let mut handoff_share_samples = 0;
+    let sample_span = plan.duration.div_f64(f64::from(SAMPLES));
+    let mut current_blocking_gap = Duration::ZERO;
+    let mut current_structural_break_gap = Duration::ZERO;
+    let mut longest_blocking_gap = Duration::ZERO;
     let peak_guard = AutoMixPeakGuard::from_analyses_with_base_gains(
         outgoing,
         incoming,
@@ -2169,8 +2241,8 @@ fn transition_energy_report(
             .incoming_start
             .saturating_add(incoming_source_elapsed(plan, elapsed));
         let (Some(outgoing_energy), Some(incoming_energy)) = (
-            energy_at(outgoing, outgoing_position),
-            energy_at(incoming, incoming_position),
+            windowed_energy_at(outgoing, outgoing_position, MIN_ENERGY_WINDOW),
+            windowed_energy_at(incoming, incoming_position, MIN_ENERGY_WINDOW),
         ) else {
             continue;
         };
@@ -2201,6 +2273,12 @@ fn transition_energy_report(
         let combined = (outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level))
             .sqrt()
             / reference;
+        let outgoing_source_ratio = outgoing_energy * outgoing_base_gain / outgoing_reference;
+        let incoming_source_ratio = incoming_energy * incoming_base_gain / incoming_reference;
+        let both_sources_in_structural_break = outgoing_source_ratio.is_finite()
+            && incoming_source_ratio.is_finite()
+            && outgoing_source_ratio < MIN_STRUCTURAL_BREAK_RATIO
+            && incoming_source_ratio < MIN_STRUCTURAL_BREAK_RATIO;
         let total_power = outgoing_level.mul_add(outgoing_level, incoming_level * incoming_level);
         if progress >= 0.75 && total_power > 1.0e-12 {
             let incoming_share = (incoming_level * incoming_level / total_power).clamp(0.0, 1.0);
@@ -2208,19 +2286,69 @@ fn transition_energy_report(
             handoff_share_samples += 1;
         }
         samples += 1;
-        min_ratio = min_ratio.min(combined);
+        let mut include_in_minimum = !both_sources_in_structural_break;
+        if !both_sources_in_structural_break {
+            actionable_samples += 1;
+        }
         max_ratio = max_ratio.max(combined);
+        if mix_energy_dip_is_blocking(combined) {
+            current_blocking_gap = current_blocking_gap
+                .saturating_add(sample_span)
+                .min(plan.duration);
+            if both_sources_in_structural_break {
+                current_structural_break_gap = current_structural_break_gap
+                    .saturating_add(sample_span)
+                    .min(plan.duration);
+                include_in_minimum = include_in_minimum
+                    || current_structural_break_gap > MAX_STRUCTURAL_BREAK_DURATION;
+            } else {
+                current_structural_break_gap = Duration::ZERO;
+            }
+            // A simultaneous source break is an unavoidable low-energy
+            // passage only after it persists for the same blocking window.
+            // Keep shorter breaks eligible for the normal continuous-gap
+            // guard, and discard the accumulated run once the break is
+            // proven structural.
+            if (MIN_BLOCKING_ENERGY_GAP..=MAX_STRUCTURAL_BREAK_DURATION)
+                .contains(&current_structural_break_gap)
+            {
+                current_blocking_gap = Duration::ZERO;
+            } else {
+                longest_blocking_gap = longest_blocking_gap.max(current_blocking_gap);
+            }
+        } else {
+            current_blocking_gap = Duration::ZERO;
+            current_structural_break_gap = Duration::ZERO;
+        }
+        if include_in_minimum {
+            min_ratio = min_ratio.min(combined);
+            if both_sources_in_structural_break {
+                actionable_samples += 1;
+            }
+        }
         if let Some(previous) = previous_ratio {
             max_step = max_step.max((combined - previous).abs());
         }
         previous_ratio = Some(combined);
     }
 
+    if current_structural_break_gap < MIN_BLOCKING_ENERGY_GAP
+        || current_structural_break_gap > MAX_STRUCTURAL_BREAK_DURATION
+    {
+        longest_blocking_gap = longest_blocking_gap.max(current_blocking_gap);
+    }
+
     TransitionEnergyReport {
         samples,
-        min_ratio: (samples > 0).then_some(min_ratio),
+        // A simultaneous structural break is score-only: do not let its
+        // unavoidable silence become the minimum used by the blocking gate.
+        // Keep a finite neutral value when the entire overlap is structural.
+        min_ratio: (actionable_samples > 0)
+            .then_some(min_ratio)
+            .or_else(|| (samples > 0).then_some(1.0)),
         max_ratio: (samples > 0).then_some(max_ratio),
         max_step: (samples > 1).then_some(max_step),
+        longest_blocking_gap,
         handoff_ratio: previous_ratio,
         handoff_incoming_share: (handoff_share_samples > 0).then_some(handoff_incoming_share),
     }
@@ -2245,10 +2373,22 @@ fn select_energy_balanced_start(
         return (default_start, None);
     }
 
+    // A vocal/structure constraint can leave only a very short initial
+    // overlap.  Still inspect the bounded marker history before accepting
+    // that short candidate: a nearby trusted marker farther toward the
+    // outgoing end may provide the required observed phase evidence.  The
+    // vocal and energy gates below remain authoritative, so this cannot turn
+    // an unsafe long overlap into an accepted one.
+    let marker_search_window = if beat_aligned && search_window < MIN_NATURAL_MIX_OVERLAP {
+        MAX_SHORTER_TRANSITION_SEARCH
+    } else {
+        search_window
+    };
+
     let mut candidates = vec![default_start];
     if beat_aligned {
         if harmonic_compatibility.is_none_or(|score| score >= 0.5)
-            && incoming.downbeat_confidence >= 0.25
+            && incoming.downbeat_confidence >= MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
             && incoming.first_downbeat.is_some()
         {
             candidates.extend(matching_phrase_phase_candidates(
@@ -2256,7 +2396,7 @@ fn select_energy_balanced_start(
                 incoming,
                 incoming_start,
                 target,
-                search_window,
+                marker_search_window,
                 PhraseLength::FourBars,
                 phase_bias,
             ));
@@ -2266,18 +2406,21 @@ fn select_energy_balanced_start(
             incoming,
             incoming_start,
             target,
-            search_window,
+            marker_search_window,
             phase_bias,
         ));
         candidates.extend(beat_start_candidates(
             outgoing,
             target,
-            search_window,
+            marker_search_window,
             phase_bias,
         ));
-        if let Some(shorter_window) = shorter_transition_search_window(search_window, phase_bias) {
+        if !harmonic_compatibility.is_some_and(|score| score < 0.5)
+            && let Some(shorter_window) =
+                shorter_transition_search_window(search_window, phase_bias)
+        {
             if harmonic_compatibility.is_none_or(|score| score >= 0.5)
-                && incoming.downbeat_confidence >= 0.25
+                && incoming.downbeat_confidence >= MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
                 && incoming.first_downbeat.is_some()
             {
                 candidates.extend(matching_phrase_phase_candidates(
@@ -2316,27 +2459,20 @@ fn select_energy_balanced_start(
 
     candidates.sort_unstable();
     candidates.dedup();
+    if let Ok(index) = candidates.binary_search(&default_start) {
+        candidates.remove(index);
+    }
+    candidates.insert(0, default_start);
 
-    let Some((mut best_start, mut best_score)) = transition_start_energy_score(
-        outgoing,
-        incoming,
-        incoming_start,
-        default_start,
-        beat_aligned,
-        harmonic_compatibility,
-        incoming_gain,
-        tempo_curve,
-        max_tempo_adjustment,
-    ) else {
-        return (default_start, None);
-    };
-    let mut candidates_checked = 1;
-
-    for candidate in candidates
-        .into_iter()
-        .filter(|candidate| *candidate != default_start)
-        .take(MAX_ENERGY_START_CANDIDATES)
-    {
+    let marker_fallback = beat_aligned.then(|| {
+        candidates
+            .iter()
+            .copied()
+            .find(|candidate| trusted_marker_position(outgoing, *candidate))
+    });
+    let mut best: Option<(Duration, f32)> = None;
+    let mut candidates_checked = 0;
+    for candidate in candidates.into_iter().take(MAX_ENERGY_START_CANDIDATES) {
         let Some((candidate_start, candidate_score)) = transition_start_energy_score(
             outgoing,
             incoming,
@@ -2351,11 +2487,21 @@ fn select_energy_balanced_start(
             continue;
         };
         candidates_checked += 1;
-        if candidate_score + ENERGY_SELECTION_EPSILON < best_score {
-            best_start = candidate_start;
-            best_score = candidate_score;
+        if best
+            .is_none_or(|(_, best_score)| candidate_score + ENERGY_SELECTION_EPSILON < best_score)
+        {
+            best = Some((candidate_start, candidate_score));
         }
     }
+
+    let Some((best_start, _)) = best else {
+        // A failed energy/phase candidate must never reintroduce the
+        // synthetic phase/grid start that the candidate gate rejected.  Keep
+        // the first actual trusted marker as the diagnostic raw plan; the
+        // quality guard will still select the conservative fallback if that
+        // marker is unsafe.
+        return (marker_fallback.flatten().unwrap_or(default_start), None);
+    };
 
     (
         best_start,
@@ -2381,6 +2527,14 @@ fn transition_start_energy_score(
 ) -> Option<(Duration, f32)> {
     let duration = outgoing.audible_end.saturating_sub(outgoing_start);
     if duration < MIN_AUDIBLE_MIX_OVERLAP {
+        return None;
+    }
+    // BeatMatched candidates must retain an observed trusted outgoing anchor
+    // all the way through energy/structure scoring.  A phase duration or
+    // global BPM grid is not a substitute for the marker that produced the
+    // candidate; rejecting it here prevents a later nearest-marker lookup
+    // from silently converting a synthetic start into phase evidence.
+    if beat_aligned && marker_anchor_index(outgoing, outgoing_start).is_none() {
         return None;
     }
 
@@ -2438,9 +2592,50 @@ fn transition_start_energy_score(
     {
         1_000.0
     } else {
+        // Structural breaks are score-only for an accepted plan, but a
+        // candidate whose rendered mix still spends most of its overlap below
+        // the analysis floor should not win start selection over a healthy
+        // alternative.
+        quality
+            .min_mix_energy_ratio
+            .filter(|ratio| ratio.is_finite() && *ratio < MIN_SAFE_MIX_ENERGY_RATIO)
+            .map_or(0.0, |ratio| (MIN_SAFE_MIX_ENERGY_RATIO - ratio) * 100.0)
+    };
+    let phrase_evidence_penalty = if beat_aligned
+        && quality.downbeat_pairs_checked >= MIN_DOWNBEAT_PHASE_PAIRS
+        && quality.phrase_pairs_checked == 0
+    {
+        // Phrase evidence is optional once beat/downbeat evidence is sound,
+        // but a candidate with no observed phrase pair should not outrank an
+        // otherwise equivalent marker-backed phrase candidate solely because
+        // its synthetic phase happens to have a lower energy score.
+        1.0
+    } else {
         0.0
     };
-    transition_start_score(&quality).map(|score| (outgoing_start, score + unsafe_energy_penalty))
+    transition_start_score(&quality).map(|score| {
+        (
+            outgoing_start,
+            score + unsafe_energy_penalty + phrase_evidence_penalty,
+        )
+    })
+}
+
+fn marker_evidence_penalty(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    quality: &AutoMixQualityReport,
+) -> f32 {
+    // Keep short but otherwise valid marker overlaps eligible as a final
+    // fallback.  Prefer candidates with the corpus-quality evidence budget,
+    // however, so a 3-beat tail cannot win over an 8-pair observed overlap.
+    let pair_penalty =
+        MIN_MARKER_BACKED_KICK_MARKERS.saturating_sub(quality.beat_pairs_checked) as f32 * 0.25;
+    let coverage = outgoing
+        .trusted_kick_coverage()
+        .min(incoming.trusted_kick_coverage());
+    let coverage_penalty = (MIN_MARKER_BACKED_KICK_COVERAGE - coverage).max(0.0);
+    pair_penalty + coverage_penalty
 }
 
 pub fn transition_score_breakdown(quality: &AutoMixQualityReport) -> Option<AutoMixScoreBreakdown> {
@@ -2598,7 +2793,9 @@ fn matching_phrase_phase_candidates(
     let Some(incoming_grid) = incoming.beat_grid() else {
         return Vec::new();
     };
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+    if outgoing_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+        || incoming_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+    {
         return Vec::new();
     }
 
@@ -2623,9 +2820,10 @@ fn matching_phrase_phase_candidates(
         latest,
     )
     .into_iter()
-    .filter(|candidate| {
-        valid_outgoing_start(outgoing, *candidate)
-            && has_trusted_marker_near(outgoing, *candidate, MAX_BEATMATCH_PHASE_ERROR)
+    .filter_map(|candidate| {
+        valid_outgoing_start(outgoing, candidate)
+            .then(|| trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
+            .flatten()
     })
     .collect()
 }
@@ -2644,7 +2842,9 @@ fn matching_bar_phase_candidates(
     let Some(incoming_grid) = incoming.beat_grid() else {
         return Vec::new();
     };
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+    if outgoing_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+        || incoming_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+    {
         return Vec::new();
     }
 
@@ -2668,9 +2868,10 @@ fn matching_bar_phase_candidates(
         latest,
     )
     .into_iter()
-    .filter(|candidate| {
-        valid_outgoing_start(outgoing, *candidate)
-            && has_trusted_marker_near(outgoing, *candidate, MAX_BEATMATCH_PHASE_ERROR)
+    .filter_map(|candidate| {
+        valid_outgoing_start(outgoing, candidate)
+            .then(|| trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
+            .flatten()
     })
     .collect()
 }
@@ -2722,15 +2923,14 @@ fn beat_start_candidates(
         .copied()
         .enumerate()
         .filter(|(index, beat)| {
-            marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE
-                && *beat >= earliest
-                && *beat <= latest
+            marker_is_trusted(analysis, *index) && *beat >= earliest && *beat <= latest
         })
         .map(|(_, beat)| beat)
         .filter(|beat| valid_outgoing_start(analysis, *beat))
         .collect::<Vec<_>>();
 
-    if let (Some(first), Some(bpm)) = (analysis.first_beat, analysis.bpm)
+    if analysis.beat_markers.is_empty()
+        && let (Some(first), Some(bpm)) = (analysis.first_beat, analysis.bpm)
         && bpm.is_finite()
         && bpm > 0.0
         && let Some(interval) = beat_interval_from_bpm(bpm)
@@ -2911,7 +3111,94 @@ fn energy_at(analysis: &TrackAnalysis, position: Duration) -> Option<f32> {
     let value = analysis.energy_profile.get(index)?;
     let dbfs =
         MIN_ENERGY_PROFILE_DBFS + (f32::from(*value) / 255.0) * (0.0 - MIN_ENERGY_PROFILE_DBFS);
-    Some(dbfs_to_linear(dbfs))
+    let energy = dbfs_to_linear(dbfs);
+    energy
+        .is_finite()
+        .then_some(energy)
+        .filter(|energy| *energy >= 0.0)
+}
+
+fn windowed_energy_at(
+    analysis: &TrackAnalysis,
+    position: Duration,
+    window: Duration,
+) -> Option<f32> {
+    if window.is_zero() {
+        return energy_at(analysis, position);
+    }
+    let half_window = window.div_f64(2.0);
+    let start = position
+        .saturating_sub(half_window)
+        .max(analysis.audible_start);
+    let end = position
+        .saturating_add(half_window)
+        .min(analysis.audible_end);
+    if end <= start {
+        return energy_at(analysis, position);
+    }
+    let samples = ((end.saturating_sub(start).as_secs_f64()
+        * f64::from(analysis.energy_profile_rate))
+    .ceil() as u32)
+        .clamp(1, 32);
+    average_energy_between(analysis, start, end, samples)
+}
+
+fn robust_energy_reference(
+    analysis: &TrackAnalysis,
+    overlap_start: Duration,
+    overlap_end: Duration,
+) -> Option<f32> {
+    if !has_energy_profile(analysis) || overlap_end <= overlap_start {
+        return None;
+    }
+    let start = overlap_start
+        .saturating_sub(ENERGY_REFERENCE_RADIUS)
+        .max(analysis.audible_start);
+    let end = overlap_end
+        .saturating_add(ENERGY_REFERENCE_RADIUS)
+        .min(analysis.audible_end);
+    if end <= start {
+        return None;
+    }
+
+    let span = end.saturating_sub(start);
+    let sample_count = (span.as_secs_f64() * f64::from(analysis.energy_profile_rate))
+        .ceil()
+        .clamp(1.0, MAX_ENERGY_REFERENCE_SAMPLES as f64) as usize;
+    let mut samples = [0.0_f32; MAX_ENERGY_REFERENCE_SAMPLES];
+    let mut checked = 0;
+    for index in 0..sample_count {
+        let position =
+            start.saturating_add(span.mul_f64((index as f64 + 0.5) / sample_count as f64));
+        if let Some(energy) =
+            energy_at(analysis, position).filter(|energy| energy.is_finite() && *energy >= 0.0)
+        {
+            samples[checked] = energy;
+            checked += 1;
+        }
+    }
+    if checked == 0 {
+        return None;
+    }
+    let samples = &mut samples[..checked];
+    samples.sort_by(f32::total_cmp);
+    let upper_quartile = samples[(checked.saturating_sub(1) * 3) / 4];
+    // A 500 ms windowed edge value is itself an aggregate, not a single
+    // global spike; retain it when it represents a real available source
+    // floor while still using the robust percentile for quiet edges.
+    let edge_reference = [
+        windowed_energy_at(analysis, overlap_start, MIN_ENERGY_WINDOW),
+        windowed_energy_at(analysis, overlap_end, MIN_ENERGY_WINDOW),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|energy| energy.is_finite() && *energy >= 0.0)
+    .fold(0.0, f32::max);
+    upper_quartile
+        .max(edge_reference)
+        .is_finite()
+        .then_some(upper_quartile.max(edge_reference))
+        .filter(|energy| *energy > 1.0e-6)
 }
 
 fn incoming_mix_source(plan: &TransitionPlan) -> Duration {
@@ -3027,19 +3314,25 @@ fn safe_incoming_beat_start(incoming: &TrackAnalysis) -> Option<Duration> {
 
 fn safe_incoming_beat_starts(incoming: &TrackAnalysis) -> Vec<Duration> {
     let mut candidates = Vec::new();
-    for candidate in incoming_cue_positions_between(
+    let pickup_limit = beat_interval(incoming)
+        .map(|interval| interval.mul_f64(f64::from(MAX_INCOMING_PICKUP_BEATS)))
+        .unwrap_or(MAX_STRUCTURED_INTRO_SKIP)
+        .min(MAX_STRUCTURED_INTRO_SKIP);
+    // Search a bounded beat window for the first observed, trustworthy cue.
+    // Later markers are not automatically safe pickup cuts: they still need
+    // the structured-intro or low-energy checks below.
+    if let Some(candidate) = incoming_cue_positions_between(
         incoming,
         incoming.audible_start,
         incoming
             .audible_end
-            .min(incoming.audible_start.saturating_add(MAX_AUDIBLE_PICKUP)),
-    ) {
-        if candidates.len() >= MAX_INCOMING_CUE_CANDIDATES {
-            break;
-        }
-        if !known_vocal_risk_between(incoming, incoming.audible_start, candidate) {
-            candidates.push(candidate);
-        }
+            .min(incoming.audible_start.saturating_add(pickup_limit)),
+    )
+    .into_iter()
+    .next()
+        && safe_to_skip_initial_pickup(incoming, candidate, pickup_limit)
+    {
+        candidates.push(candidate);
     }
 
     if let Some(intro_end) = incoming
@@ -3086,6 +3379,38 @@ fn safe_incoming_beat_starts(incoming: &TrackAnalysis) -> Vec<Duration> {
     candidates.dedup();
     candidates.truncate(MAX_INCOMING_CUE_CANDIDATES);
     candidates
+}
+
+fn safe_to_skip_initial_pickup(
+    incoming: &TrackAnalysis,
+    candidate: Duration,
+    maximum_pickup: Duration,
+) -> bool {
+    if candidate < incoming.audible_start
+        || candidate.saturating_sub(incoming.audible_start) > maximum_pickup
+    {
+        return false;
+    }
+    let skipped = candidate.saturating_sub(incoming.audible_start);
+    // A cue at the audible boundary is not a pickup skip. Keep this tiny
+    // numerical snap window metadata-free, but require trusted vocal
+    // evidence for every positive skip beyond it (including a sub-beat one).
+    if skipped <= MAX_BEATMATCH_PHASE_ERROR {
+        return true;
+    }
+    let vocal_summary = summarize_vocals(incoming);
+    if !vocal_summary.known {
+        return false;
+    }
+    if max_vocal_risk_between(incoming, incoming.audible_start, candidate)
+        .is_some_and(|risk| risk > MAX_SKIPPED_INTRO_VOCAL_RISK)
+    {
+        return false;
+    }
+    if skipped <= beat_interval(incoming).unwrap_or(MIN_ENERGY_WINDOW) {
+        return true;
+    }
+    safe_to_skip_intro_until(incoming, candidate, maximum_pickup, 0.55)
 }
 
 fn safe_to_skip_low_energy_intro(incoming: &TrackAnalysis, candidate: Duration) -> bool {
@@ -3172,42 +3497,10 @@ fn incoming_cue_positions_between(
         }
     }
 
-    // A marker-backed analysis already gives us the observed beat positions.
-    // Only infer a regular beat grid when those observations are unavailable;
-    // otherwise an untrusted first_beat could reintroduce the very cue that a
-    // marker safety check rejected.
-    if analysis.beat_markers.is_empty()
-        && let (Some(first_beat), Some(bpm)) = (analysis.first_beat, analysis.bpm)
-        && bpm.is_finite()
-        && bpm > 0.0
-        && let Some(interval) = beat_interval_from_bpm(bpm)
-    {
-        let mut beat = if first_beat >= start {
-            first_beat
-        } else {
-            align_to_global_beat_at_or_after(start, analysis)
-        };
-        while beat <= end && candidates.len() < MAX_INCOMING_CUE_CANDIDATES {
-            candidates.push(beat);
-            let Some(next) = beat.checked_add(interval) else {
-                break;
-            };
-            if next <= beat {
-                break;
-            }
-            beat = next;
-        }
-    }
-
-    // Preserve the legacy first_beat fallback for analyses without a usable
-    // observed/grid cue. It remains subject to the caller's vocal/intro check.
-    if candidates.is_empty()
-        && analysis
-            .first_beat
-            .is_some_and(|first_beat| first_beat >= start && first_beat <= end)
-    {
-        candidates.push(analysis.first_beat.expect("checked above"));
-    }
+    // Do not synthesize an incoming cue from first_beat/BPM.  An audible
+    // pickup can only be discarded when the source exposes an observed,
+    // individually trusted marker.  Native crossfade planning remains the
+    // fallback for markerless analyses.
 
     candidates.sort_unstable();
     candidates.dedup();
@@ -3219,18 +3512,25 @@ fn has_trusted_marker_near(
     position: Duration,
     tolerance: Duration,
 ) -> bool {
-    if analysis.beat_markers.is_empty() {
-        return true;
-    }
+    !analysis.beat_markers.is_empty()
+        && trusted_marker_near(analysis, position, tolerance).is_some()
+}
+
+fn trusted_marker_near(
+    analysis: &TrackAnalysis,
+    position: Duration,
+    tolerance: Duration,
+) -> Option<Duration> {
     analysis
         .beat_markers
         .iter()
         .copied()
         .enumerate()
-        .any(|(index, beat)| {
-            marker_confidence(analysis, index) >= MIN_PHASE_MARKER_CONFIDENCE
-                && beat.abs_diff(position) <= tolerance
+        .filter(|(index, beat)| {
+            marker_is_trusted(analysis, *index) && beat.abs_diff(position) <= tolerance
         })
+        .map(|(_, beat)| beat)
+        .min_by_key(|beat| beat.abs_diff(position))
 }
 
 #[derive(Clone, Copy)]
@@ -3289,10 +3589,6 @@ fn summarize_vocals(analysis: &TrackAnalysis) -> VocalSummary {
     }
 }
 
-fn known_vocal_risk_between(analysis: &TrackAnalysis, start: Duration, end: Duration) -> bool {
-    max_vocal_risk_between(analysis, start, end).is_some_and(|risk| risk >= 0.58)
-}
-
 fn max_vocal_risk_between(analysis: &TrackAnalysis, start: Duration, end: Duration) -> Option<f32> {
     let summary = summarize_vocals(analysis);
     if !summary.known || end <= start {
@@ -3341,11 +3637,11 @@ fn align_to_beat_at_or_after(position: Duration, analysis: &TrackAnalysis) -> Du
         .iter()
         .copied()
         .enumerate()
-        .filter(|(index, _)| marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE)
+        .filter(|(index, _)| marker_is_trusted(analysis, *index))
         .map(|(_, beat)| beat)
         .filter(|beat| *beat >= position)
-        .min_by_key(|beat| beat.abs_diff(fallback))
-        .filter(|beat| beat.abs_diff(fallback) <= marker_snap_tolerance(analysis))
+        .min()
+        .filter(|beat| beat.abs_diff(position) <= MAX_SHORTER_TRANSITION_SEARCH)
         .unwrap_or(fallback)
         .min(analysis.audible_end)
 }
@@ -3417,7 +3713,9 @@ fn align_to_matching_phrase_phase(
 ) -> Option<Duration> {
     let outgoing_grid = outgoing.beat_grid()?;
     let incoming_grid = incoming.beat_grid()?;
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+    if outgoing_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+        || incoming_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+    {
         return None;
     }
 
@@ -3447,9 +3745,9 @@ fn align_to_matching_phrase_phase(
     (inside_search
         && candidate >= outgoing.audible_start
         && candidate <= outgoing.audible_end
-        && outgoing.audible_end.saturating_sub(candidate) >= MIN_AUDIBLE_MIX_OVERLAP
-        && has_trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
-    .then_some(candidate)
+        && outgoing.audible_end.saturating_sub(candidate) >= MIN_AUDIBLE_MIX_OVERLAP)
+        .then(|| trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
+        .flatten()
 }
 
 #[derive(Clone, Copy)]
@@ -3467,7 +3765,9 @@ fn align_to_matching_bar_phase(
 ) -> Option<Duration> {
     let outgoing_grid = outgoing.beat_grid()?;
     let incoming_grid = incoming.beat_grid()?;
-    if outgoing_grid.downbeat_confidence < 0.25 || incoming_grid.downbeat_confidence < 0.25 {
+    if outgoing_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+        || incoming_grid.downbeat_confidence < MIN_ACTIONABLE_DOWNBEAT_CONFIDENCE
+    {
         return None;
     }
 
@@ -3482,10 +3782,9 @@ fn align_to_matching_bar_phase(
         target,
         bias,
     )?;
-    (candidate >= outgoing.audible_start
-        && candidate <= outgoing.audible_end
-        && has_trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
-    .then_some(candidate)
+    (candidate >= outgoing.audible_start && candidate <= outgoing.audible_end)
+        .then(|| trusted_marker_near(outgoing, candidate, MAX_BEATMATCH_PHASE_ERROR))
+        .flatten()
 }
 
 fn bar_interval(grid: BeatGrid) -> Option<Duration> {
@@ -3540,11 +3839,11 @@ fn align_to_beat(position: Duration, analysis: &TrackAnalysis) -> Duration {
         .iter()
         .copied()
         .enumerate()
-        .filter(|(index, _)| marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE)
+        .filter(|(index, _)| marker_is_trusted(analysis, *index))
         .map(|(_, beat)| beat)
         .filter(|beat| *beat <= position)
-        .min_by_key(|beat| beat.abs_diff(fallback))
-        .filter(|beat| beat.abs_diff(fallback) <= marker_snap_tolerance(analysis))
+        .max()
+        .filter(|beat| beat.abs_diff(position) <= MAX_SHORTER_TRANSITION_SEARCH)
         .unwrap_or(fallback)
 }
 
@@ -3570,7 +3869,7 @@ fn snap_to_nearest_beat(analysis: &TrackAnalysis, position: Duration) -> Option<
         .iter()
         .copied()
         .enumerate()
-        .filter(|(index, _)| marker_confidence(analysis, *index) >= MIN_PHASE_MARKER_CONFIDENCE)
+        .filter(|(index, _)| marker_is_trusted(analysis, *index))
         .map(|(_, beat)| beat)
         .min_by_key(|beat| beat.abs_diff(position))
         .filter(|beat| beat.abs_diff(position) <= marker_snap_tolerance(analysis))
@@ -3584,12 +3883,27 @@ fn marker_snap_tolerance(analysis: &TrackAnalysis) -> Duration {
         .unwrap_or(Duration::from_millis(100))
 }
 
-fn marker_confidence(analysis: &TrackAnalysis, index: usize) -> f32 {
+fn marker_confidence(analysis: &TrackAnalysis, index: usize) -> Option<f32> {
+    let confidence = analysis.beat_marker_confidences.get(index).copied()?;
+    (confidence.is_finite() && (0.0..=1.0).contains(&confidence)).then_some(confidence)
+}
+
+fn marker_is_trusted(analysis: &TrackAnalysis, index: usize) -> bool {
+    marker_confidence(analysis, index)
+        .is_some_and(|confidence| confidence >= MIN_PHASE_MARKER_CONFIDENCE)
+}
+
+fn has_trusted_marker_evidence(analysis: &TrackAnalysis) -> bool {
+    // A single trusted pickup cue is enough to choose a safe source start,
+    // but not enough to establish a local phase anchor for BeatMatched.
     analysis
-        .beat_marker_confidences
-        .get(index)
-        .copied()
-        .unwrap_or(analysis.beat_confidence)
+        .beat_markers
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| marker_is_trusted(analysis, *index))
+        .take(MIN_MARKER_BACKED_KICK_MARKERS)
+        .count()
+        >= MIN_MARKER_BACKED_KICK_MARKERS
 }
 
 fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> TransitionPlan {
@@ -3730,24 +4044,21 @@ fn closest_tempo_family_ratio(outgoing_bpm: f32, incoming_bpm: f32) -> Option<f3
 }
 
 fn tempo_alignment_confident(analysis: &TrackAnalysis, min_beat_confidence: f32) -> bool {
-    if analysis.beat_confidence >= min_beat_confidence {
+    if analysis.beat_confidence.is_finite() && analysis.beat_confidence >= min_beat_confidence {
         return true;
     }
     if analysis.beat_confidence < MIN_MARKER_BACKED_BEAT_CONFIDENCE
         || analysis.beat_markers.len() < MIN_MARKER_BACKED_KICK_MARKERS
-        || analysis.beat_marker_confidences.is_empty()
+        || analysis.beat_marker_confidences.len() != analysis.beat_markers.len()
     {
         return false;
     }
 
-    let trusted = analysis
-        .beat_marker_confidences
-        .iter()
-        .filter(|confidence| **confidence >= MIN_PHASE_MARKER_CONFIDENCE)
-        .count();
-    trusted >= MIN_MARKER_BACKED_KICK_MARKERS
-        && trusted as f32 / analysis.beat_marker_confidences.len() as f32
-            >= MIN_MARKER_BACKED_KICK_COVERAGE
+    let trusted = analysis.trusted_kick_coverage();
+    trusted.is_finite()
+        && trusted * analysis.beat_marker_confidences.len() as f32
+            >= MIN_MARKER_BACKED_KICK_MARKERS as f32
+        && trusted >= MIN_MARKER_BACKED_KICK_COVERAGE
 }
 
 fn phase_follow_segments(
@@ -3770,7 +4081,9 @@ fn phase_follow_segments(
         .copied()
         .enumerate()
         .filter(|(_, beat)| *beat >= outgoing_start && *beat <= outgoing_end)
-        .map(|(index, beat)| (beat, marker_confidence(outgoing, index)))
+        .filter_map(|(index, beat)| {
+            marker_confidence(outgoing, index).map(|confidence| (beat, confidence))
+        })
         .collect::<Vec<_>>();
     let incoming_beats = incoming
         .beat_markers
@@ -3778,7 +4091,9 @@ fn phase_follow_segments(
         .copied()
         .enumerate()
         .filter(|(_, beat)| *beat >= incoming_start)
-        .map(|(index, beat)| (beat, marker_confidence(incoming, index)))
+        .filter_map(|(index, beat)| {
+            marker_confidence(incoming, index).map(|confidence| (beat, confidence))
+        })
         .collect::<Vec<_>>();
     let paired_beats = pair_phase_follow_beats(
         &outgoing_beats,
@@ -3786,6 +4101,7 @@ fn phase_follow_segments(
         outgoing_start,
         incoming_start,
         global_speed,
+        outgoing,
         incoming,
     );
     let paired = paired_beats.len();
@@ -3857,31 +4173,47 @@ fn pair_phase_follow_beats(
     outgoing_start: Duration,
     incoming_start: Duration,
     global_speed: f32,
+    outgoing_analysis: &TrackAnalysis,
     incoming: &TrackAnalysis,
 ) -> Vec<((Duration, f32), (Duration, f32))> {
     let tolerance = marker_snap_tolerance(incoming).max(MAX_BEATMATCH_PHASE_ERROR);
+    let Some(outgoing_anchor) = outgoing_beats.iter().position(|(beat, confidence)| {
+        *confidence >= MIN_PHASE_MARKER_CONFIDENCE && beat.abs_diff(outgoing_start) <= tolerance
+    }) else {
+        return Vec::new();
+    };
+    let Some(incoming_anchor) = incoming_beats.iter().position(|(beat, confidence)| {
+        *confidence >= MIN_PHASE_MARKER_CONFIDENCE && beat.abs_diff(incoming_start) <= tolerance
+    }) else {
+        return Vec::new();
+    };
+    let (outgoing_stride, incoming_stride) =
+        beat_family_strides_for_speed(outgoing_analysis, incoming, global_speed);
     let mut pairs = Vec::new();
-    let mut next_incoming_index = 0;
-
-    for outgoing in outgoing_beats {
+    let mut step = 0_usize;
+    while let Some(outgoing_index) =
+        outgoing_anchor.checked_add(step.saturating_mul(outgoing_stride))
+    {
+        let Some(incoming_index) =
+            incoming_anchor.checked_add(step.saturating_mul(incoming_stride))
+        else {
+            break;
+        };
+        let (Some(outgoing), Some(incoming)) = (
+            outgoing_beats.get(outgoing_index),
+            incoming_beats.get(incoming_index),
+        ) else {
+            break;
+        };
         let output_elapsed = outgoing.0.saturating_sub(outgoing_start);
         let target_source = incoming_start.saturating_add(Duration::from_secs_f64(
             output_elapsed.as_secs_f64() * f64::from(global_speed),
         ));
-        let Some((offset, (_, incoming))) = incoming_beats
-            .iter()
-            .enumerate()
-            .skip(next_incoming_index)
-            .map(|(index, beat)| (index, (beat.0.abs_diff(target_source), beat)))
-            .min_by_key(|(_, (error, _))| *error)
-        else {
-            break;
-        };
         if incoming.0.abs_diff(target_source) > tolerance {
-            continue;
+            break;
         }
         pairs.push((*outgoing, *incoming));
-        next_incoming_index = offset + 1;
+        step += 1;
     }
 
     pairs
@@ -4174,6 +4506,7 @@ mod tests {
             beat_markers.push(beat);
             beat += interval;
         }
+        let marker_count = beat_markers.len();
         TrackAnalysis {
             duration: Duration::from_secs(180),
             audible_start: Duration::from_secs(1),
@@ -4191,7 +4524,7 @@ mod tests {
             beat_confidence: 0.9,
             first_beat: Some(Duration::from_secs(1)),
             beat_markers,
-            beat_marker_confidences: Vec::new(),
+            beat_marker_confidences: vec![0.9; marker_count],
             first_downbeat: Some(Duration::from_secs(1)),
             downbeat_confidence: 0.9,
             musical_key: None,
@@ -4284,7 +4617,7 @@ mod tests {
         let plan = plan_transition(&analyzed(120.0), &analyzed(124.0), &config());
         assert_eq!(plan.kind, TransitionKind::BeatMatched);
         assert!((plan.incoming_tempo_ratio - 120.0 / 124.0).abs() < 0.0001);
-        assert_eq!(plan.duration, Duration::from_secs(10));
+        assert_eq!(plan.duration, Duration::from_secs(10), "plan={plan:?}");
     }
 
     #[test]
@@ -4369,10 +4702,9 @@ mod tests {
             report.max_phrase_phase_error.unwrap() <= Duration::from_millis(1),
             "report={report:?}"
         );
-        assert!(
-            report.handoff_phrase_phase_error.unwrap() <= Duration::from_millis(1),
-            "report={report:?}"
-        );
+        // The fade endpoint is not itself an observed phrase marker; a
+        // synthetic global-phase handoff must not be reported as verified.
+        assert_eq!(report.handoff_phrase_phase_error, None, "report={report:?}");
         assert!(
             report.low_handoff_min.unwrap() >= 0.99 && report.low_handoff_max.unwrap() <= 1.01,
             "report={report:?}"
@@ -4386,6 +4718,145 @@ mod tests {
             report.max_mix_energy_ratio.unwrap() <= 1.05,
             "report={report:?}"
         );
+    }
+
+    #[test]
+    fn beat_phase_requires_eight_pairs_and_sufficient_overlap_coverage() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+        let short_plan = TransitionPlan {
+            kind: TransitionKind::BeatMatched,
+            outgoing_start: Duration::from_secs(1),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(1),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let short_quality = evaluate_transition_quality(&outgoing, &incoming, &short_plan);
+        assert_eq!(short_quality.beat_pairs_checked, 3);
+        assert_eq!(short_quality.beat_phase_coverage, Some(1.0));
+        assert_eq!(short_quality.max_beat_phase_error, None);
+        assert!(
+            short_quality
+                .issues
+                .contains(&AutoMixQualityIssue::BeatPhaseUnverified)
+        );
+
+        let full_plan = TransitionPlan {
+            duration: Duration::from_secs(4),
+            ..short_plan
+        };
+        let full_quality = evaluate_transition_quality(&outgoing, &incoming, &full_plan);
+        assert!(full_quality.beat_pairs_checked >= MIN_BEAT_PHASE_PAIRS);
+        assert!(
+            full_quality
+                .beat_phase_coverage
+                .is_some_and(|coverage| coverage >= MIN_BEAT_PHASE_COVERAGE)
+        );
+        assert!(full_quality.max_beat_phase_error.is_some());
+        assert!(
+            !full_quality
+                .issues
+                .contains(&AutoMixQualityIssue::BeatPhaseUnverified)
+        );
+
+        let mut sparse_outgoing = outgoing.clone();
+        let mut sparse_incoming = incoming.clone();
+        for index in [2, 4, 6, 8] {
+            sparse_outgoing.beat_marker_confidences[index] = 0.0;
+            sparse_incoming.beat_marker_confidences[index] = 0.0;
+        }
+        let sparse_quality =
+            evaluate_transition_quality(&sparse_outgoing, &sparse_incoming, &full_plan);
+        assert_eq!(sparse_quality.beat_phase_coverage, Some(0.625));
+        assert_eq!(sparse_quality.max_beat_phase_error, None);
+        assert!(
+            sparse_quality
+                .issues
+                .contains(&AutoMixQualityIssue::BeatPhaseUnverified)
+        );
+    }
+
+    #[test]
+    fn marker_shifted_outro_uses_local_markers_instead_of_a_synthetic_grid() {
+        let mut track = analyzed(131.875);
+        track.duration = Duration::from_millis(204_382);
+        track.audible_start = Duration::from_millis(236);
+        track.audible_end = Duration::from_millis(203_780);
+        track.first_beat = Some(Duration::from_millis(250));
+        track.first_downbeat = Some(Duration::from_millis(250));
+        track.downbeat_confidence = 0.017;
+        track.beat_confidence = 0.56;
+        track.vocal_activity = vec![0; 205 * 4];
+        track.vocal_activity_confidences = vec![255; 205 * 4];
+        track.energy_profile = vec![192; 205 * 4];
+
+        let mut markers = Vec::new();
+        let mut marker = Duration::from_millis(250);
+        while marker <= Duration::from_secs(16) {
+            markers.push(marker);
+            marker += Duration::from_millis(455);
+        }
+        marker = Duration::from_millis(194_760);
+        while marker <= Duration::from_millis(201_605) {
+            markers.push(marker);
+            // Keep the local tail's observed phase shift, while retaining
+            // the intermediate trusted beat markers needed to measure the
+            // full overlap's evidence coverage.
+            marker += Duration::from_millis(455);
+        }
+        track.beat_markers = markers;
+        track.beat_marker_confidences = vec![0.75; track.beat_markers.len()];
+
+        let mut config = config();
+        config.crossfade = Duration::from_millis(8_345);
+        let synthetic_start =
+            align_to_global_beat(track.audible_end.saturating_sub(config.crossfade), &track);
+        let plan = plan_transition(&track, &track, &config);
+        let quality = evaluate_transition_quality(&track, &track, &plan);
+        let guarded = plan_guarded_transition(&track, &track, &config);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched, "plan={plan:?}");
+        assert!(track.beat_markers.contains(&plan.outgoing_start));
+        assert_ne!(plan.outgoing_start, synthetic_start);
+        assert_eq!(plan.incoming_start, Duration::from_millis(250));
+        assert!(quality.beat_pairs_checked >= 5, "quality={quality:?}");
+        assert!(
+            quality
+                .max_beat_phase_error
+                .is_some_and(|error| error <= Duration::from_millis(1)),
+            "plan={plan:?} quality={quality:?}"
+        );
+        assert_eq!(quality.handoff_beat_phase_error, None);
+        assert!(!quality.has_blocking_issue(), "quality={quality:?}");
+        assert_eq!(
+            guarded.plan.kind,
+            TransitionKind::BeatMatched,
+            "{guarded:?}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_downbeats_do_not_override_trusted_beat_alignment() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.first_downbeat = Some(Duration::from_millis(1_750));
+        incoming.downbeat_confidence = 0.4;
+        let mut outgoing = outgoing;
+        outgoing.downbeat_confidence = 0.4;
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched, "plan={plan:?}");
+        assert!(quality.beat_pairs_checked > 0, "quality={quality:?}");
+        assert_eq!(quality.downbeat_pairs_checked, 0);
+        assert_eq!(quality.max_downbeat_phase_error, None);
+        assert!(!quality.has_blocking_issue(), "quality={quality:?}");
     }
 
     #[test]
@@ -4453,18 +4924,70 @@ mod tests {
             "report={report:?}"
         );
         assert!(
-            report.issues.iter().any(|issue| matches!(
-                issue,
-                AutoMixQualityIssue::DownbeatPhaseDriftTooLarge { max_error }
-                    if *max_error > Duration::from_millis(400)
-            )),
+            report
+                .issues
+                .contains(&AutoMixQualityIssue::DownbeatPhaseUnverified),
             "report={report:?}"
         );
         assert!(report.has_blocking_issue(), "report={report:?}");
     }
 
     #[test]
-    fn transition_quality_detects_phrase_phase_drift() {
+    fn marker_ordinal_phase_survives_long_local_tempo_drift() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        // Keep the two observed marker streams aligned while allowing their
+        // local clock to drift well beyond the global first_downbeat+BPM
+        // extrapolation by the end of the track.
+        for (index, marker) in outgoing.beat_markers.iter_mut().enumerate() {
+            let drift = Duration::from_millis((index as u64 * 180) / 358);
+            *marker += drift;
+        }
+        incoming.beat_markers.clone_from(&outgoing.beat_markers);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched, "plan={plan:?}");
+        assert!(report.beat_pairs_checked >= 8, "report={report:?}");
+        assert!(report.downbeat_pairs_checked >= 2, "report={report:?}");
+        assert!(!report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn actionable_phase_metadata_without_observed_phase_pair_fails_closed() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.first_downbeat = Some(Duration::from_millis(1_250));
+        incoming.downbeat_confidence = 0.9;
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(report.max_downbeat_phase_error, None);
+        assert!(
+            report
+                .issues
+                .contains(&AutoMixQualityIssue::DownbeatPhaseUnverified),
+            "report={report:?}"
+        );
+        assert!(report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn one_sided_marker_confidence_cannot_anchor_a_beatmatch() {
+        let mut outgoing = analyzed(120.0);
+        outgoing.beat_marker_confidences.clear();
+        let incoming = analyzed(120.0);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+
+        assert_ne!(plan.kind, TransitionKind::BeatMatched, "plan={plan:?}");
+    }
+
+    #[test]
+    fn transition_quality_leaves_unobserved_phrase_phase_optional() {
         let outgoing = analyzed(120.0);
         let mut incoming = analyzed(120.0);
         let plan = plan_transition(&outgoing, &incoming, &config());
@@ -4478,15 +5001,8 @@ mod tests {
             report.max_downbeat_phase_error.unwrap() <= Duration::from_millis(1),
             "report={report:?}"
         );
-        assert!(
-            report.issues.iter().any(|issue| matches!(
-                issue,
-                AutoMixQualityIssue::PhrasePhaseDriftTooLarge { max_error }
-                    if *max_error > Duration::from_millis(1_900)
-            )),
-            "report={report:?}"
-        );
-        assert!(report.has_blocking_issue(), "report={report:?}");
+        assert!(report.max_phrase_phase_error.is_none(), "report={report:?}");
+        assert!(!report.has_blocking_issue(), "report={report:?}");
     }
 
     #[test]
@@ -4824,6 +5340,71 @@ mod tests {
     }
 
     #[test]
+    fn non_beatmatched_guard_skips_beatmatch_and_keeps_a_safe_crossfade() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+
+        let guarded = plan_guarded_non_beatmatched_transition_with_base_gains(
+            &outgoing,
+            &incoming,
+            &config(),
+            1.0,
+            1.0,
+        );
+
+        assert_eq!(guarded.plan.kind, TransitionKind::Crossfade);
+        assert!(!guarded.quality.has_blocking_issue(), "{guarded:?}");
+        assert!(guarded.rejected_plan.is_none());
+    }
+
+    #[test]
+    fn non_beatmatched_guard_uses_gapless_for_an_unsafe_crossfade() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(175.0, 177.0, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(5.0, 7.0, -42.0)]);
+
+        let guarded = plan_guarded_non_beatmatched_transition_with_base_gains(
+            &outgoing,
+            &incoming,
+            &config(),
+            1.0,
+            1.0,
+        );
+
+        assert_eq!(guarded.plan.kind, TransitionKind::Gapless, "{guarded:?}");
+        assert!(guarded.quality.is_ok(), "{guarded:?}");
+        assert_eq!(
+            guarded.rejected_plan.as_ref().map(|plan| plan.kind),
+            Some(TransitionKind::Crossfade)
+        );
+        assert!(
+            guarded
+                .rejected_quality
+                .as_ref()
+                .is_some_and(AutoMixQualityReport::has_blocking_issue),
+            "{guarded:?}"
+        );
+    }
+
+    #[test]
+    fn non_beatmatched_guard_is_safe_without_energy_or_finite_gains() {
+        let outgoing = TrackAnalysis::unanalyzed(Duration::from_secs(30));
+        let incoming = TrackAnalysis::unanalyzed(Duration::from_secs(30));
+
+        let guarded = plan_guarded_non_beatmatched_transition_with_base_gains(
+            &outgoing,
+            &incoming,
+            &config(),
+            f32::NAN,
+            f32::INFINITY,
+        );
+
+        assert_eq!(guarded.plan.kind, TransitionKind::Crossfade);
+        assert!(!guarded.quality.has_blocking_issue(), "{guarded:?}");
+    }
+
+    #[test]
     fn corrects_small_tempo_differences_that_would_drift_during_the_mix() {
         let plan = plan_transition(&analyzed(120.0), &analyzed(120.3), &config());
         let envelope = plan
@@ -4866,7 +5447,7 @@ mod tests {
             &config(),
         );
         assert_eq!(plan.harmonic_compatibility, Some(0.2));
-        assert_eq!(plan.duration, Duration::from_secs(4));
+        assert_eq!(plan.duration, Duration::from_secs(4), "plan={plan:?}");
     }
 
     #[test]
@@ -4940,8 +5521,37 @@ mod tests {
 
         let candidates = safe_incoming_beat_starts(&incoming);
 
-        assert_eq!(candidates, vec![Duration::from_secs(1)]);
+        assert!(candidates.is_empty());
         assert!(incoming.beat_grid().is_none());
+    }
+
+    #[test]
+    fn missing_marker_confidence_does_not_fallback_to_global_beat_confidence() {
+        let mut incoming = analyzed(120.0);
+        incoming.beat_confidence = 0.8;
+        incoming.beat_marker_confidences.clear();
+
+        assert!(safe_incoming_beat_starts(&incoming).is_empty());
+        let outgoing = analyzed(120.0);
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        assert_eq!(plan.kind, TransitionKind::Crossfade, "plan={plan:?}");
+        assert_eq!(incoming.trusted_kick_coverage(), 0.0);
+    }
+
+    #[test]
+    fn markerless_safe_intro_does_not_synthesize_a_beatmatch_cue() {
+        let outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        incoming.first_beat = Some(Duration::from_millis(1_500));
+        incoming.first_downbeat = Some(Duration::from_millis(1_500));
+        incoming.beat_markers.clear();
+        incoming.beat_marker_confidences.clear();
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 1.5, -50.0)]);
+
+        assert!(safe_incoming_beat_starts(&incoming).is_empty());
+        let plan = plan_transition(&outgoing, &incoming, &config());
+        assert_eq!(plan.kind, TransitionKind::Crossfade, "plan={plan:?}");
+        assert_eq!(plan.incoming_start, incoming.audible_start);
     }
 
     #[test]
@@ -4951,10 +5561,72 @@ mod tests {
             .map(|index| Duration::from_millis(1_000 + index))
             .collect();
         incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+        set_energy_ranges(&mut incoming, -14.0, &[(1.0, 1.25, -50.0)]);
 
         let candidates = safe_incoming_beat_starts(&incoming);
 
         assert_eq!(candidates.len(), MAX_INCOMING_CUE_CANDIDATES);
+    }
+
+    #[test]
+    fn initial_pickup_search_selects_only_the_first_trusted_marker() {
+        let mut incoming = analyzed(120.0);
+        incoming.beat_markers = (0..500)
+            .map(|index| Duration::from_millis(1_000 + index))
+            .collect();
+        incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
+
+        let candidates = safe_incoming_beat_starts(&incoming);
+
+        assert_eq!(candidates, vec![Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn initial_pickup_requires_known_vocals_beyond_the_audible_boundary() {
+        let mut incoming = analyzed(120.0);
+        let pickup = Duration::from_millis(1_250);
+        incoming.first_beat = Some(pickup);
+        incoming.first_downbeat = Some(pickup);
+        incoming.beat_markers = vec![pickup];
+        incoming.beat_marker_confidences = vec![1.0];
+
+        incoming.vocal_activity.clear();
+        incoming.vocal_activity_confidences.clear();
+        assert!(safe_incoming_beat_starts(&incoming).is_empty());
+        assert_eq!(
+            explain_beatmatch_decision(
+                &analyzed(120.0),
+                &incoming,
+                &config(),
+                &plan_guarded_transition(&analyzed(120.0), &incoming, &config()),
+            ),
+            AutoMixBeatMatchDecision::NoTrustedIncomingBeatStart
+        );
+
+        incoming.vocal_activity = vec![0; 180 * 4];
+        incoming.vocal_activity_confidences = vec![0; 180 * 4];
+        incoming.vocal_activity_rate = 4;
+        assert!(safe_incoming_beat_starts(&incoming).is_empty());
+
+        incoming.vocal_activity_confidences.fill(255);
+        assert_eq!(safe_incoming_beat_starts(&incoming), vec![pickup]);
+    }
+
+    #[test]
+    fn initial_pickup_at_audible_boundary_needs_no_vocal_metadata() {
+        let mut incoming = analyzed(120.0);
+        incoming.beat_markers = vec![incoming.audible_start];
+        incoming.beat_marker_confidences = vec![1.0];
+        incoming.first_beat = Some(incoming.audible_start);
+        incoming.first_downbeat = Some(incoming.audible_start);
+        incoming.vocal_activity.clear();
+        incoming.vocal_activity_confidences.clear();
+        incoming.vocal_activity_rate = 0;
+
+        assert_eq!(
+            safe_incoming_beat_starts(&incoming),
+            vec![incoming.audible_start]
+        );
     }
 
     #[test]
@@ -5229,7 +5901,7 @@ mod tests {
     }
 
     #[test]
-    fn audible_pickup_before_first_beat_is_not_trimmed() {
+    fn trusted_first_beat_beyond_the_old_pickup_limit_can_start_a_beatmatch() {
         let outgoing = analyzed(120.0);
         let mut incoming = analyzed(120.0);
         incoming.first_beat = Some(Duration::from_millis(1_250));
@@ -5239,10 +5911,15 @@ mod tests {
             .collect();
 
         let plan = plan_transition(&outgoing, &incoming, &config());
+        let quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
 
-        assert_eq!(plan.kind, TransitionKind::Crossfade);
-        assert_eq!(plan.incoming_start, incoming.audible_start);
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.incoming_start, Duration::from_millis(1_250));
         assert_eq!(plan.outgoing_start + plan.duration, outgoing.audible_end);
+        assert!(
+            !quality.has_blocking_issue(),
+            "plan={plan:?} quality={quality:?}"
+        );
     }
 
     #[test]
@@ -5359,6 +6036,86 @@ mod tests {
     }
 
     #[test]
+    fn transition_energy_uses_nearby_normal_energy_when_edges_are_quiet() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(170.5, 171.5, -42.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(8.5, 9.5, -42.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(report.min_mix_energy_ratio.unwrap() < MIN_SAFE_MIX_ENERGY_RATIO);
+        assert!(report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn simultaneous_structural_break_is_score_only() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(175.0, 177.0, -80.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(5.0, 7.0, -80.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(!report.has_blocking_issue(), "report={report:?}");
+    }
+
+    #[test]
+    fn a_single_windowed_energy_drop_does_not_block_the_transition() {
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_energy_ranges(&mut outgoing, -18.0, &[(174.875, 175.125, -80.0)]);
+        set_energy_ranges(&mut incoming, -18.0, &[(4.875, 5.125, -80.0)]);
+        let plan = TransitionPlan {
+            kind: TransitionKind::Crossfade,
+            outgoing_start: Duration::from_secs(171),
+            incoming_start: Duration::from_secs(1),
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+
+        let report = evaluate_transition_quality(&outgoing, &incoming, &plan);
+
+        assert!(report.energy_samples_checked > 0, "report={report:?}");
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AutoMixQualityIssue::MixEnergyDipTooDeep { .. })),
+            "report={report:?}"
+        );
+    }
+
+    #[test]
     fn normalization_base_gains_are_part_of_energy_quality() {
         let mut outgoing = analyzed(120.0);
         let mut incoming = analyzed(120.0);
@@ -5439,10 +6196,10 @@ mod tests {
     fn planner_finds_a_safe_alternative_to_an_audible_normalized_energy_dip() {
         let mut outgoing = analyzed(120.0);
         let mut incoming = analyzed(120.0);
-        outgoing.duration = Duration::from_secs(10);
-        outgoing.audible_end = Duration::from_secs(9);
-        incoming.duration = Duration::from_secs(10);
-        incoming.audible_end = Duration::from_secs(9);
+        outgoing.duration = Duration::from_secs(16);
+        outgoing.audible_end = Duration::from_secs(15);
+        incoming.duration = Duration::from_secs(16);
+        incoming.audible_end = Duration::from_secs(15);
         outgoing
             .beat_markers
             .retain(|marker| *marker <= outgoing.audible_end);
@@ -5675,6 +6432,60 @@ mod tests {
     }
 
     #[test]
+    fn energy_start_search_continues_after_an_unverifiable_default() {
+        let outgoing = analyzed(120.0);
+        let incoming = analyzed(120.0);
+        let unverifiable_default = Duration::from_millis(168_750);
+
+        let (selected, selection) = select_energy_balanced_start(
+            &outgoing,
+            &incoming,
+            Duration::from_secs(1),
+            unverifiable_default,
+            Duration::from_secs(169),
+            Duration::from_secs(10),
+            true,
+            BarPhaseBias::AtOrBefore,
+            None,
+            1.0,
+            Some((1.0, 1.0)),
+            config().max_tempo_adjustment,
+        );
+
+        let selection = selection.expect("a later marker-backed candidate must be evaluated");
+        assert_ne!(selected, unverifiable_default);
+        assert!(outgoing.beat_markers.contains(&selected));
+        assert!(selection.candidates_checked > 0);
+    }
+
+    #[test]
+    fn rejected_marker_candidates_do_not_restore_a_synthetic_beatmatch_start() {
+        let mut no_valid_outgoing = analyzed(120.0);
+        let mut no_valid_incoming = analyzed(120.0);
+        // Force every full-length energy candidate through the vocal safety
+        // gate while leaving the observed marker stream available for the
+        // diagnostic raw plan.  No valid marker candidate means a safe
+        // non-beatmatched fallback is correct.
+        set_vocal_ranges(&mut no_valid_outgoing, &[(178.0, 179.0)]);
+        set_vocal_ranges(&mut no_valid_incoming, &[(1.0, 2.0)]);
+        let no_valid_plan = plan_transition(&no_valid_outgoing, &no_valid_incoming, &config());
+        assert_ne!(no_valid_plan.kind, TransitionKind::BeatMatched);
+
+        // When the vocal limit leaves one valid marker-backed overlap, that
+        // later observed candidate is retained instead of restoring a
+        // synthetic default start.
+        let mut outgoing = analyzed(120.0);
+        let mut incoming = analyzed(120.0);
+        set_vocal_ranges(&mut outgoing, &[(176.0, 177.0)]);
+        set_vocal_ranges(&mut incoming, &[(1.0, 2.0)]);
+
+        let plan = plan_transition(&outgoing, &incoming, &config());
+
+        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert!(trusted_marker_position(&outgoing, plan.outgoing_start));
+    }
+
+    #[test]
     fn energy_balancing_improves_crossfade_when_beatmatch_is_unavailable() {
         let mut outgoing = analyzed(90.0);
         let mut incoming = analyzed(140.0);
@@ -5744,7 +6555,10 @@ mod tests {
     fn start_selection_can_shorten_transition_to_avoid_energy_buildup() {
         let mut outgoing = analyzed(120.0);
         let mut incoming = analyzed(120.0);
-        set_energy_ranges(&mut outgoing, -18.0, &[(172.0, 175.0, -6.0)]);
+        // The early, longer candidates cross a sustained buildup; the later
+        // marker-backed candidates have normal energy and can safely shorten
+        // the overlap without changing any quality thresholds.
+        set_energy_ranges(&mut outgoing, -18.0, &[(169.0, 171.0, -6.0)]);
         set_energy_ranges(&mut incoming, -18.0, &[]);
         let default_start = Duration::from_secs(169);
         let default_plan = TransitionPlan {

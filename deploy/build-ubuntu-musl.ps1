@@ -190,7 +190,38 @@ Copy-Item (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md') (Join-Path $packageRoot
 $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
 $rustNotices = Join-Path $thirdParty 'rust'
 New-Item -ItemType Directory -Force -Path $rustNotices | Out-Null
+$neuralNotices = Join-Path $thirdParty 'neural-models'
+New-Item -ItemType Directory -Force -Path $neuralNotices | Out-Null
 Copy-Item (Join-Path $repoRoot 'Cargo.lock') (Join-Path $rustNotices 'Cargo.lock')
+$neuralModelHashes = @{
+    'beat_this_small.onnx' = 'a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f'
+    'mel_spectrogram.onnx' = 'fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9'
+}
+$neuralNoticeText = [System.IO.File]::ReadAllText(
+    (Join-Path $repoRoot 'crates\wotoha-runtime\models\NOTICE.txt')
+)
+foreach ($neuralModelName in $neuralModelHashes.Keys) {
+    $neuralModelPath = Join-Path $repoRoot "crates\wotoha-runtime\models\$neuralModelName"
+    if (-not (Test-Path -LiteralPath $neuralModelPath -PathType Leaf)) {
+        throw "Embedded neural model is missing: $neuralModelPath"
+    }
+    $neuralActualHash = (Get-FileHash -LiteralPath $neuralModelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($neuralActualHash -ne $neuralModelHashes[$neuralModelName] -or
+        -not $neuralNoticeText.Contains($neuralModelHashes[$neuralModelName])) {
+        throw "Embedded neural model hash or NOTICE metadata drifted: $neuralModelName"
+    }
+}
+foreach ($neuralNoticeName in @(
+    'NOTICE.txt',
+    'LICENSE.beat-this-rs.txt',
+    'LICENSE.beat-this-original.txt'
+)) {
+    $neuralSource = Join-Path $repoRoot "crates\wotoha-runtime\models\$neuralNoticeName"
+    if (-not (Test-Path -LiteralPath $neuralSource -PathType Leaf)) {
+        throw "Neural model attribution file is missing: $neuralSource"
+    }
+    Copy-Item -LiteralPath $neuralSource -Destination (Join-Path $neuralNotices $neuralNoticeName)
+}
 $cargoMetadataJson = & cargo metadata --locked --format-version 1
 Assert-NativeSuccess 'cargo metadata for the license inventory'
 $cargoMetadata = $cargoMetadataJson | ConvertFrom-Json
@@ -297,6 +328,10 @@ Copy-Item (Join-Path $rustNotices 'Cargo.lock') (Join-Path $portableRoot 'third-
 Copy-Item (Join-Path $rustNotices 'license-inventory.json') (Join-Path $portableRoot 'third-party\rust\license-inventory.json')
 Copy-Item (Join-Path $rustNotices 'THIRD_PARTY_LICENSES.html') (Join-Path $portableRoot 'third-party\rust\THIRD_PARTY_LICENSES.html')
 Copy-Item (Join-Path $rustNotices 'THIRD_PARTY_ATTRIBUTIONS.txt') (Join-Path $portableRoot 'third-party\rust\THIRD_PARTY_ATTRIBUTIONS.txt')
+New-Item -ItemType Directory -Force -Path (Join-Path $portableRoot 'third-party\neural-models') | Out-Null
+Copy-Item (Join-Path $neuralNotices 'NOTICE.txt') (Join-Path $portableRoot 'third-party\neural-models\NOTICE.txt')
+Copy-Item (Join-Path $neuralNotices 'LICENSE.beat-this-rs.txt') (Join-Path $portableRoot 'third-party\neural-models\LICENSE.beat-this-rs.txt')
+Copy-Item (Join-Path $neuralNotices 'LICENSE.beat-this-original.txt') (Join-Path $portableRoot 'third-party\neural-models\LICENSE.beat-this-original.txt')
 
 Write-InternalChecksums $packageRoot
 Write-InternalChecksums $portableRoot

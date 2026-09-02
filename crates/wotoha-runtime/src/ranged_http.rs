@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, SeekFrom},
     pin::Pin,
     task::{Context, Poll},
@@ -16,8 +17,18 @@ use songbird::input::{
     core::io::MediaSource,
 };
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
-use tokio_util::io::StreamReader;
+use tokio_util::{
+    io::StreamReader,
+    sync::{CancellationToken, WaitForCancellationFutureOwned},
+};
 use wotoha_core::{PreparedRangeMode, debug::append_debug_log};
+
+fn cancelled_stream_error() -> AudioStreamError {
+    AudioStreamError::Fail(Box::new(IoError::new(
+        IoErrorKind::Interrupted,
+        "stream cancelled",
+    )))
+}
 
 #[derive(Clone, Debug)]
 pub struct RangedHttpRequest {
@@ -27,6 +38,7 @@ pub struct RangedHttpRequest {
     pub content_length: Option<u64>,
     pub range_chunk_size: u64,
     pub range_mode: PreparedRangeMode,
+    pub cancellation: Option<CancellationToken>,
 }
 
 impl RangedHttpRequest {
@@ -39,6 +51,26 @@ impl RangedHttpRequest {
         range_chunk_size: u64,
         range_mode: PreparedRangeMode,
     ) -> Self {
+        Self::new_with_headers_and_cancellation(
+            client,
+            request,
+            headers,
+            content_length,
+            range_chunk_size,
+            range_mode,
+            None,
+        )
+    }
+
+    pub fn new_with_headers_and_cancellation(
+        client: Client,
+        request: String,
+        headers: HeaderMap,
+        content_length: Option<u64>,
+        range_chunk_size: u64,
+        range_mode: PreparedRangeMode,
+        cancellation: Option<CancellationToken>,
+    ) -> Self {
         Self {
             client,
             request,
@@ -46,6 +78,7 @@ impl RangedHttpRequest {
             content_length,
             range_chunk_size,
             range_mode,
+            cancellation,
         }
     }
 
@@ -103,10 +136,18 @@ impl RangedHttpRequest {
             if self.range_mode != PreparedRangeMode::QueryParam {
                 request = request.header(RANGE, &range_header);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|error| AudioStreamError::Fail(Box::new(error)))?;
+            let response = if let Some(cancellation) = self.cancellation.clone() {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return Err(cancelled_stream_error()),
+                    response = request.send() => response
+                        .map_err(|error| AudioStreamError::Fail(Box::new(error)))?,
+                }
+            } else {
+                request
+                    .send()
+                    .await
+                    .map_err(|error| AudioStreamError::Fail(Box::new(error)))?
+            };
             append_debug_log(format!(
                 "ranged_http: response offset={} range={} status={}",
                 offset,
@@ -160,6 +201,11 @@ impl RangedHttpRequest {
                 resume,
                 start_offset: offset,
                 bytes_read: 0,
+                cancellation: self.cancellation.clone(),
+                cancellation_wait: self
+                    .cancellation
+                    .clone()
+                    .map(|token| Box::pin(token.cancelled_owned())),
             });
         }
         let message: Box<dyn std::error::Error + Send + Sync + 'static> = format!(
@@ -239,6 +285,8 @@ struct RangedHttpStream {
     resume: Option<RangedHttpRequest>,
     start_offset: u64,
     bytes_read: u64,
+    cancellation: Option<CancellationToken>,
+    cancellation_wait: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
 }
 
 impl AsyncRead for RangedHttpStream {
@@ -248,6 +296,20 @@ impl AsyncRead for RangedHttpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
         let mut this = self.project();
+        if this
+            .cancellation
+            .as_ref()
+            .is_some_and(|cancellation| cancellation.is_cancelled())
+            || this
+                .cancellation_wait
+                .as_mut()
+                .is_some_and(|wait| wait.as_mut().poll(cx).is_ready())
+        {
+            return Poll::Ready(Err(std::io::Error::new(
+                IoErrorKind::Interrupted,
+                "stream cancelled",
+            )));
+        }
         let before = buf.filled().len();
         match AsyncRead::poll_read(this.stream.as_mut(), cx, buf) {
             Poll::Ready(Ok(())) => {

@@ -54,6 +54,51 @@ SBOM, a source bundle, or a license-compatibility determination. Downstream
 binary redistributors must review the material and satisfy the applicable
 notice and source-availability terms for their distribution.
 
+### Beat This! embedded model assets
+
+The neural beat detector embeds two ONNX assets from the pinned
+[beat-this-rs commit `089b509247e6fdcec666511c0dcf0d5f39c21e73`](https://github.com/danigb/beat-this-rs/tree/089b509247e6fdcec666511c0dcf0d5f39c21e73)
+using `include_bytes!`; release archives therefore contain the model in the
+executable and do not duplicate the approximately 10 MiB `.onnx` file. The
+copyright attribution and complete pinned MIT license texts are included in
+the archive's `third-party/neural-models/` bundle. No training files or datasets are included.
+CPJKU's primary README says that the code and
+published model weights are MIT-licensed while noting that some training files
+may have separate terms; downstream distributors should review the terms that
+apply to their distribution.
+
+| Embedded asset | SHA-256 | Size | Upstream Git blob |
+| --- | --- | ---: | --- |
+| `beat_this_small.onnx` | `a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f` | 10,555,592 | `4f43223f38751cdb40ed1d7cff44acccaf7e3794` |
+| `mel_spectrogram.onnx` | `fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9` | 270,742 | `d54915ce662785df07343af176cb61be61283448` |
+
+The files originate at the pinned commit's
+[`models/` paths](https://github.com/danigb/beat-this-rs/tree/089b509247e6fdcec666511c0dcf0d5f39c21e73/models).
+The pinned conversion script documents that they are exports of official
+Beat This! checkpoints from the JKU cloud:
+[`scripts/ckpt2onnx.py`](https://github.com/danigb/beat-this-rs/blob/089b509247e6fdcec666511c0dcf0d5f39c21e73/scripts/ckpt2onnx.py).
+The original project's primary
+[license section at the model-source commit `b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c`](https://github.com/CPJKU/beat_this/blob/b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c/README.md#license)
+states that its code and published model weights are MIT-licensed and carries
+`Copyright (c) 2024 Institute of Computational Perception, JKU Linz, Austria`.
+The original MIT text is retained from the corresponding
+[LICENSE commit `72f586c02402bce53cb9bf30029bd4c2f620efa0`](https://github.com/CPJKU/beat_this/blob/72f586c02402bce53cb9bf30029bd4c2f620efa0/LICENSE).
+The corresponding reference paper is
+["Beat This! Accurate Beat Tracking Without DBN Postprocessing"](https://arxiv.org/abs/2407.21658)
+(ISMIR 2024).
+The pinned port's
+[LICENSE](https://github.com/danigb/beat-this-rs/blob/089b509247e6fdcec666511c0dcf0d5f39c21e73/LICENSE)
+retains that notice and adds `Copyright (c) 2025 danigb (Rust port)`. The
+archive's model bundle includes complete copies of both texts, not links only.
+
+The embedded runtime uses RTen `0.24.0`. RTen and its `rten-tensor`
+subcrate declare `MIT OR Apache-2.0` in the pinned upstream
+[workspace manifest](https://github.com/robertknight/rten/blob/v0.24.0/Cargo.toml)
+and [tensor manifest](https://github.com/robertknight/rten/blob/v0.24.0/rten-tensor/Cargo.toml).
+All RTen `0.24.0` crates in the locked graph are covered by the generated
+Rust license bundle above; no additional model-specific license is inferred
+from RTen's runtime license.
+
 ### MPL-2.0 source availability
 
 The locked release dependency graph includes the Mozilla Public License 2.0

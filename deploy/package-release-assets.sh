@@ -26,7 +26,10 @@ for command in awk bash cp find grep install jq mkdir sha256sum sort stat tar to
 done
 for input in "$binary" "$metadata" "$licenses_html" "$attributions_txt" \
   "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" \
-  "$ROOT/Cargo.lock"; do
+  "$ROOT/Cargo.lock" \
+  "$ROOT/crates/wotoha-runtime/models/NOTICE.txt" \
+  "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-rs.txt" \
+  "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-original.txt"; do
   [[ -s "$input" ]] || fail "required release input is missing: $input"
 done
 
@@ -42,6 +45,12 @@ mkdir -p "$app/bin" "$app/third-party/rust"
 install -m 0755 "$binary" "$app/bin/wotoha-app"
 install -m 0644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$app/"
 install -m 0644 "$ROOT/Cargo.lock" "$app/third-party/rust/Cargo.lock"
+mkdir -p "$app/third-party/neural-models"
+install -m 0644 \
+  "$ROOT/crates/wotoha-runtime/models/NOTICE.txt" \
+  "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-rs.txt" \
+  "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-original.txt" \
+  "$app/third-party/neural-models/"
 grep -Fq 'Wotoha third-party Rust licenses' "$licenses_html" \
   || fail 'generated third-party license bundle has an unexpected format'
 grep -Fq 'Used by:' "$licenses_html" \

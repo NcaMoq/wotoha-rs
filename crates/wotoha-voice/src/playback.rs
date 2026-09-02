@@ -17,18 +17,21 @@ use tokio::sync::{
 };
 use tracing::{info, warn};
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRestartSnapshot,
-    PlaybackRuntimeEvent, PlaybackService, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason,
-    TrackStartOptions, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime,
+    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
+    PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent, PlaybackService, RuntimeEventSink,
+    RuntimeTrackHandle, TrackEndReason, TrackStartOptions, TransitionArmFailureKind,
+    TransitionArmResult, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime,
     VoiceUpdateDecision,
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
     automix::{
         AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TempoEnvelope,
-        TrackAnalysis, TransitionKind, TransitionTiming, automix_peak_safe_mix_gains,
-        explain_beatmatch_decision, plan_guarded_transition_with_base_gains,
-        plan_transition_timing, transition_score_breakdown,
+        TrackAnalysis, TransitionKind, TransitionPlan, TransitionTiming,
+        automix_peak_safe_mix_gains, explain_beatmatch_decision,
+        plan_guarded_non_beatmatched_transition_with_base_gains,
+        plan_guarded_transition_with_base_gains, plan_transition_timing,
+        transition_score_breakdown,
     },
     config::LoudnessConfig,
     debug::append_debug_log,
@@ -47,7 +50,6 @@ const MIN_EQUALIZER_TRANSITION: std::time::Duration = std::time::Duration::from_
 const AUTOMIX_ANALYSIS_LOOKAHEAD: usize = 4;
 const LOUDNESS_GAIN_RAMP_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 const LOUDNESS_GAIN_RAMP_STEP: std::time::Duration = std::time::Duration::from_millis(50);
-
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
         wotoha_core::PreparedSource::Http { content_length, .. } => *content_length,
@@ -96,9 +98,17 @@ where
     current_playback_id: Option<PlaybackId>,
     retiring_handle: Option<(PlaybackId, Arc<dyn RuntimeTrackHandle>)>,
     fade_abort: Option<tokio::task::AbortHandle>,
+    /// The outgoing EQ transition may outlive `prepared_transition` after a
+    /// handoff.  Keep its id so toggle/skip/cancel races can cancel both decks.
+    active_equalizer_transition: Option<(PlaybackId, u64)>,
     automix_enabled: bool,
     automix_rearm_in_progress: Option<PlaybackId>,
     prefetch_generation: u64,
+    /// Non-StartedLate arm failures claim this token while a fresh native
+    /// deck is prepared.  It prevents a concurrent TransitionDue/rearm from
+    /// promoting the stopped speculative deck and closes the ABA window after
+    /// `arm_generation` is cleared.
+    fallback_replacement_generation: Option<u64>,
     transition_due: Option<PlaybackId>,
     prepared_transition: Option<PreparedTransition>,
     current_analysis: Option<TrackAnalysis>,
@@ -130,11 +140,31 @@ struct PreparedTransition {
     transition_kind: TransitionKind,
     start_delay: std::time::Duration,
     incoming_analysis: Option<TrackAnalysis>,
+    /// A safe native-tempo plan retained for runtime arm rejection.  It is
+    /// computed during lookahead while both analyses are still available, so
+    /// failure handling never has to reinterpret a BeatMatched plan.
+    fallback_plan: Option<TransitionPlan>,
     incoming_gain: f32,
     peak_guard: AutoMixPeakGuard,
     source_start: std::time::Duration,
     tempo_envelope: Option<TempoEnvelope>,
     outgoing_equalizer_transition: Option<EqTransition>,
+    arm_result: Option<TransitionArmResult>,
+    arm_generation: Option<u64>,
+    /// Set only when runtime telemetry proves the incoming deck already
+    /// started.  In that case degradation must not stop/restart it.
+    incoming_started: bool,
+    /// Runtime reported a started-but-late BeatMatched deck.  Keep its actual
+    /// source/tempo state, but use a bounded emergency fade for promotion.
+    emergency_degraded: bool,
+}
+
+#[derive(Clone)]
+struct FallbackTransitionSpec {
+    next: TrackRequest,
+    plan: TransitionPlan,
+    incoming_analysis: Option<TrackAnalysis>,
+    incoming_gain: f32,
 }
 
 #[derive(Default)]
@@ -193,9 +223,11 @@ where
             current_playback_id: None,
             retiring_handle: None,
             fade_abort: None,
+            active_equalizer_transition: None,
             automix_enabled: false,
             automix_rearm_in_progress: None,
             prefetch_generation: 0,
+            fallback_replacement_generation: None,
             transition_due: None,
             prepared_transition: None,
             current_analysis: None,
@@ -299,6 +331,54 @@ where
                             playback
                                 .prefetch_transition(guild_id, session_id, playback_id)
                                 .await
+                        });
+                    }
+                    PlaybackRuntimeEvent::TransitionStarted {
+                        guild_id,
+                        session_id,
+                        outgoing_playback_id,
+                        generation,
+                        ..
+                    } => {
+                        let playback = playback.clone();
+                        tokio::spawn(async move {
+                            playback
+                                .transition_started(
+                                    guild_id,
+                                    session_id,
+                                    outgoing_playback_id,
+                                    generation,
+                                )
+                                .await
+                        });
+                    }
+                    PlaybackRuntimeEvent::TransitionArmFailed {
+                        guild_id,
+                        session_id,
+                        outgoing_playback_id,
+                        incoming_playback_id,
+                        generation,
+                        actual_frame,
+                        underflow,
+                        failure_kind,
+                        reason,
+                        ..
+                    } => {
+                        let playback = playback.clone();
+                        tokio::spawn(async move {
+                            playback
+                                .degrade_armed_transition(
+                                    guild_id,
+                                    session_id,
+                                    outgoing_playback_id,
+                                    incoming_playback_id,
+                                    generation,
+                                    actual_frame,
+                                    underflow,
+                                    failure_kind,
+                                    reason,
+                                )
+                                .await;
                         });
                     }
                     PlaybackRuntimeEvent::TrackEnded {
@@ -1215,6 +1295,7 @@ where
                 .is_some_and(|prepared| prepared.incoming.playback_id == playback_id);
             if matches_prefetch {
                 playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+                playback.fallback_replacement_generation = None;
                 playback
                     .prepared_transition
                     .take()
@@ -1253,6 +1334,7 @@ where
                 let Some(prepared) = playback.prepared_transition.take() else {
                     return;
                 };
+                playback.fallback_replacement_generation = None;
                 playback.active_handle = Some(prepared.incoming.handle.clone());
                 let previous_retiring = playback
                     .retiring_handle
@@ -1278,6 +1360,11 @@ where
             }
             outgoing.stop();
             prepared.incoming.handle.set_volume(prepared.incoming_gain);
+            // A natural end is already the delayed fallback boundary.  The
+            // runtime has not provided an atomic shared-frame barrier here,
+            // so always use the ordinary resume path; a BeatMatched plan can
+            // only reach this point from a test/runtime that explicitly owns
+            // such a barrier and must not be started early by this handoff.
             prepared.incoming.handle.resume();
             {
                 let mut playback = session.playback.lock();
@@ -1402,7 +1489,10 @@ where
             if playback.current_playback_id != Some(playback_id) {
                 return;
             }
-            if !playback.automix_enabled || playback.transition_due == Some(playback_id) {
+            if !playback.automix_enabled
+                || playback.transition_due == Some(playback_id)
+                || playback.fallback_replacement_generation.is_some()
+            {
                 return;
             }
             let Some(outgoing_duration) = playback
@@ -1469,6 +1559,13 @@ where
             )
         };
         let incoming_id = self.next_playback_id();
+        let outgoing_frame_support = {
+            let playback = session.playback.lock();
+            playback
+                .active_handle
+                .as_ref()
+                .map(|handle| handle.frame_scheduled_transition_support())
+        };
         let incoming_analysis = if incoming_cached_analysis.is_some() {
             incoming_cached_analysis
         } else {
@@ -1495,6 +1592,40 @@ where
                     incoming_gain,
                 )
             });
+        let beatmatched_plan = guarded_plan
+            .as_ref()
+            .is_some_and(|guarded| guarded.plan.kind == TransitionKind::BeatMatched);
+        let fallback_plan = beatmatched_plan
+            .then(|| {
+                outgoing_analysis
+                    .as_ref()
+                    .zip(incoming_analysis.as_ref())
+                    .map(|(outgoing, incoming)| {
+                        plan_guarded_non_beatmatched_transition_with_base_gains(
+                            outgoing,
+                            incoming,
+                            &self.inner.automix,
+                            outgoing_gain,
+                            incoming_gain,
+                        )
+                        .plan
+                    })
+            })
+            .flatten();
+        let mut frame_schedule_supported = !beatmatched_plan;
+        if beatmatched_plan {
+            frame_schedule_supported =
+                outgoing_frame_support.is_some_and(target_frame_scheduler_supported);
+            if !frame_schedule_supported {
+                warn!(
+                    guild_id = guild_id.get(),
+                    playback_id = playback_id.get(),
+                    incoming_playback_id = incoming_id.get(),
+                    runtime_support = ?outgoing_frame_support,
+                    "AutoMix BeatMatched is unavailable on this runtime; falling back to Crossfade"
+                );
+            }
+        }
         if guarded_plan.is_none() {
             // Without both analyses there is no evidence that an overlap is
             // safe.  Keep playback continuous at the metadata boundary, but
@@ -1509,7 +1640,11 @@ where
             outgoing_analysis.as_ref(),
             incoming_analysis.as_ref(),
         ) {
-            let plan = &guarded.plan;
+            let plan = if beatmatched_plan && !frame_schedule_supported {
+                fallback_plan.as_ref().unwrap_or(&guarded.plan)
+            } else {
+                &guarded.plan
+            };
             let quality = &guarded.quality;
             if let (Some(rejected_plan), Some(rejected_quality)) = (
                 guarded.rejected_plan.as_ref(),
@@ -1637,8 +1772,15 @@ where
         }
         if let Some(guarded) = &guarded_plan {
             let plan = &guarded.plan;
+            // The selected cue is still valid for a Crossfade fallback.  Only
+            // tempo alignment and its timing-dependent EQ automation require
+            // the target-frame scheduler.
             options.source_start = plan.incoming_start;
-            options.tempo_envelope = plan.tempo_envelope;
+            let use_frame_plan =
+                plan.kind != TransitionKind::BeatMatched || frame_schedule_supported;
+            if use_frame_plan {
+                options.tempo_envelope = plan.tempo_envelope;
+            }
             if plan.kind == TransitionKind::Gapless {
                 // A gapless plan is a boundary handoff, not a zero-length
                 // crossfade.  Keep the incoming deck free of transition DSP;
@@ -1647,7 +1789,7 @@ where
                 timing.fade_duration = std::time::Duration::ZERO;
                 transition_after = plan.outgoing_start;
                 options.equalizer_transition = None;
-            } else if plan.duration >= MIN_EQUALIZER_TRANSITION {
+            } else if use_frame_plan && plan.duration >= MIN_EQUALIZER_TRANSITION {
                 let id = incoming_id.get();
                 outgoing_equalizer_transition = Some(EqTransition {
                     id,
@@ -1667,6 +1809,14 @@ where
                 });
             }
         }
+        if beatmatched_plan && !frame_schedule_supported {
+            // This is already a native fallback, but it was selected before
+            // any deck was promoted.  Keep speculative BeatMatched EQ from
+            // leaking onto the replacement; ordinary Crossfade may schedule
+            // its own EQ only at handoff.
+            options.equalizer_transition = None;
+            outgoing_equalizer_transition = None;
+        }
         let dsp_requested = options.tempo_envelope.is_some();
         if !dsp_requested {
             compensate_trimmed_source_events(&mut options);
@@ -1683,7 +1833,58 @@ where
                 options,
             )
             .await;
-        let dsp_active = if incoming_result.is_err() && dsp_requested {
+        if beatmatched_plan && frame_schedule_supported {
+            let incoming_support = incoming_result
+                .as_ref()
+                .ok()
+                .map(|handle| handle.frame_scheduled_transition_support());
+            if !incoming_support.is_some_and(target_frame_scheduler_supported) {
+                warn!(
+                    guild_id = guild_id.get(),
+                    playback_id = playback_id.get(),
+                    incoming_playback_id = incoming_id.get(),
+                    runtime_support = ?incoming_support,
+                    "AutoMix BeatMatched incoming deck is not frame-schedulable; falling back to Crossfade"
+                );
+                if let Ok(handle) = incoming_result {
+                    handle.stop();
+                }
+                frame_schedule_supported = false;
+                if let Some(plan) = fallback_plan.as_ref() {
+                    apply_native_plan_options(
+                        plan,
+                        incoming_id,
+                        &mut options,
+                        &mut outgoing_equalizer_transition,
+                    );
+                    // A runtime arm rejection means the BeatMatched deck
+                    // was never promoted.  Keep the replacement strictly
+                    // native-tempo and gain-only; EQ is not allowed to begin
+                    // on a failed speculative deck.
+                    options.equalizer_transition = None;
+                    outgoing_equalizer_transition = None;
+                    timing = timing_for_plan(plan);
+                    transition_after = plan.outgoing_start;
+                    transition_kind = plan.kind;
+                } else {
+                    reset_beatmatched_options(&mut options);
+                }
+                compensate_trimmed_source_events(&mut options);
+                incoming_result = self
+                    .inner
+                    .runtime
+                    .prepare_track_with_options(
+                        guild_id,
+                        session_id,
+                        incoming_id,
+                        &prepared,
+                        self.inner.events.clone(),
+                        options,
+                    )
+                    .await;
+            }
+        }
+        let mut dsp_active = if incoming_result.is_err() && dsp_requested {
             warn!(
                 guild_id = guild_id.get(),
                 "AutoMix tempo DSP unavailable; retrying adaptive crossfade"
@@ -1706,9 +1907,9 @@ where
                 .await;
             false
         } else {
-            dsp_requested
+            dsp_requested && (!beatmatched_plan || frame_schedule_supported)
         };
-        let incoming = match incoming_result {
+        let mut incoming = match incoming_result {
             Ok(handle) => StartedTrack {
                 playback_id: incoming_id,
                 handle,
@@ -1721,12 +1922,81 @@ where
             }
         };
         if let Some(guarded) = guarded_plan {
-            let plan = guarded.plan;
-            let tempo_is_supported = dsp_active || plan.tempo_envelope.is_none();
+            let plan = if beatmatched_plan && !frame_schedule_supported {
+                fallback_plan.as_ref().unwrap_or(&guarded.plan)
+            } else {
+                &guarded.plan
+            };
+            let tempo_is_supported = (plan.kind != TransitionKind::BeatMatched
+                || frame_schedule_supported)
+                && (dsp_active || plan.tempo_envelope.is_none());
             if !plan.duration.is_zero() && tempo_is_supported {
                 timing.fade_duration = plan.duration;
                 transition_after = plan.outgoing_start;
                 transition_kind = plan.kind;
+            }
+        }
+        let mut arm_result = None;
+        if beatmatched_plan && frame_schedule_supported {
+            let result = self
+                .inner
+                .runtime
+                .arm_transition(
+                    guild_id,
+                    session_id,
+                    playback_id,
+                    incoming_id,
+                    transition_after,
+                    generation,
+                    self.inner.events.clone(),
+                )
+                .await;
+            if matches!(result, TransitionArmResult::Armed { .. }) {
+                arm_result = Some(result);
+            } else {
+                warn!(
+                    guild_id = guild_id.get(),
+                    playback_id = playback_id.get(),
+                    incoming_playback_id = incoming_id.get(),
+                    arm_result = ?result,
+                    "AutoMix target-frame arm failed; degrading to Crossfade"
+                );
+                dsp_active = false;
+                let Some(plan) = fallback_plan.as_ref() else {
+                    return;
+                };
+                transition_kind = plan.kind;
+                timing = timing_for_plan(plan);
+                transition_after = plan.outgoing_start;
+                apply_native_plan_options(
+                    plan,
+                    incoming_id,
+                    &mut options,
+                    &mut outgoing_equalizer_transition,
+                );
+                options.equalizer_transition = None;
+                outgoing_equalizer_transition = None;
+                compensate_trimmed_source_events(&mut options);
+                incoming.handle.stop();
+                let fallback = self
+                    .inner
+                    .runtime
+                    .prepare_track_with_options(
+                        guild_id,
+                        session_id,
+                        incoming_id,
+                        &prepared,
+                        self.inner.events.clone(),
+                        options,
+                    )
+                    .await;
+                incoming.handle = match fallback {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        warn!(guild_id = guild_id.get(), error = %error, "AutoMix native fallback prepare failed");
+                        return;
+                    }
+                };
             }
         }
         timing.transition_after = transition_after;
@@ -1773,11 +2043,16 @@ where
                     transition_kind,
                     start_delay,
                     incoming_analysis,
+                    fallback_plan,
                     incoming_gain,
                     peak_guard,
                     source_start: options.source_start,
                     tempo_envelope: dsp_active.then_some(options.tempo_envelope).flatten(),
                     outgoing_equalizer_transition,
+                    arm_result,
+                    arm_generation: arm_result.map(|_| generation),
+                    incoming_started: false,
+                    emergency_degraded: false,
                 }) {
                     cancel_prepared_equalizer(&previous, playback.active_handle.as_ref());
                     previous.incoming.handle.stop();
@@ -1801,7 +2076,7 @@ where
             let mut playback = session.playback.lock();
             if playback.current_playback_id != Some(playback_id)
                 || !playback.automix_enabled
-                || playback.transition_due == Some(playback_id)
+                || playback.fallback_replacement_generation.is_some()
             {
                 return;
             }
@@ -1822,41 +2097,67 @@ where
             {
                 return;
             }
-            playback.transition_due = Some(playback_id);
             let prepared = playback
                 .prepared_transition
                 .as_mut()
                 .expect("prepared transition was checked above");
-            if let Some(transition) = prepared.outgoing_equalizer_transition
-                && !handle.schedule_equalizer_transition(transition)
-            {
-                prepared
-                    .incoming
-                    .handle
-                    .cancel_equalizer_transition(transition.id);
-                prepared.outgoing_equalizer_transition = None;
-            }
-            Some((
+            let state = Some((
                 prepared.start_delay,
                 prepared.timing.transition_after,
                 handle,
                 current_tempo,
-            ))
+                prepared.arm_result,
+                prepared.incoming_started,
+            ));
+            playback.transition_due = Some(playback_id);
+            state
         };
-        let Some((fallback_delay, transition_after, outgoing_handle, current_tempo)) =
-            transition_state
+        let Some((
+            fallback_delay,
+            transition_after,
+            outgoing_handle,
+            current_tempo,
+            arm_result,
+            incoming_started,
+        )) = transition_state
         else {
             return;
         };
-        let start_delay = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            outgoing_handle.position(),
-        )
-        .await
-        .ok()
-        .flatten()
-        .map(|position| transition_remaining_delay(position, transition_after, current_tempo))
-        .unwrap_or(fallback_delay);
+        // A target-frame arm is accepted during lookahead, but promotion must
+        // wait for the runtime's periodic trigger.  This guard also makes a
+        // manually delivered TransitionDue harmless at 60 s lookahead.
+        if matches!(arm_result, Some(TransitionArmResult::Armed { .. })) {
+            let at_target = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                outgoing_handle.position(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|position| position >= transition_after);
+            if !at_target {
+                return;
+            }
+        }
+        // A StartedLate notification proves that the incoming deck is already
+        // audible.  Re-reading the outgoing position and sleeping to the
+        // original boundary here would delay the emergency fade and can also
+        // reapply a stale BeatMatched clock.  Promote immediately from the
+        // current audible state; the bounded fade below is the only recovery
+        // action.  Normal prepared decks retain the position-derived delay.
+        let start_delay = if incoming_started {
+            std::time::Duration::ZERO
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                outgoing_handle.position(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|position| transition_remaining_delay(position, transition_after, current_tempo))
+            .unwrap_or(fallback_delay)
+        };
         if !start_delay.is_zero() {
             tokio::time::sleep(start_delay).await;
         }
@@ -1874,6 +2175,19 @@ where
                     stale.incoming.handle.stop();
                 }
                 return;
+            }
+            if let Some(prepared) = playback.prepared_transition.as_mut()
+                && let Some(transition) = prepared.outgoing_equalizer_transition
+            {
+                if outgoing_handle.schedule_equalizer_transition(transition) {
+                    playback.active_equalizer_transition = Some((playback_id, transition.id));
+                } else {
+                    prepared
+                        .incoming
+                        .handle
+                        .cancel_equalizer_transition(transition.id);
+                    prepared.outgoing_equalizer_transition = None;
+                }
             }
             let Some(prepared) = playback.prepared_transition.take() else {
                 return;
@@ -1933,15 +2247,38 @@ where
             return;
         }
         self.spawn_relevant_analyses(guild_id, session_id);
-        prepared.incoming.handle.resume();
+        // This is deliberately one ordinary Songbird resume after the
+        // position-derived delay.  A runtime that cannot provide an atomic
+        // shared-frame barrier is converted to Crossfade during prefetch, so
+        // this cannot claim BeatMatched timing.
+        if !matches!(prepared.arm_result, Some(TransitionArmResult::Armed { .. }))
+            && !prepared.incoming_started
+        {
+            prepared.incoming.handle.resume();
+        }
+        let fade_duration = if prepared.emergency_degraded {
+            prepared
+                .timing
+                .fade_duration
+                .min(std::time::Duration::from_secs(2))
+        } else {
+            prepared.timing.fade_duration
+        };
+        let fade_kind = if prepared.emergency_degraded {
+            // The deck itself remains BeatMatched; this only selects a
+            // bounded emergency gain curve after a StartedLate report.
+            TransitionKind::Crossfade
+        } else {
+            prepared.transition_kind
+        };
 
         let coordinator = self.clone();
         let fade_task = tokio::spawn(async move {
             run_automix_fade(
                 outgoing.clone(),
                 prepared.incoming.handle,
-                prepared.timing.fade_duration,
-                prepared.transition_kind,
+                fade_duration,
+                fade_kind,
                 outgoing_gain,
                 prepared.incoming_gain,
                 prepared.peak_guard,
@@ -1959,12 +2296,284 @@ where
                 {
                     playback.retiring_handle = None;
                 }
+                if playback
+                    .active_equalizer_transition
+                    .is_some_and(|(id, _)| id == playback_id)
+                {
+                    playback.active_equalizer_transition = None;
+                }
                 drop(playback);
                 coordinator.spawn_current_loudness_ramp(guild_id, session_id);
             }
         });
         session.playback.lock().fade_abort = Some(fade_task.abort_handle());
         drop(_operation);
+    }
+
+    async fn transition_started(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        generation: u64,
+    ) {
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        let valid = {
+            let _operation = session.operation.lock().await;
+            let playback = session.playback.lock();
+            playback.current_playback_id == Some(playback_id)
+                && playback
+                    .prepared_transition
+                    .as_ref()
+                    .is_some_and(|prepared| {
+                        prepared.origin_playback_id == playback_id
+                            && prepared.arm_generation == Some(generation)
+                            && matches!(
+                                prepared.arm_result,
+                                Some(TransitionArmResult::Armed { .. })
+                            )
+                    })
+        };
+        if valid {
+            self.transition(guild_id, session_id, playback_id).await;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn degrade_armed_transition(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        incoming_playback_id: PlaybackId,
+        generation: u64,
+        actual_frame: Option<u64>,
+        underflow: bool,
+        failure_kind: TransitionArmFailureKind,
+        reason: Arc<str>,
+    ) {
+        let Some(session) = self.get_session(guild_id) else {
+            return;
+        };
+        let started_late = matches!(failure_kind, TransitionArmFailureKind::StartedLate)
+            && actual_frame.is_some()
+            && !underflow;
+        let (old_handle, fallback, replacement_generation) = {
+            let _operation = session.operation.lock().await;
+            let mut playback = session.playback.lock();
+            let valid = playback.current_playback_id == Some(playback_id)
+                && playback.automix_enabled
+                && playback
+                    .prepared_transition
+                    .as_ref()
+                    .is_some_and(|prepared| {
+                        prepared.origin_playback_id == playback_id
+                            && prepared.incoming.playback_id == incoming_playback_id
+                            && prepared.arm_generation == Some(generation)
+                    });
+            if !valid {
+                return;
+            }
+            if started_late {
+                if let Some(prepared) = playback.prepared_transition.as_mut() {
+                    // The incoming handle is already audible.  Do not apply
+                    // the native fallback's source cue, tempo map, EQ, peak
+                    // guard, or timing: those belong to a fresh deck only.
+                    prepared.fallback_plan = None;
+                    prepared.arm_result = None;
+                    prepared.arm_generation = None;
+                    prepared.incoming_started = true;
+                    prepared.emergency_degraded = true;
+                }
+                (None, None, None)
+            } else {
+                let (fallback, old_handle) = {
+                    let prepared = playback
+                        .prepared_transition
+                        .as_ref()
+                        .expect("validated armed transition");
+                    let plan = prepared.fallback_plan.clone();
+                    let fallback = plan.map(|plan| FallbackTransitionSpec {
+                        next: prepared.next.clone(),
+                        plan,
+                        incoming_analysis: prepared.incoming_analysis.clone(),
+                        incoming_gain: prepared.incoming_gain,
+                    });
+                    (fallback, Some(prepared.incoming.handle.clone()))
+                };
+                // Claim the failed arm before awaiting a replacement.  The
+                // generation token blocks a concurrent TransitionDue/rearm
+                // and closes the ABA window after arm fields are cleared.
+                playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+                let replacement_generation = playback.prefetch_generation;
+                playback.fallback_replacement_generation = Some(replacement_generation);
+                if let Some(prepared) = playback.prepared_transition.as_mut() {
+                    prepared.arm_result = None;
+                    prepared.arm_generation = None;
+                    prepared.incoming_started = false;
+                    prepared.emergency_degraded = false;
+                }
+                (old_handle, fallback, Some(replacement_generation))
+            }
+        };
+        if started_late {
+            warn!(
+                guild_id = guild_id.get(),
+                playback_id = playback_id.get(),
+                incoming_playback_id = incoming_playback_id.get(),
+                actual_frame,
+                reason = reason.as_ref(),
+                "AutoMix target-frame transition started late; preserving audible incoming deck"
+            );
+            self.transition(guild_id, session_id, playback_id).await;
+            return;
+        }
+
+        if let Some(handle) = old_handle.as_ref() {
+            handle.stop();
+        }
+        let Some(fallback) = fallback else {
+            self.clear_failed_prepared_transition(
+                &session,
+                playback_id,
+                old_handle,
+                replacement_generation.expect("non-started arm claim"),
+            );
+            return;
+        };
+        let mut options = track_start_options(
+            &self.inner.automix,
+            fallback.next.metadata.duration,
+            fallback.incoming_gain,
+        );
+        let mut fallback_outgoing_equalizer_transition = None;
+        apply_native_plan_options(
+            &fallback.plan,
+            incoming_playback_id,
+            &mut options,
+            &mut fallback_outgoing_equalizer_transition,
+        );
+        options.equalizer_transition = None;
+        fallback_outgoing_equalizer_transition = None;
+        // Keep the incoming deck's own event clock from `track_start_options`.
+        // `fallback.plan.outgoing_start` belongs to the current outgoing deck
+        // and must not be installed as an absolute event on the replacement.
+        compensate_trimmed_source_events(&mut options);
+        let replacement = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.inner.runtime.prepare_track_with_options(
+                guild_id,
+                session_id,
+                incoming_playback_id,
+                &fallback.next,
+                self.inner.events.clone(),
+                options,
+            ),
+        )
+        .await;
+        let Ok(Ok(handle)) = replacement else {
+            self.clear_failed_prepared_transition(
+                &session,
+                playback_id,
+                old_handle,
+                replacement_generation.expect("non-started arm claim"),
+            );
+            return;
+        };
+        let _operation = session.operation.lock().await;
+        let valid = {
+            let mut playback = session.playback.lock();
+            let current_analysis = playback.current_analysis.clone();
+            let current_gain = playback.current_gain;
+            let valid = playback.current_playback_id == Some(playback_id)
+                && playback.automix_enabled
+                && playback
+                    .prepared_transition
+                    .as_ref()
+                    .is_some_and(|prepared| {
+                        prepared.origin_playback_id == playback_id
+                            && prepared.incoming.playback_id == incoming_playback_id
+                    })
+                && playback.fallback_replacement_generation == replacement_generation;
+            if valid && let Some(prepared) = playback.prepared_transition.as_mut() {
+                prepared.incoming.handle = handle.clone();
+                prepared.incoming.analysis = fallback.incoming_analysis.clone();
+                prepared.incoming.base_gain = fallback.incoming_gain;
+                prepared.incoming_gain = fallback.incoming_gain;
+                prepared.peak_guard = prepared
+                    .incoming_analysis
+                    .as_ref()
+                    .and_then(|incoming| {
+                        current_analysis.as_ref().map(|outgoing| {
+                            AutoMixPeakGuard::from_analyses_with_base_gains(
+                                outgoing,
+                                incoming,
+                                current_gain,
+                                fallback.incoming_gain,
+                            )
+                        })
+                    })
+                    .unwrap_or_else(AutoMixPeakGuard::unity);
+                prepared.fallback_plan = None;
+                prepared.arm_result = None;
+                prepared.arm_generation = None;
+                prepared.incoming_started = false;
+                prepared.emergency_degraded = false;
+                prepared.transition_kind = fallback.plan.kind;
+                prepared.timing = timing_for_plan(&fallback.plan);
+                prepared.start_delay = prepared
+                    .timing
+                    .transition_after
+                    .saturating_sub(transition_event_after(prepared.timing));
+                prepared.source_start = fallback.plan.incoming_start;
+                prepared.tempo_envelope = fallback.plan.tempo_envelope;
+                prepared.outgoing_equalizer_transition = fallback_outgoing_equalizer_transition;
+            }
+            if valid {
+                playback.fallback_replacement_generation = None;
+            }
+            valid
+        };
+        if !valid {
+            handle.stop();
+            return;
+        }
+        drop(_operation);
+        warn!(
+            guild_id = guild_id.get(),
+            playback_id = playback_id.get(),
+            incoming_playback_id = incoming_playback_id.get(),
+            reason = reason.as_ref(),
+            "AutoMix target-frame transition replaced failed incoming deck with native fallback"
+        );
+        self.transition(guild_id, session_id, playback_id).await;
+    }
+
+    fn clear_failed_prepared_transition(
+        &self,
+        session: &SessionHandle<M::Error, R::Error>,
+        playback_id: PlaybackId,
+        old_handle: Option<Arc<dyn RuntimeTrackHandle>>,
+        replacement_generation: u64,
+    ) {
+        let mut playback = session.playback.lock();
+        if playback.current_playback_id == Some(playback_id)
+            && playback.fallback_replacement_generation == Some(replacement_generation)
+        {
+            playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+            playback.fallback_replacement_generation = None;
+            playback.transition_due = None;
+            if let Some(prepared) = playback.prepared_transition.take() {
+                let same_as_stopped = old_handle
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, &prepared.incoming.handle));
+                if !same_as_stopped {
+                    prepared.incoming.handle.stop();
+                }
+            }
+        }
     }
 
     async fn play_request(
@@ -2120,6 +2729,62 @@ fn compensate_trimmed_source_events(options: &mut TrackStartOptions) {
     options.transition_after = options
         .transition_after
         .map(|position| position.saturating_sub(options.source_start));
+}
+
+fn reset_beatmatched_options(options: &mut TrackStartOptions) {
+    options.tempo_envelope = None;
+    options.equalizer_transition = None;
+    compensate_trimmed_source_events(options);
+}
+
+fn timing_for_plan(plan: &TransitionPlan) -> TransitionTiming {
+    let fade_duration = if plan.kind == TransitionKind::Gapless {
+        std::time::Duration::ZERO
+    } else {
+        plan.duration
+    };
+    TransitionTiming {
+        prefetch_after: plan.outgoing_start.saturating_sub(fade_duration),
+        transition_after: plan.outgoing_start,
+        fade_duration,
+    }
+}
+
+fn apply_native_plan_options(
+    plan: &TransitionPlan,
+    incoming_id: PlaybackId,
+    options: &mut TrackStartOptions,
+    outgoing_equalizer_transition: &mut Option<EqTransition>,
+) {
+    options.source_start = plan.incoming_start;
+    options.tempo_envelope = plan.tempo_envelope;
+    options.equalizer_transition = None;
+    *outgoing_equalizer_transition = None;
+    if plan.kind != TransitionKind::Gapless && plan.duration >= MIN_EQUALIZER_TRANSITION {
+        let id = incoming_id.get();
+        *outgoing_equalizer_transition = Some(EqTransition {
+            id,
+            source_start: plan.outgoing_start,
+            duration: plan.duration,
+            role: EqTransitionRole::Outgoing,
+            harmonic_compatibility: plan.harmonic_compatibility,
+        });
+        options.equalizer_transition = Some(EqTransition {
+            id,
+            source_start: plan.incoming_start,
+            duration: plan.duration,
+            role: EqTransitionRole::Incoming,
+            harmonic_compatibility: plan.harmonic_compatibility,
+        });
+    }
+}
+
+fn target_frame_scheduler_supported(support: FrameScheduledTransitionSupport) -> bool {
+    matches!(
+        support,
+        FrameScheduledTransitionSupport::TrackPositionDelayedEvent
+            | FrameScheduledTransitionSupport::SharedOutputFrame
+    )
 }
 
 fn transition_event_after(timing: TransitionTiming) -> std::time::Duration {
@@ -2432,13 +3097,36 @@ where
     ME: std::error::Error + Send + Sync + 'static,
     RE: std::error::Error + Send + Sync + 'static,
 {
+    cancel_active_equalizer(playback);
     playback.prefetch_generation = playback.prefetch_generation.wrapping_add(1);
+    playback.fallback_replacement_generation = None;
     playback.transition_due = None;
     playback.automix_rearm_in_progress = None;
     playback.prepared_transition.take().map(|prepared| {
         cancel_prepared_equalizer(&prepared, playback.active_handle.as_ref());
         prepared.incoming.handle
     })
+}
+
+fn cancel_active_equalizer<ME, RE>(playback: &mut PlaybackRuntime<ME, RE>)
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    let Some((_, transition_id)) = playback.active_equalizer_transition.take() else {
+        return;
+    };
+    let active = playback.active_handle.clone();
+    let retiring = playback
+        .retiring_handle
+        .as_ref()
+        .map(|(_, handle)| handle.clone());
+    if let Some(handle) = active {
+        handle.cancel_equalizer_transition(transition_id);
+    }
+    if let Some(handle) = retiring {
+        handle.cancel_equalizer_transition(transition_id);
+    }
 }
 
 fn cancel_prepared_equalizer(
@@ -2534,7 +3222,7 @@ where
 mod tests {
     use super::{
         GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
-        run_automix_fade, track_start_options,
+        compensate_trimmed_source_events, run_automix_fade, track_start_options,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -2553,8 +3241,9 @@ mod tests {
         time::timeout,
     };
     use wotoha_contracts::{
-        ChannelKey, EnqueueOutcome, GuildKey, MediaBackend, PlaybackId, PlaybackRuntimeEvent,
-        RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions, VoiceActionAccess,
+        ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
+        PlaybackId, PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason,
+        TrackStartOptions, TransitionArmFailureKind, TransitionArmResult, VoiceActionAccess,
         VoiceRuntime,
     };
     use wotoha_core::{
@@ -2613,6 +3302,34 @@ mod tests {
         assert_eq!(long.transition_after, Some(Duration::from_secs(112)));
         assert!(long.equalizer_enabled);
         assert!(long.equalizer_transition.is_none());
+    }
+
+    #[test]
+    fn native_fallback_replacement_keeps_incoming_event_clock() {
+        let config = automix_config(Duration::from_secs(8));
+        let incoming_duration = Duration::from_secs(330);
+        let outgoing_start = Duration::from_secs(180);
+        let incoming_source_start = Duration::from_secs(37);
+
+        // This is the replacement path used after an unstarted arm failure:
+        // construct the incoming deck's own metadata clock, apply only its
+        // source cue, then compensate that cue once.  The outgoing handoff
+        // position must never become an event time on this new deck.
+        let mut options = track_start_options(&config, Some(incoming_duration), 0.0);
+        let metadata_prefetch = options.prefetch_after.expect("prefetch metadata");
+        let metadata_transition = options.transition_after.expect("transition metadata");
+        options.source_start = incoming_source_start;
+        compensate_trimmed_source_events(&mut options);
+
+        assert_eq!(
+            options.prefetch_after,
+            Some(metadata_prefetch.saturating_sub(incoming_source_start))
+        );
+        assert_eq!(
+            options.transition_after,
+            Some(metadata_transition.saturating_sub(incoming_source_start))
+        );
+        assert_ne!(options.transition_after, Some(outgoing_start));
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2802,6 +3519,7 @@ mod tests {
         equalizer_schedules: Mutex<Vec<(PlaybackId, EqTransition)>>,
         equalizer_cancellations: Mutex<Vec<(PlaybackId, u64)>>,
         volumes: Mutex<Vec<(PlaybackId, f32)>>,
+        arm_result: Mutex<Option<TransitionArmResult>>,
         disconnects: Mutex<Vec<GuildKey>>,
         play_notify: Notify,
         analysis_notify: Notify,
@@ -2902,6 +3620,10 @@ mod tests {
             self.state.positions.lock().insert(playback_id, position);
         }
 
+        fn arm_with(&self, result: TransitionArmResult) {
+            *self.state.arm_result.lock() = Some(result);
+        }
+
         fn equalizer_schedules(&self) -> Vec<(PlaybackId, EqTransition)> {
             self.state.equalizer_schedules.lock().clone()
         }
@@ -2928,6 +3650,10 @@ mod tests {
 
         fn set_volume(&self, volume: f32) {
             self.state.volumes.lock().push((self.playback_id, volume));
+        }
+
+        fn frame_scheduled_transition_support(&self) -> FrameScheduledTransitionSupport {
+            FrameScheduledTransitionSupport::TrackPositionDelayedEvent
         }
 
         fn pause(&self) {
@@ -3022,6 +3748,23 @@ mod tests {
         async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
             self.state.disconnects.lock().push(guild_id);
             Ok(())
+        }
+
+        async fn arm_transition(
+            &self,
+            _guild_id: GuildKey,
+            _session_id: u64,
+            _outgoing_playback_id: PlaybackId,
+            _incoming_playback_id: PlaybackId,
+            _target_position: Duration,
+            _generation: u64,
+            _events: RuntimeEventSink,
+        ) -> TransitionArmResult {
+            self.state
+                .arm_result
+                .lock()
+                .take()
+                .unwrap_or(TransitionArmResult::Unsupported)
         }
 
         async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
@@ -4780,6 +5523,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn started_late_keeps_audible_beatmatched_deck_without_restart() {
+        let guild_id = GuildKey::new(1234);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let duration = Duration::from_secs(30);
+        let analysis = |bpm| {
+            let mut analysis = beat_analysis(duration, bpm);
+            let beat_interval = Duration::from_secs_f64(60.0 / f64::from(bpm));
+            let mut marker = Duration::ZERO;
+            while marker <= duration {
+                analysis.beat_markers.push(marker);
+                marker += beat_interval;
+            }
+            analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
+            analysis
+        };
+        runtime.analyze_with("first", analysis(120.0));
+        runtime.analyze_with("second", analysis(124.0));
+        runtime.arm_with(TransitionArmResult::Armed { target_frame: 1000 });
+        let playback = PlaybackCoordinator::new_with_automix(
+            media.clone(),
+            runtime.clone(),
+            automix_config(Duration::from_secs(8)),
+        );
+        for key in ["first", "second"] {
+            media.resolve_with(key, Ok(track_request_with_duration(key, Some(duration))));
+            playback.enqueue_impl(guild_id, key).await.unwrap();
+        }
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let incoming = runtime.played()[1].clone();
+        let (source_start, tempo_envelope, generation) = {
+            let session = playback
+                .get_session(guild_id)
+                .expect("playback session missing");
+            let state = session.playback.lock();
+            let prepared = state
+                .prepared_transition
+                .as_ref()
+                .expect("armed transition was not prepared");
+            assert_eq!(prepared.transition_kind, TransitionKind::BeatMatched);
+            (
+                prepared.source_start,
+                prepared.tempo_envelope.expect("beatmatched tempo map"),
+                prepared.arm_generation.expect("arm generation"),
+            )
+        };
+
+        first
+            .events
+            .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                guild_id,
+                session_id: first.session_id,
+                outgoing_playback_id: first.playback_id,
+                incoming_playback_id: incoming.playback_id,
+                generation,
+                target_position: Duration::from_secs(20),
+                target_frame: 1000,
+                actual_frame: Some(1002),
+                skew_ms: Some(40),
+                underflow: false,
+                failure_kind: TransitionArmFailureKind::StartedLate,
+                reason: "test late mixer event".into(),
+            })
+            .unwrap();
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let session = playback
+                    .get_session(guild_id)
+                    .expect("playback session missing");
+                if session.playback.lock().current_playback_id == Some(incoming.playback_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("StartedLate deck was not promoted");
+
+        // StartedLate is an emergency promotion of the already-running deck:
+        // it must not prepare a native fallback or issue a redundant resume.
+        assert_eq!(
+            runtime
+                .start_options()
+                .into_iter()
+                .filter(|(key, _)| key == "second")
+                .count(),
+            1
+        );
+        assert!(!runtime.resumed().contains(&incoming.playback_id));
+        let session = playback
+            .get_session(guild_id)
+            .expect("playback session missing");
+        let state = session.playback.lock();
+        assert_eq!(
+            state.current_tempo,
+            Some((source_start, tempo_envelope)),
+            "StartedLate must preserve the audible BeatMatched clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_failed_replacement_uses_incoming_metadata_event_clock() {
+        let guild_id = GuildKey::new(1235);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let outgoing_duration = Duration::from_secs(240);
+        let incoming_duration = Duration::from_secs(330);
+        let incoming_start = Duration::from_secs(37);
+        let with_markers = |mut analysis: TrackAnalysis, bpm: f32, first: Duration| {
+            let beat_interval = Duration::from_secs_f64(60.0 / f64::from(bpm));
+            let mut marker = first;
+            while marker <= analysis.duration {
+                analysis.beat_markers.push(marker);
+                marker += beat_interval;
+            }
+            analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
+            analysis
+        };
+        let outgoing_analysis = with_markers(
+            beat_analysis(outgoing_duration, 120.0),
+            120.0,
+            Duration::ZERO,
+        );
+        let mut incoming_analysis = with_markers(
+            beat_analysis(incoming_duration, 120.0),
+            120.0,
+            incoming_start,
+        );
+        incoming_analysis.audible_start = incoming_start;
+        incoming_analysis.first_beat = Some(incoming_start);
+        // The observed trusted marker train begins at the incoming cue, so
+        // its actionable downbeat anchor must share that phase.
+        incoming_analysis.first_downbeat = Some(incoming_start);
+        runtime.analyze_with("first", outgoing_analysis);
+        runtime.analyze_with("second", incoming_analysis);
+        runtime.arm_with(TransitionArmResult::Armed { target_frame: 1000 });
+        let config = automix_config(Duration::from_secs(8));
+        let playback =
+            PlaybackCoordinator::new_with_automix(media.clone(), runtime.clone(), config.clone());
+        media.resolve_with(
+            "first",
+            Ok(track_request_with_duration(
+                "first",
+                Some(outgoing_duration),
+            )),
+        );
+        media.resolve_with(
+            "second",
+            Ok(track_request_with_duration(
+                "second",
+                Some(incoming_duration),
+            )),
+        );
+        playback.enqueue_impl(guild_id, "first").await.unwrap();
+        playback.enqueue_impl(guild_id, "second").await.unwrap();
+        runtime.wait_for_analysis_count(2).await;
+        tokio::task::yield_now().await;
+        let first = runtime.played()[0].clone();
+        playback
+            .prefetch_transition(guild_id, first.session_id, first.playback_id)
+            .await;
+        runtime.wait_for_play_count(2).await;
+        let incoming = runtime.played()[1].clone();
+        let generation = {
+            let session = playback
+                .get_session(guild_id)
+                .expect("playback session missing");
+            let state = session.playback.lock();
+            let prepared = state
+                .prepared_transition
+                .as_ref()
+                .expect("armed transition was not prepared");
+            assert_eq!(prepared.transition_kind, TransitionKind::BeatMatched);
+            prepared.arm_generation.expect("arm generation")
+        };
+        // Let the fallback promotion complete immediately once the fresh
+        // deck is installed; this also proves the replacement does not retain
+        // the old target-frame sleep.
+        runtime.set_position(first.playback_id, outgoing_duration);
+
+        first
+            .events
+            .send(PlaybackRuntimeEvent::TransitionArmFailed {
+                guild_id,
+                session_id: first.session_id,
+                outgoing_playback_id: first.playback_id,
+                incoming_playback_id: incoming.playback_id,
+                generation,
+                target_position: Duration::from_secs(200),
+                target_frame: 1000,
+                actual_frame: None,
+                skew_ms: None,
+                underflow: true,
+                failure_kind: TransitionArmFailureKind::ActionFailed,
+                reason: "test closed decoder".into(),
+            })
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime
+                    .start_options()
+                    .into_iter()
+                    .filter(|(key, _)| key == "second")
+                    .count()
+                    >= 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed arm did not prepare a fresh fallback deck");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if playback
+                    .get_session(guild_id)
+                    .expect("playback session missing")
+                    .playback
+                    .lock()
+                    .current_playback_id
+                    == Some(incoming.playback_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fresh fallback deck was not promoted");
+
+        let attempts = runtime
+            .start_options()
+            .into_iter()
+            .filter(|(key, _)| key == "second")
+            .map(|(_, options)| options)
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            runtime
+                .stopped()
+                .into_iter()
+                .filter(|id| *id == incoming.playback_id)
+                .count(),
+            1,
+            "only the old speculative handle may be stopped"
+        );
+        assert!(runtime.resumed().contains(&incoming.playback_id));
+        let metadata = track_start_options(&config, Some(incoming_duration), 0.0);
+        let fallback = attempts.last().expect("replacement options");
+        assert_eq!(fallback.source_start, incoming_start);
+        assert_eq!(
+            fallback.prefetch_after,
+            metadata
+                .prefetch_after
+                .map(|position| position.saturating_sub(incoming_start))
+        );
+        assert_eq!(
+            fallback.transition_after,
+            metadata
+                .transition_after
+                .map(|position| position.saturating_sub(incoming_start))
+        );
+        assert!(fallback.tempo_envelope.is_none());
+        assert!(fallback.equalizer_transition.is_none());
+    }
+
+    #[tokio::test]
     async fn automix_prefetch_guard_replaces_drifted_beatmatch_with_crossfade() {
         let guild_id = GuildKey::new(129);
         let media = MockMedia::default();
@@ -4839,6 +5858,11 @@ mod tests {
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
         let duration = Duration::from_secs(30);
+        let mut outgoing = beat_analysis(duration, 120.0);
+        outgoing.beat_markers = (0..60)
+            .map(|index| Duration::from_millis(index * 500))
+            .collect();
+        outgoing.beat_marker_confidences = vec![1.0; outgoing.beat_markers.len()];
         let mut incoming = beat_analysis(duration, 120.0);
         incoming.audible_start = Duration::from_secs(1);
         incoming.first_beat = Some(Duration::from_secs(1));
@@ -4847,7 +5871,14 @@ mod tests {
             .chain((0..60).map(|index| Duration::from_millis(1_050 + index * 500)))
             .collect();
         incoming.beat_marker_confidences = vec![1.0; incoming.beat_markers.len()];
-        runtime.analyze_with("first", beat_analysis(duration, 120.0));
+        let guarded = wotoha_core::automix::plan_guarded_transition(
+            &outgoing,
+            &incoming,
+            &automix_config(Duration::from_secs(8)),
+        );
+        assert_eq!(guarded.plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(guarded.plan.incoming_start, Duration::from_millis(1_050));
+        runtime.analyze_with("first", outgoing);
         runtime.analyze_with("second", incoming);
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
@@ -4961,6 +5992,7 @@ mod tests {
             .prefetch_transition(guild_id, first.session_id, first.playback_id)
             .await;
         let incoming = runtime.played()[1].clone();
+        runtime.set_position(first.playback_id, duration);
         let transition = {
             let playback = playback.clone();
             let first = first.clone();
@@ -5007,8 +6039,20 @@ mod tests {
             analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
             analysis
         };
-        runtime.analyze_with("first", analysis(120.0, Duration::ZERO));
-        runtime.analyze_with("second", analysis(124.0, Duration::from_millis(50)));
+        let outgoing_analysis = analysis(120.0, Duration::ZERO);
+        let incoming_analysis = analysis(124.0, Duration::from_millis(50));
+        let native_fallback =
+            wotoha_core::automix::plan_guarded_non_beatmatched_transition_with_base_gains(
+                &outgoing_analysis,
+                &incoming_analysis,
+                &automix_config(Duration::from_secs(8)),
+                1.0,
+                1.0,
+            );
+        assert_eq!(native_fallback.plan.kind, TransitionKind::Crossfade);
+        assert_eq!(native_fallback.plan.incoming_start, Duration::ZERO);
+        runtime.analyze_with("first", outgoing_analysis);
+        runtime.analyze_with("second", incoming_analysis);
         runtime.fail_play_for("second", TestRuntimeError::new("DSP unavailable"));
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
@@ -5048,10 +6092,10 @@ mod tests {
         );
         assert!(attempts[1].tempo_envelope.is_none());
         assert!(attempts[1].equalizer_transition.is_none());
-        assert_eq!(attempts[1].source_start, Duration::from_millis(50));
+        assert_eq!(attempts[1].source_start, Duration::ZERO);
         assert_eq!(
             attempts[1].transition_after,
-            Some(Duration::from_millis(450))
+            Some(Duration::from_millis(500))
         );
     }
 
@@ -5061,34 +6105,49 @@ mod tests {
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
         let duration = Duration::from_secs(30);
-        let analysis = |first_beat| TrackAnalysis {
-            duration,
-            audible_start: Duration::ZERO,
-            audible_end: duration,
-            intro_end: None,
-            intro_confidence: 0.0,
-            outro_start: None,
-            outro_confidence: 0.0,
-            vocal_activity: Vec::new(),
-            vocal_activity_confidences: Vec::new(),
-            vocal_activity_rate: 0,
-            energy_profile: Vec::new(),
-            energy_profile_rate: 0,
-            bpm: Some(120.0),
-            beat_confidence: 1.0,
-            first_beat: Some(first_beat),
-            beat_markers: Vec::new(),
-            beat_marker_confidences: Vec::new(),
-            first_downbeat: None,
-            downbeat_confidence: 0.0,
-            musical_key: None,
-            rms_dbfs: None,
-            sample_peak_dbfs: None,
-            integrated_lufs: None,
-            true_peak_dbtp: None,
+        let analysis = |first_beat| {
+            let mut analysis = TrackAnalysis {
+                duration,
+                audible_start: Duration::ZERO,
+                audible_end: duration,
+                intro_end: None,
+                intro_confidence: 0.0,
+                outro_start: None,
+                outro_confidence: 0.0,
+                vocal_activity: vec![0; duration.as_secs() as usize * 4],
+                vocal_activity_confidences: vec![u8::MAX; duration.as_secs() as usize * 4],
+                vocal_activity_rate: 4,
+                energy_profile: Vec::new(),
+                energy_profile_rate: 0,
+                bpm: Some(120.0),
+                beat_confidence: 1.0,
+                first_beat: Some(first_beat),
+                beat_markers: Vec::new(),
+                beat_marker_confidences: Vec::new(),
+                first_downbeat: None,
+                downbeat_confidence: 0.0,
+                musical_key: None,
+                rms_dbfs: None,
+                sample_peak_dbfs: None,
+                integrated_lufs: None,
+                true_peak_dbtp: None,
+            };
+            let mut marker = first_beat;
+            while marker <= duration {
+                analysis.beat_markers.push(marker);
+                marker += Duration::from_millis(500);
+            }
+            analysis.beat_marker_confidences = vec![1.0; analysis.beat_markers.len()];
+            analysis
         };
         runtime.analyze_with("first", analysis(Duration::ZERO));
         runtime.analyze_with("second", analysis(Duration::from_millis(50)));
+        let guarded = wotoha_core::automix::plan_guarded_transition(
+            &analysis(Duration::ZERO),
+            &analysis(Duration::from_millis(50)),
+            &automix_config(Duration::from_secs(8)),
+        );
+        assert_eq!(guarded.plan.kind, TransitionKind::BeatMatched);
         let playback = PlaybackCoordinator::new_with_automix(
             media.clone(),
             runtime.clone(),

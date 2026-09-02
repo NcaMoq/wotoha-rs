@@ -15,6 +15,7 @@ WINDOWS_PACKAGER="$ROOT/deploy/build-ubuntu-musl.ps1"
 ABOUT_CONFIG="$ROOT/deploy/release-about.toml"
 ABOUT_TEMPLATE="$ROOT/deploy/third-party-licenses.hbs"
 ATTRIBUTION_GENERATOR="$ROOT/deploy/generate-cargo-attributions.sh"
+MODEL_COMPLIANCE="$ROOT/deploy/tests/neural-model-compliance.sh"
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
@@ -28,7 +29,9 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [[ -s "$ABOUT_CONFIG" && -s "$ABOUT_TEMPLATE" ]] \
   || fail 'cargo-about release policy and template are required'
 [[ -s "$ATTRIBUTION_GENERATOR" ]] || fail 'standalone Cargo attribution generator is required'
-bash -n "$PACKAGER" "$VERIFY" "$BOOTSTRAP" "$ATTRIBUTION_GENERATOR" "$0"
+[[ -s "$MODEL_COMPLIANCE" ]] || fail 'embedded neural model compliance test is required'
+bash -n "$PACKAGER" "$VERIFY" "$BOOTSTRAP" "$ATTRIBUTION_GENERATOR" "$MODEL_COMPLIANCE" "$0"
+bash "$MODEL_COMPLIANCE"
 
 # shellcheck source=/dev/null
 source "$VERSIONS"
@@ -101,6 +104,32 @@ grep -Fq "stat --format='%s' \"\$archive\"" "$APP_UPDATER" \
   || fail 'application updater does not compare the archive byte size'
 grep -Fq 'https://www.mozilla.org/MPL/2.0/' "$NOTICES" \
   || fail 'notices do not link the MPL-2.0 terms'
+for model_contract in \
+  'third-party/neural-models/' \
+  'a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f' \
+  'fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9' \
+  'include_bytes!' \
+  'do not duplicate the approximately 10 MiB' \
+  'copyright attribution and complete pinned MIT license texts are included' \
+  'No training files or datasets are included.' \
+  'may have separate terms'; do
+  grep -Fq -- "$model_contract" "$NOTICES" \
+    || fail "notices are missing neural-model contract: $model_contract"
+done
+! grep -Fq "This is sufficient for MIT's redistribution terms" "$NOTICES" \
+  || fail 'notices make an unsupported blanket MIT sufficiency claim'
+! grep -Fq 'MIT imposes no source-availability requirement' "$NOTICES" \
+  || fail 'notices make an unsupported source-availability conclusion'
+for model_notice_name in NOTICE.txt LICENSE.beat-this-rs.txt LICENSE.beat-this-original.txt; do
+  grep -Fq -- "$model_notice_name" "$PACKAGER" \
+    || fail "Linux packager does not copy neural-model attribution: $model_notice_name"
+  grep -Fq -- "$model_notice_name" "$WINDOWS_PACKAGER" \
+    || fail "PowerShell packager does not copy neural-model attribution: $model_notice_name"
+done
+grep -Fq 'third-party/neural-models/NOTICE.txt' "$VERIFY" \
+  || fail 'archive verifier does not require neural-model attribution'
+grep -Fq -- "-name '*.onnx'" "$VERIFY" \
+  || fail 'archive verifier does not reject duplicate ONNX payloads'
 
 # On CI, require an exact crates.io source link and upstream repository for
 # every MPL-2.0 package in the locked release dependency graph. This keeps the
@@ -172,6 +201,38 @@ if command -v jq >/dev/null 2>&1; then
     || fail 'app-only checksum list omits the generated license texts'
   grep -Fq 'third-party/rust/THIRD_PARTY_ATTRIBUTIONS.txt' "$app/SHA256SUMS.txt" \
     || fail 'app-only checksum list omits standalone copyright/notice material'
+  for model_file in \
+    third-party/neural-models/NOTICE.txt \
+    third-party/neural-models/LICENSE.beat-this-rs.txt \
+    third-party/neural-models/LICENSE.beat-this-original.txt; do
+    grep -Fq "$model_file" "$app/SHA256SUMS.txt" \
+      || fail "app-only checksum list omits neural-model attribution: $model_file"
+  done
+
+  mkdir -p "$work/missing-model"
+  cp -a "$app" "$work/missing-model/$app_name"
+  rm -f "$work/missing-model/$app_name/third-party/neural-models/NOTICE.txt"
+  tar -czf "$work/missing-model.tar.gz" -C "$work/missing-model" "$app_name"
+  if bash "$VERIFY" "$fixture_dist/$legacy_name.tar.gz" "$work/missing-model.tar.gz" \
+    >/dev/null 2>&1; then
+    fail 'archive verifier accepted an app-only archive missing neural-model attribution'
+  fi
+
+  mkdir -p "$work/duplicate-model"
+  cp -a "$app" "$work/duplicate-model/$app_name"
+  printf 'duplicate model fixture\n' \
+    > "$work/duplicate-model/$app_name/third-party/neural-models/duplicate.onnx"
+  (
+    cd "$work/duplicate-model/$app_name"
+    find . -type f ! -name SHA256SUMS.txt -print0 \
+      | sort -z | xargs -0 sha256sum > SHA256SUMS.txt
+  )
+  tar -czf "$work/duplicate-model.tar.gz" -C "$work/duplicate-model" "$app_name"
+  if bash "$VERIFY" "$fixture_dist/$legacy_name.tar.gz" "$work/duplicate-model.tar.gz" \
+    >/dev/null 2>&1; then
+    fail 'archive verifier accepted an app-only archive with a duplicate ONNX payload'
+  fi
+
   grep -Fq 'yt-dlp-update.sh' "$legacy/SHA256SUMS.txt" \
     || fail 'updater-compatible checksum list omits an installed executable'
 

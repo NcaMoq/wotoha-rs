@@ -113,6 +113,28 @@ verify_common() {
         or ((.license_file // "") | length > 0)))
   ' "$package/third-party/rust/license-inventory.json" >/dev/null \
     || fail "$package has an invalid Rust license inventory"
+  for neural_model_file in \
+    third-party/neural-models/NOTICE.txt \
+    third-party/neural-models/LICENSE.beat-this-rs.txt \
+    third-party/neural-models/LICENSE.beat-this-original.txt; do
+    [[ -s "$package/$neural_model_file" ]] \
+      || fail "$package is missing neural-model attribution: $neural_model_file"
+  done
+  cmp --silent "$ROOT/crates/wotoha-runtime/models/NOTICE.txt" \
+    "$package/third-party/neural-models/NOTICE.txt" \
+    || fail "$package neural-model notice differs from the source metadata"
+  cmp --silent "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-rs.txt" \
+    "$package/third-party/neural-models/LICENSE.beat-this-rs.txt" \
+    || fail "$package pinned beat-this-rs license differs from the source text"
+  cmp --silent "$ROOT/crates/wotoha-runtime/models/LICENSE.beat-this-original.txt" \
+    "$package/third-party/neural-models/LICENSE.beat-this-original.txt" \
+    || fail "$package original Beat This! license differs from the source text"
+  grep -Fq 'a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f' \
+    "$package/third-party/neural-models/NOTICE.txt" \
+    || fail "$package neural-model notice lacks the small-model hash"
+  grep -Fq 'fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9' \
+    "$package/third-party/neural-models/NOTICE.txt" \
+    || fail "$package neural-model notice lacks the mel-model hash"
   verify_checksums "$package"
 }
 
@@ -149,12 +171,16 @@ for package in "$app" "$legacy"; do
     fail "release archive contains a third-party runtime payload: ${payload#"$package/"}"
   done < <(find "$package" -type f \
     \( -name 'yt-dlp' -o -name 'yt-dlp_linux' -o -name 'deno' \
-       -o -name 'deno*.zip' -o -name 'SHA2-256SUMS' -o -name 'SHA2-256SUMS.sig' \))
+       -o -name 'deno*.zip' -o -name 'SHA2-256SUMS' -o -name 'SHA2-256SUMS.sig' \
+       -o -name '*.onnx' \))
 done
 for shared in bin/wotoha-app LICENSE THIRD_PARTY_NOTICES.md \
   third-party/rust/Cargo.lock third-party/rust/license-inventory.json \
   third-party/rust/THIRD_PARTY_LICENSES.html \
-  third-party/rust/THIRD_PARTY_ATTRIBUTIONS.txt; do
+  third-party/rust/THIRD_PARTY_ATTRIBUTIONS.txt \
+  third-party/neural-models/NOTICE.txt \
+  third-party/neural-models/LICENSE.beat-this-rs.txt \
+  third-party/neural-models/LICENSE.beat-this-original.txt; do
   cmp --silent "$app/$shared" "$legacy/$shared" \
     || fail "archives disagree on shared file: $shared"
 done

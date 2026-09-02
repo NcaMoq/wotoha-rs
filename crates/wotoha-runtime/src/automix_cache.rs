@@ -14,13 +14,15 @@ use wotoha_core::{
     automix::{KeyMode, MusicalKey, TrackAnalysis},
 };
 
-pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 9;
+pub const ANALYSIS_CACHE_SCHEMA_VERSION: u32 = 11;
+pub(crate) const ANALYSIS_CACHE_ANALYZER_VERSION: &str = "pcm-onset-chroma-level-loudness-neural-beat-this-1.0.0-rten-0.24.0-small-a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f-mel-fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9-v12";
+pub(crate) const ANALYSIS_CACHE_CLASSICAL_ANALYZER_VERSION: &str = "pcm-onset-chroma-level-loudness-classical-permanent-neural-eligibility-beat-this-1.0.0-rten-0.24.0-a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f-fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9-v12";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AnalysisCacheKey {
     provider_id: String,
     canonical_key: String,
@@ -692,12 +694,27 @@ mod tests {
     }
 
     #[test]
-    fn treats_previous_schema_as_a_cache_miss() {
+    fn permanent_classical_backend_is_separate_from_neural_cache() {
+        let directory = TestDirectory::new();
+        let neural = AnalysisCache::new(directory.path(), "neural-v12").unwrap();
+        let classical =
+            AnalysisCache::new(directory.path().join("classical"), "classical-v11").unwrap();
+        let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
+
+        classical.store(&key, &analysis()).unwrap();
+        assert_eq!(neural.load(&key).unwrap(), None);
+        assert_eq!(classical.load(&key).unwrap(), Some(analysis()));
+    }
+
+    #[test]
+    fn treats_previous_marker_schema_as_a_cache_miss() {
         let directory = TestDirectory::new();
         let cache = AnalysisCache::new(directory.path(), "tempo-v1").unwrap();
         let key = AnalysisCacheKey::new("youtube", "abc", None, None).unwrap();
         let mut record = CachedAnalysis::new(&key, "tempo-v1", &analysis());
-        record.schema_version = ANALYSIS_CACHE_SCHEMA_VERSION - 1;
+        // v9 used the former marker-boundary semantics. It must never be
+        // reused after the Extended intro/outro marker update.
+        record.schema_version = 9;
         let file = File::create(cache.path_for(&key)).unwrap();
         serde_json::to_writer(file, &record).unwrap();
 

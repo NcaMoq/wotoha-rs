@@ -7,7 +7,12 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+ebur128 = "=0.1.10"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 serenity.workspace = true
+sha2.workspace = true
 songbird.workspace = true
 tokio.workspace = true
 tracing.workspace = true

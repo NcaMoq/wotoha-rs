@@ -96,6 +96,33 @@ pub enum PlaybackRuntimeEvent {
         session_id: u64,
         playback_id: PlaybackId,
     },
+    /// The runtime observed the prepared incoming deck start on its target
+    /// mixer frame.  This is emitted by a runtime-owned target-frame
+    /// scheduler, not by the lookahead notification.
+    TransitionStarted {
+        guild_id: GuildKey,
+        session_id: u64,
+        outgoing_playback_id: PlaybackId,
+        incoming_playback_id: PlaybackId,
+        generation: u64,
+        target_position: Duration,
+        target_frame: u64,
+        actual_frame: u64,
+    },
+    TransitionArmFailed {
+        guild_id: GuildKey,
+        session_id: u64,
+        outgoing_playback_id: PlaybackId,
+        incoming_playback_id: PlaybackId,
+        generation: u64,
+        target_position: Duration,
+        target_frame: u64,
+        actual_frame: Option<u64>,
+        skew_ms: Option<u64>,
+        underflow: bool,
+        failure_kind: TransitionArmFailureKind,
+        reason: Arc<str>,
+    },
     TrackErrored {
         guild_id: GuildKey,
         session_id: u64,
@@ -109,6 +136,34 @@ pub enum PlaybackRuntimeEvent {
 }
 
 pub type RuntimeEventSink = mpsc::UnboundedSender<PlaybackRuntimeEvent>;
+
+/// Describes the clock that a runtime can use for a prepared two-deck
+/// transition.
+///
+/// Songbird's public track API only exposes asynchronous control messages.  A
+/// runtime must opt in explicitly before the playback layer is allowed to
+/// claim that a beat-matched transition was scheduled on a shared output
+/// frame.  The conservative default is `Unsupported`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameScheduledTransitionSupport {
+    Unsupported,
+    /// A Songbird track-position delayed event starts the prepared deck on
+    /// the next mixer tick after a compensated trigger.  This is deliberately
+    /// distinct from a multi-track atomic barrier.
+    TrackPositionDelayedEvent,
+    /// Reserved for a proven runtime-owned barrier.  Songbird does not use
+    /// this variant; independent TrackHandle queues must never advertise it.
+    SharedOutputFrame,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionArmFailureKind {
+    DeadlineMissed,
+    ActionFailed,
+    StartedLate,
+    Underflow,
+    IdentityMismatch,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VoiceGatewayStateUpdate {
@@ -136,6 +191,23 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
     fn stop(&self);
     fn set_volume(&self, volume: f32);
 
+    /// Returns whether this handle can participate in a sample/frame
+    /// coordinated transition with another handle from the same runtime.
+    ///
+    /// This is deliberately opt-in.  Implementations that only expose
+    /// asynchronous pause/resume or volume commands must leave the default in
+    /// place; the playback layer will then use its strict crossfade fallback.
+    fn frame_scheduled_transition_support(&self) -> FrameScheduledTransitionSupport {
+        FrameScheduledTransitionSupport::Unsupported
+    }
+
+    /// Legacy capability retained for source compatibility.  The playback
+    /// coordinator does not use this per-track operation for BeatMatched,
+    /// because two independent command queues are not atomic.
+    fn arm_shared_output_frame(&self) -> bool {
+        false
+    }
+
     fn pause(&self) {}
 
     fn resume(&self) {}
@@ -155,6 +227,42 @@ pub trait RuntimeTrackHandle: Send + Sync + 'static {
 
     fn cancel_equalizer_transition(&self, _id: u64) {}
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransitionArmResult {
+    Armed { target_frame: u64 },
+    Unsupported,
+    NotReady,
+    IdentityMismatch,
+    DeadlineMissed,
+    Underflow,
+}
+
+/// Stable identity for a prepared deck.  Backends may use `token` to bind a
+/// decoder/preroll generation; playback never treats a playback id alone as
+/// sufficient identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PreparedDeckToken {
+    pub guild_id: GuildKey,
+    pub session_id: u64,
+    pub playback_id: PlaybackId,
+    pub generation: u64,
+    pub token: u64,
+}
+
+/// Structured arm input for runtimes that expose a target-frame scheduler.
+/// The existing `VoiceRuntime::arm_transition` method remains the compatibility
+/// entry point; this type keeps identity/deadline data separable for backends
+/// and deterministic drivers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArmRequest {
+    pub outgoing: PreparedDeckToken,
+    pub incoming: PreparedDeckToken,
+    pub target_position: Duration,
+}
+
+pub type ArmResult = TransitionArmResult;
+pub type TransitionRuntimeEvent = PlaybackRuntimeEvent;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaybackRestartSnapshot {
@@ -241,6 +349,23 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
             .await?;
         handle.pause();
         Ok(handle)
+    }
+
+    /// Arm a prepared incoming deck against an outgoing deck's runtime clock.
+    /// Runtimes without a target-frame scheduler return `Unsupported`, which
+    /// makes the playback layer use its ordinary Crossfade/Gapless fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn arm_transition(
+        &self,
+        _guild_id: GuildKey,
+        _session_id: u64,
+        _outgoing_playback_id: PlaybackId,
+        _incoming_playback_id: PlaybackId,
+        _target_position: Duration,
+        _generation: u64,
+        _events: RuntimeEventSink,
+    ) -> TransitionArmResult {
+        TransitionArmResult::Unsupported
     }
 
     async fn analyze_track(&self, _request: &TrackRequest) -> Option<TrackAnalysis> {

@@ -325,7 +325,7 @@ mod tests {
     use symphonia::core::audio::{Channels, SignalSpec};
     use wotoha_core::automix::{
         AutoMixConfig, AutoMixPeakGuard, EqTransitionRole, TrackAnalysis, TransitionKind,
-        automix_peak_safe_mix_gains, plan_transition,
+        automix_peak_safe_mix_gains, plan_guarded_transition, plan_transition,
     };
 
     fn outgoing(start: Duration) -> EqTransition {
@@ -418,7 +418,21 @@ mod tests {
         let outgoing = beat_analysis(duration, 120.0);
         let incoming = beat_analysis(duration, 124.0);
         let plan = plan_transition(&outgoing, &incoming, &config);
-        assert_eq!(plan.kind, TransitionKind::BeatMatched);
+        assert_eq!(plan.kind, TransitionKind::BeatMatched, "raw plan={plan:?}");
+        let guarded = plan_guarded_transition(&outgoing, &incoming, &config);
+        assert_eq!(
+            guarded.plan.kind,
+            TransitionKind::BeatMatched,
+            "guarded plan={:?}",
+            guarded.plan
+        );
+        assert!(guarded.quality.beat_pairs_checked >= 8);
+        assert!(
+            guarded
+                .quality
+                .beat_phase_coverage
+                .is_some_and(|coverage| coverage >= 0.65)
+        );
         let envelope = plan
             .tempo_envelope
             .expect("incoming deck should be tempo-matched");
@@ -515,6 +529,7 @@ mod tests {
             markers.push(position);
             position += beat;
         }
+        let vocal_bins = (duration.as_secs_f64() * 10.0).ceil() as usize;
         TrackAnalysis {
             duration,
             audible_start: Duration::ZERO,
@@ -523,9 +538,9 @@ mod tests {
             intro_confidence: 1.0,
             outro_start: Some(duration.saturating_sub(Duration::from_secs(8))),
             outro_confidence: 1.0,
-            vocal_activity: Vec::new(),
-            vocal_activity_confidences: Vec::new(),
-            vocal_activity_rate: 0,
+            vocal_activity: vec![0; vocal_bins],
+            vocal_activity_confidences: vec![255; vocal_bins],
+            vocal_activity_rate: 10,
             energy_profile: Vec::new(),
             energy_profile_rate: 0,
             bpm: Some(bpm),
@@ -533,8 +548,8 @@ mod tests {
             first_beat: Some(Duration::ZERO),
             beat_marker_confidences: vec![1.0; markers.len()],
             beat_markers: markers,
-            first_downbeat: Some(Duration::ZERO),
-            downbeat_confidence: 1.0,
+            first_downbeat: None,
+            downbeat_confidence: 0.0,
             musical_key: None,
             rms_dbfs: Some(-12.0),
             sample_peak_dbfs: Some(-3.0),

@@ -9,14 +9,21 @@ use symphonia::core::{audio::SampleBuffer, errors::Error};
 use wotoha_core::{
     audio_analysis::{LowBandFilter, analyze_mono_pcm_with_low_band, apply_energy_structure},
     automix::TrackAnalysis,
+    beat_analysis::apply_neural_beat_observations,
     key_analysis::estimate_musical_key,
     vocal_analysis::{VocalActivityAnalyzer, apply_vocal_activity},
 };
 
 const ANALYSIS_RATE: u32 = 1_000;
 const TONAL_RATE: u32 = 11_025;
+const NEURAL_RATE: u32 = 22_050;
 const STRUCTURE_RATE: u32 = 4;
 pub(crate) const MAX_ANALYSIS_DURATION: Duration = Duration::from_secs(30 * 60);
+/// Neural inference is bounded separately from classical analysis.  A 12-minute
+/// mono f32 buffer is about 63.5 MiB; tracks beyond this limit deliberately use
+/// the deterministic Phase 1 analyzer only.
+const MAX_NEURAL_DURATION: Duration = Duration::from_secs(12 * 60);
+const MAX_NEURAL_SAMPLES: usize = NEURAL_RATE as usize * MAX_NEURAL_DURATION.as_secs() as usize;
 const MAX_ANALYSIS_SECONDS: usize = MAX_ANALYSIS_DURATION.as_secs() as usize;
 const MAX_TONAL_SECONDS: usize = 6 * 60;
 
@@ -24,6 +31,46 @@ struct LoudnessMeasurement {
     analyzer: Option<EbuR128>,
     layout: Option<(u32, u32)>,
     failed: bool,
+}
+
+/// The analyzer backend and cache provenance used by callers that need to enforce
+/// a neural-only gate. Cache variants are deliberately distinct from fresh
+/// analysis: a cache hit must never masquerade as a neural inference performed
+/// during the current run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AnalysisBackend {
+    Neural,
+    ClassicalPermanentIneligible,
+    ClassicalTransientFailure,
+    CachedNeural,
+    CachedClassicalPermanentIneligible,
+    CachedClassicalTransientFailure,
+}
+
+impl AnalysisBackend {
+    #[must_use]
+    pub fn is_fresh_neural(self) -> bool {
+        matches!(self, Self::Neural)
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neural => "Neural",
+            Self::ClassicalPermanentIneligible => "ClassicalPermanentIneligible",
+            Self::ClassicalTransientFailure => "ClassicalTransientFailure",
+            Self::CachedNeural => "CachedNeural",
+            Self::CachedClassicalPermanentIneligible => "CachedClassicalPermanentIneligible",
+            Self::CachedClassicalTransientFailure => "CachedClassicalTransientFailure",
+        }
+    }
+}
+
+/// Analysis plus the backend/provenance that produced it.
+#[derive(Clone, Debug)]
+pub struct AnalysisOutcome {
+    pub analysis: TrackAnalysis,
+    pub backend: AnalysisBackend,
 }
 
 impl LoudnessMeasurement {
@@ -110,10 +157,23 @@ pub(crate) fn analyze_input(input: Input) -> Option<TrackAnalysis> {
     analyze_input_with_cancel(input, &AtomicBool::new(false))
 }
 
+#[cfg(test)]
 pub(crate) fn analyze_input_with_cancel(
     input: Input,
     cancelled: &AtomicBool,
 ) -> Option<TrackAnalysis> {
+    analyze_input_with_limit(
+        input,
+        ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS,
+        cancelled,
+    )
+    .map(|outcome| outcome.analysis)
+}
+
+pub(crate) fn analyze_input_with_cancel_outcome(
+    input: Input,
+    cancelled: &AtomicBool,
+) -> Option<AnalysisOutcome> {
     analyze_input_with_limit(
         input,
         ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS,
@@ -125,7 +185,7 @@ fn analyze_input_with_limit(
     input: Input,
     max_samples: usize,
     cancelled: &AtomicBool,
-) -> Option<TrackAnalysis> {
+) -> Option<AnalysisOutcome> {
     let Input::Live(LiveInput::Parsed(mut parsed), _) = input else {
         return None;
     };
@@ -139,6 +199,10 @@ fn analyze_input_with_limit(
     let mut tonal_accumulator = 0.0_f32;
     let mut tonal_accumulated = 0_usize;
     let mut tonal_phase = 0_u64;
+    let mut neural_mono = Vec::with_capacity(NEURAL_RATE as usize * 180);
+    let mut neural_resampler = None;
+    let mut neural_available = true;
+    let mut neural_permanently_ineligible = false;
     let mut stream_rate = None;
     let mut low_band_filter = None;
     let mut vocal_analyzer = None;
@@ -170,13 +234,32 @@ fn analyze_input_with_limit(
         };
         let source_rate = decoded.spec().rate;
         let channels = decoded.spec().channels.count();
-        if channels == 0 || source_rate < ANALYSIS_RATE {
-            continue;
+        if channels == 0 || source_rate == 0 {
+            // A zero-rate or channel-less packet is malformed rather than a
+            // supported low-rate source. Do not manufacture a duration or a
+            // classical result from it.
+            return None;
+        }
+        let low_rate_classical = source_rate < ANALYSIS_RATE;
+        if low_rate_classical {
+            // Keep decoding valid sub-kHz PCM for the classical analyzer, but
+            // classify neural analysis as permanently ineligible. The
+            // analysis clock below follows the native source rate in this
+            // branch instead of silently dropping every packet.
+            neural_available = false;
+            neural_permanently_ineligible = true;
         }
         if stream_rate.is_some_and(|rate| rate != source_rate) {
             return None;
         }
         stream_rate = Some(source_rate);
+        if source_rate < NEURAL_RATE {
+            neural_available = false;
+            neural_permanently_ineligible = true;
+        } else if neural_resampler.is_none() {
+            neural_resampler =
+                crate::neural_resampler::StreamingNeuralResampler::new(source_rate, NEURAL_RATE);
+        }
         if low_band_filter.is_none() {
             low_band_filter = LowBandFilter::new(source_rate);
             vocal_analyzer = VocalActivityAnalyzer::new(source_rate);
@@ -233,19 +316,40 @@ fn analyze_input_with_limit(
                 structure_sum_squares = 0.0;
                 structure_frames = 0;
             }
-            accumulator += sample;
-            low_band_accumulator += low_band_sample;
-            accumulated += 1;
-            phase += ANALYSIS_RATE as u64;
-            if phase >= source_rate as u64 {
-                phase -= source_rate as u64;
-                mono.push(accumulator / accumulated as f32);
-                low_band.push(low_band_accumulator / accumulated as f32);
-                accumulator = 0.0;
-                low_band_accumulator = 0.0;
-                accumulated = 0;
-                if mono.len() > max_samples {
-                    break;
+            if low_rate_classical {
+                mono.push(sample);
+                low_band.push(low_band_sample);
+            } else {
+                accumulator += sample;
+                low_band_accumulator += low_band_sample;
+                accumulated += 1;
+                phase += ANALYSIS_RATE as u64;
+                if phase >= source_rate as u64 {
+                    phase -= source_rate as u64;
+                    mono.push(accumulator / accumulated as f32);
+                    low_band.push(low_band_accumulator / accumulated as f32);
+                    accumulator = 0.0;
+                    low_band_accumulator = 0.0;
+                    accumulated = 0;
+                    if mono.len() > max_samples {
+                        break;
+                    }
+                }
+            }
+            if neural_available {
+                let Some(resampler) = neural_resampler.as_mut() else {
+                    neural_available = false;
+                    neural_permanently_ineligible = true;
+                    continue;
+                };
+                if !resampler.push_sample(stable_mono, &mut neural_mono, MAX_NEURAL_SAMPLES) {
+                    // Do not retain a partial neural input for an over-limit
+                    // track: release it and fall back to Phase 1 explicitly.
+                    neural_available = false;
+                    neural_permanently_ineligible = true;
+                    neural_resampler = None;
+                    neural_mono.clear();
+                    neural_mono.shrink_to_fit();
                 }
             }
             if source_rate >= TONAL_RATE && tonal.len() < TONAL_RATE as usize * MAX_TONAL_SECONDS {
@@ -267,8 +371,30 @@ fn analyze_input_with_limit(
     if mono.len() > max_samples {
         return None;
     }
+    if cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    if neural_available {
+        if let Some(resampler) = neural_resampler.as_mut()
+            && !resampler.finish(&mut neural_mono, MAX_NEURAL_SAMPLES)
+        {
+            neural_available = false;
+            neural_permanently_ineligible = true;
+            neural_mono.clear();
+            neural_mono.shrink_to_fit();
+        } else if neural_resampler.is_none() {
+            neural_available = false;
+            neural_permanently_ineligible = true;
+        }
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+    let classical_rate = stream_rate
+        .filter(|rate| *rate < ANALYSIS_RATE)
+        .unwrap_or(ANALYSIS_RATE);
     let mut analysis = (!mono.is_empty())
-        .then(|| analyze_mono_pcm_with_low_band(&mono, &low_band, ANALYSIS_RATE))
+        .then(|| analyze_mono_pcm_with_low_band(&mono, &low_band, classical_rate))
         .flatten()?;
     apply_energy_structure(&mut analysis, &structure_rms, STRUCTURE_RATE);
     apply_vocal_activity(&mut analysis, vocal_analyzer?.finish());
@@ -280,7 +406,30 @@ fn analyze_input_with_limit(
         analysis.sample_peak_dbfs = Some(20.0 * sample_peak.log10());
     }
     (analysis.integrated_lufs, analysis.true_peak_dbtp) = loudness.finish();
-    Some(analysis)
+    let mut backend = if neural_permanently_ineligible {
+        AnalysisBackend::ClassicalPermanentIneligible
+    } else {
+        AnalysisBackend::ClassicalTransientFailure
+    };
+    if neural_available && !cancelled.load(Ordering::Relaxed) && !neural_mono.is_empty() {
+        // Keep the model lock scoped to this call.  All classical feature work
+        // above is independent and is intentionally completed before serialized
+        // inference begins.
+        if let Some(observations) =
+            crate::beat_this_analysis::analyze_with_cancel(&neural_mono, NEURAL_RATE, cancelled)
+            && !cancelled.load(Ordering::Relaxed)
+        {
+            if apply_neural_beat_observations(&mut analysis, &observations, &low_band) {
+                backend = AnalysisBackend::Neural;
+            } else {
+                // A valid finite model response with no supported periodic
+                // structure is a permanent content ineligibility, not a
+                // transient model/backend failure.
+                backend = AnalysisBackend::ClassicalPermanentIneligible;
+            }
+        }
+    }
+    Some(AnalysisOutcome { analysis, backend })
 }
 
 #[cfg(test)]
@@ -299,7 +448,10 @@ mod tests {
             .await
             .expect("generated WAV should be playable");
 
-        let analysis = analyze_input(playable).expect("WAV should produce an analysis");
+        let outcome = analyze_input_with_cancel_outcome(playable, &AtomicBool::new(false))
+            .expect("WAV should produce an analysis");
+        assert_eq!(outcome.backend, AnalysisBackend::Neural);
+        let analysis = outcome.analysis;
 
         assert!(analysis.duration.abs_diff(Duration::from_secs(12)) < Duration::from_millis(1));
         assert!((analysis.bpm.expect("tempo should be detected") - 120.0).abs() < 1.0);
@@ -334,6 +486,36 @@ mod tests {
             "{analysis:?}"
         );
         assert!(analysis.trusted_kick_coverage() > 0.6, "{analysis:?}");
+    }
+
+    #[tokio::test]
+    async fn low_source_rate_is_a_permanent_neural_ineligibility() {
+        const SAMPLE_RATE: u32 = 800;
+        let samples = (0..SAMPLE_RATE as usize * 4)
+            .map(|index| {
+                let time = index as f32 / SAMPLE_RATE as f32;
+                let phase = time.rem_euclid(0.5);
+                let sample = if phase < 0.04 {
+                    (std::f32::consts::TAU * 80.0 * phase).sin() * (1.0 - phase / 0.04)
+                } else {
+                    0.0
+                };
+                (sample * i16::MAX as f32) as i16
+            })
+            .collect::<Vec<_>>();
+        let input = Input::from(mono_wav(SAMPLE_RATE, &samples));
+        let playable = input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .expect("generated WAV should be playable");
+
+        let outcome = analyze_input_with_cancel_outcome(playable, &AtomicBool::new(false))
+            .expect("classical analysis should still succeed");
+        assert_eq!(
+            outcome.backend,
+            AnalysisBackend::ClassicalPermanentIneligible
+        );
+        assert_eq!(outcome.analysis.duration, Duration::from_secs(4));
     }
 
     #[tokio::test]

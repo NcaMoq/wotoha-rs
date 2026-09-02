@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use songbird::input::{AsyncAdapterStream, AsyncReadOnlySource, Input, LiveInput, RawAdapter};
@@ -11,13 +14,27 @@ use wotoha_core::automix::TempoEnvelope;
 
 use crate::transition_dsp::{EqualizerControl, OutputTimeline, ThreeBandEqualizer};
 
+// `timestretch 0.4.0/src/stream/processor.rs` uses this exact threshold for
+// its bit-exact unity-ratio passthrough (target, current, and pitch ratios).
+const UPSTREAM_RATIO_SNAP_THRESHOLD: f64 = 0.0001;
+
 pub(crate) struct TempoStretchProcessor {
-    inner: StreamProcessor,
+    // `None` is a deliberate global identity-envelope bypass.  Keeping the
+    // upstream processor out of this path preserves frame 0 and avoids
+    // assigning its nominal 6144-frame latency to a passthrough stream.
+    inner: Option<StreamProcessor>,
     envelope: TempoEnvelope,
     sample_rate: u32,
     channels: usize,
-    emitted_samples: usize,
-    latency_samples: usize,
+    /// PCM frames emitted by the processor.
+    ///
+    /// `timestretch::StreamProcessor::latency_samples` is unfortunately named:
+    /// its result is a per-channel frame count (as its `latency_secs` API and
+    /// implementation make clear), not an interleaved-value count.
+    emitted_frames: usize,
+    latency_frames: usize,
+    latency_values: usize,
+    pending_value: Option<f32>,
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +217,7 @@ fn decode_and_stretch(
     mut processor: TempoStretchProcessor,
     mut worker: PcmWorker,
 ) -> Result<(), String> {
-    let mut discard_output = processor.latency_samples();
+    let mut discard_output = processor.latency_frames();
     let mut equalizer = worker.equalizer.take().map(|control| {
         StreamEqualizer::new(
             control,
@@ -250,7 +267,7 @@ fn decode_and_stretch(
         if input.is_empty() {
             continue;
         }
-        let mut output = Vec::with_capacity(input.len() * 2 + processor.latency_samples());
+        let mut output = Vec::with_capacity(input.len() * 2 + processor.latency_values());
         processor
             .process_into(input, &mut output)
             .map_err(|error| error.to_string())?;
@@ -260,10 +277,11 @@ fn decode_and_stretch(
             &mut discard_output,
             &worker.cancelled,
             &worker.runtime,
+            processor.channels,
             equalizer.as_mut(),
         )?;
     }
-    let mut output = Vec::with_capacity(processor.latency_samples() * 4);
+    let mut output = Vec::with_capacity(processor.latency_values().saturating_mul(4));
     processor
         .flush_into(&mut output)
         .map_err(|error| error.to_string())?;
@@ -273,6 +291,7 @@ fn decode_and_stretch(
         &mut discard_output,
         &worker.cancelled,
         &worker.runtime,
+        processor.channels,
         equalizer.as_mut(),
     )?;
     let _ = worker.runtime.block_on(worker.writer.shutdown());
@@ -344,6 +363,7 @@ fn decode_and_trim(
                     &mut discard,
                     &worker.cancelled,
                     &worker.runtime,
+                    worker.output_channels,
                     Some(equalizer),
                 )?;
             } else {
@@ -353,6 +373,7 @@ fn decode_and_trim(
                     &mut discard,
                     &worker.cancelled,
                     &worker.runtime,
+                    worker.output_channels,
                 )?;
             }
         }
@@ -395,12 +416,13 @@ fn normalize_channels<'a>(
 fn write_pcm(
     writer: &mut tokio::io::DuplexStream,
     samples: &[f32],
-    discard: &mut usize,
+    discard_frames: &mut usize,
     cancelled: &AtomicBool,
     runtime: &tokio::runtime::Handle,
+    channels: usize,
 ) -> Result<(), String> {
-    let skip = (*discard).min(samples.len());
-    *discard -= skip;
+    let skip = discard_interleaved_frames(samples, discard_frames, channels)
+        .map_err(|error| error.to_string())?;
     if skip == samples.len() || cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -449,16 +471,24 @@ impl StreamEqualizer {
 fn write_pcm_with_equalizer(
     writer: &mut tokio::io::DuplexStream,
     samples: &mut [f32],
-    discard: &mut usize,
+    discard_frames: &mut usize,
     cancelled: &AtomicBool,
     runtime: &tokio::runtime::Handle,
+    channels: usize,
     equalizer: Option<&mut StreamEqualizer>,
 ) -> Result<(), String> {
     let Some(equalizer) = equalizer else {
-        return write_pcm(writer, samples, discard, cancelled, runtime);
+        return write_pcm(
+            writer,
+            samples,
+            discard_frames,
+            cancelled,
+            runtime,
+            channels,
+        );
     };
-    let skip = (*discard).min(samples.len());
-    *discard -= skip;
+    let skip = discard_interleaved_frames(samples, discard_frames, channels)
+        .map_err(|error| error.to_string())?;
     if skip == samples.len() || cancelled.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -481,51 +511,234 @@ impl TempoStretchProcessor {
         channels: usize,
         envelope: TempoEnvelope,
     ) -> Result<Self, StretchError> {
-        let inner =
-            StreamProcessor::try_from_tempo(source_bpm, target_bpm, sample_rate, channels as u32)?;
-        let latency_samples = inner.latency_samples();
+        if sample_rate == 0 {
+            return Err(StretchError::InvalidFormat(
+                "sample rate must be greater than zero".into(),
+            ));
+        }
+        if !(1..=2).contains(&channels) {
+            return Err(StretchError::InvalidFormat(format!(
+                "supported channel counts are 1 or 2, got {channels}"
+            )));
+        }
+
+        let bypass = envelope_is_global_identity(envelope);
+        let inner = if bypass {
+            None
+        } else {
+            Some(StreamProcessor::try_from_tempo(
+                source_bpm,
+                target_bpm,
+                sample_rate,
+                channels as u32,
+            )?)
+        };
+        let processor_latency_frames = inner.as_ref().map_or(0, StreamProcessor::latency_samples);
+        let latency_frames = effective_latency_frames(envelope, processor_latency_frames);
+        let latency_values = interleaved_values(latency_frames, channels).ok_or_else(|| {
+            StretchError::InvalidFormat(
+                "time-stretch latency exceeds interleaved PCM limits".into(),
+            )
+        })?;
         Ok(Self {
             inner,
             envelope,
             sample_rate,
             channels,
-            emitted_samples: 0,
-            latency_samples,
+            emitted_frames: 0,
+            latency_frames,
+            latency_values,
+            pending_value: None,
         })
     }
 
+    /// Processes whole interleaved frames. Empty input is a valid no-op;
+    /// malformed partial frames are rejected without modifying output.
     pub(crate) fn process_into(
         &mut self,
         input: &[f32],
         output: &mut Vec<f32>,
     ) -> Result<(), StretchError> {
-        let output_elapsed = std::time::Duration::from_secs_f64(
-            audible_output_samples(self.emitted_samples, self.latency_samples) as f64
-                / self.channels as f64
-                / self.sample_rate as f64,
-        );
+        validate_interleaved_input(input, self.channels)?;
+        if input.iter().any(|sample| !sample.is_finite()) {
+            return Err(StretchError::NonFiniteInput);
+        }
+
+        if self.inner.is_none() {
+            output.reserve(input.len());
+            output.extend_from_slice(input);
+            self.record_emitted_values(input.len())?;
+            return Ok(());
+        }
+
+        let output_elapsed =
+            audible_output_elapsed(self.emitted_frames, self.latency_frames, self.sample_rate);
         let speed = self.envelope.speed_at(output_elapsed);
-        self.inner.set_stretch_ratio(1.0 / f64::from(speed))?;
-        let before = output.len();
-        output.reserve(input.len().saturating_mul(2) + self.inner.latency_samples());
-        self.inner.process_into(input, output)?;
-        self.emitted_samples += output.len() - before;
+        self.inner
+            .as_mut()
+            .expect("checked above")
+            .set_stretch_ratio(1.0 / f64::from(speed))?;
+        let mut generated = Vec::with_capacity(input.len().saturating_mul(2) + self.latency_values);
+        self.inner
+            .as_mut()
+            .expect("checked above")
+            .process_into(input, &mut generated)?;
+        let emitted_values = self.append_complete_output(&generated, output)?;
+        self.record_emitted_values(emitted_values)?;
         Ok(())
     }
 
     pub(crate) fn flush_into(&mut self, output: &mut Vec<f32>) -> Result<(), StretchError> {
-        output.reserve(self.inner.latency_samples().saturating_mul(4));
-        self.inner.flush_into(output)?;
+        if self.inner.is_none() {
+            return Ok(());
+        }
+        let mut generated = Vec::with_capacity(self.latency_values.saturating_mul(4));
+        self.inner
+            .as_mut()
+            .expect("checked above")
+            .flush_into(&mut generated)?;
+        let mut emitted_values = self.append_complete_output(&generated, output)?;
+        if let Some(pending) = self.pending_value.take() {
+            // The upstream flush length correction can round to one value in
+            // a stereo stream. Complete that terminal frame deterministically
+            // instead of exposing a partial interleaved frame downstream.
+            output.extend_from_slice(&[pending, 0.0]);
+            emitted_values += 2;
+        }
+        self.record_emitted_values(emitted_values)?;
         Ok(())
     }
 
-    pub(crate) fn latency_samples(&self) -> usize {
-        self.latency_samples
+    pub(crate) fn latency_frames(&self) -> usize {
+        self.latency_frames
+    }
+
+    pub(crate) fn latency_values(&self) -> usize {
+        self.latency_values
+    }
+
+    fn record_emitted_values(&mut self, emitted_values: usize) -> Result<(), StretchError> {
+        let emitted_frames = emitted_values / self.channels;
+        if emitted_frames * self.channels != emitted_values {
+            return Err(StretchError::InvalidState(
+                "time-stretch emitted a partial interleaved frame",
+            ));
+        }
+        self.emitted_frames =
+            self.emitted_frames
+                .checked_add(emitted_frames)
+                .ok_or(StretchError::InvalidState(
+                    "time-stretch output frame counter overflow",
+                ))?;
+        Ok(())
+    }
+
+    fn append_complete_output(
+        &mut self,
+        generated: &[f32],
+        output: &mut Vec<f32>,
+    ) -> Result<usize, StretchError> {
+        if self.channels == 1 {
+            output.extend_from_slice(generated);
+            return Ok(generated.len());
+        }
+
+        let before = output.len();
+        let mut start = 0;
+        if let Some(pending) = self.pending_value.take() {
+            if generated.is_empty() {
+                self.pending_value = Some(pending);
+                return Ok(0);
+            }
+            output.extend_from_slice(&[pending, generated[0]]);
+            start = 1;
+        }
+        let remaining = generated.len() - start;
+        let end = generated.len() - remaining % self.channels;
+        if end < generated.len() {
+            let last = generated[end];
+            self.pending_value = Some(last);
+        }
+        output.extend_from_slice(&generated[start..end]);
+        Ok(output.len() - before)
     }
 }
 
-fn audible_output_samples(emitted_samples: usize, latency_samples: usize) -> usize {
-    emitted_samples.saturating_sub(latency_samples)
+fn interleaved_values(frames: usize, channels: usize) -> Option<usize> {
+    frames.checked_mul(channels)
+}
+
+fn audible_output_frames(emitted_frames: usize, latency_frames: usize) -> usize {
+    emitted_frames.saturating_sub(latency_frames)
+}
+
+fn audible_output_elapsed(
+    emitted_frames: usize,
+    latency_frames: usize,
+    sample_rate: u32,
+) -> std::time::Duration {
+    std::time::Duration::from_secs_f64(
+        audible_output_frames(emitted_frames, latency_frames) as f64 / f64::from(sample_rate),
+    )
+}
+
+fn validate_interleaved_input(input: &[f32], channels: usize) -> Result<(), StretchError> {
+    if channels == 0 || !input.len().is_multiple_of(channels) {
+        return Err(StretchError::InvalidFormat(format!(
+            "interleaved input has {} values, not a whole number of {channels}-channel frames",
+            input.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Returns the number of leading values to discard while consuming only whole
+/// interleaved frames.  This is shared by runtime chunk writes and preview
+/// rendering so latency can never split a stereo frame.
+pub(crate) fn discard_interleaved_frames(
+    samples: &[f32],
+    discard_frames: &mut usize,
+    channels: usize,
+) -> Result<usize, StretchError> {
+    validate_interleaved_input(samples, channels)?;
+    let skip_frames = (*discard_frames).min(samples.len() / channels);
+    *discard_frames -= skip_frames;
+    interleaved_values(skip_frames, channels).ok_or_else(|| {
+        StretchError::InvalidFormat("latency discard exceeds interleaved PCM limits".into())
+    })
+}
+
+fn ratio_is_upstream_unity(speed: f32) -> bool {
+    let speed = f64::from(speed);
+    speed.is_finite() && speed > 0.0 && (1.0 / speed - 1.0).abs() < UPSTREAM_RATIO_SNAP_THRESHOLD
+}
+
+fn envelope_is_global_identity(envelope: TempoEnvelope) -> bool {
+    // A canonical envelope has no private phase-follow segments.  Requiring
+    // this equality is deliberately stricter than timestretch's predicate:
+    // a hidden future phase segment must not turn a later 1.0 change into an
+    // incorrectly latency-free stream.
+    let canonical = TempoEnvelope::new(
+        envelope.initial_speed,
+        envelope.mix_end_speed,
+        envelope.hold,
+        envelope.ramp,
+    );
+    envelope == canonical
+        && ratio_is_upstream_unity(envelope.speed_at(Duration::ZERO))
+        && ratio_is_upstream_unity(envelope.speed_at(envelope.hold))
+        && ratio_is_upstream_unity(envelope.speed_at(envelope.hold.saturating_add(envelope.ramp)))
+}
+
+pub(crate) fn effective_latency_frames(
+    envelope: TempoEnvelope,
+    processor_latency_frames: usize,
+) -> usize {
+    if envelope_is_global_identity(envelope) {
+        0
+    } else {
+        processor_latency_frames
+    }
 }
 
 #[cfg(test)]
@@ -548,9 +761,174 @@ mod tests {
 
     #[test]
     fn tempo_timeline_starts_after_dsp_latency_is_discarded() {
-        assert_eq!(audible_output_samples(512, 1_024), 0);
-        assert_eq!(audible_output_samples(1_024, 1_024), 0);
-        assert_eq!(audible_output_samples(1_280, 1_024), 256);
+        assert_eq!(audible_output_frames(512, 1_024), 0);
+        assert_eq!(audible_output_frames(1_024, 1_024), 0);
+        assert_eq!(audible_output_frames(1_280, 1_024), 256);
+    }
+
+    #[test]
+    fn latency_frames_convert_to_complete_interleaved_frames() {
+        assert_eq!(interleaved_values(1_024, 1), Some(1_024));
+        assert_eq!(interleaved_values(1_024, 2), Some(2_048));
+        assert_eq!(interleaved_values(usize::MAX, 2), None);
+
+        let mut stereo = vec![0.0; 2_048];
+        stereo.extend_from_slice(&[0.25, -0.75, 0.5, -0.5]);
+        let discarded = interleaved_values(1_024, 2).unwrap();
+        assert_eq!(&stereo[discarded..], &[0.25, -0.75, 0.5, -0.5]);
+    }
+
+    #[test]
+    fn latency_discard_keeps_transients_on_whole_frames_for_all_runtime_layouts() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let latency_frames = 1_024;
+            let latency_values = interleaved_values(latency_frames, channels).unwrap();
+            let transient = if channels == 1 {
+                vec![0.75]
+            } else {
+                vec![0.75, -0.25]
+            };
+            let mut output = vec![0.0; latency_values];
+            output.extend_from_slice(&transient);
+
+            // This is the exact boundary used by both the streaming and
+            // preview paths: latency is in frames, output is interleaved.
+            let audible = &output[latency_values..];
+            assert_eq!(audible, transient, "{sample_rate}Hz/{channels}ch");
+            assert_eq!(audible.len() % channels, 0, "{sample_rate}Hz/{channels}ch");
+        }
+    }
+
+    #[test]
+    fn envelope_clock_counts_only_audible_emitted_frames() {
+        for sample_rate in [44_100, 48_000] {
+            let latency = 1_024;
+            assert_eq!(
+                audible_output_elapsed(latency, latency, sample_rate),
+                Duration::ZERO
+            );
+            assert_eq!(
+                audible_output_elapsed(latency + sample_rate as usize, latency, sample_rate),
+                Duration::from_secs(1)
+            );
+        }
+    }
+
+    #[test]
+    fn unity_stretch_removes_the_full_frame_latency_before_the_kick() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let envelope = TempoEnvelope::new(1.0, 1.0, Duration::from_secs(20), Duration::ZERO);
+            let mut processor =
+                TempoStretchProcessor::new(120.0, 120.0, sample_rate, channels, envelope).unwrap();
+            let kick_start = sample_rate as usize / 2;
+            let input = kick_track(sample_rate, channels, kick_start);
+            let mut output = Vec::with_capacity(input.len() * 2);
+            for chunk in input.chunks(channels * 1_024) {
+                processor.process_into(chunk, &mut output).unwrap();
+            }
+            processor.flush_into(&mut output).unwrap();
+
+            let latency_values = processor.latency_values();
+            let audible = &output[latency_values.min(output.len())..];
+            let first_kick = first_frame_above(audible, channels, 0.1)
+                .expect("the stretched kick should remain audible");
+            let expected = kick_start.saturating_sub(processor.latency_frames);
+            assert!(
+                first_kick.abs_diff(expected) <= 256,
+                "{sample_rate}Hz/{channels}ch: kick={first_kick}, expected={expected}"
+            );
+            if channels == 2 {
+                assert_stereo_kick_sides(audible, first_kick);
+            }
+        }
+    }
+
+    #[test]
+    fn global_identity_bypasses_latency_and_preserves_interleaved_pcm() {
+        for (sample_rate, channels) in [(44_100, 1), (44_100, 2), (48_000, 1), (48_000, 2)] {
+            let envelope = TempoEnvelope::new(1.0, 1.0, Duration::from_secs(20), Duration::ZERO);
+            let frames = 2_049;
+            let mut input = Vec::with_capacity(frames * channels);
+            for frame in 0..frames {
+                if frame == 0 {
+                    input.extend(std::iter::repeat_n(0.75, channels));
+                    if channels == 2 {
+                        input[1] = -0.25;
+                    }
+                } else {
+                    for channel in 0..channels {
+                        input.push((frame as f32 + channel as f32 * 0.25) / 10_000.0);
+                    }
+                }
+            }
+            let mut processor =
+                TempoStretchProcessor::new(120.0, 120.0, sample_rate, channels, envelope).unwrap();
+            assert_eq!(processor.latency_frames(), 0);
+            let mut output = Vec::new();
+            for chunk in input.chunks(channels * 7) {
+                processor.process_into(chunk, &mut output).unwrap();
+            }
+            processor.flush_into(&mut output).unwrap();
+            assert_eq!(output, input, "{sample_rate}Hz/{channels}ch");
+            assert_eq!(output.len() / channels, frames);
+            if channels == 2 {
+                assert_eq!(&output[..2], &[0.75, -0.25]);
+            } else {
+                assert_eq!(output[0], 0.75);
+            }
+        }
+    }
+
+    #[test]
+    fn latency_discard_consumes_short_first_chunks_without_splitting_frames() {
+        let mut remaining = 3;
+        let first = [0.0, -0.0];
+        let second = [0.0, -0.0, 0.0, -0.0];
+        assert_eq!(
+            discard_interleaved_frames(&first, &mut remaining, 2).unwrap(),
+            2
+        );
+        assert_eq!(remaining, 2);
+        assert_eq!(
+            discard_interleaved_frames(&second, &mut remaining, 2).unwrap(),
+            4
+        );
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn invalid_formats_and_partial_input_return_typed_errors() {
+        let envelope = TempoEnvelope::new(1.0, 1.0, Duration::ZERO, Duration::ZERO);
+        for (sample_rate, channels) in [(0, 1), (48_000, 0), (48_000, 3)] {
+            assert!(matches!(
+                TempoStretchProcessor::new(120.0, 120.0, sample_rate, channels, envelope),
+                Err(StretchError::InvalidFormat(_))
+            ));
+        }
+        let mut processor = TempoStretchProcessor::new(120.0, 120.0, 48_000, 2, envelope).unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            processor.process_into(&[1.0], &mut output),
+            Err(StretchError::InvalidFormat(_))
+        ));
+        processor.process_into(&[], &mut output).unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn effective_latency_stays_when_envelope_can_change_later() {
+        let near_unity = TempoEnvelope::new(
+            1.0 + 0.5 * UPSTREAM_RATIO_SNAP_THRESHOLD as f32,
+            1.0 + 0.5 * UPSTREAM_RATIO_SNAP_THRESHOLD as f32,
+            Duration::from_secs(1),
+            Duration::ZERO,
+        );
+        let identity = TempoStretchProcessor::new(120.0, 120.0, 48_000, 1, near_unity).unwrap();
+        assert_eq!(identity.latency_frames(), 0);
+
+        let changes_later = TempoEnvelope::new(1.0, 0.96, Duration::from_secs(1), Duration::ZERO);
+        let stretched = TempoStretchProcessor::new(120.0, 120.0, 48_000, 1, changes_later).unwrap();
+        assert_eq!(stretched.latency_frames(), 6_144);
     }
 
     #[test]
@@ -564,7 +942,7 @@ mod tests {
         );
         let mut processor = TempoStretchProcessor::new(124.0, 120.0, SAMPLE_RATE, 1, envelope)
             .expect("valid tempo configuration");
-        let latency = processor.latency_samples();
+        let latency = processor.latency_values();
         let input = sine(440.0, SAMPLE_RATE, 4.0);
         let mut output = Vec::with_capacity(input.len() * 2);
         for chunk in input.chunks(1_024) {
@@ -642,7 +1020,7 @@ mod tests {
         let envelope = TempoEnvelope::new(0.96, 0.96, Duration::from_secs(20), Duration::ZERO);
         let mut processor = TempoStretchProcessor::new(125.0, 120.0, SAMPLE_RATE, 2, envelope)
             .expect("valid stereo tempo configuration");
-        let latency = processor.latency_samples();
+        let latency = processor.latency_values();
         let left = sine(330.0, SAMPLE_RATE, 4.0);
         let right = sine(660.0, SAMPLE_RATE, 4.0);
         let mut input = Vec::with_capacity(left.len() * 2);
@@ -896,6 +1274,47 @@ mod tests {
                 (std::f32::consts::TAU * frequency * index as f32 / sample_rate as f32).sin() * 0.5
             })
             .collect()
+    }
+
+    fn kick_track(sample_rate: u32, channels: usize, kick_start: usize) -> Vec<f32> {
+        let frames = sample_rate as usize * 2;
+        let kick_frames = sample_rate as usize / 40;
+        let mut output = vec![0.0; frames * channels];
+        for frame in 0..kick_frames {
+            let amplitude = 1.0 - frame as f32 / kick_frames as f32;
+            let sample = (std::f32::consts::TAU * 65.0 * frame as f32 / sample_rate as f32).sin()
+                * amplitude;
+            let index = (kick_start + frame) * channels;
+            output[index] = sample;
+            if channels == 2 {
+                output[index + 1] = -sample * 0.5;
+            }
+        }
+        output
+    }
+
+    fn first_frame_above(samples: &[f32], channels: usize, threshold: f32) -> Option<usize> {
+        samples
+            .chunks_exact(channels)
+            .position(|frame| frame.iter().any(|sample| sample.abs() > threshold))
+    }
+
+    fn assert_stereo_kick_sides(samples: &[f32], first_kick: usize) {
+        let window = &samples[first_kick * 2..]
+            .chunks_exact(2)
+            .take(512)
+            .collect::<Vec<_>>();
+        let left_energy = window.iter().map(|frame| frame[0] * frame[0]).sum::<f32>();
+        let right_energy = window.iter().map(|frame| frame[1] * frame[1]).sum::<f32>();
+        let cross_energy = window.iter().map(|frame| frame[0] * frame[1]).sum::<f32>();
+        assert!(left_energy > 0.1, "left transient was not preserved");
+        assert!(right_energy > 0.01, "right transient was not preserved");
+        assert!(
+            cross_energy < 0.0,
+            "left/right transient polarity was not preserved"
+        );
+        let ratio = (right_energy / left_energy).sqrt();
+        assert!((0.3..0.7).contains(&ratio), "right/left kick ratio={ratio}");
     }
 
     fn estimate_frequency(samples: &[f32], sample_rate: u32) -> f32 {

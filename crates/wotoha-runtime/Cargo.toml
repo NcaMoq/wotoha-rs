@@ -6,9 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 aes = "0.8.4"
 async-trait.workspace = true
 async-stream = "0.3.6"
+beat-this.workspace = true
 bytes = "1.10.1"
 cipher = "0.4.4"
 cbc = "0.1.2"
@@ -19,6 +21,8 @@ hls_m3u8 = "0.4.1"
 patricia_tree = "0.8.0"
 pin-project.workspace = true
 reqwest.workspace = true
+rten = "0.24.0"
+rten-tensor = "0.24.0"
 serde.workspace = true
 serde_json.workspace = true
 serenity.workspace = true

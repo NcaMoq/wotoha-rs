@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "tracks": [
+    {
+      "id": "lover_online_extended",
+      "title": "NOTD & Maia Wright - Lover Online (Extended Mix)",
+      "genre": "house",
+      "url": "https://youtu.be/tbM2h4rWcmg?list=RDtbM2h4rWcmg",
+      "expected_video_id": "tbM2h4rWcmg",
+      "expected_title_tokens": ["NOTD", "Maia Wright", "Lover Online", "Extended Mix"]
+    },
+    {
+      "id": "closure_extended",
+      "title": "Colyn & Fahlberg - Closure (Extended Mix) | MELODIC TECHNO",
+      "genre": "melodic-techno",
+      "url": "https://www.youtube.com/watch?v=hvHmPxOhwUw",
+      "expected_video_id": "hvHmPxOhwUw",
+      "expected_title_tokens": ["Colyn", "Fahlberg", "Closure", "Extended Mix"]
+    },
+    {
+      "id": "another_world_extended",
+      "title": "MEDUZA x HAYLA - Another World (Extended Mix)",
+      "genre": "house",
+      "url": "https://www.youtube.com/watch?v=nQSznYRCSCY",
+      "expected_video_id": "nQSznYRCSCY",
+      "expected_title_tokens": ["MEDUZA", "HAYLA", "Another World", "Extended Mix"]
+    },
+    {
+      "id": "magic_extended",
+      "title": "Tujamo & BARTS - Magic (Extended Mix)",
+      "genre": "future-house",
+      "url": "https://www.youtube.com/watch?v=IoOrtD3fdbE",
+      "expected_video_id": "IoOrtD3fdbE",
+      "expected_title_tokens": ["Tujamo", "BARTS", "Magic", "Extended Mix"]
+    }
+  ],
+  "pairs": [
+    {
+      "outgoing": "lover_online_extended",
+      "incoming": "lover_online_extended",
+      "expected_transition_kind": "BeatMatched"
+    },
+    {
+      "outgoing": "closure_extended",
+      "incoming": "closure_extended",
+      "expected_transition_kind": "BeatMatched"
+    },
+    {
+      "outgoing": "another_world_extended",
+      "incoming": "another_world_extended",
+      "expected_transition_kind": "BeatMatched"
+    },
+    {
+      "outgoing": "magic_extended",
+      "incoming": "magic_extended",
+      "expected_transition_kind": "BeatMatched"
+    },
+    {
+      "outgoing": "closure_extended",
+      "incoming": "another_world_extended",
+      "expected_transition_kind": "BeatMatched"
+    },
+    {
+      "outgoing": "another_world_extended",
+      "incoming": "magic_extended",
+      "expected_transition_kind": "BeatMatched"
+    }
+  ],
+  "thresholds": {
+    "min_kick_coverage": 0.65,
+    "min_matched_kicks": 8,
+    "kick_phase_p95_ms": 25.0,
+    "kick_phase_max_ms": 35.0,
+    "kick_handoff_ms": 25.0,
+    "minimum_rms_gap_ratio": 0.35,
+    "silence_window_ms": 250,
+    "silence_threshold_dbfs": -45.0,
+    "maximum_sample_peak_dbfs": -1.0,
+    "maximum_true_peak_dbtp": -1.0
+  }
+}
