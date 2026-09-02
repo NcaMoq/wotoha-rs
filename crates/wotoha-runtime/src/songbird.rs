@@ -38,7 +38,11 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     PreparedHeader, PreparedSource, TrackRequest,
-    automix::{AutoMixConfig, TrackAnalysis},
+    analysis::TrackAnalysisV2,
+    automix::{
+        AutoMixConfig, TrackAnalysis, V2GuardedTransitionPlan,
+        plan_guarded_transition_v2_for_analysis,
+    },
     config::LoudnessConfig,
     debug::append_debug_log,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
@@ -52,6 +56,9 @@ use crate::{
     automix_cache::{ANALYSIS_CACHE_ANALYZER_VERSION, ANALYSIS_CACHE_CLASSICAL_ANALYZER_VERSION},
     automix_preview::{
         AutoMixPreview, AutoMixPreviewError, render_automix_preview_inputs_with_cancel,
+    },
+    beat_this_analysis::{
+        track_analysis_v2_from_legacy, track_analysis_v2_from_legacy_with_backend,
     },
     cancellable_http::CancellableHttpRequest,
     niconico_hls::NiconicoHlsRequest,
@@ -813,6 +820,74 @@ impl SongbirdRuntime {
         self.analyze_track_with_backend_mode(request, false).await
     }
 
+    /// Additive V2 conversion entry point for callers that are ready to feed
+    /// the versioned planner while the existing songbird/playback API remains
+    /// V1.  Cache hits preserve the backend provenance of the cached record;
+    /// transient/permanent classical results are converted with a classical
+    /// rhythm method and retain every non-rhythm component.
+    pub async fn analyze_track_v2(&self, request: &TrackRequest) -> Option<TrackAnalysisV2> {
+        if !analysis_source_supported(request) {
+            return None;
+        }
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        // Prefer the compact V2 namespace when available.  This preserves
+        // model scores, timing support, hypotheses and provenance that a V1
+        // cache cannot represent, while leaving the V1 cache untouched.
+        if let Ok(Some(analysis)) = self.analysis_cache.load_v2(&key) {
+            return Some(analysis);
+        }
+        if let Ok(Some(analysis)) = self.classical_cache.load_v2(&key) {
+            return Some(analysis);
+        }
+        let outcome = self.analyze_track_with_backend(request).await?;
+        let backend = outcome.backend;
+        let (analysis, neural_rhythm) = if let Some(rhythm) = outcome.v2_rhythm {
+            match crate::beat_this_analysis::track_analysis_v2_from_legacy_rhythm(
+                &outcome.analysis,
+                rhythm,
+                true,
+            ) {
+                Some(analysis) => (analysis, true),
+                // A future decoder/schema change must fail closed to the
+                // unchanged classical V1 aggregate rather than dropping the
+                // whole V2 record or mislabeling it Hybrid.
+                None => (track_analysis_v2_from_legacy(&outcome.analysis)?, false),
+            }
+        } else {
+            (
+                track_analysis_v2_from_legacy_with_backend(&outcome.analysis, backend)?,
+                matches!(
+                    backend,
+                    AnalysisBackend::Neural | AnalysisBackend::CachedNeural
+                ),
+            )
+        };
+        if neural_rhythm {
+            let _ = self.analysis_cache.store_v2(&key, &analysis);
+        } else if matches!(
+            backend,
+            AnalysisBackend::ClassicalPermanentIneligible
+                | AnalysisBackend::CachedClassicalPermanentIneligible
+        ) {
+            let _ = self.classical_cache.store_v2(&key, &analysis);
+        }
+        Some(analysis)
+    }
+
+    /// Opt-in V2 planner hook for playback integrations.  The established
+    /// VoiceRuntime trait and V1 playback planner remain unchanged; callers
+    /// that have two V2 records can explicitly select the timeline-first
+    /// guarded plan here and then hand its legacy executable plan to the
+    /// existing render/arm path.
+    pub fn plan_transition_v2(
+        &self,
+        outgoing: &TrackAnalysisV2,
+        incoming: &TrackAnalysisV2,
+        config: &AutoMixConfig,
+    ) -> V2GuardedTransitionPlan {
+        plan_guarded_transition_v2_for_analysis(outgoing, incoming, config)
+    }
+
     /// Analyze a newly-resolved playback request without reusing an earlier analysis result.
     ///
     /// Corpus acquisition retries deliberately obtain a fresh signed source URL.  A provider
@@ -840,6 +915,7 @@ impl SongbirdRuntime {
                 return Some(AnalysisOutcome {
                     analysis,
                     backend: AnalysisBackend::CachedNeural,
+                    v2_rhythm: None,
                 });
             }
             // This directory has a distinct analyzer identity and is written only
@@ -849,12 +925,14 @@ impl SongbirdRuntime {
                 return Some(AnalysisOutcome {
                     analysis,
                     backend: AnalysisBackend::CachedClassicalPermanentIneligible,
+                    v2_rhythm: None,
                 });
             }
             if let Some(analysis) = self.classical_fallback(&key) {
                 return Some(AnalysisOutcome {
                     analysis,
                     backend: AnalysisBackend::CachedClassicalTransientFailure,
+                    v2_rhythm: None,
                 });
             }
         }
@@ -871,18 +949,21 @@ impl SongbirdRuntime {
                     return Some(AnalysisOutcome {
                         analysis,
                         backend: AnalysisBackend::CachedNeural,
+                        v2_rhythm: None,
                     });
                 }
                 if let Ok(Some(analysis)) = self.classical_cache.load(&key) {
                     return Some(AnalysisOutcome {
                         analysis,
                         backend: AnalysisBackend::CachedClassicalPermanentIneligible,
+                        v2_rhythm: None,
                     });
                 }
                 if let Some(analysis) = self.classical_fallback(&key) {
                     return Some(AnalysisOutcome {
                         analysis,
                         backend: AnalysisBackend::CachedClassicalTransientFailure,
+                        v2_rhythm: None,
                     });
                 }
             }
@@ -1880,7 +1961,10 @@ mod tests {
 
     use reqwest::Client;
     use songbird::Songbird;
-    use wotoha_core::{PreparedHeader, PreparedSource, TrackMetadata, TrackRequest};
+    use wotoha_core::{
+        PreparedHeader, PreparedSource, TrackMetadata, TrackRequest, analysis::TrackAnalysisV2,
+        automix::AutoMixConfig,
+    };
 
     use super::{
         AnalysisBackend, AnalysisCacheKey, AnalysisOutcome, CLASSICAL_FALLBACK_RETRY_TTL,
@@ -1943,6 +2027,23 @@ mod tests {
     }
 
     #[test]
+    fn v2_planner_hook_consumes_versioned_records() {
+        let runtime = SongbirdRuntime::new(Songbird::serenity()).unwrap();
+        let outgoing = TrackAnalysisV2::unanalyzed(Duration::from_secs(10));
+        let incoming = TrackAnalysisV2::unanalyzed(Duration::from_secs(10));
+        let config = AutoMixConfig {
+            enabled: true,
+            crossfade: Duration::from_secs(4),
+            max_tempo_adjustment: 0.08,
+            min_beat_confidence: 0.6,
+        };
+
+        let plan = runtime.plan_transition_v2(&outgoing, &incoming, &config);
+
+        assert_eq!(plan.diagnostics.beatmatched_candidates, 0);
+    }
+
+    #[test]
     fn transient_classical_fallback_expires_for_a_neural_upgrade() {
         let stored_at = Instant::now();
         let fallback = ClassicalFallback {
@@ -1969,6 +2070,7 @@ mod tests {
         let fresh = AnalysisOutcome {
             analysis: wotoha_core::automix::TrackAnalysis::unanalyzed(Duration::from_secs(1)),
             backend: AnalysisBackend::ClassicalTransientFailure,
+            v2_rhythm: None,
         };
         assert_eq!(fresh.backend, AnalysisBackend::ClassicalTransientFailure);
         runtime.store_analysis_outcome(&key, &fresh);
@@ -1983,6 +2085,7 @@ mod tests {
         );
         assert_ne!(outcome.backend, AnalysisBackend::ClassicalTransientFailure);
         assert!(!outcome.backend.is_fresh_neural());
+        assert!(outcome.v2_rhythm.is_none());
     }
 
     #[test]

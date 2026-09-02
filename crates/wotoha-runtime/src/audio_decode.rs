@@ -7,6 +7,7 @@ use ebur128::{EbuR128, Mode};
 use songbird::input::{Input, LiveInput};
 use symphonia::core::{audio::SampleBuffer, errors::Error};
 use wotoha_core::{
+    analysis::RhythmAnalysis,
     audio_analysis::{LowBandFilter, analyze_mono_pcm_with_low_band, apply_energy_structure},
     automix::TrackAnalysis,
     beat_analysis::apply_neural_beat_observations,
@@ -71,6 +72,10 @@ impl AnalysisBackend {
 pub struct AnalysisOutcome {
     pub analysis: TrackAnalysis,
     pub backend: AnalysisBackend,
+    /// Event-preserving V2 rhythm produced from the same serialized neural
+    /// inference.  Legacy/cache outcomes leave this unset and remain fully
+    /// compatible with the V1 analysis consumer.
+    pub v2_rhythm: Option<RhythmAnalysis>,
 }
 
 impl LoudnessMeasurement {
@@ -411,6 +416,7 @@ fn analyze_input_with_limit(
     } else {
         AnalysisBackend::ClassicalTransientFailure
     };
+    let mut v2_rhythm = None;
     if neural_available && !cancelled.load(Ordering::Relaxed) && !neural_mono.is_empty() {
         // Keep the model lock scoped to this call.  All classical feature work
         // above is independent and is intentionally completed before serialized
@@ -419,6 +425,14 @@ fn analyze_input_with_limit(
             crate::beat_this_analysis::analyze_with_cancel(&neural_mono, NEURAL_RATE, cancelled)
             && !cancelled.load(Ordering::Relaxed)
         {
+            // Decode once into the event-preserving V2 rhythm value from the
+            // same raw observations used by the retained V1 compatibility
+            // wrapper.  Low-band support is metadata only; it cannot erase a
+            // valid neural event from this direct path.
+            v2_rhythm = crate::beat_this_analysis::rhythm_analysis_from_observations(
+                &observations,
+                &low_band,
+            );
             if apply_neural_beat_observations(&mut analysis, &observations, &low_band) {
                 backend = AnalysisBackend::Neural;
             } else {
@@ -427,9 +441,16 @@ fn analyze_input_with_limit(
                 // transient model/backend failure.
                 backend = AnalysisBackend::ClassicalPermanentIneligible;
             }
+            if v2_rhythm.is_some() {
+                backend = AnalysisBackend::Neural;
+            }
         }
     }
-    Some(AnalysisOutcome { analysis, backend })
+    Some(AnalysisOutcome {
+        analysis,
+        backend,
+        v2_rhythm,
+    })
 }
 
 #[cfg(test)]
@@ -451,6 +472,10 @@ mod tests {
         let outcome = analyze_input_with_cancel_outcome(playable, &AtomicBool::new(false))
             .expect("WAV should produce an analysis");
         assert_eq!(outcome.backend, AnalysisBackend::Neural);
+        assert!(
+            outcome.v2_rhythm.is_some(),
+            "the neural outcome should retain the direct V2 rhythm timeline"
+        );
         let analysis = outcome.analysis;
 
         assert!(analysis.duration.abs_diff(Duration::from_secs(12)) < Duration::from_millis(1));

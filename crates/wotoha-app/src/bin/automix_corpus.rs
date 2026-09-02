@@ -1331,17 +1331,15 @@ fn http_error_code(status: StatusCode) -> &'static str {
 }
 
 fn hash_url_allowed(url: &Url) -> bool {
-    if url.scheme() == "https" {
-        return true;
-    }
     #[cfg(test)]
     {
-        return url.scheme() == "http"
-            && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        url.scheme() == "https"
+            || (url.scheme() == "http"
+                && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1")))
     }
     #[cfg(not(test))]
     {
-        false
+        url.scheme() == "https"
     }
 }
 
@@ -3273,10 +3271,11 @@ mod tests {
             let content_length = response
                 .content_length
                 .unwrap_or(response.body.len() as u64);
-            let content_length = response
-                .include_content_length
-                .then(|| format!("Content-Length: {content_length}\r\n"))
-                .unwrap_or_default();
+            let content_length = if response.include_content_length {
+                format!("Content-Length: {content_length}\r\n")
+            } else {
+                String::new()
+            };
             let headers = format!(
                 "HTTP/1.1 {} Test\r\n{}{}{}Connection: close\r\n\r\n",
                 response.status, content_length, content_type, range

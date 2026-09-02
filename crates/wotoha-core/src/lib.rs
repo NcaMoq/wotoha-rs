@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod audio_analysis;
 pub mod automix;
 pub mod beat_analysis;

@@ -2,11 +2,43 @@ use std::time::Duration;
 
 use crate::vocal_analysis::effective_vocal_risk;
 
+/// The V2 planner is intentionally additive.  The original planner in this
+/// file is still used by the playback/runtime crates; these modules provide a
+/// timeline-first API that can be adopted by callers independently.
+pub mod candidate;
+pub mod diagnostics;
+pub mod reliability;
+pub mod scoring;
+
+pub use crate::analysis::BeatEvent;
+pub use candidate::{
+    BeatMatchEligibility, BeatMatchRejection, GuardedTransitionPlanV2, TempoHypothesis,
+    TempoHypothesisPair, TransitionCandidate, TransitionPlanV2, V2AnalysisInput,
+    V2GuardedTransitionPlan, V2TransitionPlan, beat_match_eligibility,
+    beat_match_eligibility_for_timelines, check_beat_match_eligibility,
+    cross_product_tempo_hypotheses, explain_beatmatch_decision_v2, plan_guarded_transition_v2,
+    plan_guarded_transition_v2_diagnostics, plan_guarded_transition_v2_for_analysis,
+    plan_guarded_transition_v2_with_diagnostics, plan_transition_v2,
+    plan_transition_v2_diagnostics, plan_transition_v2_for_analysis,
+    plan_transition_v2_with_diagnostics, select_tempo_hypothesis_pair, tempo_hypotheses,
+    tempo_hypothesis_pairs,
+};
+pub use diagnostics::{AutoMixV2Reason, CandidateRejection, PlannerDiagnostics};
+pub use reliability::{
+    BeatTimeline, ReliabilityBreakdown, TimelineEvent, compute_pair_reliability,
+    compute_pair_reliability_for_timelines, compute_pair_reliability_v2, compute_reliability,
+    compute_reliability_v2, geometric_pair_reliability, pair_reliability, reliability,
+    reliability_for_beat_events, reliability_for_rhythm, reliability_for_timeline,
+    reliability_for_timeline_window, reliability_for_track_analysis_v2, timeline_from_analysis,
+    timeline_from_beat_events, timeline_from_rhythm, timeline_from_track_analysis_v2,
+};
+pub use scoring::TransitionCostBreakdown;
+
 pub const TEMPO_SYNC_DEADBAND: f32 = 0.001;
 const MAX_TEMPO_SEGMENTS: usize = 32;
 const MIN_PHASE_MARKER_CONFIDENCE: f32 = 0.35;
 const MIN_AUDIBLE_MIX_OVERLAP: Duration = Duration::from_secs(1);
-const MAX_BEATMATCH_PHASE_ERROR: Duration = Duration::from_millis(35);
+pub(crate) const MAX_BEATMATCH_PHASE_ERROR: Duration = Duration::from_millis(35);
 const MAX_DOWNBEAT_PHASE_ERROR: Duration = Duration::from_millis(70);
 const MAX_PHRASE_PHASE_ERROR: Duration = Duration::from_millis(150);
 const MIN_LOW_HANDOFF_GAIN: f32 = 0.85;
