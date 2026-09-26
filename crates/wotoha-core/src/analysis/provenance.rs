@@ -1,6 +1,7 @@
 //! Provenance for analysis components.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use super::value::{Confidence, UnitInterval};
 
@@ -179,6 +180,31 @@ impl AnalysisProvenance {
         })
     }
 
+    /// Return provenance for a component by its canonical name.
+    ///
+    /// Production components are stored in their explicit named slots; the
+    /// `components` vector is reserved for additional/experimental entries.
+    /// `cue` and the older plural spelling `cues` refer to the same component.
+    /// Invalid records with conflicting entries are still rejected by
+    /// [`Self::validate`]; this accessor consistently prefers the named slot.
+    pub fn component(&self, name: &str) -> Option<&ComponentProvenance> {
+        let name = canonical_component_name(name);
+        let named = match name {
+            "rhythm" => self.rhythm.as_ref(),
+            "structure" => self.structure.as_ref(),
+            "tonal" => self.tonal.as_ref(),
+            "vocal" => self.vocal.as_ref(),
+            "energy" => self.energy.as_ref(),
+            "cue" => self.cue.as_ref().or(self.cues.as_ref()),
+            _ => None,
+        };
+        named.or_else(|| {
+            self.components
+                .iter()
+                .find(|component| canonical_component_name(&component.component) == name)
+        })
+    }
+
     pub fn validate(&self) -> bool {
         !self.analyzer.trim().is_empty()
             && self
@@ -209,20 +235,39 @@ impl AnalysisProvenance {
             && self.cues.as_ref().is_none_or(|component| {
                 component.component == "cue" || component.component == "cues"
             })
-            && self
-                .components
-                .iter()
-                .enumerate()
-                .all(|(index, component)| {
-                    self.components[..index]
-                        .iter()
-                        .all(|previous| previous.component != component.component)
-                })
+            && component_names_are_unique(self)
             && self
                 .overall_confidence
                 .as_ref()
                 .is_none_or(|confidence| confidence.validate())
     }
+}
+
+fn canonical_component_name(name: &str) -> &str {
+    if name == "cues" { "cue" } else { name }
+}
+
+fn component_names_are_unique(provenance: &AnalysisProvenance) -> bool {
+    let mut names = HashSet::with_capacity(provenance.components.len() + 7);
+    provenance
+        .components
+        .iter()
+        .map(|component| component.component.as_str())
+        .chain(
+            [
+                provenance.rhythm.as_ref(),
+                provenance.structure.as_ref(),
+                provenance.tonal.as_ref(),
+                provenance.vocal.as_ref(),
+                provenance.energy.as_ref(),
+                provenance.cue.as_ref(),
+                provenance.cues.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|component| component.component.as_str()),
+        )
+        .all(|name| names.insert(canonical_component_name(name)))
 }
 
 fn named_component_is(expected: &str, component: Option<&ComponentProvenance>) -> bool {
@@ -240,6 +285,48 @@ mod tests {
         let mut provenance = AnalysisProvenance::new("test-analyzer").unwrap();
         provenance.components = vec![component.clone(), component];
         assert!(!provenance.validate());
+    }
+
+    #[test]
+    fn provenance_rejects_duplicates_between_named_slots_and_extension_list() {
+        let rhythm = ComponentProvenance::new("rhythm", AnalysisMethod::Neural).unwrap();
+        let mut provenance = AnalysisProvenance::new("test-analyzer").unwrap();
+        provenance.rhythm = Some(rhythm.clone());
+        provenance.components.push(rhythm);
+
+        assert!(!provenance.validate());
+    }
+
+    #[test]
+    fn provenance_rejects_cue_cues_alias_collisions() {
+        let mut provenance = AnalysisProvenance::new("test-analyzer").unwrap();
+        provenance.cue = ComponentProvenance::new("cue", AnalysisMethod::Derived);
+        provenance.cues = ComponentProvenance::new("cues", AnalysisMethod::Imported);
+        assert!(!provenance.validate());
+
+        provenance.cues = None;
+        provenance
+            .components
+            .push(ComponentProvenance::new("cues", AnalysisMethod::Imported).unwrap());
+        assert!(!provenance.validate());
+    }
+
+    #[test]
+    fn canonical_component_accessor_prefers_named_slots_and_supports_extensions() {
+        let mut provenance = AnalysisProvenance::new("test-analyzer").unwrap();
+        provenance.rhythm = ComponentProvenance::new("rhythm", AnalysisMethod::Neural);
+        provenance.cues = ComponentProvenance::new("cues", AnalysisMethod::Derived);
+        provenance
+            .components
+            .push(ComponentProvenance::new("loudness", AnalysisMethod::Classical).unwrap());
+
+        assert_eq!(provenance.component("rhythm"), provenance.rhythm.as_ref());
+        assert_eq!(provenance.component("cue"), provenance.cues.as_ref());
+        assert_eq!(provenance.component("cues"), provenance.cues.as_ref());
+        assert_eq!(
+            provenance.component("loudness"),
+            provenance.components.first()
+        );
     }
 
     #[test]

@@ -47,8 +47,9 @@ pub struct NeuralBeatObservations {
 /// `time` is the event's source-of-truth timestamp. Callers must not discard
 /// these events and regenerate a uniform grid from a tempo summary. The
 /// support values intentionally remain separate: timing confidence describes
-/// the bounded-DP path, onset support describes the neural activation, and
-/// low-frequency support describes kick-band evidence.
+/// the bounded-DP path, generic onset support is absent unless an independent
+/// onset detector supplies it, and low-frequency support describes kick-band
+/// evidence. The Beat This! activation is already represented by `model_score`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NeuralBeatEvent {
     pub time: Duration,
@@ -57,7 +58,7 @@ pub struct NeuralBeatEvent {
     /// Raw downbeat score at this event (sigmoid downbeat logit).
     pub downbeat_score: f32,
     pub timing_confidence: f32,
-    pub onset_support: f32,
+    pub onset_support: Option<f32>,
     pub low_frequency_support: Option<f32>,
 }
 
@@ -115,7 +116,7 @@ impl NeuralRhythmAnalysis {
                     ModelScore::new(event.model_score),
                     ModelScore::new(event.downbeat_score),
                     Confidence::new(event.timing_confidence)?,
-                    Support::new(event.onset_support),
+                    event.onset_support.and_then(Support::new),
                     event.low_frequency_support.and_then(Support::new),
                 ))
             })
@@ -431,7 +432,9 @@ fn rhythm_from_grid(
                 model_score,
                 downbeat_score,
                 timing_confidence: grid.marker_confidences[index].clamp(0.0, 1.0),
-                onset_support: model_score,
+                // Beat This! activation is already carried as model_score;
+                // copying it here would count the same evidence twice.
+                onset_support: None,
                 low_frequency_support: low_frequency_support
                     .and_then(|support| support.get(index).copied())
                     .map(|support| support.clamp(0.0, 1.0)),
@@ -447,7 +450,9 @@ fn rhythm_from_grid(
                 || !event.model_score.is_finite()
                 || !event.downbeat_score.is_finite()
                 || !event.timing_confidence.is_finite()
-                || !event.onset_support.is_finite()
+                || event
+                    .onset_support
+                    .is_some_and(|support| !support.is_finite())
                 || event
                     .low_frequency_support
                     .is_some_and(|support| !support.is_finite())
@@ -1352,6 +1357,52 @@ mod tests {
                 .iter()
                 .all(|event| event.low_frequency_support.is_none())
         );
+        assert!(
+            rhythm
+                .beat_events
+                .iter()
+                .all(|event| event.onset_support.is_none())
+        );
+    }
+
+    #[test]
+    fn model_score_is_not_duplicated_as_onset_and_weak_kick_support_is_usable() {
+        let observations = click_logits(25, 300);
+        let mut low = vec![0.0_f32; 6_000];
+        for (index, frame) in (25..300).step_by(25).enumerate() {
+            let center_ms = frame * 20;
+            let amplitude = 0.1 + index as f32 * 0.08;
+            for sample in low.iter_mut().take(center_ms + 6).skip(center_ms - 4) {
+                *sample = amplitude;
+            }
+        }
+
+        let decoded = decode_neural_rhythm_with_low_frequency(&observations, &low)
+            .expect("periodic logits should decode with low-band support");
+        assert!(
+            decoded
+                .beat_events
+                .iter()
+                .all(|event| { event.model_score > 0.9 && event.onset_support.is_none() })
+        );
+        assert!(decoded.beat_events.iter().any(|event| {
+            event
+                .low_frequency_support
+                .is_some_and(|support| support > 0.0 && support < 0.35)
+        }));
+
+        let rhythm = decoded
+            .into_rhythm_analysis()
+            .expect("missing independent onset support is valid");
+        assert!(
+            rhythm
+                .beats
+                .iter()
+                .all(|event| { event.beat_model_score.is_some() && event.onset_support.is_none() })
+        );
+        let reliability = crate::automix::reliability::reliability_for_rhythm(&rhythm);
+        assert_eq!(reliability.generic_onset, None);
+        assert!(reliability.reliability.is_finite());
     }
 
     #[test]

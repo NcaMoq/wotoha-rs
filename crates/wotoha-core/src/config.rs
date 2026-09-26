@@ -16,6 +16,7 @@ const DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP: f32 = -2.0;
 const DEFAULT_MAX_QUEUE_LEN: usize = 512;
 const DEFAULT_MAX_PENDING_ENQUEUES: usize = 64;
 const DEFAULT_AUTOMIX_ENABLED: bool = true;
+const DEFAULT_AUTOMIX_V2_SHADOW_ENABLED: bool = false;
 const DEFAULT_AUTOMIX_CROSSFADE_SECONDS: f32 = 8.0;
 const DEFAULT_AUTOMIX_MAX_TEMPO_ADJUSTMENT: f32 = 0.06;
 const DEFAULT_AUTOMIX_MIN_BEAT_CONFIDENCE: f32 = 0.70;
@@ -51,6 +52,8 @@ pub struct PlaybackConfig {
     pub max_queue_len: usize,
     pub max_pending_enqueues: usize,
     pub automix: AutoMixConfig,
+    /// Observe the V2 transition planner alongside V1 without affecting playback.
+    pub automix_v2_shadow_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,6 +138,11 @@ impl BotConfig {
         )?;
         let automix_enabled =
             read_optional_bool(&get, "WOTOHA_AUTOMIX_ENABLED", DEFAULT_AUTOMIX_ENABLED)?;
+        let automix_v2_shadow_enabled = read_optional_bool(
+            &get,
+            "WOTOHA_AUTOMIX_V2_SHADOW_ENABLED",
+            DEFAULT_AUTOMIX_V2_SHADOW_ENABLED,
+        )?;
         let automix_crossfade_seconds = read_optional_f32(
             &get,
             "WOTOHA_AUTOMIX_CROSSFADE_SECONDS",
@@ -181,6 +189,7 @@ impl BotConfig {
                     max_tempo_adjustment: automix_max_tempo_adjustment,
                     min_beat_confidence: automix_min_beat_confidence,
                 },
+                automix_v2_shadow_enabled,
             },
         })
     }
@@ -372,6 +381,7 @@ mod tests {
         assert_eq!(config.playback.max_pending_enqueues, 64);
         assert!(config.playback.automix.enabled);
         assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 8.0);
+        assert!(!config.playback.automix_v2_shadow_enabled);
     }
 
     #[test]
@@ -390,6 +400,7 @@ mod tests {
             ("WOTOHA_MAX_QUEUE_LEN", "256"),
             ("WOTOHA_MAX_PENDING_ENQUEUES", "32"),
             ("WOTOHA_AUTOMIX_ENABLED", "false"),
+            ("WOTOHA_AUTOMIX_V2_SHADOW_ENABLED", "true"),
             ("WOTOHA_AUTOMIX_CROSSFADE_SECONDS", "12.5"),
             ("WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT", "0.08"),
             ("WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE", "0.80"),
@@ -412,6 +423,7 @@ mod tests {
         assert_eq!(config.playback.max_queue_len, 256);
         assert_eq!(config.playback.max_pending_enqueues, 32);
         assert!(!config.playback.automix.enabled);
+        assert!(config.playback.automix_v2_shadow_enabled);
         assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 12.5);
         assert_eq!(config.playback.automix.max_tempo_adjustment, 0.08);
         assert_eq!(config.playback.automix.min_beat_confidence, 0.80);

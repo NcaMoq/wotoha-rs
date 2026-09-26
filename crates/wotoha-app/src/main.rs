@@ -69,6 +69,7 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         default_volume = config.playback.default_volume,
         max_queue_len = config.playback.max_queue_len,
         max_pending_enqueues = config.playback.max_pending_enqueues,
+        automix_v2_shadow_enabled = config.playback.automix_v2_shadow_enabled,
         "configuration loaded"
     );
     let resolver = MediaResolver::new()?;
@@ -81,13 +82,16 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     });
     let (playback_runtime, songbird) = SongbirdRuntime::paired()?;
     let playback_runtime =
+        playback_runtime.with_v2_shadow_enabled(config.playback.automix_v2_shadow_enabled);
+    let playback_runtime =
         ConfiguredVoiceRuntime::new(playback_runtime, config.playback.default_volume);
     append_debug_log("main: playback runtime created");
-    let playback = PlaybackCoordinator::new_with_automix_and_loudness(
+    let playback = PlaybackCoordinator::new_with_automix_loudness_and_v2_shadow(
         resolver,
         playback_runtime.clone(),
         config.playback.automix.clone(),
         config.playback.loudness.clone(),
+        config.playback.automix_v2_shadow_enabled,
     );
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
@@ -252,6 +256,13 @@ where
         request: &TrackRequest,
     ) -> Option<wotoha_core::automix::TrackAnalysis> {
         self.inner.cached_track_analysis(request)
+    }
+
+    fn cached_track_analysis_v2(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<wotoha_core::analysis::TrackAnalysisV2> {
+        self.inner.cached_track_analysis_v2(request)
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -894,6 +905,7 @@ mod tests {
                 max_tempo_adjustment: 0.06,
                 min_beat_confidence: 0.7,
             },
+            automix_v2_shadow_enabled: false,
         }
     }
 

@@ -25,6 +25,7 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
+    automix::plan_guarded_transition_v2_for_analysis,
     automix::{
         AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TempoEnvelope,
         TrackAnalysis, TransitionKind, TransitionPlan, TransitionTiming,
@@ -50,6 +51,7 @@ const MIN_EQUALIZER_TRANSITION: std::time::Duration = std::time::Duration::from_
 const AUTOMIX_ANALYSIS_LOOKAHEAD: usize = 4;
 const LOUDNESS_GAIN_RAMP_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 const LOUDNESS_GAIN_RAMP_STEP: std::time::Duration = std::time::Duration::from_millis(50);
+const MAX_V2_SHADOW_DIAGNOSTICS: u64 = 128;
 fn track_analysis_key(request: &TrackRequest) -> String {
     let content_length = match &request.prepared {
         wotoha_core::PreparedSource::Http { content_length, .. } => *content_length,
@@ -75,6 +77,8 @@ struct PlaybackCoordinatorInner<M: MediaBackend, R: VoiceRuntime> {
     next_playback_id: AtomicU64,
     automix: AutoMixConfig,
     loudness: LoudnessConfig,
+    automix_v2_shadow_enabled: bool,
+    v2_shadow_diagnostic_count: AtomicU64,
 }
 
 struct GuildSession<ME, RE>
@@ -288,6 +292,16 @@ where
         automix: AutoMixConfig,
         loudness: LoudnessConfig,
     ) -> Self {
+        Self::new_with_automix_loudness_and_v2_shadow(media, runtime, automix, loudness, false)
+    }
+
+    pub fn new_with_automix_loudness_and_v2_shadow(
+        media: M,
+        runtime: R,
+        automix: AutoMixConfig,
+        loudness: LoudnessConfig,
+        automix_v2_shadow_enabled: bool,
+    ) -> Self {
         let (events, receiver) = unbounded_channel();
         let playback = Self {
             inner: Arc::new(PlaybackCoordinatorInner {
@@ -299,6 +313,8 @@ where
                 next_playback_id: AtomicU64::new(1),
                 automix,
                 loudness,
+                automix_v2_shadow_enabled,
+                v2_shadow_diagnostic_count: AtomicU64::new(0),
             }),
         };
         playback.spawn_runtime_event_loop(receiver);
@@ -1480,7 +1496,7 @@ where
         let Some(session) = self.get_session(guild_id) else {
             return;
         };
-        let (generation, next, timing, event_after, current_tempo) = {
+        let (generation, next, timing, event_after, current_tempo, outgoing_request) = {
             let _operation = session.operation.lock().await;
             if !self.session_is_current(guild_id, session_id) {
                 return;
@@ -1528,6 +1544,7 @@ where
                 timing,
                 event_after,
                 playback.current_tempo,
+                playback.logical.current().cloned(),
             )
         };
 
@@ -1592,6 +1609,64 @@ where
                     incoming_gain,
                 )
             });
+        if self.inner.automix_v2_shadow_enabled
+            && let Some(outgoing_request) = outgoing_request.as_ref()
+        {
+            let outgoing_v2 = self
+                .inner
+                .runtime
+                .cached_track_analysis_v2(outgoing_request);
+            let incoming_v2 = self.inner.runtime.cached_track_analysis_v2(&prepared);
+            if let (Some(outgoing_v2), Some(incoming_v2)) = (outgoing_v2, incoming_v2) {
+                let diagnostic_index = self
+                    .inner
+                    .v2_shadow_diagnostic_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if diagnostic_index < MAX_V2_SHADOW_DIAGNOSTICS {
+                    let shadow = plan_guarded_transition_v2_for_analysis(
+                        &outgoing_v2,
+                        &incoming_v2,
+                        &self.inner.automix,
+                    );
+                    let selected_cue = shadow.cue_diagnostics;
+                    info!(
+                        guild_id = guild_id.get(),
+                        playback_id = playback_id.get(),
+                        incoming_playback_id = incoming_id.get(),
+                        v1_kind = ?guarded_plan.as_ref().map(|plan| plan.plan.kind),
+                        v2_shadow_kind = ?shadow.plan.kind,
+                        v2_beatmatched_candidates = shadow.diagnostics.beatmatched_candidates,
+                        v2_crossfade_candidates = shadow.diagnostics.crossfade_candidates,
+                        v2_gapless_candidates = shadow.diagnostics.gapless_candidates,
+                        v2_cue_pairs_checked = shadow.diagnostics.cue_pairs_checked,
+                        v2_cue_tempo_combinations_checked = shadow.diagnostics.cue_tempo_combinations_checked,
+                        v2_hard_rejection_count = shadow.diagnostics.hard_rejections.len(),
+                        v2_eligible_but_crossfaded = shadow.diagnostics.eligible_but_crossfaded,
+                        v2_cost_total = shadow.cost.total,
+                        v2_cost_rhythm_uncertainty = shadow.cost.rhythm_uncertainty_cost,
+                        v2_cost_tempo_stretch = shadow.cost.tempo_stretch_cost,
+                        v2_cost_phase_precision = shadow.cost.phase_precision_cost,
+                        v2_cost_structure_uncertainty = shadow.cost.structure_uncertainty_cost,
+                        v2_cost_cue_suitability = shadow.cost.cue_suitability_cost,
+                        v2_cost_legacy_quality = shadow.cost.legacy_quality_cost,
+                        v2_outgoing_cue_index = ?selected_cue.map(|cue| cue.outgoing_cue_index),
+                        v2_incoming_cue_index = ?selected_cue.map(|cue| cue.incoming_cue_index),
+                        v2_cue_score = ?selected_cue.map(|cue| cue.cue_score),
+                        v2_tempo_pair_cost = ?selected_cue.map(|cue| cue.tempo_pair.cost),
+                        v2_outgoing_tempo_bpm = ?selected_cue.map(|cue| cue.tempo_pair.outgoing.bpm),
+                        v2_incoming_tempo_bpm = ?selected_cue.map(|cue| cue.tempo_pair.incoming.bpm),
+                        v2_outgoing_tempo_relation = ?selected_cue.map(|cue| cue.tempo_pair.outgoing.relation),
+                        v2_incoming_tempo_relation = ?selected_cue.map(|cue| cue.tempo_pair.incoming.relation),
+                        v2_rhythm_reliability = ?selected_cue.map(|cue| cue.rhythm_reliability),
+                        outgoing_base_gain = outgoing_gain,
+                        incoming_base_gain = incoming_gain,
+                        "AutoMix V2 shadow observation (V1 remains authoritative)"
+                    );
+                } else if diagnostic_index == MAX_V2_SHADOW_DIAGNOSTICS {
+                    info!("AutoMix V2 shadow diagnostics suppressed after bounded sample");
+                }
+            }
+        }
         let beatmatched_plan = guarded_plan
             .as_ref()
             .is_some_and(|guarded| guarded.plan.kind == TransitionKind::BeatMatched);

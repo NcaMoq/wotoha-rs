@@ -89,6 +89,7 @@ const STREAM_HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_V2_SHADOW_CACHE_ENTRIES: usize = 32;
 // A classical fallback is deliberately process-local and short-lived. This
 // bounds retries after a transient model failure while allowing a newly
 // available embedded model to upgrade the same source on the next attempt.
@@ -144,6 +145,8 @@ pub struct SongbirdRuntime {
     classical_fallbacks: Arc<Mutex<HashMap<AnalysisCacheKey, ClassicalFallback>>>,
     analysis_limit: Arc<Semaphore>,
     tracks: Arc<Mutex<HashMap<TrackIdentity, Weak<SongbirdTrackHandle>>>>,
+    v2_shadow_enabled: bool,
+    v2_shadow_cache: Option<Arc<Mutex<HashMap<AnalysisCacheKey, TrackAnalysisV2>>>>,
 }
 
 struct ClassicalFallback {
@@ -229,7 +232,21 @@ impl SongbirdRuntime {
             classical_fallbacks: Arc::new(Mutex::new(HashMap::new())),
             analysis_limit: Arc::new(Semaphore::new(2)),
             tracks: Arc::new(Mutex::new(HashMap::new())),
+            v2_shadow_enabled: false,
+            v2_shadow_cache: None,
         })
+    }
+
+    /// Enables V2 cache observation for the playback shadow path. It does not
+    /// alter the V1 analyzer or playback planner.
+    pub fn with_v2_shadow_enabled(mut self, enabled: bool) -> Self {
+        self.v2_shadow_enabled = enabled;
+        if enabled && self.v2_shadow_cache.is_none() {
+            self.v2_shadow_cache = Some(Arc::new(Mutex::new(HashMap::new())));
+        } else if !enabled {
+            self.v2_shadow_cache = None;
+        }
+        self
     }
 
     pub async fn ensure_joined(
@@ -789,9 +806,11 @@ impl VoiceRuntime for SongbirdRuntime {
     }
 
     async fn analyze_track(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
-        self.analyze_track_with_backend(request)
-            .await
-            .map(|outcome| outcome.analysis)
+        let outcome = self.analyze_track_with_backend(request).await?;
+        if self.v2_shadow_enabled {
+            self.remember_analysis_v2_from_outcome(request, &outcome);
+        }
+        Some(outcome.analysis)
     }
 
     fn cached_track_analysis(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
@@ -799,7 +818,27 @@ impl VoiceRuntime for SongbirdRuntime {
             return None;
         }
         let key = AnalysisCacheKey::from_request(request).ok()?;
-        self.analysis_cache.load(&key).ok().flatten()
+        let analysis = self.analysis_cache.load(&key).ok().flatten()?;
+        if self.v2_shadow_enabled {
+            self.remember_cached_v2(&key, &analysis);
+        }
+        Some(analysis)
+    }
+
+    fn cached_track_analysis_v2(&self, request: &TrackRequest) -> Option<TrackAnalysisV2> {
+        if !self.v2_shadow_enabled {
+            return None;
+        }
+        if !analysis_source_supported(request) {
+            return None;
+        }
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        self.v2_shadow_cache
+            .as_ref()?
+            .lock()
+            .ok()?
+            .get(&key)
+            .cloned()
     }
 
     async fn disconnect_guild(&self, guild_id: GuildKey) -> Result<(), Self::Error> {
@@ -811,6 +850,52 @@ impl VoiceRuntime for SongbirdRuntime {
 }
 
 impl SongbirdRuntime {
+    fn remember_analysis_v2_from_outcome(&self, request: &TrackRequest, outcome: &AnalysisOutcome) {
+        let Some(key) = AnalysisCacheKey::from_request(request).ok() else {
+            return;
+        };
+        let Some((analysis, _neural_rhythm)) = analysis_outcome_to_v2(outcome) else {
+            return;
+        };
+        self.remember_v2(&key, analysis);
+    }
+
+    fn remember_cached_v2(&self, key: &AnalysisCacheKey, legacy: &TrackAnalysis) {
+        let Some(shadow_cache) = self.v2_shadow_cache.as_ref() else {
+            return;
+        };
+        if shadow_cache
+            .lock()
+            .ok()
+            .is_some_and(|cache| cache.contains_key(key))
+        {
+            return;
+        }
+        // Adapt the already-loaded V1 record locally. Avoid additional disk
+        // reads on the playback path; V2 cache misses are observational only.
+        if let Some(analysis) =
+            track_analysis_v2_from_legacy_with_backend(legacy, AnalysisBackend::CachedNeural)
+        {
+            self.remember_v2(key, analysis);
+        }
+    }
+
+    fn remember_v2(&self, key: &AnalysisCacheKey, analysis: TrackAnalysisV2) {
+        let Some(shadow_cache) = self.v2_shadow_cache.as_ref() else {
+            return;
+        };
+        let Ok(mut cache) = shadow_cache.lock() else {
+            return;
+        };
+        if !cache.contains_key(key)
+            && cache.len() >= MAX_V2_SHADOW_CACHE_ENTRIES
+            && let Some(evicted_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted_key);
+        }
+        cache.insert(key.clone(), analysis);
+    }
+
     /// Analyze a track while preserving the backend/provenance needed by
     /// callers that enforce a fresh neural-analysis gate.
     pub async fn analyze_track_with_backend(
@@ -841,27 +926,7 @@ impl SongbirdRuntime {
         }
         let outcome = self.analyze_track_with_backend(request).await?;
         let backend = outcome.backend;
-        let (analysis, neural_rhythm) = if let Some(rhythm) = outcome.v2_rhythm {
-            match crate::beat_this_analysis::track_analysis_v2_from_legacy_rhythm(
-                &outcome.analysis,
-                rhythm,
-                true,
-            ) {
-                Some(analysis) => (analysis, true),
-                // A future decoder/schema change must fail closed to the
-                // unchanged classical V1 aggregate rather than dropping the
-                // whole V2 record or mislabeling it Hybrid.
-                None => (track_analysis_v2_from_legacy(&outcome.analysis)?, false),
-            }
-        } else {
-            (
-                track_analysis_v2_from_legacy_with_backend(&outcome.analysis, backend)?,
-                matches!(
-                    backend,
-                    AnalysisBackend::Neural | AnalysisBackend::CachedNeural
-                ),
-            )
-        };
+        let (analysis, neural_rhythm) = analysis_outcome_to_v2(&outcome)?;
         if neural_rhythm {
             let _ = self.analysis_cache.store_v2(&key, &analysis);
         } else if matches!(
@@ -1035,6 +1100,29 @@ impl SongbirdRuntime {
         let mut tracks = self.tracks.lock().ok()?;
         tracks.retain(|_, handle| handle.strong_count() != 0);
         tracks.get(&identity).and_then(Weak::upgrade)
+    }
+}
+
+fn analysis_outcome_to_v2(outcome: &AnalysisOutcome) -> Option<(TrackAnalysisV2, bool)> {
+    if let Some(rhythm) = outcome.v2_rhythm.clone() {
+        match crate::beat_this_analysis::track_analysis_v2_from_legacy_rhythm(
+            &outcome.analysis,
+            rhythm,
+            true,
+        ) {
+            Some(analysis) => Some((analysis, true)),
+            // Fail closed to the unchanged V1 aggregate. An invalid future
+            // neural schema must not make the observation path affect playback.
+            None => Some((track_analysis_v2_from_legacy(&outcome.analysis)?, false)),
+        }
+    } else {
+        Some((
+            track_analysis_v2_from_legacy_with_backend(&outcome.analysis, outcome.backend)?,
+            matches!(
+                outcome.backend,
+                AnalysisBackend::Neural | AnalysisBackend::CachedNeural
+            ),
+        ))
     }
 }
 
@@ -1961,16 +2049,17 @@ mod tests {
 
     use reqwest::Client;
     use songbird::Songbird;
+    use wotoha_contracts::VoiceRuntime;
     use wotoha_core::{
-        PreparedHeader, PreparedSource, TrackMetadata, TrackRequest, analysis::TrackAnalysisV2,
-        automix::AutoMixConfig,
+        PreparedHeader, PreparedSource, TrackMetadata, TrackRequest, analysis::RhythmAnalysis,
+        analysis::TrackAnalysisV2, automix::AutoMixConfig,
     };
 
     use super::{
         AnalysisBackend, AnalysisCacheKey, AnalysisOutcome, CLASSICAL_FALLBACK_RETRY_TTL,
-        ClassicalFallback, MAX_ANALYSIS_DURATION, SongbirdRuntime, SongbirdRuntimeError,
-        TrackEndReason, TrackLifecycle, analysis_source_supported, build_input,
-        should_use_ranged_request,
+        ClassicalFallback, MAX_ANALYSIS_DURATION, MAX_V2_SHADOW_CACHE_ENTRIES, SongbirdRuntime,
+        SongbirdRuntimeError, TrackEndReason, TrackLifecycle, analysis_outcome_to_v2,
+        analysis_source_supported, build_input, should_use_ranged_request,
     };
 
     fn request_with_source(prepared: PreparedSource) -> TrackRequest {
@@ -2041,6 +2130,57 @@ mod tests {
         let plan = runtime.plan_transition_v2(&outgoing, &incoming, &config);
 
         assert_eq!(plan.diagnostics.beatmatched_candidates, 0);
+    }
+
+    #[test]
+    fn shadow_conversion_reuses_v2_rhythm_from_the_v1_analysis_outcome() {
+        let rhythm = RhythmAnalysis::default();
+        let outcome = AnalysisOutcome {
+            analysis: wotoha_core::automix::TrackAnalysis::unanalyzed(Duration::from_secs(10)),
+            backend: AnalysisBackend::Neural,
+            v2_rhythm: Some(rhythm.clone()),
+        };
+
+        let (versioned, neural_rhythm) =
+            analysis_outcome_to_v2(&outcome).expect("same-outcome conversion should succeed");
+
+        assert!(neural_rhythm);
+        assert_eq!(versioned.rhythm, rhythm);
+    }
+
+    #[test]
+    fn shadow_cache_is_opt_in_and_reuses_only_bounded_memory_records() {
+        let runtime = SongbirdRuntime::new(Songbird::serenity()).unwrap();
+        let request = request_with_source(PreparedSource::http(
+            "https://manifest.googlevideo.com/videoplayback",
+            Vec::<PreparedHeader>::new().into_boxed_slice(),
+            None,
+            None,
+        ));
+        let key = AnalysisCacheKey::from_request(&request).unwrap();
+        let versioned = TrackAnalysisV2::unanalyzed(Duration::from_secs(10));
+        assert!(runtime.cached_track_analysis_v2(&request).is_none());
+        let shadow_enabled = runtime.with_v2_shadow_enabled(true);
+        shadow_enabled.remember_v2(&key, versioned.clone());
+        assert_eq!(
+            shadow_enabled.cached_track_analysis_v2(&request),
+            Some(versioned)
+        );
+        for index in 0..=MAX_V2_SHADOW_CACHE_ENTRIES {
+            let key =
+                AnalysisCacheKey::new("youtube", format!("shadow-{index}"), None, None).unwrap();
+            shadow_enabled.remember_v2(&key, TrackAnalysisV2::unanalyzed(Duration::from_secs(10)));
+        }
+        assert_eq!(
+            shadow_enabled
+                .v2_shadow_cache
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .len(),
+            MAX_V2_SHADOW_CACHE_ENTRIES
+        );
     }
 
     #[test]

@@ -89,6 +89,7 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 | `DISCORD_TOKEN` | 必須 | Discord Botトークン |
 | `WOTOHA_DEFAULT_VOLUME` | `0.10` | マスター再生音量 |
 | `WOTOHA_AUTOMIX_ENABLED` | `true` | 起動時からAutoMixを有効化 |
+| `WOTOHA_AUTOMIX_V2_SHADOW_ENABLED` | `false` | V1 を再生判断のまま維持し、V2 プランナーの診断のみを観測 |
 | `WOTOHA_AUTOMIX_CROSSFADE_SECONDS` | `8.0` | 希望する最大クロスフェード時間 |
 | `WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT` | `0.06` | Beat Matchで許可する最大テンポ調整率 |
 | `WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE` | `0.70` | Beat Matchに必要な最低ビート信頼度 |

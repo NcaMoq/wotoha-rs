@@ -16,15 +16,29 @@ use super::{
 };
 
 const MIN_V2_BEAT_PAIRS: usize = 3;
-const MAX_CANDIDATES: usize = 3;
+const MAX_CUE_TRANSITION_CANDIDATES: usize = 64;
+const MIN_CUE_OVERLAP: Duration = Duration::from_secs(1);
 
-use crate::analysis::{TempoRelation, TrackAnalysisV2, UnitInterval};
+use crate::analysis::{
+    CueRole, DjCue, PhraseBoundary, TempoRelation, TrackAnalysisV2, UnitInterval,
+    bound_cue_candidates, top_mix_in_cues, top_mix_out_cues,
+};
 
 /// Adapter boundary accepted by the V2 planner.  Keeping this trait generic
 /// lets existing V1 callers use the new cost/diagnostic API while versioned
 /// callers retain the richer `TrackAnalysisV2` beat-event timeline.
 pub trait V2AnalysisInput {
     fn as_v2_legacy_view(&self) -> TrackAnalysis;
+
+    /// Beat-indexed cue evidence. Legacy adapters intentionally have no cues.
+    fn cue_candidates(&self) -> Vec<DjCue> {
+        Vec::new()
+    }
+
+    /// Phrase boundaries used to keep cue starts within the first/last phrase.
+    fn phrase_boundaries(&self) -> Vec<PhraseBoundary> {
+        Vec::new()
+    }
 
     fn rhythm_timeline(&self) -> BeatTimeline {
         timeline_from_analysis(&self.as_v2_legacy_view())
@@ -70,12 +84,14 @@ impl V2AnalysisInput for TrackAnalysisV2 {
             .sum::<f32>()
             / self.rhythm.beats.len().max(1) as f32;
 
+        // The legacy BeatGrid is explicitly 4/4.  Only adapt a resolved
+        // 4-beat meter into its phase-facing fields; an unresolved meter (or
+        // a resolved meter the legacy representation cannot express) remains
+        // auxiliary V2 evidence and must not masquerade as confirmed phase.
         if let Some(meter) = self
             .rhythm
-            .meter_hypotheses
-            .iter()
-            .filter(|meter| meter.validate())
-            .max_by(|left, right| left.score.get().total_cmp(&right.score.get()))
+            .resolved_meter_hypothesis()
+            .filter(|meter| meter.beats_per_bar == 4)
         {
             view.downbeat_confidence = meter.score.get();
             view.first_downbeat = self
@@ -152,6 +168,14 @@ impl V2AnalysisInput for TrackAnalysisV2 {
         timeline_from_track_analysis_v2(self)
     }
 
+    fn cue_candidates(&self) -> Vec<DjCue> {
+        self.cues.clone()
+    }
+
+    fn phrase_boundaries(&self) -> Vec<PhraseBoundary> {
+        self.structure.phrase_boundaries.clone()
+    }
+
     fn tempo_hypotheses(&self) -> Vec<TempoHypothesis> {
         if !self.rhythm.tempo_hypotheses.is_empty() {
             return self.rhythm.tempo_hypotheses.clone();
@@ -204,6 +228,19 @@ pub struct TempoHypothesisPair {
     pub cost: f32,
 }
 
+/// Test/debug-visible evidence explaining a cue-backed BeatMatched candidate.
+/// Non-cue candidates leave this field empty; their cost and eligibility still
+/// expose the strategy and rhythm decisions that were evaluated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CueCandidateDiagnostics {
+    pub outgoing_cue_index: usize,
+    pub incoming_cue_index: usize,
+    pub cue_score: f32,
+    pub cue_suitability_cost: f32,
+    pub tempo_pair: TempoHypothesisPair,
+    pub rhythm_reliability: f32,
+}
+
 impl TempoHypothesisPair {
     pub fn new(outgoing: TempoHypothesis, incoming: TempoHypothesis) -> Option<Self> {
         if !outgoing.validate() || !incoming.validate() {
@@ -216,17 +253,39 @@ impl TempoHypothesisPair {
         let weight = (outgoing.relative_weight.get() * incoming.relative_weight.get())
             .sqrt()
             .clamp(0.0, 1.0);
+        let normalized_adjustment = (ratio - 1.0).abs();
+        let stretch_cost = normalized_adjustment;
+        let weight_cost = (1.0 - weight) * TEMPO_PAIR_WEIGHT_COST;
+        let relation_penalty =
+            tempo_relation_penalty(outgoing.relation) + tempo_relation_penalty(incoming.relation);
         Some(Self {
             outgoing,
             incoming,
             ratio,
-            normalized_adjustment: (ratio - 1.0).abs(),
+            normalized_adjustment,
             weight,
-            // A lower stretch is preferred; when stretch is equal, stronger
-            // hypotheses win.  This is used only as a deterministic ordering
-            // signal; the planner's total cost remains authoritative.
-            cost: (ratio - 1.0).abs() + (1.0 - weight) * 0.001,
+            // Stretch remains the dominant term.  Confidence and interpretation
+            // relation are soft preferences, so a strong half/double-time
+            // hypothesis can beat a weak primary one without being treated as
+            // equivalent to the primary interpretation.
+            cost: stretch_cost + weight_cost + relation_penalty,
         })
+    }
+
+    /// Stretch contribution to the pair-selection cost.
+    pub fn stretch_cost(self) -> f32 {
+        self.normalized_adjustment
+    }
+
+    /// Joint confidence penalty derived from both hypothesis weights.
+    pub fn weight_cost(self) -> f32 {
+        (1.0 - self.weight) * TEMPO_PAIR_WEIGHT_COST
+    }
+
+    /// Sum of the two relation penalties; primary hypotheses add no cost.
+    pub fn relation_penalty(self) -> f32 {
+        tempo_relation_penalty(self.outgoing.relation)
+            + tempo_relation_penalty(self.incoming.relation)
     }
 
     pub fn within_adjustment(self, max_tempo_adjustment: f32) -> bool {
@@ -238,10 +297,24 @@ impl TempoHypothesisPair {
     }
 }
 
+const TEMPO_PAIR_WEIGHT_COST: f32 = 0.02;
+
+fn tempo_relation_penalty(relation: TempoRelation) -> f32 {
+    match relation {
+        TempoRelation::Primary => 0.0,
+        TempoRelation::HalfTime | TempoRelation::DoubleTime => 0.001,
+        TempoRelation::Alternative => 0.003,
+    }
+}
+
 pub fn cross_product_tempo_hypotheses(
     outgoing: &[TempoHypothesis],
     incoming: &[TempoHypothesis],
 ) -> Vec<TempoHypothesisPair> {
+    const MAX_HYPOTHESES_PER_TRACK: usize = 8;
+    const MAX_TEMPO_COMBINATIONS: usize = MAX_HYPOTHESES_PER_TRACK * MAX_HYPOTHESES_PER_TRACK;
+    let outgoing = bounded_tempo_hypotheses(outgoing, MAX_HYPOTHESES_PER_TRACK);
+    let incoming = bounded_tempo_hypotheses(incoming, MAX_HYPOTHESES_PER_TRACK);
     let mut pairs = outgoing
         .iter()
         .copied()
@@ -255,9 +328,38 @@ pub fn cross_product_tempo_hypotheses(
     pairs.sort_by(|left, right| {
         left.cost
             .total_cmp(&right.cost)
+            .then_with(|| {
+                left.normalized_adjustment
+                    .total_cmp(&right.normalized_adjustment)
+            })
             .then_with(|| right.weight.total_cmp(&left.weight))
+            .then_with(|| left.outgoing.bpm.total_cmp(&right.outgoing.bpm))
+            .then_with(|| left.incoming.bpm.total_cmp(&right.incoming.bpm))
     });
+    pairs.truncate(MAX_TEMPO_COMBINATIONS);
     pairs
+}
+
+fn bounded_tempo_hypotheses(hypotheses: &[TempoHypothesis], limit: usize) -> Vec<TempoHypothesis> {
+    let mut hypotheses = hypotheses
+        .iter()
+        .copied()
+        .filter(TempoHypothesis::validate)
+        .collect::<Vec<_>>();
+    hypotheses.sort_by(|left, right| {
+        right
+            .relative_weight
+            .get()
+            .total_cmp(&left.relative_weight.get())
+            .then_with(|| left.bpm.total_cmp(&right.bpm))
+            .then_with(|| {
+                tempo_relation_penalty(left.relation)
+                    .total_cmp(&tempo_relation_penalty(right.relation))
+            })
+    });
+    hypotheses.dedup_by(|left, right| left.bpm == right.bpm && left.relation == right.relation);
+    hypotheses.truncate(limit);
+    hypotheses
 }
 
 pub fn tempo_hypothesis_pairs(
@@ -292,10 +394,12 @@ pub fn select_tempo_hypothesis_pair(
         .into_iter()
         .filter(|pair| pair.within_adjustment(max_tempo_adjustment))
         .min_by(|left, right| {
-            let left_stretch = (left.ratio - 1.0).abs();
-            let right_stretch = (right.ratio - 1.0).abs();
-            left_stretch
-                .total_cmp(&right_stretch)
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| {
+                    left.normalized_adjustment
+                        .total_cmp(&right.normalized_adjustment)
+                })
                 .then_with(|| right.weight.total_cmp(&left.weight))
         })
 }
@@ -352,6 +456,7 @@ pub struct TransitionCandidate {
     pub cost: TransitionCostBreakdown,
     pub beat_eligibility: Option<BeatMatchEligibility>,
     pub hard_rejection: Option<BeatMatchRejection>,
+    pub cue_diagnostics: Option<CueCandidateDiagnostics>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -374,6 +479,7 @@ impl TransitionPlanV2 {
 pub struct V2GuardedTransitionPlan {
     pub plan: TransitionPlan,
     pub cost: TransitionCostBreakdown,
+    pub cue_diagnostics: Option<CueCandidateDiagnostics>,
     pub quality: AutoMixQualityReport,
     pub diagnostics: PlannerDiagnostics,
     pub rejected_plan: Option<TransitionPlan>,
@@ -531,6 +637,10 @@ pub fn plan_transition_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
     let incoming_timeline = incoming.rhythm_timeline();
     let outgoing_hypotheses = outgoing.tempo_hypotheses();
     let incoming_hypotheses = incoming.tempo_hypotheses();
+    let outgoing_cues = outgoing.cue_candidates();
+    let incoming_cues = incoming.cue_candidates();
+    let outgoing_phrase_boundaries = outgoing.phrase_boundaries();
+    let incoming_phrase_boundaries = incoming.phrase_boundaries();
     let outgoing = outgoing.as_v2_legacy_view();
     let incoming = incoming.as_v2_legacy_view();
     let (plan, _) = plan_transition_v2_internal_with_context(
@@ -541,6 +651,10 @@ pub fn plan_transition_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
         &incoming_timeline,
         &outgoing_hypotheses,
         &incoming_hypotheses,
+        &outgoing_cues,
+        &incoming_cues,
+        &outgoing_phrase_boundaries,
+        &incoming_phrase_boundaries,
     );
     plan
 }
@@ -579,6 +693,11 @@ pub fn explain_beatmatch_decision_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
     }
     if planned.diagnostics.eligible_but_crossfaded {
         return AutoMixV2Reason::BeatMatchAvailableButCrossfadePreferred;
+    }
+    if planned.diagnostics.beatmatched_candidates > 0
+        && planned.plan.kind == TransitionKind::Gapless
+    {
+        return AutoMixV2Reason::BeatMatchAvailableButGaplessPreferred;
     }
     if let Some(rejection) = planned.diagnostics.hard_rejections.first() {
         return rejection.reason();
@@ -619,10 +738,16 @@ pub fn plan_guarded_transition_v2_with_diagnostics<O: V2AnalysisInput, I: V2Anal
     let incoming = incoming.as_v2_legacy_view();
     let raw_quality = evaluate_transition_quality(&outgoing, &incoming, &planned.plan);
     let quality = v2_quality_report(&raw_quality, planned.plan.kind);
+    let selected_cue_diagnostics = planned
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan == planned.plan)
+        .and_then(|candidate| candidate.cue_diagnostics);
     if !quality_has_v2_hard_issue(&raw_quality, planned.plan.kind) {
         return V2GuardedTransitionPlan {
             plan: planned.plan,
             cost: planned.cost,
+            cue_diagnostics: selected_cue_diagnostics,
             quality,
             diagnostics: planned.diagnostics,
             rejected_plan: None,
@@ -647,6 +772,7 @@ pub fn plan_guarded_transition_v2_with_diagnostics<O: V2AnalysisInput, I: V2Anal
             return V2GuardedTransitionPlan {
                 plan: candidate.plan.clone(),
                 cost: candidate.cost,
+                cue_diagnostics: candidate.cue_diagnostics,
                 quality: candidate_quality,
                 diagnostics,
                 rejected_plan: Some(planned.plan),
@@ -690,6 +816,7 @@ pub fn plan_guarded_transition_v2_with_diagnostics<O: V2AnalysisInput, I: V2Anal
             None,
             0.0,
         ),
+        cue_diagnostics: None,
         quality: gapless_quality,
         diagnostics,
         rejected_plan: Some(planned.plan),
@@ -718,6 +845,7 @@ pub fn plan_guarded_transition_v2_for_analysis(
     plan_guarded_transition_v2(outgoing, incoming, config)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_transition_v2_internal_with_context(
     outgoing: &TrackAnalysis,
     incoming: &TrackAnalysis,
@@ -726,13 +854,17 @@ fn plan_transition_v2_internal_with_context(
     incoming_timeline: &BeatTimeline,
     outgoing_hypotheses: &[TempoHypothesis],
     incoming_hypotheses: &[TempoHypothesis],
+    outgoing_cue_candidates: &[DjCue],
+    incoming_cue_candidates: &[DjCue],
+    outgoing_phrase_boundaries: &[PhraseBoundary],
+    incoming_phrase_boundaries: &[PhraseBoundary],
 ) -> (TransitionPlanV2, BeatMatchEligibility) {
     let gapless = gapless_plan(outgoing, incoming);
     let pair_reliability = pair_reliability(
         reliability_for_timeline(outgoing_timeline).reliability,
         reliability_for_timeline(incoming_timeline).reliability,
     );
-    let mut candidates = Vec::with_capacity(MAX_CANDIDATES);
+    let mut candidates = Vec::with_capacity(MAX_CUE_TRANSITION_CANDIDATES + 2);
     let eligibility = beat_match_eligibility_with_context(
         outgoing,
         incoming,
@@ -746,11 +878,38 @@ fn plan_transition_v2_internal_with_context(
     if !config.enabled {
         diagnostics.add_reason(AutoMixV2Reason::Disabled);
     }
-    if let Some(reason) = eligibility.rejection {
+    let (cue_candidates, cue_counts) = cue_transition_candidates(
+        outgoing,
+        incoming,
+        config,
+        outgoing_timeline,
+        incoming_timeline,
+        outgoing_hypotheses,
+        incoming_hypotheses,
+        outgoing_cue_candidates,
+        incoming_cue_candidates,
+        outgoing_phrase_boundaries,
+        incoming_phrase_boundaries,
+    );
+    diagnostics.outgoing_mix_out_cues = cue_counts.0;
+    diagnostics.incoming_mix_in_cues = cue_counts.1;
+    diagnostics.cue_pairs_checked = cue_counts.2;
+    diagnostics.cue_tempo_combinations_checked = cue_counts.3;
+    if cue_counts.2 == 0
+        && let Some(reason) = eligibility.rejection
+    {
         diagnostics.add_reason(reason.reason());
     }
+    for candidate in cue_candidates {
+        diagnostics.add_candidate(TransitionKind::BeatMatched);
+        candidates.push(candidate);
+    }
 
-    if config.enabled
+    if candidates
+        .iter()
+        .all(|candidate| candidate.plan.kind != TransitionKind::BeatMatched)
+        && cue_counts.2 == 0
+        && config.enabled
         && eligibility.eligible
         && let Some(tempo) = eligibility.tempo_hypothesis
         && let Some((outgoing_start, incoming_start, duration)) = physical_window(
@@ -821,6 +980,7 @@ fn plan_transition_v2_internal_with_context(
                 cost,
                 beat_eligibility: Some(eligibility.clone()),
                 hard_rejection: None,
+                cue_diagnostics: None,
             });
         }
     }
@@ -848,6 +1008,7 @@ fn plan_transition_v2_internal_with_context(
                 cost,
                 beat_eligibility: Some(eligibility.clone()),
                 hard_rejection: None,
+                cue_diagnostics: None,
             });
         }
     } else {
@@ -869,6 +1030,7 @@ fn plan_transition_v2_internal_with_context(
         cost: gapless_cost,
         beat_eligibility: Some(eligibility.clone()),
         hard_rejection: None,
+        cue_diagnostics: None,
     });
     diagnostics.add_candidate(TransitionKind::Gapless);
     candidates.sort_by(|left, right| {
@@ -885,17 +1047,20 @@ fn plan_transition_v2_internal_with_context(
             cost: gapless_cost,
             beat_eligibility: Some(eligibility.clone()),
             hard_rejection: None,
+            cue_diagnostics: None,
         });
-    let beat_eligible = eligibility.eligible
-        && candidates.iter().any(|candidate| {
-            candidate.plan.kind == TransitionKind::BeatMatched && candidate.hard_rejection.is_none()
-        });
+    let beat_eligible = candidates.iter().any(|candidate| {
+        candidate.plan.kind == TransitionKind::BeatMatched && candidate.hard_rejection.is_none()
+    });
     diagnostics.set_selection(selected.plan.kind, selected.cost, beat_eligible);
     if selected.plan.kind == TransitionKind::BeatMatched {
         diagnostics.add_reason(AutoMixV2Reason::BeatMatchedSelected);
     } else if beat_eligible && selected.plan.kind == TransitionKind::Crossfade {
         diagnostics.add_reason(AutoMixV2Reason::BeatMatchAvailableButCrossfadePreferred);
         diagnostics.add_reason(AutoMixV2Reason::CrossfadeSelected);
+    } else if beat_eligible && selected.plan.kind == TransitionKind::Gapless {
+        diagnostics.add_reason(AutoMixV2Reason::BeatMatchAvailableButGaplessPreferred);
+        diagnostics.add_reason(AutoMixV2Reason::GaplessSelected);
     } else if selected.plan.kind == TransitionKind::Crossfade {
         diagnostics.add_reason(AutoMixV2Reason::CrossfadeSelected);
     } else {
@@ -908,6 +1073,304 @@ fn plan_transition_v2_internal_with_context(
         candidates,
     };
     (plan, eligibility)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cue_transition_candidates(
+    outgoing: &TrackAnalysis,
+    incoming: &TrackAnalysis,
+    config: &AutoMixConfig,
+    outgoing_timeline: &BeatTimeline,
+    incoming_timeline: &BeatTimeline,
+    outgoing_hypotheses: &[TempoHypothesis],
+    incoming_hypotheses: &[TempoHypothesis],
+    outgoing_cue_candidates: &[DjCue],
+    incoming_cue_candidates: &[DjCue],
+    outgoing_phrase_boundaries: &[PhraseBoundary],
+    incoming_phrase_boundaries: &[PhraseBoundary],
+) -> (Vec<TransitionCandidate>, (usize, usize, usize, usize)) {
+    if !config.enabled
+        || !config.max_tempo_adjustment.is_finite()
+        || config.max_tempo_adjustment < 0.0
+    {
+        return (Vec::new(), (0, 0, 0, 0));
+    }
+    let outgoing_events = usable_events(outgoing, outgoing_timeline);
+    let incoming_events = usable_events(incoming, incoming_timeline);
+    if outgoing_events.len() < MIN_V2_BEAT_PAIRS
+        || incoming_events.len() < MIN_V2_BEAT_PAIRS
+        || !outgoing_timeline.has_strict_times()
+        || !incoming_timeline.has_strict_times()
+    {
+        return (Vec::new(), (0, 0, 0, 0));
+    }
+
+    let outgoing_cues = usable_role_cues(
+        outgoing_cue_candidates,
+        CueRole::MixOut,
+        outgoing,
+        outgoing_timeline,
+        outgoing_phrase_boundaries,
+    );
+    let incoming_cues = usable_role_cues(
+        incoming_cue_candidates,
+        CueRole::MixIn,
+        incoming,
+        incoming_timeline,
+        incoming_phrase_boundaries,
+    );
+    let cue_pair_count = outgoing_cues.len() * incoming_cues.len();
+    if outgoing_cues.is_empty() || incoming_cues.is_empty() {
+        return (Vec::new(), (outgoing_cues.len(), incoming_cues.len(), 0, 0));
+    }
+
+    let tempo_pairs = cross_product_tempo_hypotheses(outgoing_hypotheses, incoming_hypotheses)
+        .into_iter()
+        .filter(|pair| pair.within_adjustment(config.max_tempo_adjustment))
+        .collect::<Vec<_>>();
+    if tempo_pairs.is_empty() {
+        return (
+            Vec::new(),
+            (outgoing_cues.len(), incoming_cues.len(), cue_pair_count, 0),
+        );
+    }
+
+    // Rank all bounded cue/tempo combinations before doing quality evaluation.
+    // This keeps actual plan construction to a fixed maximum even when every
+    // cue and every tempo interpretation is available.
+    let mut combinations = Vec::with_capacity(cue_pair_count * tempo_pairs.len());
+    for outgoing_cue in &outgoing_cues {
+        let Some(outgoing_time) = outgoing_timeline
+            .events
+            .get(outgoing_cue.beat_index)
+            .map(|event| event.time)
+        else {
+            continue;
+        };
+        for incoming_cue in &incoming_cues {
+            let Some(incoming_time) = incoming_timeline
+                .events
+                .get(incoming_cue.beat_index)
+                .map(|event| event.time)
+            else {
+                continue;
+            };
+            let cue_cost = super::scoring::cue_suitability_cost(outgoing_cue, incoming_cue);
+            for tempo in &tempo_pairs {
+                combinations.push((
+                    cue_cost + tempo.cost,
+                    outgoing_time,
+                    incoming_time,
+                    *outgoing_cue,
+                    *incoming_cue,
+                    *tempo,
+                ));
+            }
+        }
+    }
+    combinations.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.5.ratio.total_cmp(&right.5.ratio))
+    });
+    combinations.truncate(MAX_CUE_TRANSITION_CANDIDATES);
+    let checked_combinations = combinations.len();
+    let incoming_default_start = incoming_events[0].time;
+    let mut candidates = Vec::with_capacity(checked_combinations);
+
+    for (_, outgoing_start, incoming_start, outgoing_cue, incoming_cue, tempo) in combinations {
+        // The outgoing mix-out cue is the fade start. The fade reaches the
+        // audible end; it is never moved away from the cue to fit a preferred
+        // duration. Incoming playback is bounded in source time after tempo
+        // mapping, including the first observed phrase boundary when present.
+        let duration = outgoing.audible_end.saturating_sub(outgoing_start);
+        if duration < MIN_CUE_OVERLAP || duration > config.crossfade {
+            continue;
+        }
+        let incoming_end_bound =
+            incoming_phrase_edge_bound(incoming, incoming_timeline, incoming_phrase_boundaries);
+        let Some(mapped_duration) = scale_duration(duration, f64::from(tempo.ratio)) else {
+            continue;
+        };
+        let Some(mapped_incoming_end) = incoming_start.checked_add(mapped_duration) else {
+            continue;
+        };
+        if incoming_start < incoming.audible_start || mapped_incoming_end > incoming_end_bound {
+            continue;
+        }
+        let (beat_pairs, phase_error) = phase_pairs(
+            &outgoing_events,
+            &incoming_events,
+            outgoing_start,
+            incoming_start,
+            duration,
+            tempo.ratio,
+        );
+        if beat_pairs < MIN_V2_BEAT_PAIRS {
+            continue;
+        }
+        let local_pair_reliability = pair_reliability(
+            reliability_for_timeline_window(
+                outgoing_timeline,
+                outgoing_start,
+                outgoing_start.saturating_add(duration),
+            )
+            .reliability,
+            reliability_for_timeline_window(incoming_timeline, incoming_start, mapped_incoming_end)
+                .reliability,
+        );
+        let plan = TransitionPlan {
+            kind: TransitionKind::BeatMatched,
+            outgoing_start,
+            incoming_start,
+            incoming_cue_selection: Some(super::AutoMixIncomingCueSelection {
+                default_start: incoming_default_start,
+                selected_start: incoming_start,
+                candidates_checked: incoming_cues.len(),
+            }),
+            duration,
+            incoming_tempo_ratio: tempo.ratio,
+            harmonic_compatibility: harmonic_compatibility(outgoing, incoming),
+            incoming_gain: 1.0,
+            tempo_envelope: Some(TempoEnvelope::new(
+                tempo.ratio,
+                tempo.ratio,
+                duration,
+                Duration::ZERO,
+            )),
+            energy_selection: None,
+        };
+        let cue_eligibility = BeatMatchEligibility::eligible(
+            outgoing_events.len(),
+            incoming_events.len(),
+            beat_pairs,
+            phase_error,
+            tempo,
+        );
+        let cost = TransitionCostBreakdown::for_plan(
+            outgoing,
+            incoming,
+            &plan,
+            (tempo.ratio - 1.0).abs(),
+            config.max_tempo_adjustment,
+            phase_error,
+            local_pair_reliability,
+            config.min_beat_confidence,
+        )
+        .with_cue_suitability(&outgoing_cue, &incoming_cue);
+        let quality = evaluate_transition_quality(outgoing, incoming, &plan);
+        if quality_rejection_with_eligibility(&quality, plan.kind, Some(&cue_eligibility)).is_some()
+        {
+            continue;
+        }
+        let cue_suitability_cost = cost.cue_suitability_cost;
+        candidates.push(TransitionCandidate {
+            plan,
+            cost,
+            beat_eligibility: Some(cue_eligibility),
+            hard_rejection: None,
+            cue_diagnostics: Some(CueCandidateDiagnostics {
+                outgoing_cue_index: outgoing_cue.beat_index,
+                incoming_cue_index: incoming_cue.beat_index,
+                cue_score: super::scoring::cue_suitability_score(&outgoing_cue, &incoming_cue),
+                cue_suitability_cost,
+                tempo_pair: tempo,
+                rhythm_reliability: local_pair_reliability,
+            }),
+        });
+    }
+    (
+        candidates,
+        (
+            outgoing_cues.len(),
+            incoming_cues.len(),
+            cue_pair_count,
+            checked_combinations,
+        ),
+    )
+}
+
+fn usable_role_cues(
+    candidates: &[DjCue],
+    role: CueRole,
+    analysis: &TrackAnalysis,
+    timeline: &BeatTimeline,
+    phrase_boundaries: &[PhraseBoundary],
+) -> Vec<DjCue> {
+    let beat_count = timeline.events.len();
+    let filtered = candidates
+        .iter()
+        .copied()
+        .filter(|cue| cue.has_role(role) && cue.validate_for_beat_count(beat_count).is_ok())
+        .filter(|cue| {
+            timeline.events.get(cue.beat_index).is_some_and(|event| {
+                event.time >= analysis.audible_start && event.time < analysis.audible_end
+            })
+        })
+        .filter(|cue| cue_is_in_edge_phrase(cue, role, analysis, timeline, phrase_boundaries));
+    let bounded = bound_cue_candidates(filtered, beat_count);
+    match role {
+        CueRole::MixIn => top_mix_in_cues(&bounded),
+        CueRole::MixOut => top_mix_out_cues(&bounded),
+    }
+}
+
+fn cue_is_in_edge_phrase(
+    cue: &DjCue,
+    role: CueRole,
+    analysis: &TrackAnalysis,
+    timeline: &BeatTimeline,
+    phrase_boundaries: &[PhraseBoundary],
+) -> bool {
+    let cue_time = timeline.events[cue.beat_index].time;
+    let mut boundary_times = phrase_boundaries
+        .iter()
+        // PeriodicPhrase prior is useful for soft ranking, but must never
+        // remove an otherwise valid cue from the bounded search.
+        .filter(|boundary| boundary.is_real_detection())
+        .filter_map(|boundary| {
+            timeline
+                .events
+                .get(boundary.beat_index)
+                .map(|event| event.time)
+        })
+        .filter(|time| *time >= analysis.audible_start && *time < analysis.audible_end)
+        .collect::<Vec<_>>();
+    boundary_times.sort_unstable();
+    boundary_times.dedup();
+    match role {
+        CueRole::MixOut => boundary_times
+            .into_iter()
+            .filter(|time| *time < analysis.audible_end)
+            .max()
+            .is_none_or(|last_phrase_start| cue_time >= last_phrase_start),
+        CueRole::MixIn => boundary_times
+            .into_iter()
+            .filter(|time| *time > analysis.audible_start)
+            .min()
+            .is_none_or(|first_phrase_end| cue_time <= first_phrase_end),
+    }
+}
+
+fn incoming_phrase_edge_bound(
+    analysis: &TrackAnalysis,
+    timeline: &BeatTimeline,
+    phrase_boundaries: &[PhraseBoundary],
+) -> Duration {
+    phrase_boundaries
+        .iter()
+        .filter(|boundary| boundary.is_real_detection())
+        .filter_map(|boundary| {
+            timeline
+                .events
+                .get(boundary.beat_index)
+                .map(|event| event.time)
+        })
+        .filter(|time| *time > analysis.audible_start && *time <= analysis.audible_end)
+        .min()
+        .unwrap_or(analysis.audible_end)
 }
 
 fn usable_events(analysis: &TrackAnalysis, timeline: &BeatTimeline) -> Vec<TimelineEvent> {
@@ -1226,8 +1689,8 @@ pub fn v2_rhythm_uncertainty_cost(analysis: &TrackAnalysis, target: f32) -> f32 
 mod tests {
     use super::*;
     use crate::analysis::{
-        BeatEvent, Confidence, MeterHypothesis, ModelScore, Section, SectionLabel, Support,
-        TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
+        BeatEvent, Confidence, MeterHypothesis, ModelScore, PhraseBoundary, Section, SectionLabel,
+        Support, TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
     };
 
     fn config() -> AutoMixConfig {
@@ -1287,6 +1750,190 @@ mod tests {
     }
 
     #[test]
+    fn planner_uses_bounded_valid_merged_role_cues_as_transition_positions() {
+        let mut outgoing = v2_analysis_with_events(&[
+            172.0, 173.0, 174.0, 175.0, 176.0, 177.0, 178.0, 179.0, 180.0, 181.0,
+        ]);
+        outgoing.duration = Duration::from_secs(200);
+        outgoing.audible_end = Duration::from_secs(182);
+        let mut incoming =
+            v2_analysis_with_events(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        incoming.duration = Duration::from_secs(100);
+        incoming.audible_end = Duration::from_secs(100);
+
+        // Duplicate beats merge field-wise; malformed/out-of-grid cues are
+        // discarded before taking the per-role top eight.
+        for beat_index in 0..10 {
+            let mut cue = DjCue::new(beat_index, UnitInterval::clamped(0.5));
+            cue.mix_out = UnitInterval::clamped(if beat_index == 2 { 0.8 } else { 0.4 });
+            if beat_index == 2 {
+                cue.importance = UnitInterval::clamped(0.9);
+            }
+            outgoing.cues.push(cue);
+
+            let mut cue = DjCue::new(beat_index, UnitInterval::clamped(0.3));
+            cue.mix_in = UnitInterval::clamped(if beat_index == 1 { 0.9 } else { 0.4 });
+            if beat_index == 1 {
+                cue.importance = UnitInterval::ONE;
+            }
+            incoming.cues.push(cue);
+        }
+        let mut duplicate = DjCue::new(2, UnitInterval::clamped(0.1));
+        duplicate.mix_out = UnitInterval::ONE;
+        outgoing.cues.push(duplicate);
+        let mut invalid = DjCue::new(usize::MAX, UnitInterval::ONE);
+        invalid.mix_out = UnitInterval::ONE;
+        outgoing.cues.push(invalid);
+
+        outgoing
+            .structure
+            .phrase_boundaries
+            .push(PhraseBoundary::detected(0, UnitInterval::ONE));
+        incoming
+            .structure
+            .phrase_boundaries
+            .push(PhraseBoundary::detected(9, UnitInterval::ONE));
+
+        let planned = plan_transition_v2_for_analysis(&outgoing, &incoming, &config());
+        let repeated = plan_transition_v2_for_analysis(&outgoing, &incoming, &config());
+        assert_eq!(planned, repeated);
+        assert_eq!(planned.diagnostics.outgoing_mix_out_cues, 8);
+        assert_eq!(planned.diagnostics.incoming_mix_in_cues, 8);
+        assert_eq!(planned.diagnostics.cue_pairs_checked, 64);
+        assert!(planned.diagnostics.cue_tempo_combinations_checked <= 64);
+        assert!(planned.diagnostics.beatmatched_candidates <= 64);
+        assert_eq!(
+            planned.plan.kind,
+            TransitionKind::BeatMatched,
+            "{planned:?}"
+        );
+        assert_eq!(planned.plan.outgoing_start, Duration::from_secs(174));
+        assert_eq!(planned.plan.incoming_start, Duration::from_secs(1));
+        assert_eq!(planned.plan.duration, Duration::from_secs(8));
+        assert_eq!(
+            planned
+                .plan
+                .incoming_cue_selection
+                .expect("cue-backed incoming position")
+                .selected_start,
+            Duration::from_secs(1)
+        );
+        assert!(
+            planned.cost.cue_suitability_cost < TransitionCostBreakdown::MAX_CUE_SUITABILITY_COST
+        );
+        let selected_cue = planned
+            .candidates
+            .iter()
+            .find(|candidate| {
+                candidate.plan.kind == TransitionKind::BeatMatched
+                    && candidate.plan.outgoing_start == Duration::from_secs(174)
+                    && candidate.plan.incoming_start == Duration::from_secs(1)
+            })
+            .and_then(|candidate| candidate.cue_diagnostics)
+            .expect("cue-backed candidate diagnostics");
+        assert_eq!(selected_cue.outgoing_cue_index, 2);
+        assert_eq!(selected_cue.incoming_cue_index, 1);
+        assert!(selected_cue.cue_score.is_finite());
+        assert!(selected_cue.cue_suitability_cost.is_finite());
+        assert!(selected_cue.tempo_pair.cost.is_finite());
+        assert!(selected_cue.rhythm_reliability.is_finite());
+    }
+
+    #[test]
+    fn low_cue_scores_remain_soft_and_do_not_reject_physical_candidates() {
+        let mut outgoing =
+            v2_analysis_with_events(&[172.0, 173.0, 174.0, 175.0, 176.0, 177.0, 178.0, 179.0]);
+        outgoing.audible_end = Duration::from_secs(180);
+        let mut incoming = v2_analysis_with_events(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let mut outgoing_cue = DjCue::new(0, UnitInterval::ZERO);
+        outgoing_cue.mix_out = UnitInterval::clamped(0.01);
+        let mut incoming_cue = DjCue::new(0, UnitInterval::ZERO);
+        incoming_cue.mix_in = UnitInterval::clamped(0.01);
+        outgoing.cues.push(outgoing_cue);
+        incoming.cues.push(incoming_cue);
+
+        let planned = plan_transition_v2_for_analysis(&outgoing, &incoming, &config());
+        let cue_candidate = planned.candidates.iter().find(|candidate| {
+            candidate.plan.kind == TransitionKind::BeatMatched
+                && candidate.plan.outgoing_start == Duration::from_secs(172)
+                && candidate.plan.incoming_start.is_zero()
+        });
+        assert!(cue_candidate.is_some(), "{planned:?}");
+        assert_eq!(cue_candidate.unwrap().hard_rejection, None);
+        assert!(cue_candidate.unwrap().cost.cue_suitability_cost > 0.0);
+    }
+
+    #[test]
+    fn tempo_hypothesis_cross_product_is_bounded_and_repeatable() {
+        let hypotheses = (60..80)
+            .map(|bpm| {
+                TempoHypothesis::with_relation(
+                    bpm as f32,
+                    UnitInterval::clamped((bpm - 60) as f32 / 20.0),
+                    TempoRelation::Alternative,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let first = cross_product_tempo_hypotheses(&hypotheses, &hypotheses);
+        let second = cross_product_tempo_hypotheses(&hypotheses, &hypotheses);
+        assert!(first.len() <= 64);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn tempo_pair_cost_exposes_stretch_confidence_and_relation_components() {
+        let hypothesis = |bpm, weight, relation| {
+            TempoHypothesis::with_relation(bpm, UnitInterval::clamped(weight), relation).unwrap()
+        };
+        let primary = TempoHypothesisPair::new(
+            hypothesis(120.0, 0.25, TempoRelation::Primary),
+            hypothesis(120.0, 0.64, TempoRelation::Primary),
+        )
+        .unwrap();
+        assert_eq!(primary.stretch_cost(), 0.0);
+        assert!((primary.weight - 0.4).abs() < f32::EPSILON);
+        assert!((primary.weight_cost() - 0.012).abs() < 0.00001);
+        assert_eq!(primary.relation_penalty(), 0.0);
+        assert!((primary.cost - (primary.stretch_cost() + primary.weight_cost())).abs() < 0.00001);
+
+        let half_time = TempoHypothesisPair::new(
+            hypothesis(120.0, 1.0, TempoRelation::HalfTime),
+            hypothesis(120.0, 1.0, TempoRelation::Primary),
+        )
+        .unwrap();
+        let alternative = TempoHypothesisPair::new(
+            hypothesis(120.0, 1.0, TempoRelation::Alternative),
+            hypothesis(120.0, 1.0, TempoRelation::Primary),
+        )
+        .unwrap();
+        assert!((half_time.relation_penalty() - 0.001).abs() < f32::EPSILON);
+        assert!((alternative.relation_penalty() - 0.003).abs() < f32::EPSILON);
+        assert!(alternative.cost > half_time.cost);
+    }
+
+    #[test]
+    fn strong_half_time_hypothesis_can_win_pair_selection() {
+        let primary = TempoHypothesis::with_relation(
+            120.0,
+            UnitInterval::clamped(0.20),
+            TempoRelation::Primary,
+        )
+        .unwrap();
+        let half_time =
+            TempoHypothesis::with_relation(120.0, UnitInterval::ONE, TempoRelation::HalfTime)
+                .unwrap();
+        let incoming =
+            TempoHypothesis::with_relation(120.0, UnitInterval::ONE, TempoRelation::Primary)
+                .unwrap();
+
+        let selected = select_tempo_hypothesis_pair(&[primary, half_time], &[incoming], 0.05)
+            .expect("compatible hypothesis pair");
+        assert_eq!(selected.outgoing.relation, TempoRelation::HalfTime);
+        assert!(selected.cost < TempoHypothesisPair::new(primary, incoming).unwrap().cost);
+    }
+
+    #[test]
     fn strong_beat_events_with_weak_low_band_remain_beatmatched_eligible() {
         let (outgoing, incoming) = paired_edge_analyses(0.05);
         let eligibility = beat_match_eligibility(&outgoing, &incoming, &config());
@@ -1330,6 +1977,73 @@ mod tests {
 
         let planned = plan_transition_v2_for_analysis(&outgoing, &incoming, &config());
         assert!(planned.diagnostics.beatmatched_candidates > 0);
+    }
+
+    #[test]
+    fn unresolved_meter_and_downbeat_scores_do_not_become_legacy_phase_facts() {
+        let times_out = [172.0, 173.0, 174.0, 175.0, 176.0, 177.0, 178.0, 179.0];
+        let times_in = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        let mut outgoing = v2_analysis_with_events(&times_out);
+        let mut incoming = v2_analysis_with_events(&times_in);
+        for analysis in [&mut outgoing, &mut incoming] {
+            analysis.rhythm.beats[0].downbeat_model_score = Some(ModelScore::new(0.99).unwrap());
+            analysis.rhythm.meter_hypotheses = vec![
+                MeterHypothesis {
+                    beats_per_bar: 4,
+                    downbeat_phase: 0,
+                    score: UnitInterval::clamped(0.80),
+                },
+                MeterHypothesis {
+                    beats_per_bar: 3,
+                    downbeat_phase: 1,
+                    score: UnitInterval::clamped(0.70),
+                },
+            ];
+            assert_eq!(analysis.rhythm.resolved_meter(), None);
+            let legacy = analysis.as_v2_legacy_view();
+            assert_eq!(legacy.first_downbeat, None);
+            assert_eq!(legacy.downbeat_confidence, 0.0);
+        }
+
+        let planned = plan_transition_v2_for_analysis(&outgoing, &incoming, &config());
+        assert!(planned.diagnostics.beatmatched_candidates > 0);
+        assert!(planned.candidates.iter().any(|candidate| {
+            candidate.plan.kind == TransitionKind::BeatMatched && candidate.hard_rejection.is_none()
+        }));
+    }
+
+    #[test]
+    fn periodic_phrase_prior_mismatch_cannot_hard_reject_a_v2_candidate() {
+        let prior = crate::analysis::periodic_phrase_prior(64, 0, 4);
+        assert!(!crate::analysis::phrase_mismatch_requires_observed_evidence(16, 17, &prior));
+
+        let (outgoing, incoming) = paired_edge_analyses(0.95);
+        let plan = TransitionPlan {
+            kind: TransitionKind::BeatMatched,
+            outgoing_start: Duration::from_secs(172),
+            incoming_start: Duration::ZERO,
+            incoming_cue_selection: None,
+            duration: Duration::from_secs(8),
+            incoming_tempo_ratio: 1.0,
+            harmonic_compatibility: None,
+            incoming_gain: 1.0,
+            tempo_envelope: None,
+            energy_selection: None,
+        };
+        let mut quality = evaluate_transition_quality(&outgoing, &incoming, &plan);
+        quality.issues = vec![AutoMixQualityIssue::PhrasePhaseDriftTooLarge {
+            max_error: Duration::from_secs(1),
+        }];
+
+        assert_eq!(
+            quality_rejection(&quality, TransitionKind::BeatMatched),
+            None
+        );
+        assert!(
+            v2_quality_report(&quality, TransitionKind::BeatMatched)
+                .issues
+                .is_empty()
+        );
     }
 
     #[test]

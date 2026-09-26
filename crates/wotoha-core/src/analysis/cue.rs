@@ -4,7 +4,7 @@
 //! beat indexes and already-computed structure evidence; it does not parse
 //! Rekordbox XML, load a model, or perform DSP.
 
-use std::{borrow::Borrow, cmp::Ordering, time::Duration};
+use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -200,17 +200,21 @@ impl DjCue {
                 beat_count,
             });
         }
-        if !self.importance.validate()
-            || !self.mix_in.validate()
-            || !self.mix_out.validate()
-            || !self.cut_safe.validate()
-            || !self.phrase_boundary.validate()
-            || !self.drop.validate()
-            || !self.build.validate()
-        {
+        if !self.validate_scores() {
             return Err(CueValidationError::ImportanceOutOfRange);
         }
         Ok(())
+    }
+
+    /// Validate every semantic score without requiring a beat-grid length.
+    pub fn validate_scores(&self) -> bool {
+        self.importance.validate()
+            && self.mix_in.validate()
+            && self.mix_out.validate()
+            && self.cut_safe.validate()
+            && self.phrase_boundary.validate()
+            && self.drop.validate()
+            && self.build.validate()
     }
 
     pub fn has_role(self, role: CueRole) -> bool {
@@ -540,15 +544,12 @@ pub fn generate_heuristic_cues_from_boundaries(
 /// Merge duplicate beat candidates, retaining the strongest score for every
 /// semantic field.  The output is sorted by beat index.
 pub fn merge_cue_candidates(candidates: impl IntoIterator<Item = DjCue>) -> Vec<DjCue> {
-    let mut merged = Vec::new();
+    let mut merged = BTreeMap::<usize, DjCue>::new();
     for candidate in candidates {
-        if !candidate.importance.validate() {
+        if !candidate.validate_scores() {
             continue;
         }
-        if let Some(existing) = merged
-            .iter_mut()
-            .find(|existing: &&mut DjCue| existing.beat_index == candidate.beat_index)
-        {
+        if let Some(existing) = merged.get_mut(&candidate.beat_index) {
             existing.importance = max_score(existing.importance, candidate.importance);
             existing.mix_in = max_score(existing.mix_in, candidate.mix_in);
             existing.mix_out = max_score(existing.mix_out, candidate.mix_out);
@@ -559,11 +560,10 @@ pub fn merge_cue_candidates(candidates: impl IntoIterator<Item = DjCue>) -> Vec<
             existing.build = max_score(existing.build, candidate.build);
             existing.provenance = merge_provenance(existing.provenance, candidate.provenance);
         } else {
-            merged.push(candidate);
+            merged.insert(candidate.beat_index, candidate);
         }
     }
-    merged.sort_by_key(|cue| cue.beat_index);
-    merged
+    merged.into_values().collect()
 }
 
 /// Filter invalid indexes, deduplicate, rank, and retain at most
@@ -609,7 +609,7 @@ pub fn top_role_cues(candidates: &[DjCue], role: CueRole) -> Vec<DjCue> {
 pub fn top_role_cues_with_limit(candidates: &[DjCue], role: CueRole, limit: usize) -> Vec<DjCue> {
     let mut selected: Vec<_> = merge_cue_candidates(candidates.iter().copied())
         .into_iter()
-        .filter(|cue| cue.has_role(role) && cue.importance.validate())
+        .filter(|cue| cue.has_role(role) && cue.validate_scores())
         .collect();
     selected.sort_by(|left, right| {
         right
@@ -712,13 +712,17 @@ fn merge_provenance(left: CueProvenance, right: CueProvenance) -> CueProvenance 
     if left == right {
         return left;
     }
-    if left.is_human() {
-        return left;
+    match (left, right) {
+        (CueProvenance::Imported(left), CueProvenance::Imported(right)) => {
+            if left.as_str() <= right.as_str() {
+                CueProvenance::Imported(left)
+            } else {
+                CueProvenance::Imported(right)
+            }
+        }
+        (human @ CueProvenance::Imported(_), _) | (_, human @ CueProvenance::Imported(_)) => human,
+        _ => CueProvenance::Mixed,
     }
-    if right.is_human() {
-        return right;
-    }
-    CueProvenance::Mixed
 }
 
 fn max_score(left: UnitInterval, right: UnitInterval) -> UnitInterval {
@@ -797,5 +801,30 @@ mod tests {
         let bounded = bound_cue_candidates(candidates, 12);
         assert!(bounded.iter().all(|cue| cue.beat_index < 12));
         assert_eq!(top_mix_in_cues(&bounded).len(), MAX_ROLE_CUES);
+    }
+
+    #[test]
+    fn duplicate_role_cues_merge_scores_and_top_role_order_is_deterministic() {
+        let mut first = DjCue::new(4, UnitInterval::clamped(0.3));
+        first.mix_out = UnitInterval::clamped(0.4);
+        let mut second = DjCue::new(4, UnitInterval::clamped(0.8));
+        second.mix_out = UnitInterval::clamped(0.9);
+        second.provenance = CueProvenance::Detected;
+        let mut tied = DjCue::new(2, UnitInterval::clamped(0.8));
+        tied.mix_out = UnitInterval::ONE;
+
+        let merged = merge_cue_candidates([first, second, tied]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1].beat_index, 4);
+        assert_eq!(merged[1].importance, UnitInterval::clamped(0.8));
+        assert_eq!(merged[1].mix_out, UnitInterval::clamped(0.9));
+        assert_eq!(merged[1].provenance, CueProvenance::Mixed);
+
+        let top = top_mix_out_cues(&merged);
+        assert_eq!(
+            top.iter().map(|cue| cue.beat_index).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        assert_eq!(top, top_mix_out_cues(&merged));
     }
 }

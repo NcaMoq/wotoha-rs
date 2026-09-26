@@ -12,8 +12,8 @@ pub mod scoring;
 
 pub use crate::analysis::BeatEvent;
 pub use candidate::{
-    BeatMatchEligibility, BeatMatchRejection, GuardedTransitionPlanV2, TempoHypothesis,
-    TempoHypothesisPair, TransitionCandidate, TransitionPlanV2, V2AnalysisInput,
+    BeatMatchEligibility, BeatMatchRejection, CueCandidateDiagnostics, GuardedTransitionPlanV2,
+    TempoHypothesis, TempoHypothesisPair, TransitionCandidate, TransitionPlanV2, V2AnalysisInput,
     V2GuardedTransitionPlan, V2TransitionPlan, beat_match_eligibility,
     beat_match_eligibility_for_timelines, check_beat_match_eligibility,
     cross_product_tempo_hypotheses, explain_beatmatch_decision_v2, plan_guarded_transition_v2,
@@ -32,7 +32,7 @@ pub use reliability::{
     reliability_for_timeline_window, reliability_for_track_analysis_v2, timeline_from_analysis,
     timeline_from_beat_events, timeline_from_rhythm, timeline_from_track_analysis_v2,
 };
-pub use scoring::TransitionCostBreakdown;
+pub use scoring::{TransitionCostBreakdown, cue_suitability_cost, cue_suitability_score};
 
 pub const TEMPO_SYNC_DEADBAND: f32 = 0.001;
 const MAX_TEMPO_SEGMENTS: usize = 32;

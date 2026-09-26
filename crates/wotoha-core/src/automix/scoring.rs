@@ -6,6 +6,7 @@ use super::{
     TrackAnalysis, TransitionKind, TransitionPlan, evaluate_transition_quality,
     transition_score_breakdown,
 };
+use crate::analysis::DjCue;
 use crate::automix::reliability::pair_reliability;
 
 use super::MAX_BEATMATCH_PHASE_ERROR;
@@ -23,6 +24,7 @@ pub struct TransitionCostBreakdown {
     pub phase_precision_cost: f32,
     pub structure_uncertainty_cost: f32,
     pub rhythm_uncertainty_cost: f32,
+    pub cue_suitability_cost: f32,
     pub legacy_quality_cost: f32,
 }
 
@@ -30,6 +32,12 @@ impl TransitionCostBreakdown {
     pub const BEATMATCHED_BASE: f32 = 0.0;
     pub const CROSSFADE_BASE: f32 = 0.28;
     pub const GAPLESS_BASE: f32 = 0.55;
+    /// Maximum penalty for a weakly supported outgoing/incoming cue pair.
+    pub const MAX_CUE_SUITABILITY_COST: f32 = 0.24;
+    /// Each cue's role score contributes half of its suitability signal.
+    pub const CUE_ROLE_SCORE_WEIGHT: f32 = 0.5;
+    /// Each cue's importance contributes half of its suitability signal.
+    pub const CUE_IMPORTANCE_SCORE_WEIGHT: f32 = 0.5;
 
     pub fn zero(kind: TransitionKind) -> Self {
         let strategy_base_cost = Self::strategy_base(kind);
@@ -40,6 +48,7 @@ impl TransitionCostBreakdown {
             phase_precision_cost: 0.0,
             structure_uncertainty_cost: 0.0,
             rhythm_uncertainty_cost: 0.0,
+            cue_suitability_cost: 0.0,
             legacy_quality_cost: 0.0,
         }
     }
@@ -121,6 +130,7 @@ impl TransitionCostBreakdown {
             phase_precision_cost,
             structure_uncertainty_cost,
             rhythm_uncertainty_cost,
+            cue_suitability_cost: 0.0,
             legacy_quality_cost,
         }
     }
@@ -183,6 +193,38 @@ impl TransitionCostBreakdown {
             target_confidence,
         )
     }
+
+    /// Add the soft suitability penalty for the cues anchoring this plan.
+    /// Cue strength affects ranking only; it never makes a physically valid
+    /// plan ineligible.
+    pub fn with_cue_suitability(mut self, outgoing: &DjCue, incoming: &DjCue) -> Self {
+        self.cue_suitability_cost = cue_suitability_cost(outgoing, incoming);
+        self.total = finite_cost(self.total + self.cue_suitability_cost);
+        self
+    }
+}
+
+/// Return a bounded soft cost for an outgoing/incoming cue pair.
+///
+/// Role scores and general importance are both considered for both tracks.
+/// The maximum penalty is deliberately modest so cue evidence steers ties but
+/// does not overwhelm rhythm, phase, or strategy costs.
+pub fn cue_suitability_cost(outgoing_mix_out: &DjCue, incoming_mix_in: &DjCue) -> f32 {
+    TransitionCostBreakdown::MAX_CUE_SUITABILITY_COST
+        * (1.0 - cue_suitability_score(outgoing_mix_out, incoming_mix_in))
+}
+
+/// Combined, bounded suitability score used to explain the cue cost.
+pub fn cue_suitability_score(outgoing_mix_out: &DjCue, incoming_mix_in: &DjCue) -> f32 {
+    let outgoing_score = outgoing_mix_out.mix_out.get()
+        * TransitionCostBreakdown::CUE_ROLE_SCORE_WEIGHT
+        + outgoing_mix_out.importance.get() * TransitionCostBreakdown::CUE_IMPORTANCE_SCORE_WEIGHT;
+    let incoming_score = incoming_mix_in.mix_in.get()
+        * TransitionCostBreakdown::CUE_ROLE_SCORE_WEIGHT
+        + incoming_mix_in.importance.get() * TransitionCostBreakdown::CUE_IMPORTANCE_SCORE_WEIGHT;
+    (outgoing_score.clamp(0.0, 1.0) * incoming_score.clamp(0.0, 1.0))
+        .sqrt()
+        .clamp(0.0, 1.0)
 }
 
 pub fn rhythm_uncertainty_cost(reliability: f32, min_beat_confidence: f32) -> f32 {
@@ -226,6 +268,24 @@ mod tests {
                 .windows(2)
                 .all(|window| (window[1] - window[0]).abs() < 0.02)
         );
+    }
+
+    #[test]
+    fn cue_suitability_uses_both_role_and_importance_as_a_soft_cost() {
+        let outgoing = DjCue::from_bool(4, 1.0, false, true);
+        let incoming = DjCue::from_bool(8, 1.0, true, false);
+        let strong = cue_suitability_cost(&outgoing, &incoming);
+        assert_eq!(strong, 0.0);
+
+        let mut weak_outgoing = outgoing;
+        weak_outgoing.importance = crate::analysis::UnitInterval::ZERO;
+        weak_outgoing.mix_out = crate::analysis::UnitInterval::clamped(0.1);
+        let mut weak_incoming = incoming;
+        weak_incoming.importance = crate::analysis::UnitInterval::ZERO;
+        weak_incoming.mix_in = crate::analysis::UnitInterval::clamped(0.1);
+        let weak = cue_suitability_cost(&weak_outgoing, &weak_incoming);
+        assert!(weak > strong);
+        assert!(weak <= TransitionCostBreakdown::MAX_CUE_SUITABILITY_COST);
     }
 
     #[test]

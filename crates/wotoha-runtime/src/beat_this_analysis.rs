@@ -714,7 +714,7 @@ pub(crate) fn rhythm_analysis_from_neural(decoded: NeuralRhythmAnalysis) -> Opti
                 ModelScore::new(event.model_score),
                 downbeat_model_score,
                 Confidence::new(event.timing_confidence)?,
-                Support::new(event.onset_support),
+                event.onset_support.and_then(Support::new),
                 event.low_frequency_support.and_then(Support::new),
             ))
         })
@@ -892,6 +892,18 @@ pub(crate) fn test_inference_counters() -> (usize, usize) {
 mod tests {
     use super::*;
 
+    fn click_observations() -> NeuralBeatObservations {
+        let mut beat = vec![-7.0; 300];
+        let mut downbeat = vec![-7.0; 300];
+        for (index, frame) in (25..300).step_by(25).enumerate() {
+            beat[frame] = 6.0;
+            if index.is_multiple_of(4) {
+                downbeat[frame] = 6.0;
+            }
+        }
+        NeuralBeatObservations::new(beat, downbeat).unwrap()
+    }
+
     #[test]
     fn bundled_assets_have_verified_metadata_and_hashes() {
         verify_assets().expect("bundled model hashes must remain stable");
@@ -1014,6 +1026,49 @@ mod tests {
         let expected = classical.clone();
         let result = analyze_neural_rhythm_with_fallback(&[], NEURAL_SAMPLE_RATE, &[], classical);
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn runtime_conversion_keeps_model_score_separate_from_onset_and_kick_support() {
+        let observations = click_observations();
+        let mut low = vec![0.0_f32; 6_000];
+        for (index, frame) in (25..300).step_by(25).enumerate() {
+            let center_ms = frame * 20;
+            let amplitude = 0.1 + index as f32 * 0.08;
+            for sample in low.iter_mut().take(center_ms + 6).skip(center_ms - 4) {
+                *sample = amplitude;
+            }
+        }
+
+        let with_low = rhythm_analysis_from_observations(&observations, &low)
+            .expect("runtime conversion should preserve decoded events");
+        assert!(
+            with_low
+                .beats
+                .iter()
+                .all(|event| { event.beat_model_score.is_some() && event.onset_support.is_none() })
+        );
+        assert!(with_low.beats.iter().any(|event| {
+            event
+                .low_frequency_support
+                .is_some_and(|support| support.get() > 0.0 && support.get() < 0.35)
+        }));
+        let with_low_reliability =
+            wotoha_core::automix::reliability::reliability_for_rhythm(&with_low);
+        assert_eq!(with_low_reliability.generic_onset, None);
+        assert!(with_low_reliability.reliability.is_finite());
+
+        let without_low = rhythm_analysis_from_observations(&observations, &[])
+            .expect("unknown onset and kick support remain valid");
+        assert!(without_low.beats.iter().all(|event| {
+            event.beat_model_score.is_some()
+                && event.onset_support.is_none()
+                && event.low_frequency_support.is_none()
+        }));
+        let without_low_reliability =
+            wotoha_core::automix::reliability::reliability_for_rhythm(&without_low);
+        assert_eq!(without_low_reliability.generic_onset, None);
+        assert!(without_low_reliability.reliability.is_finite());
     }
 
     #[test]

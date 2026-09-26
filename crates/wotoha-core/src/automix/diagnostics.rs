@@ -82,6 +82,12 @@ pub struct PlannerDiagnostics {
     pub beatmatched_candidates: usize,
     pub crossfade_candidates: usize,
     pub gapless_candidates: usize,
+    /// Top mix-out/mix-in cues admitted to the bounded cue search.
+    pub outgoing_mix_out_cues: usize,
+    pub incoming_mix_in_cues: usize,
+    /// Cartesian cue-pair and cue/tempo combinations evaluated by the planner.
+    pub cue_pairs_checked: usize,
+    pub cue_tempo_combinations_checked: usize,
     pub hard_rejections: Vec<CandidateRejection>,
     pub selected_kind: TransitionKind,
     pub selected_cost: TransitionCostBreakdown,
@@ -96,6 +102,10 @@ impl PlannerDiagnostics {
             beatmatched_candidates: 0,
             crossfade_candidates: 0,
             gapless_candidates: 0,
+            outgoing_mix_out_cues: 0,
+            incoming_mix_in_cues: 0,
+            cue_pairs_checked: 0,
+            cue_tempo_combinations_checked: 0,
             hard_rejections: Vec::new(),
             selected_kind,
             selected_cost,

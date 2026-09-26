@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use wotoha_core::{
     QueuePreview, TrackRequest,
+    analysis::TrackAnalysisV2,
     automix::{EqTransition, TempoEnvelope, TrackAnalysis},
 };
 
@@ -374,6 +375,13 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
 
     /// Returns an already-cached analysis without starting decode work.
     fn cached_track_analysis(&self, _request: &TrackRequest) -> Option<TrackAnalysis> {
+        None
+    }
+
+    /// Returns a cached V2 record without starting decode or inference work.
+    /// Playback uses this optional hook only for non-authoritative shadow
+    /// comparisons; a miss never changes the V1 plan.
+    fn cached_track_analysis_v2(&self, _request: &TrackRequest) -> Option<TrackAnalysisV2> {
         None
     }
 
