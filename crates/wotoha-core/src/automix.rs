@@ -18,8 +18,10 @@ pub use candidate::{
     beat_match_eligibility_for_timelines, check_beat_match_eligibility,
     cross_product_tempo_hypotheses, explain_beatmatch_decision_v2, plan_guarded_transition_v2,
     plan_guarded_transition_v2_diagnostics, plan_guarded_transition_v2_for_analysis,
+    plan_guarded_transition_v2_for_analysis_with_blend_config,
     plan_guarded_transition_v2_with_diagnostics, plan_transition_v2,
     plan_transition_v2_diagnostics, plan_transition_v2_for_analysis,
+    plan_transition_v2_for_analysis_with_blend_config, plan_transition_v2_with_blend_config,
     plan_transition_v2_with_diagnostics, select_tempo_hypothesis_pair, tempo_hypotheses,
     tempo_hypothesis_pairs,
 };

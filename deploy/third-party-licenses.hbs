@@ -17,6 +17,7 @@
     <p>Used by:</p>
     <ul>
       {{#each used_by}}
+      <li><a href="https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download">source download for {{crate.name}} {{crate.version}}</a></li>
       <li><a href="https://crates.io/crates/{{crate.name}}/{{crate.version}}">{{crate.name}} {{crate.version}}</a>{{#if crate.repository}} — <a href="{{crate.repository}}">upstream repository</a>{{/if}}</li>
       {{/each}}
     </ul>

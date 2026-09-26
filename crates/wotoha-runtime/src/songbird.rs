@@ -813,11 +813,22 @@ impl VoiceRuntime for SongbirdRuntime {
         Some(outcome.analysis)
     }
 
+    async fn analyze_track_v2(&self, request: &TrackRequest) -> Option<TrackAnalysisV2> {
+        SongbirdRuntime::analyze_track_v2(self, request).await
+    }
+
     fn cached_track_analysis(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
         if !analysis_source_supported(request) {
             return None;
         }
         let key = AnalysisCacheKey::from_request(request).ok()?;
+        if self.v2_shadow_enabled {
+            if let Ok(Some(analysis)) = self.analysis_cache.load_v2(&key) {
+                self.remember_v2(&key, analysis);
+            } else if let Ok(Some(analysis)) = self.classical_cache.load_v2(&key) {
+                self.remember_v2(&key, analysis);
+            }
+        }
         let analysis = self.analysis_cache.load(&key).ok().flatten()?;
         if self.v2_shadow_enabled {
             self.remember_cached_v2(&key, &analysis);
@@ -873,9 +884,10 @@ impl SongbirdRuntime {
         }
         // Adapt the already-loaded V1 record locally. Avoid additional disk
         // reads on the playback path; V2 cache misses are observational only.
-        if let Some(analysis) =
-            track_analysis_v2_from_legacy_with_backend(legacy, AnalysisBackend::CachedNeural)
-        {
+        if let Some(analysis) = track_analysis_v2_from_legacy_with_backend(
+            legacy,
+            AnalysisBackend::CachedClassicalTransientFailure,
+        ) {
             self.remember_v2(key, analysis);
         }
     }
@@ -919,9 +931,11 @@ impl SongbirdRuntime {
         // model scores, timing support, hypotheses and provenance that a V1
         // cache cannot represent, while leaving the V1 cache untouched.
         if let Ok(Some(analysis)) = self.analysis_cache.load_v2(&key) {
+            self.remember_v2(&key, analysis.clone());
             return Some(analysis);
         }
         if let Ok(Some(analysis)) = self.classical_cache.load_v2(&key) {
+            self.remember_v2(&key, analysis.clone());
             return Some(analysis);
         }
         let outcome = self.analyze_track_with_backend(request).await?;
@@ -1118,10 +1132,7 @@ fn analysis_outcome_to_v2(outcome: &AnalysisOutcome) -> Option<(TrackAnalysisV2,
     } else {
         Some((
             track_analysis_v2_from_legacy_with_backend(&outcome.analysis, outcome.backend)?,
-            matches!(
-                outcome.backend,
-                AnalysisBackend::Neural | AnalysisBackend::CachedNeural
-            ),
+            matches!(outcome.backend, AnalysisBackend::Neural),
         ))
     }
 }

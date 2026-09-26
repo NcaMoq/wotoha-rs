@@ -18,11 +18,13 @@ use super::{
 const MIN_V2_BEAT_PAIRS: usize = 3;
 const MAX_CUE_TRANSITION_CANDIDATES: usize = 64;
 const MIN_CUE_OVERLAP: Duration = Duration::from_secs(1);
+const BLEND_BEAT_FAMILY: [usize; 4] = [8, 16, 32, 64];
 
 use crate::analysis::{
     CueRole, DjCue, PhraseBoundary, TempoRelation, TrackAnalysisV2, UnitInterval,
     bound_cue_candidates, top_mix_in_cues, top_mix_out_cues,
 };
+use crate::config::BeatmatchBlendConfig;
 
 /// Adapter boundary accepted by the V2 planner.  Keeping this trait generic
 /// lets existing V1 callers use the new cost/diagnostic API while versioned
@@ -633,6 +635,20 @@ pub fn plan_transition_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
     incoming: &I,
     config: &AutoMixConfig,
 ) -> TransitionPlanV2 {
+    plan_transition_v2_with_blend_config(
+        outgoing,
+        incoming,
+        config,
+        &BeatmatchBlendConfig::default(),
+    )
+}
+
+pub fn plan_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2AnalysisInput>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+) -> TransitionPlanV2 {
     let outgoing_timeline = outgoing.rhythm_timeline();
     let incoming_timeline = incoming.rhythm_timeline();
     let outgoing_hypotheses = outgoing.tempo_hypotheses();
@@ -655,6 +671,7 @@ pub fn plan_transition_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
         &incoming_cues,
         &outgoing_phrase_boundaries,
         &incoming_phrase_boundaries,
+        blend_config,
     );
     plan
 }
@@ -720,6 +737,15 @@ pub fn plan_transition_v2_for_analysis(
     plan_transition_v2(outgoing, incoming, config)
 }
 
+pub fn plan_transition_v2_for_analysis_with_blend_config(
+    outgoing: &TrackAnalysisV2,
+    incoming: &TrackAnalysisV2,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+) -> TransitionPlanV2 {
+    plan_transition_v2_with_blend_config(outgoing, incoming, config, blend_config)
+}
+
 pub fn plan_guarded_transition_v2<O: V2AnalysisInput, I: V2AnalysisInput>(
     outgoing: &O,
     incoming: &I,
@@ -733,7 +759,21 @@ pub fn plan_guarded_transition_v2_with_diagnostics<O: V2AnalysisInput, I: V2Anal
     incoming: &I,
     config: &AutoMixConfig,
 ) -> V2GuardedTransitionPlan {
-    let planned = plan_transition_v2(outgoing, incoming, config);
+    plan_guarded_transition_v2_with_blend_config(
+        outgoing,
+        incoming,
+        config,
+        &BeatmatchBlendConfig::default(),
+    )
+}
+
+pub fn plan_guarded_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2AnalysisInput>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+) -> V2GuardedTransitionPlan {
+    let planned = plan_transition_v2_with_blend_config(outgoing, incoming, config, blend_config);
     let outgoing = outgoing.as_v2_legacy_view();
     let incoming = incoming.as_v2_legacy_view();
     let raw_quality = evaluate_transition_quality(&outgoing, &incoming, &planned.plan);
@@ -845,6 +885,15 @@ pub fn plan_guarded_transition_v2_for_analysis(
     plan_guarded_transition_v2(outgoing, incoming, config)
 }
 
+pub fn plan_guarded_transition_v2_for_analysis_with_blend_config(
+    outgoing: &TrackAnalysisV2,
+    incoming: &TrackAnalysisV2,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+) -> V2GuardedTransitionPlan {
+    plan_guarded_transition_v2_with_blend_config(outgoing, incoming, config, blend_config)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_transition_v2_internal_with_context(
     outgoing: &TrackAnalysis,
@@ -858,6 +907,7 @@ fn plan_transition_v2_internal_with_context(
     incoming_cue_candidates: &[DjCue],
     outgoing_phrase_boundaries: &[PhraseBoundary],
     incoming_phrase_boundaries: &[PhraseBoundary],
+    blend_config: &BeatmatchBlendConfig,
 ) -> (TransitionPlanV2, BeatMatchEligibility) {
     let gapless = gapless_plan(outgoing, incoming);
     let pair_reliability = pair_reliability(
@@ -890,6 +940,7 @@ fn plan_transition_v2_internal_with_context(
         incoming_cue_candidates,
         outgoing_phrase_boundaries,
         incoming_phrase_boundaries,
+        blend_config,
     );
     diagnostics.outgoing_mix_out_cues = cue_counts.0;
     diagnostics.incoming_mix_in_cues = cue_counts.1;
@@ -1088,6 +1139,7 @@ fn cue_transition_candidates(
     incoming_cue_candidates: &[DjCue],
     outgoing_phrase_boundaries: &[PhraseBoundary],
     incoming_phrase_boundaries: &[PhraseBoundary],
+    blend_config: &BeatmatchBlendConfig,
 ) -> (Vec<TransitionCandidate>, (usize, usize, usize, usize)) {
     if !config.enabled
         || !config.max_tempo_adjustment.is_finite()
@@ -1138,7 +1190,12 @@ fn cue_transition_candidates(
     // Rank all bounded cue/tempo combinations before doing quality evaluation.
     // This keeps actual plan construction to a fixed maximum even when every
     // cue and every tempo interpretation is available.
-    let mut combinations = Vec::with_capacity(cue_pair_count * tempo_pairs.len());
+    let blend_lengths = blend_beat_lengths(blend_config);
+    let mut combinations = Vec::with_capacity(
+        cue_pair_count
+            .saturating_mul(tempo_pairs.len())
+            .saturating_mul(blend_lengths.len()),
+    );
     for outgoing_cue in &outgoing_cues {
         let Some(outgoing_time) = outgoing_timeline
             .events
@@ -1157,14 +1214,23 @@ fn cue_transition_candidates(
             };
             let cue_cost = super::scoring::cue_suitability_cost(outgoing_cue, incoming_cue);
             for tempo in &tempo_pairs {
-                combinations.push((
-                    cue_cost + tempo.cost,
-                    outgoing_time,
-                    incoming_time,
-                    *outgoing_cue,
-                    *incoming_cue,
-                    *tempo,
-                ));
+                for &beats in &blend_lengths {
+                    let duration_cost = blend_duration_cost(
+                        beats,
+                        blend_config.preferred_beats,
+                        blend_config.min_beats,
+                        blend_config.max_beats,
+                    );
+                    combinations.push((
+                        cue_cost + tempo.cost + duration_cost,
+                        outgoing_time,
+                        incoming_time,
+                        *outgoing_cue,
+                        *incoming_cue,
+                        *tempo,
+                        beats,
+                    ));
+                }
             }
         }
     }
@@ -1174,19 +1240,31 @@ fn cue_transition_candidates(
             .then_with(|| left.1.cmp(&right.1))
             .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.5.ratio.total_cmp(&right.5.ratio))
+            .then_with(|| left.6.cmp(&right.6))
     });
     combinations.truncate(MAX_CUE_TRANSITION_CANDIDATES);
     let checked_combinations = combinations.len();
     let incoming_default_start = incoming_events[0].time;
     let mut candidates = Vec::with_capacity(checked_combinations);
 
-    for (_, outgoing_start, incoming_start, outgoing_cue, incoming_cue, tempo) in combinations {
-        // The outgoing mix-out cue is the fade start. The fade reaches the
-        // audible end; it is never moved away from the cue to fit a preferred
-        // duration. Incoming playback is bounded in source time after tempo
-        // mapping, including the first observed phrase boundary when present.
-        let duration = outgoing.audible_end.saturating_sub(outgoing_start);
-        if duration < MIN_CUE_OVERLAP || duration > config.crossfade {
+    for (_, outgoing_start, incoming_start, outgoing_cue, incoming_cue, tempo, beats) in
+        combinations
+    {
+        // A DJ cue is an anchor, not an instruction to fade all the way to
+        // the source's audible end. Choose a bounded phrase-sized family and
+        // validate both decks against their physical source bounds.
+        let Some(beat_duration) = local_beat_duration(outgoing_timeline, outgoing_cue.beat_index)
+        else {
+            continue;
+        };
+        let Some(duration) = beat_duration.checked_mul(beats as u32) else {
+            continue;
+        };
+        if duration < MIN_CUE_OVERLAP
+            || outgoing_start
+                .checked_add(duration)
+                .is_none_or(|end| end > outgoing.audible_end)
+        {
             continue;
         }
         let incoming_end_bound =
@@ -1259,7 +1337,13 @@ fn cue_transition_candidates(
             local_pair_reliability,
             config.min_beat_confidence,
         )
-        .with_cue_suitability(&outgoing_cue, &incoming_cue);
+        .with_cue_suitability(&outgoing_cue, &incoming_cue)
+        .with_blend_duration(
+            beats,
+            blend_config.preferred_beats,
+            blend_config.min_beats,
+            blend_config.max_beats,
+        );
         let quality = evaluate_transition_quality(outgoing, incoming, &plan);
         if quality_rejection_with_eligibility(&quality, plan.kind, Some(&cue_eligibility)).is_some()
         {
@@ -1290,6 +1374,47 @@ fn cue_transition_candidates(
             checked_combinations,
         ),
     )
+}
+
+fn blend_beat_lengths(config: &BeatmatchBlendConfig) -> Vec<usize> {
+    let min = config.min_beats.max(1);
+    let max = config.max_beats.max(min);
+    let mut lengths = BLEND_BEAT_FAMILY
+        .into_iter()
+        .filter(|beats| *beats >= min && *beats <= max)
+        .collect::<Vec<_>>();
+    if lengths.is_empty() {
+        lengths.push(config.preferred_beats.clamp(min, max));
+    }
+    lengths.sort_unstable();
+    lengths.dedup();
+    lengths
+}
+
+fn blend_duration_cost(beats: usize, preferred: usize, min: usize, max: usize) -> f32 {
+    let preferred = preferred.max(1) as f32;
+    let span = max.saturating_sub(min).max(1) as f32;
+    (0.12 * ((beats as f32 - preferred).abs() / span.max(preferred)).min(1.0)).max(0.0)
+}
+
+fn local_beat_duration(timeline: &BeatTimeline, beat_index: usize) -> Option<Duration> {
+    let event = timeline.events.get(beat_index)?;
+    let mut intervals = Vec::with_capacity(8);
+    for pair in timeline.events.windows(2) {
+        if pair[0].time == event.time || pair[1].time == event.time {
+            let interval = pair[1].time.checked_sub(pair[0].time)?;
+            if !interval.is_zero() {
+                intervals.push(interval);
+            }
+        }
+    }
+    intervals.into_iter().next().or_else(|| {
+        timeline
+            .events
+            .windows(2)
+            .filter_map(|pair| pair[1].time.checked_sub(pair[0].time))
+            .find(|interval| !interval.is_zero())
+    })
 }
 
 fn usable_role_cues(
@@ -1522,7 +1647,6 @@ fn gapless_plan(outgoing: &TrackAnalysis, incoming: &TrackAnalysis) -> Transitio
 fn quality_has_v2_hard_issue(quality: &AutoMixQualityReport, kind: TransitionKind) -> bool {
     quality.issues.iter().any(|issue| match issue {
         AutoMixQualityIssue::MixOverlapTooShort { .. }
-        | AutoMixQualityIssue::OutgoingOverlapMissesAudibleEnd { .. }
         | AutoMixQualityIssue::IncomingOverlapExceedsAudibleEnd { .. }
         | AutoMixQualityIssue::BeatPhaseDriftTooLarge { .. }
         | AutoMixQualityIssue::BeatHandoffPhaseDriftTooLarge { .. }
@@ -1533,6 +1657,7 @@ fn quality_has_v2_hard_issue(quality: &AutoMixQualityReport, kind: TransitionKin
         // candidate itself has no observed pair; that is checked before this
         // function is called.
         AutoMixQualityIssue::BeatPhaseUnverified
+        | AutoMixQualityIssue::OutgoingOverlapMissesAudibleEnd { .. }
         | AutoMixQualityIssue::DownbeatPhaseUnverified
         | AutoMixQualityIssue::DownbeatPhaseDriftTooLarge { .. }
         | AutoMixQualityIssue::DownbeatHandoffPhaseDriftTooLarge { .. }
@@ -1591,13 +1716,13 @@ fn v2_quality_report(quality: &AutoMixQualityReport, kind: TransitionKind) -> Au
     let mut filtered = quality.clone();
     filtered.issues.retain(|issue| match issue {
         AutoMixQualityIssue::MixOverlapTooShort { .. }
-        | AutoMixQualityIssue::OutgoingOverlapMissesAudibleEnd { .. }
         | AutoMixQualityIssue::IncomingOverlapExceedsAudibleEnd { .. }
         | AutoMixQualityIssue::BeatPhaseDriftTooLarge { .. }
         | AutoMixQualityIssue::BeatHandoffPhaseDriftTooLarge { .. }
         | AutoMixQualityIssue::DualVocalOverlapTooHigh { .. }
         | AutoMixQualityIssue::MixEnergyDipTooDeep { .. } => true,
         AutoMixQualityIssue::BeatPhaseUnverified
+        | AutoMixQualityIssue::OutgoingOverlapMissesAudibleEnd { .. }
         | AutoMixQualityIssue::DownbeatPhaseUnverified
         | AutoMixQualityIssue::DownbeatPhaseDriftTooLarge { .. }
         | AutoMixQualityIssue::DownbeatHandoffPhaseDriftTooLarge { .. }

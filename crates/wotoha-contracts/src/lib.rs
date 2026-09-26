@@ -373,6 +373,13 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Obtain the native timeline-first analysis when the runtime supports
+    /// it. Implementations must reuse their existing cache/inference path;
+    /// callers treat a miss as a safe V1 fallback.
+    async fn analyze_track_v2(&self, _request: &TrackRequest) -> Option<TrackAnalysisV2> {
+        None
+    }
+
     /// Returns an already-cached analysis without starting decode work.
     fn cached_track_analysis(&self, _request: &TrackRequest) -> Option<TrackAnalysis> {
         None

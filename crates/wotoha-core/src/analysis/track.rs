@@ -119,6 +119,17 @@ impl TrackAnalysisV2 {
             .iter()
             .position(|section| (section.start_beat..section.end_beat).contains(&beat_index))
     }
+
+    /// True when the rhythm timeline was produced by the native neural/hybrid
+    /// decoder rather than synthesized by the V1 compatibility adapter.
+    pub fn has_native_rhythm_provenance(&self) -> bool {
+        self.provenance.rhythm.as_ref().is_some_and(|rhythm| {
+            matches!(
+                rhythm.method,
+                super::AnalysisMethod::Neural | super::AnalysisMethod::Hybrid
+            )
+        })
+    }
 }
 
 impl Default for TrackAnalysisV2 {

@@ -24,7 +24,7 @@ use wotoha_control::ControlService;
 use wotoha_core::{
     BotConfig, QueuePreview, TrackRequest,
     automix::EqTransition,
-    config::PlaybackConfig,
+    config::{AutoMixPlannerMode, PlaybackConfig},
     debug::{append_debug_log, sanitize_log_message},
 };
 use wotoha_media::MediaResolver;
@@ -70,6 +70,7 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_queue_len = config.playback.max_queue_len,
         max_pending_enqueues = config.playback.max_pending_enqueues,
         automix_v2_shadow_enabled = config.playback.automix_v2_shadow_enabled,
+        automix_planner_mode = ?config.playback.automix_planner_mode,
         "configuration loaded"
     );
     let resolver = MediaResolver::new()?;
@@ -81,17 +82,21 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         append_debug_log("main: media provider warmup finished");
     });
     let (playback_runtime, songbird) = SongbirdRuntime::paired()?;
-    let playback_runtime =
-        playback_runtime.with_v2_shadow_enabled(config.playback.automix_v2_shadow_enabled);
+    let v2_analysis_enabled = !matches!(
+        config.playback.automix_planner_mode,
+        AutoMixPlannerMode::Legacy
+    );
+    let playback_runtime = playback_runtime.with_v2_shadow_enabled(v2_analysis_enabled);
     let playback_runtime =
         ConfiguredVoiceRuntime::new(playback_runtime, config.playback.default_volume);
     append_debug_log("main: playback runtime created");
-    let playback = PlaybackCoordinator::new_with_automix_loudness_and_v2_shadow(
+    let playback = PlaybackCoordinator::new_with_automix_loudness_and_planner_mode(
         resolver,
         playback_runtime.clone(),
         config.playback.automix.clone(),
         config.playback.loudness.clone(),
-        config.playback.automix_v2_shadow_enabled,
+        config.playback.automix_planner_mode,
+        config.playback.automix_beatmatch,
     );
     let playback = ConfiguredPlayback::new(playback, config.playback.clone());
     let control = ControlService::new(playback);
@@ -249,6 +254,13 @@ where
         request: &TrackRequest,
     ) -> Option<wotoha_core::automix::TrackAnalysis> {
         self.inner.analyze_track(request).await
+    }
+
+    async fn analyze_track_v2(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<wotoha_core::analysis::TrackAnalysisV2> {
+        self.inner.analyze_track_v2(request).await
     }
 
     fn cached_track_analysis(
@@ -727,7 +739,7 @@ mod tests {
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
         automix::{AutoMixConfig, EqTransition, EqTransitionRole},
-        config::{LoudnessConfig, PlaybackConfig},
+        config::{AutoMixPlannerMode, LoudnessConfig, PlaybackConfig},
     };
 
     #[derive(Clone, Default)]
@@ -906,6 +918,8 @@ mod tests {
                 min_beat_confidence: 0.7,
             },
             automix_v2_shadow_enabled: false,
+            automix_planner_mode: AutoMixPlannerMode::Legacy,
+            automix_beatmatch: Default::default(),
         }
     }
 

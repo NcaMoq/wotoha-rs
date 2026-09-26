@@ -23,7 +23,7 @@ jobs:
           toolchain: "1.95.0"
       - name: Test the yt-dlp media provider
         run: cargo test --locked -p wotoha-media
-      - name: Verify managed yt-dlp and probe playback
+      - name: Verify managed yt-dlp and probe playback through production path
         shell: bash
         run: |
           set -euo pipefail
@@ -47,30 +47,16 @@ jobs:
           printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$tmp/deno.zip" | sha256sum --check --status
           unzip -q "$tmp/deno.zip" -d "$tmp"
 
-          canary_ok=false
-          for canary_url in \
-            'https://www.youtube.com/watch?v=H7HmzwI67ec' \
-            'https://www.youtube.com/watch?v=jNQXAC9IVRw'; do
-            direct_url="$(timeout --signal=TERM --kill-after=5s 60s \
-              "$tmp/yt-dlp" --ignore-config --no-playlist --no-warnings --no-progress \
-              --socket-timeout 10 --retries 2 --extractor-retries 2 \
-              --js-runtimes "deno:$tmp/deno" \
-              --format 'bestaudio[protocol^=http]/bestaudio/best' --skip-download \
-              --print '%(url)s' "$canary_url" 2>/dev/null | head -n1)" || true
-            [[ "$direct_url" =~ ^https:// ]] || continue
-            if curl --fail --silent --show-error --location "${curl_retry[@]}" --remove-on-error \
-              --range 0-1023 --max-time 20 --max-filesize 4096 \
-              --output "$tmp/canary.bytes" "$direct_url" \
-              && [[ -s "$tmp/canary.bytes" ]] \
-              && (( $(stat --format=%s "$tmp/canary.bytes") <= 4096 )); then
-              canary_ok=true
-              break
-            fi
-          done
-          [[ "$canary_ok" == true ]]
-
-          output="$(WOTOHA_YTDLP_PATH="$tmp/yt-dlp" WOTOHA_DENO_PATH="$tmp/deno" \
+          # Do not extract a URL and curl it here. The production resolver owns yt-dlp's
+          # headers, HLS selection, and Googlevideo range-query semantics; track_probe
+          # continues through prepare_playback and SongbirdRuntime::verify_track.
+          probe_log="$tmp/track-probe.log"
+          if ! WOTOHA_YTDLP_PATH="$tmp/yt-dlp" WOTOHA_DENO_PATH="$tmp/deno" \
             cargo run --locked -p wotoha-app --bin track_probe -- \
-            https://www.youtube.com/watch?v=H7HmzwI67ec)"
-          printf '%s\n' "$output"
-          grep -Fq $'PLAYABLE\t0\tok' <<<"$output"
+            --strict https://www.youtube.com/watch?v=H7HmzwI67ec \
+            2>&1 | tee "$probe_log"; then
+            echo "YouTube production-path probe failed; provider diagnostics:" >&2
+            grep -E 'PROVIDER_ERROR|yt-dlp failed|RESOLVED.*error|PLAYABLE.*error' \
+              "$probe_log" >&2 || cat "$probe_log" >&2
+            exit 1
+          fi

@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, str::FromStr};
 
 use thiserror::Error;
 
@@ -20,6 +20,9 @@ const DEFAULT_AUTOMIX_V2_SHADOW_ENABLED: bool = false;
 const DEFAULT_AUTOMIX_CROSSFADE_SECONDS: f32 = 8.0;
 const DEFAULT_AUTOMIX_MAX_TEMPO_ADJUSTMENT: f32 = 0.06;
 const DEFAULT_AUTOMIX_MIN_BEAT_CONFIDENCE: f32 = 0.70;
+const DEFAULT_AUTOMIX_BEATMATCH_MIN_BEATS: usize = 8;
+const DEFAULT_AUTOMIX_BEATMATCH_PREFERRED_BEATS: usize = 32;
+const DEFAULT_AUTOMIX_BEATMATCH_MAX_BEATS: usize = 64;
 const MAX_QUEUE_LEN_LIMIT: usize = 512;
 const MAX_PENDING_ENQUEUES_LIMIT: usize = 64;
 const MAX_PLAYBACK_VOLUME: f32 = 2.0;
@@ -54,6 +57,48 @@ pub struct PlaybackConfig {
     pub automix: AutoMixConfig,
     /// Observe the V2 transition planner alongside V1 without affecting playback.
     pub automix_v2_shadow_enabled: bool,
+    /// Explicit V2 planner selection. The legacy shadow bool remains for
+    /// backwards-compatible deployments and is used only when this is absent.
+    pub automix_planner_mode: AutoMixPlannerMode,
+    pub automix_beatmatch: BeatmatchBlendConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AutoMixPlannerMode {
+    #[default]
+    Legacy,
+    Shadow,
+    V2,
+}
+
+impl FromStr for AutoMixPlannerMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Ok(Self::Legacy),
+            "shadow" => Ok(Self::Shadow),
+            "v2" => Ok(Self::V2),
+            _ => Err(value.to_owned()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BeatmatchBlendConfig {
+    pub min_beats: usize,
+    pub preferred_beats: usize,
+    pub max_beats: usize,
+}
+
+impl Default for BeatmatchBlendConfig {
+    fn default() -> Self {
+        Self {
+            min_beats: DEFAULT_AUTOMIX_BEATMATCH_MIN_BEATS,
+            preferred_beats: DEFAULT_AUTOMIX_BEATMATCH_PREFERRED_BEATS,
+            max_beats: DEFAULT_AUTOMIX_BEATMATCH_MAX_BEATS,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -143,6 +188,50 @@ impl BotConfig {
             "WOTOHA_AUTOMIX_V2_SHADOW_ENABLED",
             DEFAULT_AUTOMIX_V2_SHADOW_ENABLED,
         )?;
+        let automix_planner_mode = match get("WOTOHA_AUTOMIX_PLANNER_MODE") {
+            Some(value) => value
+                .parse()
+                .map_err(|value| ConfigError::InvalidPlannerMode { value })?,
+            None if automix_v2_shadow_enabled => AutoMixPlannerMode::Shadow,
+            None => AutoMixPlannerMode::Legacy,
+        };
+        let automix_beatmatch_min_beats = read_optional_usize(
+            &get,
+            "WOTOHA_AUTOMIX_BEATMATCH_MIN_BEATS",
+            DEFAULT_AUTOMIX_BEATMATCH_MIN_BEATS,
+            8,
+            64,
+        )?;
+        let automix_beatmatch_preferred_beats = read_optional_usize(
+            &get,
+            "WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS",
+            DEFAULT_AUTOMIX_BEATMATCH_PREFERRED_BEATS,
+            8,
+            64,
+        )?;
+        let automix_beatmatch_max_beats = read_optional_usize(
+            &get,
+            "WOTOHA_AUTOMIX_BEATMATCH_MAX_BEATS",
+            DEFAULT_AUTOMIX_BEATMATCH_MAX_BEATS,
+            8,
+            64,
+        )?;
+        if automix_beatmatch_min_beats > automix_beatmatch_preferred_beats {
+            return Err(ConfigError::InvalidRelation {
+                name: "WOTOHA_AUTOMIX_BEATMATCH_MIN_BEATS",
+                value: automix_beatmatch_min_beats,
+                related_name: "WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS",
+                related_value: automix_beatmatch_preferred_beats,
+            });
+        }
+        if automix_beatmatch_preferred_beats > automix_beatmatch_max_beats {
+            return Err(ConfigError::InvalidRelation {
+                name: "WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS",
+                value: automix_beatmatch_preferred_beats,
+                related_name: "WOTOHA_AUTOMIX_BEATMATCH_MAX_BEATS",
+                related_value: automix_beatmatch_max_beats,
+            });
+        }
         let automix_crossfade_seconds = read_optional_f32(
             &get,
             "WOTOHA_AUTOMIX_CROSSFADE_SECONDS",
@@ -190,6 +279,12 @@ impl BotConfig {
                     min_beat_confidence: automix_min_beat_confidence,
                 },
                 automix_v2_shadow_enabled,
+                automix_planner_mode,
+                automix_beatmatch: BeatmatchBlendConfig {
+                    min_beats: automix_beatmatch_min_beats,
+                    preferred_beats: automix_beatmatch_preferred_beats,
+                    max_beats: automix_beatmatch_max_beats,
+                },
             },
         })
     }
@@ -223,6 +318,8 @@ pub enum ConfigError {
     },
     #[error("WOTOHA_LOG_FILE is not a plain file name: {value}")]
     InvalidLogFileName { value: String },
+    #[error("WOTOHA_AUTOMIX_PLANNER_MODE is invalid: {value}")]
+    InvalidPlannerMode { value: String },
 }
 
 fn read_required_string(
@@ -356,7 +453,7 @@ fn validate_log_file_name(value: String) -> Result<String, ConfigError> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{BotConfig, ConfigError};
+    use super::{AutoMixPlannerMode, BeatmatchBlendConfig, BotConfig, ConfigError};
 
     fn load_from(vars: &[(&str, &str)]) -> Result<BotConfig, ConfigError> {
         let vars = vars.iter().copied().collect::<HashMap<_, _>>();
@@ -382,6 +479,14 @@ mod tests {
         assert!(config.playback.automix.enabled);
         assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 8.0);
         assert!(!config.playback.automix_v2_shadow_enabled);
+        assert_eq!(
+            config.playback.automix_planner_mode,
+            AutoMixPlannerMode::Legacy
+        );
+        assert_eq!(
+            config.playback.automix_beatmatch,
+            BeatmatchBlendConfig::default()
+        );
     }
 
     #[test]
@@ -404,6 +509,10 @@ mod tests {
             ("WOTOHA_AUTOMIX_CROSSFADE_SECONDS", "12.5"),
             ("WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT", "0.08"),
             ("WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE", "0.80"),
+            ("WOTOHA_AUTOMIX_PLANNER_MODE", "v2"),
+            ("WOTOHA_AUTOMIX_BEATMATCH_MIN_BEATS", "8"),
+            ("WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS", "16"),
+            ("WOTOHA_AUTOMIX_BEATMATCH_MAX_BEATS", "64"),
         ])
         .unwrap();
 
@@ -427,6 +536,9 @@ mod tests {
         assert_eq!(config.playback.automix.crossfade.as_secs_f32(), 12.5);
         assert_eq!(config.playback.automix.max_tempo_adjustment, 0.08);
         assert_eq!(config.playback.automix.min_beat_confidence, 0.80);
+        assert_eq!(config.playback.automix_planner_mode, AutoMixPlannerMode::V2);
+        assert_eq!(config.playback.automix_beatmatch.min_beats, 8);
+        assert_eq!(config.playback.automix_beatmatch.preferred_beats, 16);
     }
 
     #[test]
@@ -458,6 +570,49 @@ mod tests {
             load_from(&[("DISCORD_TOKEN", "token"), ("WOTOHA_DEFAULT_VOLUME", "nan")]).unwrap_err();
 
         assert!(matches!(error, ConfigError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn legacy_shadow_flag_is_only_a_fallback_for_planner_mode() {
+        let config = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_AUTOMIX_V2_SHADOW_ENABLED", "true"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.playback.automix_planner_mode,
+            AutoMixPlannerMode::Shadow
+        );
+
+        let config = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_AUTOMIX_V2_SHADOW_ENABLED", "true"),
+            ("WOTOHA_AUTOMIX_PLANNER_MODE", "legacy"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.playback.automix_planner_mode,
+            AutoMixPlannerMode::Legacy
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_planner_mode_and_inverted_blend_bounds() {
+        assert!(matches!(
+            load_from(&[
+                ("DISCORD_TOKEN", "token"),
+                ("WOTOHA_AUTOMIX_PLANNER_MODE", "wat")
+            ]),
+            Err(ConfigError::InvalidPlannerMode { .. })
+        ));
+        assert!(matches!(
+            load_from(&[
+                ("DISCORD_TOKEN", "token"),
+                ("WOTOHA_AUTOMIX_BEATMATCH_MIN_BEATS", "32"),
+                ("WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS", "16"),
+            ]),
+            Err(ConfigError::InvalidRelation { .. })
+        ));
     }
 
     #[test]

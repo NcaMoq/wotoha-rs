@@ -28,6 +28,8 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [[ -s "$WINDOWS_PACKAGER" ]] || fail 'PowerShell release packager is required'
 [[ -s "$ABOUT_CONFIG" && -s "$ABOUT_TEMPLATE" ]] \
   || fail 'cargo-about release policy and template are required'
+grep -Fq 'https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download' "$ABOUT_TEMPLATE" \
+  || fail 'cargo-about license template does not expose exact crate source downloads'
 [[ -s "$ATTRIBUTION_GENERATOR" ]] || fail 'standalone Cargo attribution generator is required'
 [[ -s "$MODEL_COMPLIANCE" ]] || fail 'embedded neural model compliance test is required'
 bash -n "$PACKAGER" "$VERIFY" "$BOOTSTRAP" "$ATTRIBUTION_GENERATOR" "$MODEL_COMPLIANCE" "$0"

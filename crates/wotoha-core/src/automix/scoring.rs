@@ -25,6 +25,7 @@ pub struct TransitionCostBreakdown {
     pub structure_uncertainty_cost: f32,
     pub rhythm_uncertainty_cost: f32,
     pub cue_suitability_cost: f32,
+    pub blend_duration_cost: f32,
     pub legacy_quality_cost: f32,
 }
 
@@ -49,6 +50,7 @@ impl TransitionCostBreakdown {
             structure_uncertainty_cost: 0.0,
             rhythm_uncertainty_cost: 0.0,
             cue_suitability_cost: 0.0,
+            blend_duration_cost: 0.0,
             legacy_quality_cost: 0.0,
         }
     }
@@ -131,6 +133,7 @@ impl TransitionCostBreakdown {
             structure_uncertainty_cost,
             rhythm_uncertainty_cost,
             cue_suitability_cost: 0.0,
+            blend_duration_cost: 0.0,
             legacy_quality_cost,
         }
     }
@@ -200,6 +203,23 @@ impl TransitionCostBreakdown {
     pub fn with_cue_suitability(mut self, outgoing: &DjCue, incoming: &DjCue) -> Self {
         self.cue_suitability_cost = cue_suitability_cost(outgoing, incoming);
         self.total = finite_cost(self.total + self.cue_suitability_cost);
+        self
+    }
+
+    /// Prefer the configured phrase-sized blend while keeping shorter and
+    /// longer physically valid families available as soft alternatives.
+    pub fn with_blend_duration(
+        mut self,
+        beats: usize,
+        preferred_beats: usize,
+        min_beats: usize,
+        max_beats: usize,
+    ) -> Self {
+        let preferred = preferred_beats.max(1) as f32;
+        let span = max_beats.saturating_sub(min_beats).max(1) as f32;
+        let distance = (beats as f32 - preferred).abs() / span.max(preferred);
+        self.blend_duration_cost = (0.12 * distance.min(1.0)).max(0.0);
+        self.total = finite_cost(self.total + self.blend_duration_cost);
         self
     }
 }

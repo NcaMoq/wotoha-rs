@@ -88,6 +88,10 @@ Wotoha RS reads `.env` during local development and `/etc/wotoha/wotoha.env` in 
 | `WOTOHA_DEFAULT_VOLUME` | `0.10` | Master playback volume |
 | `WOTOHA_AUTOMIX_ENABLED` | `true` | Enable AutoMix by default |
 | `WOTOHA_AUTOMIX_V2_SHADOW_ENABLED` | `false` | Observe bounded V2 planner diagnostics while V1 remains authoritative |
+| `WOTOHA_AUTOMIX_PLANNER_MODE` | unset | `legacy`, `shadow`, or `v2`; overrides the compatibility shadow flag |
+| `WOTOHA_AUTOMIX_BEATMATCH_MIN_BEATS` | `8` | Minimum phrase-sized V2 beatmatch blend |
+| `WOTOHA_AUTOMIX_BEATMATCH_PREFERRED_BEATS` | `32` | Preferred V2 beatmatch blend length |
+| `WOTOHA_AUTOMIX_BEATMATCH_MAX_BEATS` | `64` | Maximum V2 beatmatch blend |
 | `WOTOHA_AUTOMIX_CROSSFADE_SECONDS` | `8.0` | Preferred maximum crossfade duration |
 | `WOTOHA_AUTOMIX_MAX_TEMPO_ADJUSTMENT` | `0.06` | Maximum beat-match tempo adjustment |
 | `WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE` | `0.70` | Minimum beat confidence for beat matching |

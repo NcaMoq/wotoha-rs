@@ -294,19 +294,16 @@ pub fn track_analysis_v2_from_legacy_with_neural_rhythm(
 }
 
 /// Backend-aware form of the adapter used by songbird and cache callers.
-/// Only a fresh or cached successful neural analysis can produce Hybrid
-/// rhythm provenance; all classical outcomes stay explicitly Classical.
+/// Only a fresh neural decode can produce Hybrid rhythm provenance. A V1
+/// cache hit does not carry the native V2 timeline and therefore remains an
+/// explicit classical/legacy adapter result.
 pub fn track_analysis_v2_from_legacy_with_backend(
     analysis: &TrackAnalysis,
     backend: crate::audio_decode::AnalysisBackend,
 ) -> Option<TrackAnalysisV2> {
     track_analysis_v2_from_legacy_with_neural_rhythm(
         analysis,
-        matches!(
-            backend,
-            crate::audio_decode::AnalysisBackend::Neural
-                | crate::audio_decode::AnalysisBackend::CachedNeural
-        ),
+        matches!(backend, crate::audio_decode::AnalysisBackend::Neural),
     )
 }
 

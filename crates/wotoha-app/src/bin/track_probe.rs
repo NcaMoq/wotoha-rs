@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.urls.is_empty() {
         eprintln!(
-            "usage: cargo run -p wotoha-app --bin track_probe -- [--warmup] [--automix-plan] [--automix-preview <file.wav>] <url>..."
+            "usage: cargo run -p wotoha-app --bin track_probe -- [--strict] [--warmup] [--automix-plan] [--automix-preview <file.wav>] <url>..."
         );
         std::process::exit(2);
     }
@@ -43,20 +43,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let runtime = SongbirdRuntime::new(Songbird::serenity())?;
     let mut prepared_tracks = Vec::new();
+    let mut probe_failed = false;
 
     for (index, url) in options.urls.into_iter().enumerate() {
         let started_at = Instant::now();
         println!("SOURCE\t{index}\t{url}");
         match resolver.resolve(&url).await {
             Ok(request) => {
-                let prepared = resolver.prepare_playback(&request).await?;
+                let prepared = match resolver.prepare_playback(&request).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        eprintln!("PROVIDER_ERROR\t{index}\tprepare_playback\t{error}");
+                        println!("RESOLVED\t{index}\terror\t{error}");
+                        if !options.strict {
+                            return Err(Box::new(error).into());
+                        }
+                        probe_failed = true;
+                        println!(
+                            "ELAPSED_MS\t{index}\t{:.2}",
+                            started_at.elapsed().as_secs_f64() * 1000.0
+                        );
+                        continue;
+                    }
+                };
                 println!(
                     "RESOLVED\t{index}\t{}\t{}\t{}",
                     prepared.provider_id, prepared.canonical_key, prepared.metadata.title
                 );
                 match runtime.verify_track(&prepared).await {
                     Ok(()) => println!("PLAYABLE\t{index}\tok"),
-                    Err(error) => println!("PLAYABLE\t{index}\terror\t{error}"),
+                    Err(error) => {
+                        eprintln!("PROVIDER_ERROR\t{index}\tverify_track\t{error}");
+                        println!("PLAYABLE\t{index}\terror\t{error}");
+                        probe_failed = true;
+                    }
                 }
                 let analysis = if automix_requested {
                     let analysis = runtime.analyze_track(&prepared).await;
@@ -72,7 +92,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 });
             }
             Err(error) => {
+                eprintln!("PROVIDER_ERROR\t{index}\tresolve\t{error}");
                 println!("RESOLVED\t{index}\terror\t{error}");
+                probe_failed = true;
                 if automix_requested {
                     prepared_tracks.push(PreparedProbe {
                         index,
@@ -95,6 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         render_preview(&runtime, &prepared_tracks, path).await?;
     }
 
+    if options.strict && probe_failed {
+        return Err(probe_error("strict YouTube/media probe failed"));
+    }
+
     Ok(())
 }
 
@@ -105,6 +131,7 @@ struct PreparedProbe {
 }
 
 struct ProbeOptions {
+    strict: bool,
     warmup: bool,
     automix_plan: bool,
     automix_preview: Option<PathBuf>,
@@ -113,6 +140,7 @@ struct ProbeOptions {
 
 impl ProbeOptions {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut strict = false;
         let mut warmup = false;
         let mut automix_plan = false;
         let mut automix_preview = None;
@@ -121,6 +149,7 @@ impl ProbeOptions {
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--strict" => strict = true,
                 "--warmup" => warmup = true,
                 "--automix-plan" => automix_plan = true,
                 "--automix-preview" => {
@@ -137,6 +166,7 @@ impl ProbeOptions {
         }
 
         Ok(Self {
+            strict,
             warmup,
             automix_plan,
             automix_preview,
@@ -398,9 +428,25 @@ mod tests {
         .unwrap();
 
         assert!(options.warmup);
+        assert!(!options.strict);
         assert!(options.automix_plan);
         assert_eq!(options.automix_preview, None);
         assert_eq!(options.urls, ["one", "two"]);
+    }
+
+    #[test]
+    fn parses_strict_option() {
+        let options = ProbeOptions::parse([
+            "--strict".to_owned(),
+            "https://www.youtube.com/watch?v=H7HmzwI67ec".to_owned(),
+        ])
+        .unwrap();
+
+        assert!(options.strict);
+        assert_eq!(
+            options.urls,
+            ["https://www.youtube.com/watch?v=H7HmzwI67ec"]
+        );
     }
 
     #[test]
