@@ -115,19 +115,35 @@ MPL-2.0 section 3.2. Wotoha does not modify the listed third-party crates.
 | [hpke-rs-libcrux](https://crates.io/crates/hpke-rs-libcrux/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/hpke-rs-libcrux/0.6.1/download) |
 | [hpke-rs-rust-crypto](https://crates.io/crates/hpke-rs-rust-crypto/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/hpke-rs-rust-crypto/0.6.1/download) |
 | [symphonia](https://crates.io/crates/symphonia/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia/0.5.5/download) |
+| [symphonia](https://crates.io/crates/symphonia/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia/0.6.1/download) |
 | [symphonia-bundle-flac](https://crates.io/crates/symphonia-bundle-flac/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-bundle-flac/0.5.5/download) |
+| [symphonia-bundle-flac](https://crates.io/crates/symphonia-bundle-flac/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-bundle-flac/0.6.1/download) |
 | [symphonia-bundle-mp3](https://crates.io/crates/symphonia-bundle-mp3/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-bundle-mp3/0.5.5/download) |
+| [symphonia-bundle-mp3](https://crates.io/crates/symphonia-bundle-mp3/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-bundle-mp3/0.6.1/download) |
 | [symphonia-codec-aac](https://crates.io/crates/symphonia-codec-aac/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-codec-aac/0.5.5/download) |
+| [symphonia-codec-aac](https://crates.io/crates/symphonia-codec-aac/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-codec-aac/0.6.1/download) |
 | [symphonia-codec-adpcm](https://crates.io/crates/symphonia-codec-adpcm/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-codec-adpcm/0.5.5/download) |
+| [symphonia-codec-adpcm](https://crates.io/crates/symphonia-codec-adpcm/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-codec-adpcm/0.6.1/download) |
 | [symphonia-codec-alac](https://crates.io/crates/symphonia-codec-alac/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-codec-alac/0.5.5/download) |
+| [symphonia-codec-alac](https://crates.io/crates/symphonia-codec-alac/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-codec-alac/0.6.1/download) |
 | [symphonia-codec-pcm](https://crates.io/crates/symphonia-codec-pcm/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-codec-pcm/0.5.5/download) |
+| [symphonia-codec-pcm](https://crates.io/crates/symphonia-codec-pcm/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-codec-pcm/0.6.1/download) |
 | [symphonia-codec-vorbis](https://crates.io/crates/symphonia-codec-vorbis/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-codec-vorbis/0.5.5/download) |
+| [symphonia-codec-vorbis](https://crates.io/crates/symphonia-codec-vorbis/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-codec-vorbis/0.6.1/download) |
+| [symphonia-common](https://crates.io/crates/symphonia-common/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-common/0.6.1/download) |
 | [symphonia-core](https://crates.io/crates/symphonia-core/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-core/0.5.5/download) |
+| [symphonia-core](https://crates.io/crates/symphonia-core/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-core/0.6.1/download) |
+| [symphonia-format-caf](https://crates.io/crates/symphonia-format-caf/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-format-caf/0.6.1/download) |
 | [symphonia-format-isomp4](https://crates.io/crates/symphonia-format-isomp4/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-format-isomp4/0.5.5/download) |
+| [symphonia-format-isomp4](https://crates.io/crates/symphonia-format-isomp4/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-format-isomp4/0.6.1/download) |
 | [symphonia-format-mkv](https://crates.io/crates/symphonia-format-mkv/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-format-mkv/0.5.5/download) |
+| [symphonia-format-mkv](https://crates.io/crates/symphonia-format-mkv/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-format-mkv/0.6.1/download) |
 | [symphonia-format-ogg](https://crates.io/crates/symphonia-format-ogg/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-format-ogg/0.5.5/download) |
+| [symphonia-format-ogg](https://crates.io/crates/symphonia-format-ogg/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-format-ogg/0.6.1/download) |
 | [symphonia-format-riff](https://crates.io/crates/symphonia-format-riff/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-format-riff/0.5.5/download) |
+| [symphonia-format-riff](https://crates.io/crates/symphonia-format-riff/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-format-riff/0.6.1/download) |
 | [symphonia-metadata](https://crates.io/crates/symphonia-metadata/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-metadata/0.5.5/download) |
+| [symphonia-metadata](https://crates.io/crates/symphonia-metadata/0.6.1) | `0.6.1` | [download](https://crates.io/api/v1/crates/symphonia-metadata/0.6.1/download) |
 | [symphonia-utils-xiph](https://crates.io/crates/symphonia-utils-xiph/0.5.5) | `0.5.5` | [download](https://crates.io/api/v1/crates/symphonia-utils-xiph/0.5.5/download) |
 
 Upstream project repositories are [hpke-rs](https://github.com/cryspen/hpke-rs)
