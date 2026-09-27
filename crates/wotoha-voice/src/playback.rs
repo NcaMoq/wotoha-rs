@@ -25,7 +25,7 @@ use wotoha_contracts::{
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
-    automix::plan_guarded_transition_v2_for_analysis_with_blend_config,
+    automix::plan_guarded_transition_v2_for_analysis_with_blend_config_and_base_gains,
     automix::{
         AutoMixConfig, AutoMixPeakGuard, EqTransition, EqTransitionRole, TempoEnvelope,
         TrackAnalysis, TransitionKind, TransitionPlan, TransitionTiming,
@@ -1730,11 +1730,13 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 let planned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    plan_guarded_transition_v2_for_analysis_with_blend_config(
+                    plan_guarded_transition_v2_for_analysis_with_blend_config_and_base_gains(
                         &outgoing_v2,
                         &incoming_v2,
                         &self.inner.automix,
                         &self.inner.automix_beatmatch,
+                        outgoing_gain,
+                        incoming_gain,
                     )
                 }));
                 if let Ok(shadow) = planned {
@@ -1745,6 +1747,7 @@ where
                         && let Some(guarded) = guarded_plan.as_mut()
                     {
                         guarded.plan = shadow.plan.clone();
+                        guarded.quality = shadow.quality.clone();
                         guarded.rejected_plan = shadow.rejected_plan.clone();
                         guarded.rejected_quality = shadow.rejected_quality.clone();
                     }
@@ -1886,6 +1889,26 @@ where
                     "AutoMix BeatMatched is unavailable on this runtime; falling back to Crossfade"
                 );
             }
+        }
+        if beatmatched_plan
+            && !frame_schedule_supported
+            && let (Some(guarded), Some(outgoing), Some(incoming)) = (
+                guarded_plan.as_mut(),
+                outgoing_analysis.as_ref(),
+                incoming_analysis.as_ref(),
+            )
+        {
+            let fallback = plan_guarded_non_beatmatched_transition_with_base_gains(
+                outgoing,
+                incoming,
+                &self.inner.automix,
+                outgoing_gain,
+                incoming_gain,
+            );
+            guarded.plan = fallback.plan;
+            guarded.quality = fallback.quality;
+            guarded.rejected_plan = fallback.rejected_plan;
+            guarded.rejected_quality = fallback.rejected_quality;
         }
         if guarded_plan.is_none() {
             // Without both analyses there is no evidence that an overlap is

@@ -173,12 +173,8 @@ Copy-Item (Join-Path $targetDir "$target\release\wotoha-app") (Join-Path $packag
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha.service') (Join-Path $packageRoot 'deploy\wotoha.service')
 Copy-Item (Join-Path $repoRoot 'deploy\install-ubuntu.sh') (Join-Path $packageRoot 'install-ubuntu.sh')
 Copy-Item (Join-Path $repoRoot 'deploy\install-yt-dlp-bundle.sh') (Join-Path $packageRoot 'install-yt-dlp-bundle.sh')
-Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.sh') (Join-Path $packageRoot 'wotoha-update.sh')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-update.sh') (Join-Path $packageRoot 'yt-dlp-update.sh')
 Copy-Item (Join-Path $repoRoot 'deploy\wotoha.env.example') (Join-Path $packageRoot 'deploy\wotoha.env.example')
-Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.env.example') (Join-Path $packageRoot 'deploy\wotoha-update.env.example')
-Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.service') (Join-Path $packageRoot 'deploy\wotoha-update.service')
-Copy-Item (Join-Path $repoRoot 'deploy\wotoha-update.timer') (Join-Path $packageRoot 'deploy\wotoha-update.timer')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-update.service') (Join-Path $packageRoot 'deploy\yt-dlp-update.service')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-update.timer') (Join-Path $packageRoot 'deploy\yt-dlp-update.timer')
 Copy-Item (Join-Path $repoRoot 'deploy\yt-dlp-public.key') (Join-Path $packageRoot 'deploy\yt-dlp-public.key')
@@ -301,7 +297,6 @@ foreach ($cargoPackage in @($cargoMetadata.packages | Sort-Object { $_.name }, {
 $deploymentTextFiles = @(
     (Join-Path $packageRoot 'install-ubuntu.sh'),
     (Join-Path $packageRoot 'install-yt-dlp-bundle.sh'),
-    (Join-Path $packageRoot 'wotoha-update.sh'),
     (Join-Path $packageRoot 'yt-dlp-update.sh')
 ) + @(Get-ChildItem (Join-Path $packageRoot 'deploy') -File | Select-Object -ExpandProperty FullName)
 foreach ($deploymentTextFile in $deploymentTextFiles) {
@@ -339,7 +334,6 @@ New-LinuxArchive -Root $packageRoot -Archive $archivePath -ExecutablePaths @(
     'bin/wotoha-app',
     'install-ubuntu.sh',
     'install-yt-dlp-bundle.sh',
-    'wotoha-update.sh',
     'yt-dlp-update.sh'
 )
 New-LinuxArchive -Root $portableRoot -Archive $portableArchivePath -ExecutablePaths @(

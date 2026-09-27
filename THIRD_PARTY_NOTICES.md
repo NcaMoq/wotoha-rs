@@ -6,6 +6,30 @@ This file describes third-party material intentionally shipped in Wotoha
 release archives. It is an attribution and distribution record, not legal
 advice or a substitute for a downstream distributor's license review.
 
+## OCI image distribution
+
+The supported production artifact is the lower-case GHCR image
+`ghcr.io/ncamoq/wotoha-rs`, built for `linux/amd64`. The final image contains
+the Wotoha executable, embedded Beat This!/RTen model assets, and pinned
+yt-dlp and Deno runtime executables. The image keeps this notice and the
+project license under `/app/licenses/`; `/data` is the only persistent
+writable application area.
+
+The bundled yt-dlp executable is distributed under the GNU General Public
+License version 3 or later by the upstream
+[yt-dlp project](https://github.com/yt-dlp/yt-dlp), from the pinned
+`yt-dlp/yt-dlp-nightly-builds` release recorded in
+`deploy/third-party-versions.env`. Corresponding source and license terms are
+available from that official repository. Deno is distributed under the MIT
+License by [Deno Land](https://github.com/denoland/deno), from the pinned
+release recorded in the same file. These upstream programs remain separate
+from Wotoha's MIT-licensed code and are not linked into the Rust executable.
+
+The native Linux archives and their legacy bootstrap material are retained for
+migration and redistribution compliance only. The native Wotoha application
+updater is disabled; the independent yt-dlp updater is the only updater path
+preserved for existing native hosts.
+
 ## Release artifacts
 
 `wotoha-linux-x86_64-musl.tar.gz` contains the portable Wotoha application,

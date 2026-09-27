@@ -19,11 +19,13 @@ pub use candidate::{
     cross_product_tempo_hypotheses, explain_beatmatch_decision_v2, plan_guarded_transition_v2,
     plan_guarded_transition_v2_diagnostics, plan_guarded_transition_v2_for_analysis,
     plan_guarded_transition_v2_for_analysis_with_blend_config,
+    plan_guarded_transition_v2_for_analysis_with_blend_config_and_base_gains,
+    plan_guarded_transition_v2_with_blend_config_and_base_gains,
     plan_guarded_transition_v2_with_diagnostics, plan_transition_v2,
     plan_transition_v2_diagnostics, plan_transition_v2_for_analysis,
     plan_transition_v2_for_analysis_with_blend_config, plan_transition_v2_with_blend_config,
-    plan_transition_v2_with_diagnostics, select_tempo_hypothesis_pair, tempo_hypotheses,
-    tempo_hypothesis_pairs,
+    plan_transition_v2_with_blend_config_and_base_gains, plan_transition_v2_with_diagnostics,
+    select_tempo_hypothesis_pair, tempo_hypotheses, tempo_hypothesis_pairs,
 };
 pub use diagnostics::{AutoMixV2Reason, CandidateRejection, PlannerDiagnostics};
 pub use reliability::{

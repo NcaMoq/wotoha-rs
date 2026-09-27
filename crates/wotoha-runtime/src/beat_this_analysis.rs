@@ -857,6 +857,12 @@ pub fn model_assets() -> &'static [BeatModelAssetMetadata; 2] {
     &BEAT_MODEL_ASSETS
 }
 
+/// Validate and initialize the embedded Beat This!/rten assets without
+/// requiring audio input, Discord credentials, or network access.
+pub fn self_check_embedded_models() -> Result<(), String> {
+    build_tracker().map(|_| ())
+}
+
 fn verify_assets() -> Result<(), String> {
     verify_hash("beat_this_small.onnx", SMALL_MODEL, SMALL_MODEL_SHA256)?;
     verify_hash("mel_spectrogram.onnx", MEL_MODEL, MEL_MODEL_SHA256)

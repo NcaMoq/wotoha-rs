@@ -1,0 +1,17 @@
+.git
+.github
+.codex
+.env
+.wotoha-analysis
+target
+dist
+logs
+*.log
+Dockerfile*
+compose*.yaml
+compose*.yml
+README*
+docs
+deploy/tests
+vendor/*/target
+**/.DS_Store

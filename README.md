@@ -80,7 +80,8 @@ The now-playing message provides these controls:
 
 ## Configuration
 
-Wotoha RS reads `.env` during local development and `/etc/wotoha/wotoha.env` in the packaged Linux deployment.
+Wotoha RS reads `.env` during local development. Supported production uses
+Compose environment variables and a persistent `/data` volume.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
@@ -101,7 +102,8 @@ Wotoha RS reads `.env` during local development and `/etc/wotoha/wotoha.env` in 
 | `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP` | `-2.0` | True-peak ceiling |
 | `WOTOHA_MAX_QUEUE_LEN` | `512` | Maximum queued tracks per Discord server |
 
-See [`deploy/wotoha.env.example`](deploy/wotoha.env.example) for the complete configuration template.
+See [`compose.yaml`](compose.yaml) and [`.env.example`](.env.example) for
+the container configuration template.
 
 ## Build from Source
 
@@ -127,9 +129,13 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-## Linux Deployment Reference
+## Legacy native archive migration
 
-This section is for maintainers operating an independent Wotoha instance. Regular users can simply [add Wotoha to Discord](https://discord.com/oauth2/authorize?client_id=1238488423208063107).
+> Deprecated migration-only path. New production deployments must use Linux +
+> Docker below; the native archive/systemd/application-updater path is not a
+> supported production deployment.
+
+This section is retained only for maintainers migrating an existing host.
 
 The official release targets **x86_64 Linux**. It provides a portable, application-only archive (`wotoha-linux-x86_64-musl.tar.gz`) and an updater-compatible archive (`wotoha-ubuntu-x86_64-musl.tar.gz`) with systemd units and installation scripts. Neither archive redistributes yt-dlp or Deno. During installation, the updater-compatible installer downloads pinned releases directly from their official GitHub repositories, verifies the yt-dlp signing-key fingerprint and signed checksum plus the pinned Deno SHA-256, runs version and extraction canaries, then installs them atomically. The application binary is statically linked; the installer and updater expect a systemd-based Linux environment with standard GNU utilities. A glibc-based distribution is recommended for the upstream Deno executable.
 
@@ -201,12 +207,46 @@ sudo systemctl restart wotoha.service
 
 The current operations guide uses Ubuntu commands as a concrete example. For verification, upgrades, rollback behavior, and manual packaging, see the [complete Linux deployment guide](docs/ubuntu-deploy.md).
 
+## Production deployment
+
+Supported production deployment is Linux + Docker, linux/amd64 only. The image
+contains the Rust application, embedded rten/Beat This! models, and verified
+pinned yt-dlp/Deno runtime tools. It does not require NVIDIA, CUDA, cuDNN,
+TensorRT, NVML, or a GPU. Native Cargo execution remains supported for Linux
+development and CI; the production image is the supported deployment unit.
+
+Choose an immutable image tag such as sha-<full-git-sha> or a release version.
+Do not use an unqualified moving latest tag:
+
+~~~bash
+cp .env.example .env
+export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
+docker compose pull
+docker compose up -d
+docker compose logs -f wotoha
+~~~
+
+The Compose service is outbound-only, runs as a dedicated non-root user, uses
+a read-only root filesystem, drops Linux capabilities, and persists only /data.
+stdout/stderr are the primary logs. Before a rollout, run the offline
+self-check without Discord credentials:
+
+~~~bash
+docker run --rm --read-only --tmpfs /tmp \
+  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
+~~~
+
+For rollback, set WOTOHA_IMAGE_TAG to the previous immutable tag and run
+docker compose up -d. See the Docker deployment guide for the complete
+release, persistence, and upgrade contract.
+
 ## Documentation
 
 - [Latest GitHub release](https://github.com/NcaMoq/wotoha-rs/releases/latest)
+- [Linux + Docker production deployment](docs/docker-deploy.md)
 - [YouTube extraction and managed yt-dlp updates](docs/youtube-extraction.md)
-- [Linux deployment and automatic updates (Ubuntu command examples)](docs/ubuntu-deploy.md)
-- [Single-host Linux architecture and operations (Ubuntu reference)](docs/single-host-ubuntu.md)
+- [Legacy native Linux migration notes](docs/ubuntu-deploy.md)
 
 ## License
 

@@ -1,5 +1,12 @@
 # YouTube extraction
 
+Production containers use the verified fallback at
+/app/tools/yt-dlp-fallback and /app/tools/deno. The application image is
+immutable and does not self-update. A separately managed optional override may
+be placed under /data/tools only when yt-dlp.sha256 matches the executable.
+The independent yt-dlp updater remains a migration-only concern for legacy
+native hosts.
+
 Wotoha resolves YouTube tracks by starting the official `yt-dlp` executable for each request. `yt-dlp` uses the separately installed Deno runtime when a JavaScript challenge needs to be evaluated. It is always started with `--ignore-config`, so global or user yt-dlp configuration cannot silently change extraction behavior.
 
 The default application settings are a 25-second request deadline and two concurrent yt-dlp processes. `WOTOHA_YTDLP_TIMEOUT_SECONDS` accepts 5–120 seconds and `WOTOHA_YTDLP_CONCURRENCY` accepts 1–8. Cookies are opt-in through `WOTOHA_YTDLP_COOKIES_FILE`; the path must be absolute, name an existing regular file, and have mode `0600` (or otherwise grant no group/other permissions).

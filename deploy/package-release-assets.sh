@@ -104,15 +104,12 @@ esac
   || fail 'Deno digest is not lowercase SHA-256'
 
 install -m 0755 "$ROOT/deploy/install-ubuntu.sh" "$ROOT/deploy/install-yt-dlp-bundle.sh" \
-  "$ROOT/deploy/wotoha-update.sh" "$ROOT/deploy/yt-dlp-update.sh" "$legacy/"
+  "$ROOT/deploy/yt-dlp-update.sh" "$legacy/"
 install -m 0644 \
   "$ROOT/deploy/wotoha.service" \
-  "$ROOT/deploy/wotoha-update.service" \
-  "$ROOT/deploy/wotoha-update.timer" \
   "$ROOT/deploy/yt-dlp-update.service" \
   "$ROOT/deploy/yt-dlp-update.timer" \
   "$ROOT/deploy/wotoha.env.example" \
-  "$ROOT/deploy/wotoha-update.env.example" \
   "$ROOT/deploy/yt-dlp-public.key" \
   "$ROOT/deploy/third-party-versions.env" \
   "$legacy/deploy/"

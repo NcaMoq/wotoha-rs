@@ -67,3 +67,6 @@ The following work still needs to happen:
 - `WOTOHA_MAX_PENDING_ENQUEUES`: pending enqueue limit value, accepted range `1..=64`. It cannot exceed `WOTOHA_MAX_QUEUE_LEN`.
 
 Startup applies these values before the Discord client is built. Logging settings configure both stdout and the runtime log file. Playback volume is applied through the runtime track handle. Queue and pending enqueue limits are checked before enqueue work enters the playback coordinator.
+> Legacy native architecture reference. Supported production is Linux +
+> Docker on linux/amd64; see docker-deploy.md. Native Linux Cargo execution
+> remains a development and CI path.

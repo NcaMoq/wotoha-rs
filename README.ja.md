@@ -82,7 +82,8 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 
 ## 設定
 
-ローカル開発時は `.env`、Linux向けパッケージでは `/etc/wotoha/wotoha.env` から設定を読み込みます。
+ローカル開発時は `.env` から設定を読み込みます。本番はComposeの
+環境変数と永続 `/data` ボリュームを使用します。
 
 | 環境変数 | 既定値 | 用途 |
 | --- | ---: | --- |
@@ -99,7 +100,8 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 | `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP` | `-2.0` | True Peakの上限 |
 | `WOTOHA_MAX_QUEUE_LEN` | `512` | Discordサーバーごとの最大キュー長 |
 
-すべての設定項目は [`deploy/wotoha.env.example`](deploy/wotoha.env.example) を参照してください。
+コンテナ設定は [`compose.yaml`](compose.yaml) と
+[`.env.example`](.env.example) を参照してください。
 
 ## ソースからビルド
 
@@ -125,9 +127,11 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
 ```
 
-## Linuxでの運用資料
+## 旧ネイティブアーカイブからの移行
 
-ここからは、独自のWotohaインスタンスを管理する運用者向けの内容です。通常は[WotohaをDiscordへ追加](https://discord.com/oauth2/authorize?client_id=1238488423208063107)するだけで利用できます。
+> これは既存ホストの移行専用です。新しい本番デプロイでは以下の
+> Linux + Docker を使用してください。ネイティブアーカイブ、systemd、
+> アプリケーション更新機構は本番のサポート対象外です。
 
 公式リリースは **x86_64 Linux** を対象としています。持ち運び向けのアプリ本体のみのアーカイブ（`wotoha-linux-x86_64-musl.tar.gz`）と、既存のアップデーターと互換性のあるアーカイブ（`wotoha-ubuntu-x86_64-musl.tar.gz`）を用意します。後者にはsystemd unitと導入スクリプトが含まれますが、どちらのアーカイブにもyt-dlpとDenoは再配布しません。導入時にインストーラーが公式GitHub Releaseから固定バージョンを直接取得し、yt-dlpの署名鍵フィンガープリントと署名付きチェックサム、Denoの固定SHA-256、バージョンと抽出canaryを検証してから原子的に導入します。Wotoha本体は静的リンクされています。インストーラーと自動更新は、systemdと標準的なGNUツールを利用できるLinux環境を想定しています。上流のDenoを利用するため、glibcベースのディストリビューションを推奨します。
 
@@ -195,14 +199,48 @@ sudoedit /etc/wotoha/wotoha.env
 sudo systemctl restart wotoha.service
 ```
 
-現在の詳しい運用手順では、具体例としてUbuntuのコマンドを使用しています。配布物の検証、自動更新、ロールバック、Windowsからの手動パッケージ作成については、[Linux Server導入手順](docs/ubuntu-deploy.md)を参照してください。
+既存ホストからの移行、配布物の扱い、ロールバックについては
+[Linux Server導入手順](docs/ubuntu-deploy.md)を参照してください。
+
+## 本番デプロイ
+
+サポートする本番デプロイは Linux + Docker、linux/amd64 のみです。
+イメージにはRustアプリ、組み込みrten/Beat This!モデル、検証済みの固定版
+yt-dlp/Denoが含まれます。NVIDIA、CUDA、cuDNN、TensorRT、NVML、GPUは
+必要ありません。LinuxでのCargo実行は開発・CI向けにサポートしますが、
+本番の運用単位はDockerイメージです。
+
+sha-<完全なGit SHA> またはリリースバージョンの不変タグを使用し、動く
+latest は使わないでください。
+
+~~~bash
+cp .env.example .env
+export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
+docker compose pull
+docker compose up -d
+docker compose logs -f wotoha
+~~~
+
+Composeサービスは外向き通信のみ、専用の非rootユーザー、read-only root
+filesystem、Linux capability全削除で動作し、永続化するのは /data だけです。
+stdout/stderrを主ログとし、Discord認証情報なしでオフラインself-checkを
+実行できます。
+
+~~~bash
+docker run --rm --read-only --tmpfs /tmp \
+  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
+~~~
+
+ロールバックは WOTOHA_IMAGE_TAG を以前の不変タグに変更して
+docker compose up -d を実行します。詳細はDockerデプロイ手順を参照してください。
 
 ## ドキュメント
 
 - [最新のGitHub Release](https://github.com/NcaMoq/wotoha-rs/releases/latest)
+- [Linux + Docker本番デプロイ](docs/docker-deploy.md)
 - [YouTube抽出とyt-dlpの管理](docs/youtube-extraction.md)
-- [Linux導入と自動更新（Ubuntuのコマンド例）](docs/ubuntu-deploy.md)
-- [単一Linuxホスト構成と運用（Ubuntuリファレンス）](docs/single-host-ubuntu.md)
+- [旧ネイティブLinuxからの移行メモ](docs/ubuntu-deploy.md)
 
 ## ライセンス
 

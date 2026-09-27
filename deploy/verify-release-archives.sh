@@ -148,21 +148,17 @@ done
 
 for required in \
   deploy/wotoha.service \
-  deploy/wotoha-update.service \
-  deploy/wotoha-update.timer \
   deploy/third-party-versions.env \
   deploy/yt-dlp-public.key \
   deploy/yt-dlp-update.service \
   deploy/yt-dlp-update.timer \
   install-ubuntu.sh \
   install-yt-dlp-bundle.sh \
-  wotoha-update.sh \
   yt-dlp-update.sh; do
   [[ -s "$legacy/$required" ]] || fail "legacy archive is missing $required"
 done
 [[ -x "$legacy/install-ubuntu.sh" \
     && -x "$legacy/install-yt-dlp-bundle.sh" \
-    && -x "$legacy/wotoha-update.sh" \
     && -x "$legacy/yt-dlp-update.sh" ]] \
   || fail 'legacy updater entry points are not executable'
 

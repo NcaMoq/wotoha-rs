@@ -10,7 +10,6 @@ WORKFLOW="$ROOT/.github/workflows/release.yml"
 PACKAGER="$ROOT/deploy/package-release-assets.sh"
 VERIFY="$ROOT/deploy/verify-release-archives.sh"
 BOOTSTRAP="$ROOT/deploy/install-yt-dlp-bundle.sh"
-APP_UPDATER="$ROOT/deploy/wotoha-update.sh"
 WINDOWS_PACKAGER="$ROOT/deploy/build-ubuntu-musl.ps1"
 ABOUT_CONFIG="$ROOT/deploy/release-about.toml"
 ABOUT_TEMPLATE="$ROOT/deploy/third-party-licenses.hbs"
@@ -100,10 +99,12 @@ grep -Fq 'tampered release manifest passed attestation verification' "$WORKFLOW"
   || fail 'release workflow does not test tampered manifest attestations'
 grep -Fq 'download_bundle "$name.tar.gz.manifest.json"' "$WORKFLOW" \
   || fail 'release attestation bundle does not explicitly include the manifest alias subject'
-grep -Fq "release_size=\"\$(jq --raw-output '.size'" "$APP_UPDATER" \
-  || fail 'application updater does not read the attested archive size'
-grep -Fq "stat --format='%s' \"\$archive\"" "$APP_UPDATER" \
-  || fail 'application updater does not compare the archive byte size'
+grep -Fq 'wotoha-update is disabled' "$ROOT/deploy/wotoha-update.sh" \
+  || fail 'native application updater is not fail-closed'
+! grep -Fq 'wotoha-update.sh' "$PACKAGER" \
+  || fail 'native application updater is still packaged'
+! grep -Fq 'wotoha-update.service' "$PACKAGER" \
+  || fail 'native application updater service is still packaged'
 grep -Fq 'https://www.mozilla.org/MPL/2.0/' "$NOTICES" \
   || fail 'notices do not link the MPL-2.0 terms'
 for model_contract in \

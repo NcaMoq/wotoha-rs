@@ -4,6 +4,8 @@ use std::{
     fmt,
     fs::OpenOptions,
     io::{self, Write},
+    path::PathBuf,
+    process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -28,7 +30,9 @@ use wotoha_core::{
     debug::{append_debug_log, sanitize_log_message},
 };
 use wotoha_media::MediaResolver;
-use wotoha_runtime::{DiscordGateway, SongbirdRuntime, recommended_cache_settings};
+use wotoha_runtime::{
+    DiscordGateway, SongbirdRuntime, recommended_cache_settings, self_check_embedded_models,
+};
 use wotoha_voice::PlaybackCoordinator;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -39,13 +43,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if std::env::args().any(|argument| argument == "--self-check") {
+        return self_check().await;
+    }
     let config = BotConfig::load()?;
     std::fs::create_dir_all(&config.logging.directory)?;
     let log_path = config.logging.file_path();
-    let log_file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
+    let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "wotoha: optional file logging unavailable at {}: {error}; continuing on stdout",
+                log_path.display()
+            );
+            OpenOptions::new()
+                .write(true)
+                .open(if cfg!(unix) { "/dev/null" } else { "NUL" })?
+        }
+    };
     let (file_writer, guard) = non_blocking(log_file);
     let _guard = Box::leak(Box::new(guard));
     let env_filter = EnvFilter::builder()
@@ -128,6 +143,96 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     append_debug_log("main: client exited");
+    Ok(())
+}
+
+async fn self_check() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let data_dir =
+        PathBuf::from(std::env::var_os("WOTOHA_DATA_DIR").unwrap_or_else(|| "/data".into()));
+    for relative in ["cache/analysis", "logs", "tools"] {
+        std::fs::create_dir_all(data_dir.join(relative))?;
+    }
+    let probe = data_dir.join(".wotoha-self-check");
+    std::fs::write(&probe, b"wotoha self-check\n")?;
+    std::fs::remove_file(&probe)?;
+
+    self_check_embedded_models().map_err(io::Error::other)?;
+    check_tool(
+        "yt-dlp",
+        resolve_tool_path(
+            "WOTOHA_YTDLP_PATH",
+            [
+                PathBuf::from("/data/tools/yt-dlp"),
+                PathBuf::from("/app/tools/yt-dlp-fallback"),
+                PathBuf::from("/opt/wotoha/bin/yt-dlp"),
+            ],
+        )?,
+    )
+    .await?;
+    check_tool(
+        "Deno",
+        resolve_tool_path(
+            "WOTOHA_DENO_PATH",
+            [
+                PathBuf::from("/app/tools/deno"),
+                PathBuf::from("/opt/wotoha/bin/deno"),
+            ],
+        )?,
+    )
+    .await?;
+    println!("wotoha self-check: OK (data={})", data_dir.display());
+    Ok(())
+}
+
+fn resolve_tool_path<const N: usize>(
+    environment: &str,
+    defaults: [PathBuf; N],
+) -> Result<PathBuf, io::Error> {
+    if let Some(path) = std::env::var_os(environment) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{environment} must be an absolute path"),
+            ));
+        }
+        return Ok(path);
+    }
+    defaults
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{environment} tool is unavailable"),
+            )
+        })
+}
+
+async fn check_tool(
+    name: &str,
+    path: PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let output = tokio::process::Command::new(&path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "{name} self-check failed at {} with status {}",
+            path.display(),
+            output.status
+        ))
+        .into());
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    if version.trim().is_empty() {
+        return Err(io::Error::other(format!("{name} returned no version")).into());
+    }
+    println!("wotoha self-check: {name} {}", version.trim());
     Ok(())
 }
 

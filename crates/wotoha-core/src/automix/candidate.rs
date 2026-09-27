@@ -11,14 +11,19 @@ use super::reliability::{
 use super::scoring::{TransitionCostBreakdown, rhythm_uncertainty_cost};
 use super::{
     AutoMixConfig, AutoMixQualityIssue, AutoMixQualityReport, TempoEnvelope, TrackAnalysis,
-    TransitionKind, TransitionPlan, evaluate_transition_quality, harmonic_compatibility,
-    plan_transition_timing,
+    TransitionKind, TransitionPlan, evaluate_transition_quality_with_base_gains,
+    harmonic_compatibility, plan_transition_timing,
 };
 
 const MIN_V2_BEAT_PAIRS: usize = 3;
 const MAX_CUE_TRANSITION_CANDIDATES: usize = 64;
 const MIN_CUE_OVERLAP: Duration = Duration::from_secs(1);
 const BLEND_BEAT_FAMILY: [usize; 4] = [8, 16, 32, 64];
+const STRUCTURE_CUE_PROXIMITY_WEIGHT: f32 = 0.10;
+const STRUCTURE_HANDOFF_ALIGNMENT_WEIGHT: f32 = 0.08;
+const STRUCTURE_BOUNDARY_CROSSING_WEIGHT: f32 = 0.04;
+const STRUCTURE_PERIODIC_PRIOR_WEIGHT: f32 = 0.15;
+const MAX_STRUCTURE_ALIGNMENT_COST: f32 = 0.05;
 
 use crate::analysis::{
     CueRole, DjCue, PhraseBoundary, TempoRelation, TrackAnalysisV2, UnitInterval,
@@ -649,6 +654,30 @@ pub fn plan_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2AnalysisInp
     config: &AutoMixConfig,
     blend_config: &BeatmatchBlendConfig,
 ) -> TransitionPlanV2 {
+    plan_transition_v2_with_blend_config_and_base_gains(
+        outgoing,
+        incoming,
+        config,
+        blend_config,
+        1.0,
+        1.0,
+    )
+}
+
+/// Plan V2 candidates using the persistent gains already applied to each
+/// runtime deck. The gains affect rendered-quality scoring only; the returned
+/// plan continues to carry relative transition gains.
+pub fn plan_transition_v2_with_blend_config_and_base_gains<
+    O: V2AnalysisInput,
+    I: V2AnalysisInput,
+>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> TransitionPlanV2 {
     let outgoing_timeline = outgoing.rhythm_timeline();
     let incoming_timeline = incoming.rhythm_timeline();
     let outgoing_hypotheses = outgoing.tempo_hypotheses();
@@ -672,6 +701,8 @@ pub fn plan_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2AnalysisInp
         &outgoing_phrase_boundaries,
         &incoming_phrase_boundaries,
         blend_config,
+        outgoing_base_gain,
+        incoming_base_gain,
     );
     plan
 }
@@ -773,10 +804,45 @@ pub fn plan_guarded_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2Ana
     config: &AutoMixConfig,
     blend_config: &BeatmatchBlendConfig,
 ) -> V2GuardedTransitionPlan {
-    let planned = plan_transition_v2_with_blend_config(outgoing, incoming, config, blend_config);
+    plan_guarded_transition_v2_with_blend_config_and_base_gains(
+        outgoing,
+        incoming,
+        config,
+        blend_config,
+        1.0,
+        1.0,
+    )
+}
+
+/// Guarded V2 planning paired with the base gains used by playback.
+pub fn plan_guarded_transition_v2_with_blend_config_and_base_gains<
+    O: V2AnalysisInput,
+    I: V2AnalysisInput,
+>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> V2GuardedTransitionPlan {
+    let planned = plan_transition_v2_with_blend_config_and_base_gains(
+        outgoing,
+        incoming,
+        config,
+        blend_config,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
     let outgoing = outgoing.as_v2_legacy_view();
     let incoming = incoming.as_v2_legacy_view();
-    let raw_quality = evaluate_transition_quality(&outgoing, &incoming, &planned.plan);
+    let raw_quality = evaluate_transition_quality_with_base_gains(
+        &outgoing,
+        &incoming,
+        &planned.plan,
+        outgoing_base_gain,
+        incoming_base_gain,
+    );
     let quality = v2_quality_report(&raw_quality, planned.plan.kind);
     let selected_cue_diagnostics = planned
         .candidates
@@ -798,8 +864,13 @@ pub fn plan_guarded_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2Ana
     // Re-run the bounded candidate list in ascending cost and retain the first
     // candidate passing V2's hard guard.  Soft quality concerns remain costs.
     for candidate in &planned.candidates {
-        let raw_candidate_quality =
-            evaluate_transition_quality(&outgoing, &incoming, &candidate.plan);
+        let raw_candidate_quality = evaluate_transition_quality_with_base_gains(
+            &outgoing,
+            &incoming,
+            &candidate.plan,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         if !quality_has_v2_hard_issue(&raw_candidate_quality, candidate.plan.kind) {
             let candidate_quality = v2_quality_report(&raw_candidate_quality, candidate.plan.kind);
             let mut diagnostics = planned.diagnostics.clone();
@@ -825,7 +896,13 @@ pub fn plan_guarded_transition_v2_with_blend_config<O: V2AnalysisInput, I: V2Ana
     // report contains diagnostics about malformed source metadata.
     let gapless = gapless_plan(&outgoing, &incoming);
     let gapless_quality = v2_quality_report(
-        &evaluate_transition_quality(&outgoing, &incoming, &gapless),
+        &evaluate_transition_quality_with_base_gains(
+            &outgoing,
+            &incoming,
+            &gapless,
+            outgoing_base_gain,
+            incoming_base_gain,
+        ),
         gapless.kind,
     );
     let mut diagnostics = planned.diagnostics;
@@ -894,6 +971,24 @@ pub fn plan_guarded_transition_v2_for_analysis_with_blend_config(
     plan_guarded_transition_v2_with_blend_config(outgoing, incoming, config, blend_config)
 }
 
+pub fn plan_guarded_transition_v2_for_analysis_with_blend_config_and_base_gains(
+    outgoing: &TrackAnalysisV2,
+    incoming: &TrackAnalysisV2,
+    config: &AutoMixConfig,
+    blend_config: &BeatmatchBlendConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
+) -> V2GuardedTransitionPlan {
+    plan_guarded_transition_v2_with_blend_config_and_base_gains(
+        outgoing,
+        incoming,
+        config,
+        blend_config,
+        outgoing_base_gain,
+        incoming_base_gain,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_transition_v2_internal_with_context(
     outgoing: &TrackAnalysis,
@@ -908,6 +1003,8 @@ fn plan_transition_v2_internal_with_context(
     outgoing_phrase_boundaries: &[PhraseBoundary],
     incoming_phrase_boundaries: &[PhraseBoundary],
     blend_config: &BeatmatchBlendConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
 ) -> (TransitionPlanV2, BeatMatchEligibility) {
     let gapless = gapless_plan(outgoing, incoming);
     let pair_reliability = pair_reliability(
@@ -941,6 +1038,8 @@ fn plan_transition_v2_internal_with_context(
         outgoing_phrase_boundaries,
         incoming_phrase_boundaries,
         blend_config,
+        outgoing_base_gain,
+        incoming_base_gain,
     );
     diagnostics.outgoing_mix_out_cues = cue_counts.0;
     diagnostics.incoming_mix_in_cues = cue_counts.1;
@@ -1009,7 +1108,7 @@ fn plan_transition_v2_internal_with_context(
                 super::reliability::pair_reliability(outgoing_reliability, incoming_reliability)
             })
             .unwrap_or(pair_reliability);
-        let cost = TransitionCostBreakdown::for_plan(
+        let cost = TransitionCostBreakdown::for_plan_with_base_gains(
             outgoing,
             incoming,
             &plan,
@@ -1018,8 +1117,16 @@ fn plan_transition_v2_internal_with_context(
             eligibility.phase_error,
             local_pair_reliability,
             config.min_beat_confidence,
+            outgoing_base_gain,
+            incoming_base_gain,
         );
-        let quality = evaluate_transition_quality(outgoing, incoming, &plan);
+        let quality = evaluate_transition_quality_with_base_gains(
+            outgoing,
+            incoming,
+            &plan,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         let hard_rejection =
             quality_rejection_with_eligibility(&quality, plan.kind, Some(&eligibility));
         if let Some(reason) = hard_rejection {
@@ -1038,13 +1145,19 @@ fn plan_transition_v2_internal_with_context(
 
     let crossfade = crossfade_plan(outgoing, incoming, config);
     if crossfade.kind == TransitionKind::Crossfade {
-        let quality = evaluate_transition_quality(outgoing, incoming, &crossfade);
+        let quality = evaluate_transition_quality_with_base_gains(
+            outgoing,
+            incoming,
+            &crossfade,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         let hard_rejection = quality_rejection(&quality, crossfade.kind);
         if let Some(reason) = hard_rejection {
             diagnostics.add_reason(reason.reason());
         } else {
             diagnostics.add_candidate(TransitionKind::Crossfade);
-            let cost = TransitionCostBreakdown::for_plan(
+            let cost = TransitionCostBreakdown::for_plan_with_base_gains(
                 outgoing,
                 incoming,
                 &crossfade,
@@ -1053,6 +1166,8 @@ fn plan_transition_v2_internal_with_context(
                 None,
                 pair_reliability,
                 config.min_beat_confidence,
+                outgoing_base_gain,
+                incoming_base_gain,
             );
             candidates.push(TransitionCandidate {
                 plan: crossfade,
@@ -1066,7 +1181,7 @@ fn plan_transition_v2_internal_with_context(
         diagnostics.add_reason(AutoMixV2Reason::PhysicalWindowUnavailable);
     }
 
-    let gapless_cost = TransitionCostBreakdown::for_plan(
+    let gapless_cost = TransitionCostBreakdown::for_plan_with_base_gains(
         outgoing,
         incoming,
         &gapless,
@@ -1075,6 +1190,8 @@ fn plan_transition_v2_internal_with_context(
         None,
         pair_reliability,
         config.min_beat_confidence,
+        outgoing_base_gain,
+        incoming_base_gain,
     );
     candidates.push(TransitionCandidate {
         plan: gapless,
@@ -1140,6 +1257,8 @@ fn cue_transition_candidates(
     outgoing_phrase_boundaries: &[PhraseBoundary],
     incoming_phrase_boundaries: &[PhraseBoundary],
     blend_config: &BeatmatchBlendConfig,
+    outgoing_base_gain: f32,
+    incoming_base_gain: f32,
 ) -> (Vec<TransitionCandidate>, (usize, usize, usize, usize)) {
     if !config.enabled
         || !config.max_tempo_adjustment.is_finite()
@@ -1253,8 +1372,11 @@ fn cue_transition_candidates(
         // A DJ cue is an anchor, not an instruction to fade all the way to
         // the source's audible end. Choose a bounded phrase-sized family and
         // validate both decks against their physical source bounds.
-        let Some(beat_duration) = local_beat_duration(outgoing_timeline, outgoing_cue.beat_index)
-        else {
+        let Some(beat_duration) = local_beat_duration(
+            outgoing_timeline,
+            outgoing_cue.beat_index,
+            Some(tempo.outgoing.bpm),
+        ) else {
             continue;
         };
         let Some(duration) = beat_duration.checked_mul(beats as u32) else {
@@ -1267,15 +1389,13 @@ fn cue_transition_candidates(
         {
             continue;
         }
-        let incoming_end_bound =
-            incoming_phrase_edge_bound(incoming, incoming_timeline, incoming_phrase_boundaries);
         let Some(mapped_duration) = scale_duration(duration, f64::from(tempo.ratio)) else {
             continue;
         };
         let Some(mapped_incoming_end) = incoming_start.checked_add(mapped_duration) else {
             continue;
         };
-        if incoming_start < incoming.audible_start || mapped_incoming_end > incoming_end_bound {
+        if incoming_start < incoming.audible_start || mapped_incoming_end > incoming.audible_end {
             continue;
         }
         let (beat_pairs, phase_error) = phase_pairs(
@@ -1327,7 +1447,7 @@ fn cue_transition_candidates(
             phase_error,
             tempo,
         );
-        let cost = TransitionCostBreakdown::for_plan(
+        let cost = TransitionCostBreakdown::for_plan_with_base_gains(
             outgoing,
             incoming,
             &plan,
@@ -1336,6 +1456,8 @@ fn cue_transition_candidates(
             phase_error,
             local_pair_reliability,
             config.min_beat_confidence,
+            outgoing_base_gain,
+            incoming_base_gain,
         )
         .with_cue_suitability(&outgoing_cue, &incoming_cue)
         .with_blend_duration(
@@ -1343,8 +1465,25 @@ fn cue_transition_candidates(
             blend_config.preferred_beats,
             blend_config.min_beats,
             blend_config.max_beats,
+        )
+        .with_structure_alignment(structure_alignment_cost(
+            outgoing_timeline,
+            incoming_timeline,
+            outgoing_cue,
+            incoming_cue,
+            outgoing_phrase_boundaries,
+            incoming_phrase_boundaries,
+            outgoing_start,
+            incoming_start,
+            duration,
+        ));
+        let quality = evaluate_transition_quality_with_base_gains(
+            outgoing,
+            incoming,
+            &plan,
+            outgoing_base_gain,
+            incoming_base_gain,
         );
-        let quality = evaluate_transition_quality(outgoing, incoming, &plan);
         if quality_rejection_with_eligibility(&quality, plan.kind, Some(&cue_eligibility)).is_some()
         {
             continue;
@@ -1397,23 +1536,41 @@ fn blend_duration_cost(beats: usize, preferred: usize, min: usize, max: usize) -
     (0.12 * ((beats as f32 - preferred).abs() / span.max(preferred)).min(1.0)).max(0.0)
 }
 
-fn local_beat_duration(timeline: &BeatTimeline, beat_index: usize) -> Option<Duration> {
-    let event = timeline.events.get(beat_index)?;
-    let mut intervals = Vec::with_capacity(8);
-    for pair in timeline.events.windows(2) {
-        if pair[0].time == event.time || pair[1].time == event.time {
-            let interval = pair[1].time.checked_sub(pair[0].time)?;
-            if !interval.is_zero() {
-                intervals.push(interval);
-            }
-        }
+fn local_beat_duration(
+    timeline: &BeatTimeline,
+    beat_index: usize,
+    tempo_fallback_bpm: Option<f32>,
+) -> Option<Duration> {
+    timeline.events.get(beat_index)?;
+    let local_start = beat_index.saturating_sub(8);
+    let local_end = beat_index.saturating_add(9).min(timeline.events.len());
+    let local_intervals = interval_durations(&timeline.events[local_start..local_end]);
+    robust_duration_median(&local_intervals)
+        .or_else(|| robust_duration_median(&interval_durations(&timeline.events)))
+        .or_else(|| tempo_fallback_bpm.and_then(super::beat_interval_from_bpm))
+}
+
+fn interval_durations(events: &[TimelineEvent]) -> Vec<Duration> {
+    events
+        .windows(2)
+        .filter_map(|pair| pair[1].time.checked_sub(pair[0].time))
+        .filter(|interval| !interval.is_zero() && interval.as_secs_f64().is_finite())
+        .collect()
+}
+
+fn robust_duration_median(intervals: &[Duration]) -> Option<Duration> {
+    if intervals.is_empty() {
+        return None;
     }
-    intervals.into_iter().next().or_else(|| {
-        timeline
-            .events
-            .windows(2)
-            .filter_map(|pair| pair[1].time.checked_sub(pair[0].time))
-            .find(|interval| !interval.is_zero())
+    let mut sorted = intervals.to_vec();
+    sorted.sort_unstable();
+    let middle = sorted.len() / 2;
+    Some(if sorted.len().is_multiple_of(2) {
+        sorted[middle - 1]
+            .checked_add(sorted[middle])
+            .map_or(sorted[middle], |sum| sum / 2)
+    } else {
+        sorted[middle]
     })
 }
 
@@ -1422,7 +1579,7 @@ fn usable_role_cues(
     role: CueRole,
     analysis: &TrackAnalysis,
     timeline: &BeatTimeline,
-    phrase_boundaries: &[PhraseBoundary],
+    _phrase_boundaries: &[PhraseBoundary],
 ) -> Vec<DjCue> {
     let beat_count = timeline.events.len();
     let filtered = candidates
@@ -1433,8 +1590,7 @@ fn usable_role_cues(
             timeline.events.get(cue.beat_index).is_some_and(|event| {
                 event.time >= analysis.audible_start && event.time < analysis.audible_end
             })
-        })
-        .filter(|cue| cue_is_in_edge_phrase(cue, role, analysis, timeline, phrase_boundaries));
+        });
     let bounded = bound_cue_candidates(filtered, beat_count);
     match role {
         CueRole::MixIn => top_mix_in_cues(&bounded),
@@ -1442,60 +1598,120 @@ fn usable_role_cues(
     }
 }
 
-fn cue_is_in_edge_phrase(
-    cue: &DjCue,
-    role: CueRole,
-    analysis: &TrackAnalysis,
-    timeline: &BeatTimeline,
-    phrase_boundaries: &[PhraseBoundary],
-) -> bool {
-    let cue_time = timeline.events[cue.beat_index].time;
-    let mut boundary_times = phrase_boundaries
-        .iter()
-        // PeriodicPhrase prior is useful for soft ranking, but must never
-        // remove an otherwise valid cue from the bounded search.
-        .filter(|boundary| boundary.is_real_detection())
-        .filter_map(|boundary| {
-            timeline
-                .events
-                .get(boundary.beat_index)
-                .map(|event| event.time)
-        })
-        .filter(|time| *time >= analysis.audible_start && *time < analysis.audible_end)
-        .collect::<Vec<_>>();
-    boundary_times.sort_unstable();
-    boundary_times.dedup();
-    match role {
-        CueRole::MixOut => boundary_times
-            .into_iter()
-            .filter(|time| *time < analysis.audible_end)
-            .max()
-            .is_none_or(|last_phrase_start| cue_time >= last_phrase_start),
-        CueRole::MixIn => boundary_times
-            .into_iter()
-            .filter(|time| *time > analysis.audible_start)
-            .min()
-            .is_none_or(|first_phrase_end| cue_time <= first_phrase_end),
-    }
+/// Compute a small, finite preference for transitions that use structure
+/// evidence well. This is deliberately independent from cue existence: a
+/// candidate may cross a detected boundary and remains physically eligible.
+#[allow(clippy::too_many_arguments)]
+fn structure_alignment_cost(
+    outgoing_timeline: &BeatTimeline,
+    incoming_timeline: &BeatTimeline,
+    outgoing_cue: DjCue,
+    incoming_cue: DjCue,
+    outgoing_boundaries: &[PhraseBoundary],
+    incoming_boundaries: &[PhraseBoundary],
+    outgoing_start: Duration,
+    incoming_start: Duration,
+    duration: Duration,
+) -> f32 {
+    let outgoing_cue_time = outgoing_timeline.events[outgoing_cue.beat_index].time;
+    let incoming_cue_time = incoming_timeline.events[incoming_cue.beat_index].time;
+    let outgoing_end = outgoing_start.saturating_add(duration);
+    let incoming_end = incoming_start.saturating_add(duration);
+    let outgoing_alignment =
+        structure_position_alignment(outgoing_timeline, outgoing_boundaries, outgoing_cue_time);
+    let incoming_alignment =
+        structure_position_alignment(incoming_timeline, incoming_boundaries, incoming_cue_time);
+    let outgoing_handoff =
+        structure_position_alignment(outgoing_timeline, outgoing_boundaries, outgoing_end);
+    let incoming_handoff =
+        structure_position_alignment(incoming_timeline, incoming_boundaries, incoming_start);
+    let cue_cost = [outgoing_alignment, incoming_alignment]
+        .into_iter()
+        .flatten()
+        .map(|alignment| (1.0 - alignment) * STRUCTURE_CUE_PROXIMITY_WEIGHT)
+        .sum::<f32>();
+    let handoff_cost = [outgoing_handoff, incoming_handoff]
+        .into_iter()
+        .flatten()
+        .map(|alignment| (1.0 - alignment) * STRUCTURE_HANDOFF_ALIGNMENT_WEIGHT)
+        .sum::<f32>();
+    let crossing_cost = [
+        structure_boundary_crossing_cost(
+            outgoing_timeline,
+            outgoing_boundaries,
+            outgoing_start,
+            outgoing_end,
+        ),
+        structure_boundary_crossing_cost(
+            incoming_timeline,
+            incoming_boundaries,
+            incoming_start,
+            incoming_end,
+        ),
+    ]
+    .into_iter()
+    .sum::<f32>();
+    finite_structure_cost(cue_cost + handoff_cost + crossing_cost)
 }
 
-fn incoming_phrase_edge_bound(
-    analysis: &TrackAnalysis,
+fn structure_position_alignment(
     timeline: &BeatTimeline,
-    phrase_boundaries: &[PhraseBoundary],
-) -> Duration {
-    phrase_boundaries
-        .iter()
-        .filter(|boundary| boundary.is_real_detection())
-        .filter_map(|boundary| {
-            timeline
-                .events
-                .get(boundary.beat_index)
-                .map(|event| event.time)
-        })
-        .filter(|time| *time > analysis.audible_start && *time <= analysis.audible_end)
+    boundaries: &[PhraseBoundary],
+    position: Duration,
+) -> Option<f32> {
+    let local_interval = interval_durations(&timeline.events)
+        .into_iter()
         .min()
-        .unwrap_or(analysis.audible_end)
+        .unwrap_or(Duration::from_secs(1));
+    let radius = local_interval.saturating_mul(4);
+    boundaries
+        .iter()
+        .filter_map(|boundary| {
+            let time = timeline.events.get(boundary.beat_index)?.time;
+            let proximity = if radius.is_zero() {
+                0.0
+            } else {
+                (1.0 - time.abs_diff(position).as_secs_f32() / radius.as_secs_f32()).clamp(0.0, 1.0)
+            };
+            let source_weight = if boundary.source.is_periodic_prior() {
+                STRUCTURE_PERIODIC_PRIOR_WEIGHT
+            } else {
+                1.0
+            };
+            Some(proximity * boundary.strength.get() * source_weight)
+        })
+        .max_by(f32::total_cmp)
+}
+
+fn structure_boundary_crossing_cost(
+    timeline: &BeatTimeline,
+    boundaries: &[PhraseBoundary],
+    start: Duration,
+    end: Duration,
+) -> f32 {
+    boundaries
+        .iter()
+        .filter_map(|boundary| {
+            let time = timeline.events.get(boundary.beat_index)?.time;
+            (time > start && time < end).then_some(
+                boundary.strength.get()
+                    * if boundary.source.is_periodic_prior() {
+                        STRUCTURE_PERIODIC_PRIOR_WEIGHT
+                    } else {
+                        1.0
+                    },
+            )
+        })
+        .map(|strength| strength * STRUCTURE_BOUNDARY_CROSSING_WEIGHT)
+        .sum()
+}
+
+fn finite_structure_cost(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_STRUCTURE_ALIGNMENT_COST)
+    } else {
+        0.0
+    }
 }
 
 fn usable_events(analysis: &TrackAnalysis, timeline: &BeatTimeline) -> Vec<TimelineEvent> {
@@ -1817,6 +2033,7 @@ mod tests {
         BeatEvent, Confidence, MeterHypothesis, ModelScore, PhraseBoundary, Section, SectionLabel,
         Support, TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
     };
+    use crate::automix::evaluate_transition_quality;
 
     fn config() -> AutoMixConfig {
         AutoMixConfig {
@@ -1872,6 +2089,133 @@ mod tests {
             relation: TempoRelation::Primary,
         });
         analysis
+    }
+
+    #[test]
+    fn local_beat_duration_ignores_a_single_outlier_interval() {
+        let timeline = BeatTimeline::from_times(
+            [0_u64, 1, 2, 3, 4, 5, 6, 7, 8, 1_008]
+                .into_iter()
+                .map(Duration::from_secs),
+        );
+
+        assert_eq!(
+            local_beat_duration(&timeline, 8, Some(60.0)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            local_beat_duration(&BeatTimeline::from_times([Duration::ZERO]), 0, Some(60.0)),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn structure_alignment_is_a_finite_ranking_cost_not_a_rejection() {
+        let outgoing_timeline = BeatTimeline::from_times((0_u64..=12).map(Duration::from_secs));
+        let incoming_timeline = BeatTimeline::from_times((0_u64..=12).map(Duration::from_secs));
+        let outgoing_cue = DjCue::new(4, UnitInterval::ONE);
+        let incoming_cue = DjCue::new(0, UnitInterval::ONE);
+        let aligned_boundaries = [
+            PhraseBoundary::detected(4, UnitInterval::ONE),
+            PhraseBoundary::detected(8, UnitInterval::ONE),
+        ];
+        let aligned_incoming_boundaries = [
+            PhraseBoundary::detected(0, UnitInterval::ONE),
+            PhraseBoundary::detected(4, UnitInterval::ONE),
+        ];
+        let misaligned_boundaries = [
+            PhraseBoundary::detected(2, UnitInterval::ONE),
+            PhraseBoundary::detected(10, UnitInterval::ONE),
+        ];
+
+        let aligned = structure_alignment_cost(
+            &outgoing_timeline,
+            &incoming_timeline,
+            outgoing_cue,
+            incoming_cue,
+            &aligned_boundaries,
+            &aligned_incoming_boundaries,
+            Duration::from_secs(4),
+            Duration::ZERO,
+            Duration::from_secs(4),
+        );
+        let misaligned = structure_alignment_cost(
+            &outgoing_timeline,
+            &incoming_timeline,
+            outgoing_cue,
+            incoming_cue,
+            &misaligned_boundaries,
+            &misaligned_boundaries,
+            Duration::from_secs(4),
+            Duration::ZERO,
+            Duration::from_secs(4),
+        );
+
+        assert!(aligned.is_finite() && misaligned.is_finite());
+        assert!(
+            aligned < misaligned,
+            "aligned={aligned}, misaligned={misaligned}"
+        );
+    }
+
+    #[test]
+    fn v2_quality_and_cost_use_runtime_base_gains_once() {
+        let (mut outgoing, mut incoming) = paired_edge_analyses(0.95);
+        outgoing.energy_profile = vec![200; 180];
+        outgoing.energy_profile_rate = 1;
+        incoming.energy_profile = vec![150; 180];
+        incoming.energy_profile_rate = 1;
+        let blend = BeatmatchBlendConfig::default();
+        let guarded = plan_guarded_transition_v2_with_blend_config_and_base_gains(
+            &outgoing,
+            &incoming,
+            &config(),
+            &blend,
+            0.5,
+            0.75,
+        );
+        let expected_quality = v2_quality_report(
+            &evaluate_transition_quality_with_base_gains(
+                &outgoing,
+                &incoming,
+                &guarded.plan,
+                0.5,
+                0.75,
+            ),
+            guarded.plan.kind,
+        );
+        assert_eq!(guarded.quality, expected_quality);
+
+        let planned = plan_transition_v2_with_blend_config_and_base_gains(
+            &outgoing,
+            &incoming,
+            &config(),
+            &blend,
+            0.5,
+            0.75,
+        );
+        let selected = planned
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan == planned.plan)
+            .expect("selected V2 candidate");
+        let expected_legacy_quality = crate::automix::transition_score_breakdown(
+            &evaluate_transition_quality_with_base_gains(
+                &outgoing,
+                &incoming,
+                &planned.plan,
+                0.5,
+                0.75,
+            ),
+        )
+        .map_or(0.0, |breakdown| breakdown.total.max(0.0));
+        assert!((selected.cost.legacy_quality_cost - expected_legacy_quality).abs() < 0.00001);
+        assert!(selected.cost.total.is_finite());
+        assert!(planned.candidates.iter().all(|candidate| {
+            candidate.cost.total.is_finite()
+                && candidate.cost.structure_alignment_cost.is_finite()
+                && candidate.cost.legacy_quality_cost.is_finite()
+        }));
     }
 
     #[test]

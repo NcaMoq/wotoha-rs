@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use super::{
-    TrackAnalysis, TransitionKind, TransitionPlan, evaluate_transition_quality,
+    TrackAnalysis, TransitionKind, TransitionPlan, evaluate_transition_quality_with_base_gains,
     transition_score_breakdown,
 };
 use crate::analysis::DjCue;
@@ -23,6 +23,7 @@ pub struct TransitionCostBreakdown {
     pub tempo_stretch_cost: f32,
     pub phase_precision_cost: f32,
     pub structure_uncertainty_cost: f32,
+    pub structure_alignment_cost: f32,
     pub rhythm_uncertainty_cost: f32,
     pub cue_suitability_cost: f32,
     pub blend_duration_cost: f32,
@@ -48,6 +49,7 @@ impl TransitionCostBreakdown {
             tempo_stretch_cost: 0.0,
             phase_precision_cost: 0.0,
             structure_uncertainty_cost: 0.0,
+            structure_alignment_cost: 0.0,
             rhythm_uncertainty_cost: 0.0,
             cue_suitability_cost: 0.0,
             blend_duration_cost: 0.0,
@@ -131,6 +133,7 @@ impl TransitionCostBreakdown {
             tempo_stretch_cost,
             phase_precision_cost,
             structure_uncertainty_cost,
+            structure_alignment_cost: 0.0,
             rhythm_uncertainty_cost,
             cue_suitability_cost: 0.0,
             blend_duration_cost: 0.0,
@@ -149,7 +152,40 @@ impl TransitionCostBreakdown {
         reliability: f32,
         target_confidence: f32,
     ) -> Self {
-        let quality = evaluate_transition_quality(outgoing, incoming, plan);
+        Self::for_plan_with_base_gains(
+            outgoing,
+            incoming,
+            plan,
+            tempo_adjustment,
+            max_tempo_adjustment,
+            phase_error,
+            reliability,
+            target_confidence,
+            1.0,
+            1.0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_plan_with_base_gains(
+        outgoing: &TrackAnalysis,
+        incoming: &TrackAnalysis,
+        plan: &TransitionPlan,
+        tempo_adjustment: f32,
+        max_tempo_adjustment: f32,
+        phase_error: Option<Duration>,
+        reliability: f32,
+        target_confidence: f32,
+        outgoing_base_gain: f32,
+        incoming_base_gain: f32,
+    ) -> Self {
+        let quality = evaluate_transition_quality_with_base_gains(
+            outgoing,
+            incoming,
+            plan,
+            outgoing_base_gain,
+            incoming_base_gain,
+        );
         // The existing score is useful as a preference, but V2 decides hard
         // eligibility separately.  A missing breakdown is simply neutral.
         let legacy_quality = transition_score_breakdown(&quality)
@@ -203,6 +239,14 @@ impl TransitionCostBreakdown {
     pub fn with_cue_suitability(mut self, outgoing: &DjCue, incoming: &DjCue) -> Self {
         self.cue_suitability_cost = cue_suitability_cost(outgoing, incoming);
         self.total = finite_cost(self.total + self.cue_suitability_cost);
+        self
+    }
+
+    /// Add a bounded structure-alignment preference. Structure evidence is
+    /// intentionally a ranking signal and never changes hard eligibility.
+    pub fn with_structure_alignment(mut self, cost: f32) -> Self {
+        self.structure_alignment_cost = finite_cost(cost);
+        self.total = finite_cost(self.total + self.structure_alignment_cost);
         self
     }
 

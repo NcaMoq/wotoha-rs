@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{
     io::AsyncReadExt,
     process::{Child, Command},
@@ -33,6 +34,8 @@ pub enum YtDlpError {
     NotConfigured,
     #[error("yt-dlp path must be absolute: {0}")]
     RelativePath(String),
+    #[error("managed yt-dlp override at {path} failed SHA-256 verification")]
+    UnverifiedManagedTool { path: String },
     #[error("yt-dlp is unavailable at {path}: {source}")]
     Unavailable {
         path: String,
@@ -341,18 +344,47 @@ fn sanitize_headers(
 }
 
 fn yt_dlp_path() -> Result<PathBuf, YtDlpError> {
-    let path = env::var_os("WOTOHA_YTDLP_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let managed = PathBuf::from("/opt/wotoha/bin/yt-dlp");
-            managed.is_file().then_some(managed)
-        })
-        .ok_or(YtDlpError::NotConfigured)?;
+    let path = if let Some(path) = env::var_os("WOTOHA_YTDLP_PATH").map(PathBuf::from) {
+        path
+    } else if let Some(path) = verified_managed_ytdlp_override()? {
+        path
+    } else {
+        [
+            PathBuf::from("/app/tools/yt-dlp-fallback"),
+            PathBuf::from("/opt/wotoha/bin/yt-dlp"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or(YtDlpError::NotConfigured)?
+    };
     if !path.is_absolute() {
         return Err(YtDlpError::RelativePath(path.display().to_string()));
     }
     Ok(path)
 }
+
+fn verified_managed_ytdlp_override() -> Result<Option<PathBuf>, YtDlpError> {
+    let path = PathBuf::from("/data/tools/yt-dlp");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let digest_path = PathBuf::from("/data/tools/yt-dlp.sha256");
+    let expected = std::fs::read_to_string(&digest_path)
+        .ok()
+        .and_then(|contents| contents.split_whitespace().next().map(str::to_owned));
+    let actual = std::fs::read(&path)
+        .ok()
+        .map(|contents| format!("{:x}", Sha256::digest(contents)))
+        .unwrap_or_default();
+    if expected.as_deref() == Some(actual.as_str()) {
+        Ok(Some(path))
+    } else {
+        Err(YtDlpError::UnverifiedManagedTool {
+            path: path.display().to_string(),
+        })
+    }
+}
+
 fn cookies_file() -> Result<Option<PathBuf>, YtDlpError> {
     let Some(path) = env::var_os("WOTOHA_YTDLP_COOKIES_FILE").map(PathBuf::from) else {
         return Ok(None);
@@ -376,6 +408,14 @@ fn deno_path() -> Option<PathBuf> {
     env::var_os("WOTOHA_DENO_PATH")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_file())
+        .or_else(|| {
+            [
+                PathBuf::from("/app/tools/deno"),
+                PathBuf::from("/opt/wotoha/bin/deno"),
+            ]
+            .into_iter()
+            .find(|path| path.is_file())
+        })
 }
 fn extraction_timeout() -> Duration {
     env::var("WOTOHA_YTDLP_TIMEOUT_SECONDS")
