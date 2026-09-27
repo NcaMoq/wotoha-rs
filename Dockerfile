@@ -67,6 +67,10 @@ FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2
 ARG SOURCE_COMMIT=unknown
 ARG IMAGE_VERSION=development
 
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN groupadd --system --gid 10001 wotoha \
     && useradd --system --uid 10001 --gid 10001 --home-dir /data --shell /usr/sbin/nologin wotoha \
     && install -d -o 10001 -g 10001 -m 0755 /app /app/tools /app/licenses /data /data/cache/analysis /data/logs /data/tools /tmp
