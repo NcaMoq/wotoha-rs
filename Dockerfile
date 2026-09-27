@@ -86,7 +86,6 @@ RUN chmod 0555 /app /app/wotoha-app /app/tools /app/tools/yt-dlp-fallback /app/t
 
 ENV WOTOHA_ANALYSIS_CACHE_DIR=/data/cache/analysis \
     WOTOHA_LOG_DIR=/data/logs \
-    WOTOHA_YTDLP_PATH=/app/tools/yt-dlp-fallback \
     WOTOHA_DENO_PATH=/app/tools/deno \
     RUST_LOG=info,wotoha_debug=info
 

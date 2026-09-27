@@ -35,6 +35,22 @@ Only /data is writable and persistent:
 - /data/tools is reserved for a separately managed, SHA-256-verified yt-dlp
   override named yt-dlp with a matching yt-dlp.sha256 sidecar.
 
+The production yt-dlp resolver has one explicit, deterministic order:
+
+1. `WOTOHA_YTDLP_PATH`, when an administrator explicitly provides an absolute
+   path.
+2. `/data/tools/yt-dlp`, only when `/data/tools/yt-dlp.sha256` verifies its
+   contents.
+3. The immutable image-pinned `/app/tools/yt-dlp-fallback`.
+4. The legacy native `/opt/wotoha/bin/yt-dlp` path, only when present for
+   migration compatibility.
+
+An invalid managed override is diagnosed and skipped; it is never executed.
+The resolver then uses the immutable image fallback when available. The
+Compose file passes through `WOTOHA_YTDLP_PATH` only when it is set in the
+administrator's environment; it does not force the image fallback through
+that variable.
+
 stdout and stderr are the primary logs. The application handles SIGTERM
 directly as PID 1 and has a 30-second Compose stop grace period. The image
 does not self-update its application binary. A separate yt-dlp updater may

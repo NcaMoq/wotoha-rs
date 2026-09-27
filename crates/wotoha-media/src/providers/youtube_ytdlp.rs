@@ -343,41 +343,74 @@ fn sanitize_headers(
     Ok(result)
 }
 
+pub fn resolve_ytdlp_path() -> Result<PathBuf, YtDlpError> {
+    resolve_ytdlp_path_with_candidates(
+        env::var_os("WOTOHA_YTDLP_PATH").map(PathBuf::from),
+        Path::new("/data/tools/yt-dlp"),
+        Path::new("/data/tools/yt-dlp.sha256"),
+        Path::new("/app/tools/yt-dlp-fallback"),
+        Path::new("/opt/wotoha/bin/yt-dlp"),
+    )
+}
+
 fn yt_dlp_path() -> Result<PathBuf, YtDlpError> {
-    let path = if let Some(path) = env::var_os("WOTOHA_YTDLP_PATH").map(PathBuf::from) {
+    resolve_ytdlp_path()
+}
+
+fn resolve_ytdlp_path_with_candidates(
+    explicit: Option<PathBuf>,
+    managed: &Path,
+    managed_digest: &Path,
+    fallback: &Path,
+    legacy: &Path,
+) -> Result<PathBuf, YtDlpError> {
+    let path = if let Some(path) = explicit {
         path
-    } else if let Some(path) = verified_managed_ytdlp_override()? {
-        path
+    } else if managed.is_file() {
+        match verified_managed_ytdlp_override(managed, managed_digest) {
+            Ok(Some(path)) => path,
+            Ok(None) => unreachable!("managed yt-dlp was checked as a regular file"),
+            Err(error) => {
+                eprintln!(
+                    "wotoha: ignoring invalid managed yt-dlp override at {} ({error}); continuing with fallback resolution",
+                    managed.display()
+                );
+                [fallback, legacy]
+                    .into_iter()
+                    .find(|candidate| candidate.is_file())
+                    .ok_or(YtDlpError::NotConfigured)?
+                    .to_path_buf()
+            }
+        }
     } else {
-        [
-            PathBuf::from("/app/tools/yt-dlp-fallback"),
-            PathBuf::from("/opt/wotoha/bin/yt-dlp"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or(YtDlpError::NotConfigured)?
+        [fallback, legacy]
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .ok_or(YtDlpError::NotConfigured)?
+            .to_path_buf()
     };
     if !path.is_absolute() {
         return Err(YtDlpError::RelativePath(path.display().to_string()));
     }
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
-fn verified_managed_ytdlp_override() -> Result<Option<PathBuf>, YtDlpError> {
-    let path = PathBuf::from("/data/tools/yt-dlp");
+fn verified_managed_ytdlp_override(
+    path: &Path,
+    digest_path: &Path,
+) -> Result<Option<PathBuf>, YtDlpError> {
     if !path.is_file() {
         return Ok(None);
     }
-    let digest_path = PathBuf::from("/data/tools/yt-dlp.sha256");
-    let expected = std::fs::read_to_string(&digest_path)
+    let expected = std::fs::read_to_string(digest_path)
         .ok()
         .and_then(|contents| contents.split_whitespace().next().map(str::to_owned));
-    let actual = std::fs::read(&path)
+    let actual = std::fs::read(path)
         .ok()
         .map(|contents| format!("{:x}", Sha256::digest(contents)))
         .unwrap_or_default();
     if expected.as_deref() == Some(actual.as_str()) {
-        Ok(Some(path))
+        Ok(Some(path.to_path_buf()))
     } else {
         Err(YtDlpError::UnverifiedManagedTool {
             path: path.display().to_string(),
@@ -517,6 +550,148 @@ mod tests {
         assert!(!is_googlevideo_url(
             "https://googlevideo.com.example.test/videoplayback"
         ));
+    }
+
+    fn resolution_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "wotoha-ytdlp-resolution-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn write_digest(path: &Path, digest_path: &Path) {
+        let contents = std::fs::read(path).unwrap();
+        std::fs::write(
+            digest_path,
+            format!("{:x}  {}\n", Sha256::digest(contents), path.display()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn explicit_ytdlp_override_wins_and_must_be_absolute() {
+        let directory = resolution_directory("explicit");
+        let managed = directory.join("managed");
+        let digest = directory.join("managed.sha256");
+        let fallback = directory.join("fallback");
+        let legacy = directory.join("legacy");
+        std::fs::write(&managed, b"managed").unwrap();
+        write_digest(&managed, &digest);
+        std::fs::write(&fallback, b"fallback").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+
+        assert_eq!(
+            resolve_ytdlp_path_with_candidates(
+                Some(directory.join("administrator")),
+                &managed,
+                &digest,
+                &fallback,
+                &legacy,
+            )
+            .unwrap(),
+            directory.join("administrator")
+        );
+        assert!(matches!(
+            resolve_ytdlp_path_with_candidates(
+                Some(PathBuf::from("relative/yt-dlp")),
+                &managed,
+                &digest,
+                &fallback,
+                &legacy,
+            ),
+            Err(YtDlpError::RelativePath(_))
+        ));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn valid_managed_override_beats_image_and_legacy_fallbacks() {
+        let directory = resolution_directory("managed");
+        let managed = directory.join("managed");
+        let digest = directory.join("managed.sha256");
+        let fallback = directory.join("fallback");
+        let legacy = directory.join("legacy");
+        std::fs::write(&managed, b"managed").unwrap();
+        write_digest(&managed, &digest);
+        std::fs::write(&fallback, b"fallback").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+
+        assert_eq!(
+            resolve_ytdlp_path_with_candidates(None, &managed, &digest, &fallback, &legacy)
+                .unwrap(),
+            managed
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn no_managed_override_uses_image_fallback_before_legacy() {
+        let directory = resolution_directory("fallback");
+        let managed = directory.join("missing-managed");
+        let digest = directory.join("missing-managed.sha256");
+        let fallback = directory.join("fallback");
+        let legacy = directory.join("legacy");
+        std::fs::write(&fallback, b"fallback").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+
+        assert_eq!(
+            resolve_ytdlp_path_with_candidates(None, &managed, &digest, &fallback, &legacy)
+                .unwrap(),
+            fallback
+        );
+        let _ = std::fs::remove_file(&fallback);
+        assert_eq!(
+            resolve_ytdlp_path_with_candidates(None, &managed, &digest, &fallback, &legacy)
+                .unwrap(),
+            legacy
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn invalid_managed_digest_uses_image_fallback() {
+        let directory = resolution_directory("invalid");
+        let managed = directory.join("managed");
+        let digest = directory.join("managed.sha256");
+        let fallback = directory.join("fallback");
+        let legacy = directory.join("legacy");
+        std::fs::write(&managed, b"managed").unwrap();
+        std::fs::write(
+            &digest,
+            format!("{}  {}\n", "0".repeat(64), managed.display()),
+        )
+        .unwrap();
+        std::fs::write(&fallback, b"fallback").unwrap();
+        std::fs::write(&legacy, b"legacy").unwrap();
+
+        assert_eq!(
+            resolve_ytdlp_path_with_candidates(None, &managed, &digest, &fallback, &legacy)
+                .unwrap(),
+            fallback
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn resolver_order_is_deterministic_when_candidates_are_repeated() {
+        let directory = resolution_directory("deterministic");
+        let managed = directory.join("managed");
+        let digest = directory.join("managed.sha256");
+        let fallback = directory.join("fallback");
+        let legacy = directory.join("legacy");
+        std::fs::write(&fallback, b"fallback").unwrap();
+
+        for _ in 0..8 {
+            assert_eq!(
+                resolve_ytdlp_path_with_candidates(None, &managed, &digest, &fallback, &legacy)
+                    .unwrap(),
+                fallback
+            );
+        }
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[cfg(unix)]

@@ -3,13 +3,13 @@ services:
     image: ghcr.io/ncamoq/wotoha-rs:${WOTOHA_IMAGE_TAG:?set WOTOHA_IMAGE_TAG to an immutable sha-<commit> or version tag}
     restart: unless-stopped
     environment:
-      DISCORD_TOKEN: ${DISCORD_TOKEN-}
-      WOTOHA_AUTOMIX_PLANNER_MODE: ${WOTOHA_AUTOMIX_PLANNER_MODE:-legacy}
-      WOTOHA_AUTOMIX_V2_SHADOW_ENABLED: ${WOTOHA_AUTOMIX_V2_SHADOW_ENABLED:-false}
-      WOTOHA_ANALYSIS_CACHE_DIR: /data/cache/analysis
-      WOTOHA_LOG_DIR: /data/logs
-      WOTOHA_YTDLP_PATH: /app/tools/yt-dlp-fallback
-      WOTOHA_DENO_PATH: /app/tools/deno
+      - DISCORD_TOKEN=${DISCORD_TOKEN-}
+      - WOTOHA_AUTOMIX_PLANNER_MODE=${WOTOHA_AUTOMIX_PLANNER_MODE:-legacy}
+      - WOTOHA_AUTOMIX_V2_SHADOW_ENABLED=${WOTOHA_AUTOMIX_V2_SHADOW_ENABLED:-false}
+      - WOTOHA_ANALYSIS_CACHE_DIR=/data/cache/analysis
+      - WOTOHA_LOG_DIR=/data/logs
+      - WOTOHA_DENO_PATH=/app/tools/deno
+      - WOTOHA_YTDLP_PATH
     volumes:
       - wotoha-data:/data
     read_only: true

@@ -29,7 +29,7 @@ use wotoha_core::{
     config::{AutoMixPlannerMode, PlaybackConfig},
     debug::{append_debug_log, sanitize_log_message},
 };
-use wotoha_media::MediaResolver;
+use wotoha_media::{MediaResolver, resolve_ytdlp_path};
 use wotoha_runtime::{
     DiscordGateway, SongbirdRuntime, recommended_cache_settings, self_check_embedded_models,
 };
@@ -159,14 +159,8 @@ async fn self_check() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     self_check_embedded_models().map_err(io::Error::other)?;
     check_tool(
         "yt-dlp",
-        resolve_tool_path(
-            "WOTOHA_YTDLP_PATH",
-            [
-                PathBuf::from("/data/tools/yt-dlp"),
-                PathBuf::from("/app/tools/yt-dlp-fallback"),
-                PathBuf::from("/opt/wotoha/bin/yt-dlp"),
-            ],
-        )?,
+        resolve_ytdlp_path()
+            .map_err(|error| io::Error::other(format!("WOTOHA_YTDLP_PATH resolver: {error}")))?,
     )
     .await?;
     check_tool(
@@ -232,6 +226,7 @@ async fn check_tool(
     if version.trim().is_empty() {
         return Err(io::Error::other(format!("{name} returned no version")).into());
     }
+    println!("wotoha self-check: {name} path={}", path.display());
     println!("wotoha self-check: {name} {}", version.trim());
     Ok(())
 }

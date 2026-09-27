@@ -1820,6 +1820,7 @@ where
                             v2_cost_tempo_stretch = shadow.cost.tempo_stretch_cost,
                             v2_cost_phase_precision = shadow.cost.phase_precision_cost,
                             v2_cost_structure_uncertainty = shadow.cost.structure_uncertainty_cost,
+                            v2_cost_structure_alignment = shadow.cost.structure_alignment_cost,
                             v2_cost_cue_suitability = shadow.cost.cue_suitability_cost,
                             v2_cost_blend_duration = shadow.cost.blend_duration_cost,
                             v2_cost_legacy_quality = shadow.cost.legacy_quality_cost,

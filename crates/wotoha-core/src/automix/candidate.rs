@@ -1476,6 +1476,9 @@ fn cue_transition_candidates(
             outgoing_start,
             incoming_start,
             duration,
+            mapped_duration,
+            Some(tempo.outgoing.bpm),
+            Some(tempo.incoming.bpm),
         ));
         let quality = evaluate_transition_quality_with_base_gains(
             outgoing,
@@ -1611,20 +1614,39 @@ fn structure_alignment_cost(
     incoming_boundaries: &[PhraseBoundary],
     outgoing_start: Duration,
     incoming_start: Duration,
-    duration: Duration,
+    outgoing_duration: Duration,
+    incoming_mapped_duration: Duration,
+    outgoing_tempo_bpm: Option<f32>,
+    incoming_tempo_bpm: Option<f32>,
 ) -> f32 {
     let outgoing_cue_time = outgoing_timeline.events[outgoing_cue.beat_index].time;
     let incoming_cue_time = incoming_timeline.events[incoming_cue.beat_index].time;
-    let outgoing_end = outgoing_start.saturating_add(duration);
-    let incoming_end = incoming_start.saturating_add(duration);
-    let outgoing_alignment =
-        structure_position_alignment(outgoing_timeline, outgoing_boundaries, outgoing_cue_time);
-    let incoming_alignment =
-        structure_position_alignment(incoming_timeline, incoming_boundaries, incoming_cue_time);
-    let outgoing_handoff =
-        structure_position_alignment(outgoing_timeline, outgoing_boundaries, outgoing_end);
-    let incoming_handoff =
-        structure_position_alignment(incoming_timeline, incoming_boundaries, incoming_start);
+    let outgoing_end = outgoing_start.saturating_add(outgoing_duration);
+    let incoming_end = incoming_start.saturating_add(incoming_mapped_duration);
+    let outgoing_alignment = structure_position_alignment(
+        outgoing_timeline,
+        outgoing_boundaries,
+        outgoing_cue_time,
+        outgoing_tempo_bpm,
+    );
+    let incoming_alignment = structure_position_alignment(
+        incoming_timeline,
+        incoming_boundaries,
+        incoming_cue_time,
+        incoming_tempo_bpm,
+    );
+    let outgoing_handoff = structure_position_alignment(
+        outgoing_timeline,
+        outgoing_boundaries,
+        outgoing_end,
+        outgoing_tempo_bpm,
+    );
+    let incoming_handoff = structure_position_alignment(
+        incoming_timeline,
+        incoming_boundaries,
+        incoming_start,
+        incoming_tempo_bpm,
+    );
     let cue_cost = [outgoing_alignment, incoming_alignment]
         .into_iter()
         .flatten()
@@ -1658,10 +1680,15 @@ fn structure_position_alignment(
     timeline: &BeatTimeline,
     boundaries: &[PhraseBoundary],
     position: Duration,
+    tempo_fallback_bpm: Option<f32>,
 ) -> Option<f32> {
-    let local_interval = interval_durations(&timeline.events)
-        .into_iter()
-        .min()
+    let beat_index = timeline
+        .events
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, event)| event.time.abs_diff(position))
+        .map(|(index, _)| index)?;
+    let local_interval = local_beat_duration(timeline, beat_index, tempo_fallback_bpm)
         .unwrap_or(Duration::from_secs(1));
     let radius = local_interval.saturating_mul(4);
     boundaries
@@ -2138,6 +2165,9 @@ mod tests {
             Duration::from_secs(4),
             Duration::ZERO,
             Duration::from_secs(4),
+            Duration::from_secs(4),
+            Some(60.0),
+            Some(60.0),
         );
         let misaligned = structure_alignment_cost(
             &outgoing_timeline,
@@ -2149,6 +2179,9 @@ mod tests {
             Duration::from_secs(4),
             Duration::ZERO,
             Duration::from_secs(4),
+            Duration::from_secs(4),
+            Some(60.0),
+            Some(60.0),
         );
 
         assert!(aligned.is_finite() && misaligned.is_finite());
@@ -2156,6 +2189,116 @@ mod tests {
             aligned < misaligned,
             "aligned={aligned}, misaligned={misaligned}"
         );
+    }
+
+    #[test]
+    fn structure_radius_ignores_a_single_short_interval_outlier() {
+        let timeline = BeatTimeline::from_times([
+            Duration::ZERO,
+            Duration::from_millis(500),
+            Duration::from_millis(1_000),
+            Duration::from_millis(1_070),
+            Duration::from_millis(1_570),
+            Duration::from_millis(2_070),
+            Duration::from_millis(2_570),
+        ]);
+        let boundaries = [PhraseBoundary::detected(6, UnitInterval::ONE)];
+
+        let alignment = structure_position_alignment(
+            &timeline,
+            &boundaries,
+            Duration::from_millis(1_070),
+            Some(120.0),
+        )
+        .unwrap();
+
+        assert!(
+            alignment > 0.2,
+            "the 500 ms local median should keep the four-beat radius active: {alignment}"
+        );
+    }
+
+    #[test]
+    fn structure_crossing_uses_the_mapped_incoming_duration() {
+        let outgoing_timeline = BeatTimeline::from_times((0_u64..=12).map(Duration::from_secs));
+        let incoming_timeline = BeatTimeline::from_times((0_u64..=12).map(Duration::from_secs));
+        let outgoing_cue = DjCue::new(0, UnitInterval::ONE);
+        let incoming_cue = DjCue::new(0, UnitInterval::ONE);
+        let incoming_boundary = [PhraseBoundary::detected(6, UnitInterval::ONE)];
+        let ratio_one_duration = Duration::from_secs(4);
+        let ratio_above_one_duration = Duration::from_secs(4);
+        let ratio_above_one_mapped_duration =
+            scale_duration(ratio_above_one_duration, 2.0).unwrap();
+        let ratio_below_one_duration = Duration::from_secs(8);
+        let ratio_below_one_mapped_duration =
+            scale_duration(ratio_below_one_duration, 0.5).unwrap();
+
+        let ratio_one = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_one_duration,
+        );
+        let ratio_one_unscaled_window = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_one_duration,
+        );
+        assert_eq!(ratio_one, ratio_one_unscaled_window);
+
+        let ratio_above_one = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_above_one_mapped_duration,
+        );
+        let ratio_above_one_incorrect_window = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_above_one_duration,
+        );
+        let ratio_below_one = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_below_one_mapped_duration,
+        );
+        let ratio_below_one_incorrect_window = structure_boundary_crossing_cost(
+            &incoming_timeline,
+            &incoming_boundary,
+            Duration::ZERO,
+            ratio_below_one_duration,
+        );
+        let mapped_cost = structure_alignment_cost(
+            &outgoing_timeline,
+            &incoming_timeline,
+            outgoing_cue,
+            incoming_cue,
+            &[],
+            &incoming_boundary,
+            Duration::from_secs(4),
+            Duration::ZERO,
+            ratio_above_one_duration,
+            ratio_above_one_mapped_duration,
+            Some(60.0),
+            Some(30.0),
+        );
+
+        assert!(
+            ratio_above_one > ratio_above_one_incorrect_window,
+            "mapped incoming span must include the boundary: mapped={ratio_above_one}, incorrect={ratio_above_one_incorrect_window}"
+        );
+        assert!(
+            ratio_below_one < ratio_below_one_incorrect_window,
+            "mapped incoming span must exclude the boundary: mapped={ratio_below_one}, incorrect={ratio_below_one_incorrect_window}"
+        );
+        assert!(ratio_above_one.is_finite() && ratio_below_one.is_finite());
+        assert!(ratio_above_one >= 0.0 && ratio_below_one >= 0.0);
+        assert!(ratio_above_one <= MAX_STRUCTURE_ALIGNMENT_COST);
+        assert!(ratio_below_one <= MAX_STRUCTURE_ALIGNMENT_COST);
+        assert!(mapped_cost.is_finite() && mapped_cost <= MAX_STRUCTURE_ALIGNMENT_COST);
     }
 
     #[test]

@@ -87,6 +87,45 @@ jobs:
             test -x /app/tools/deno
           '
 
+      - name: Test verified managed yt-dlp override and invalid fallback
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+        run: |
+          set -euo pipefail
+          image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          managed_output="$(docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            --tmpfs /data:rw,exec,mode=0777 \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            --entrypoint /bin/sh "$image" -c '
+              set -eu
+              mkdir -p /data/tools
+              cp /app/tools/yt-dlp-fallback /data/tools/yt-dlp
+              sha256sum /data/tools/yt-dlp > /data/tools/yt-dlp.sha256
+              exec /app/wotoha-app --self-check
+            ' 2>&1)"
+          printf '%s\n' "$managed_output"
+          grep -F 'wotoha self-check: yt-dlp path=/data/tools/yt-dlp' <<< "$managed_output"
+
+          invalid_output="$(docker run --rm \
+            --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            --tmpfs /data:rw,exec,mode=0777 \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            --entrypoint /bin/sh "$image" -c '
+              set -eu
+              mkdir -p /data/tools
+              cp /app/tools/yt-dlp-fallback /data/tools/yt-dlp
+              printf "%064d  %s\\n" 0 /data/tools/yt-dlp > /data/tools/yt-dlp.sha256
+              exec /app/wotoha-app --self-check
+            ' 2>&1)"
+          printf '%s\n' "$invalid_output"
+          grep -F 'ignoring invalid managed yt-dlp override' <<< "$invalid_output"
+          grep -F 'wotoha self-check: yt-dlp path=/app/tools/yt-dlp-fallback' <<< "$invalid_output"
+
       - name: Push immutable image tags
         if: github.event_name == 'push'
         env:
