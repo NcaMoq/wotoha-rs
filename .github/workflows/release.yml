@@ -1,4 +1,6 @@
-name: release
+# Deprecated migration-only workflow. Supported production releases are built
+# and published by container.yml to the immutable GHCR image.
+name: legacy native archive release (migration-only)
 
 on:
   push:

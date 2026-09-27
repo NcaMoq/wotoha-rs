@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Deprecated migration-only installer for existing native Linux hosts.
+# New production deployments must use the Linux/amd64 Docker image.
 set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

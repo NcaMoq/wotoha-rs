@@ -1,3 +1,5 @@
+# Deprecated migration-only packager for existing native Linux installations.
+# Supported production releases are Linux/amd64 OCI images from container.yml.
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot

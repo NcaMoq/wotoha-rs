@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the updater-compatible and app-only Linux release archives.
+# Build deprecated migration-only native Linux archives. Supported production
+# releases are Linux/amd64 OCI images published by .github/workflows/container.yml.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
