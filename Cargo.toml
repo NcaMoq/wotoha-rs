@@ -5,6 +5,7 @@ members = [
     "crates/wotoha-contracts",
     "crates/wotoha-control",
     "crates/wotoha-core",
+    "crates/wotoha-analysis-lab",
     "crates/wotoha-media",
     "crates/wotoha-runtime",
     "crates/wotoha-voice",

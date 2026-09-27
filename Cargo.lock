@@ -5448,6 +5448,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wotoha-analysis-lab"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "wotoha-core",
+ "wotoha-runtime",
+]
+
+[[package]]
 name = "wotoha-app"
 version = "0.1.0"
 dependencies = [

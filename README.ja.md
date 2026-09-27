@@ -240,6 +240,7 @@ docker compose up -d を実行します。詳細はDockerデプロイ手順を�
 - [最新のGitHub Release](https://github.com/NcaMoq/wotoha-rs/releases/latest)
 - [Linux + Docker本番デプロイ](docs/docker-deploy.md)
 - [YouTube抽出とyt-dlpの管理](docs/youtube-extraction.md)
+- [クリーンルーム解析ラボと合成評価](docs/analysis-lab.md)
 - [旧ネイティブLinuxからの移行メモ](docs/ubuntu-deploy.md)
 
 ## ライセンス

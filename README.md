@@ -246,6 +246,7 @@ release, persistence, and upgrade contract.
 - [Latest GitHub release](https://github.com/NcaMoq/wotoha-rs/releases/latest)
 - [Linux + Docker production deployment](docs/docker-deploy.md)
 - [YouTube extraction and managed yt-dlp updates](docs/youtube-extraction.md)
+- [Clean-room analysis lab and synthetic evaluation](docs/analysis-lab.md)
 - [Legacy native Linux migration notes](docs/ubuntu-deploy.md)
 
 ## License
