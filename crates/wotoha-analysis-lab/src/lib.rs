@@ -3622,12 +3622,19 @@ fn experimental_tempo_report(
         };
         report.applicable_tracks += 1;
         let current_bpm = primary_tempo_bpm(prediction);
-        let current_relation = prediction
-            .tempo_hypotheses
-            .first()
-            .map(|hypothesis| canonical_relation_name(&hypothesis.relation).to_owned());
         let current_correct = current_bpm
             .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
+        let current_relation = current_bpm.map(|bpm| {
+            tempo_relation_to_truth(bpm, truth.primary_bpm)
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    prediction
+                        .tempo_hypotheses
+                        .first()
+                        .map(|hypothesis| canonical_relation_name(&hypothesis.relation).to_owned())
+                        .unwrap_or_else(|| "absent".into())
+                })
+        });
         let experimental_correct = experimental
             .selected_bpm
             .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
@@ -3640,10 +3647,13 @@ fn experimental_tempo_report(
         report.experimental_ambiguous_count += usize::from(experimental.ambiguous);
         report.experimental_wrong_primary_count +=
             usize::from(!experimental.ambiguous && !experimental_correct);
-        if experimental.selected_relation.as_deref() == Some("half_time") {
+        let experimental_relation = experimental
+            .selected_bpm
+            .and_then(|bpm| tempo_relation_to_truth(bpm, truth.primary_bpm));
+        if experimental_relation == Some("half_time") {
             report.experimental_half_time_count += 1;
         }
-        if experimental.selected_relation.as_deref() == Some("double_time") {
+        if experimental_relation == Some("double_time") {
             report.experimental_double_time_count += 1;
         }
         let family = record.spec.family.as_str().to_owned();
@@ -3662,6 +3672,19 @@ fn experimental_tempo_report(
         });
     }
     report
+}
+
+fn tempo_relation_to_truth(bpm: f32, truth_bpm: f32) -> Option<&'static str> {
+    let within = |expected: f32| expected > 0.0 && (bpm - expected).abs() / expected < 0.005;
+    if within(truth_bpm) {
+        Some("primary")
+    } else if within(truth_bpm / 2.0) {
+        Some("half_time")
+    } else if within(truth_bpm * 2.0) {
+        Some("double_time")
+    } else {
+        None
+    }
 }
 
 fn calibration(tracks: &[TrackEvaluation]) -> Vec<CalibrationBin> {
