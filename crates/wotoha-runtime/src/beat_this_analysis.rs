@@ -24,8 +24,9 @@ use wotoha_core::analysis::{
 };
 use wotoha_core::automix::{KeyMode, MusicalKey as LegacyMusicalKey, PhraseCue, TrackAnalysis};
 use wotoha_core::beat_analysis::{
-    NeuralBeatObservations, NeuralRhythmAnalysis, TempoRelation as NeuralTempoRelation,
-    decode_neural_rhythm, decode_neural_rhythm_with_low_frequency,
+    NeuralBeatObservations, NeuralRhythmAnalysis, NeuralRhythmDiagnostics,
+    TempoRelation as NeuralTempoRelation, decode_neural_rhythm,
+    decode_neural_rhythm_with_low_frequency, diagnose_neural_rhythm,
 };
 
 use crate::embedded_rten::EmbeddedRtenRuntime;
@@ -50,6 +51,12 @@ pub const MAX_NEURAL_SAMPLES: usize =
 /// direct V2 input bounded to the same neural analysis horizon; an empty slice
 /// remains valid and simply records zero low-frequency support.
 pub const MAX_NEURAL_LOW_BAND_SAMPLES: usize = 1_000 * MAX_NEURAL_DURATION.as_secs() as usize;
+
+#[derive(Clone, Debug)]
+pub struct NeuralRhythmDiagnosticResult {
+    pub rhythm: Option<RhythmAnalysis>,
+    pub diagnostics: NeuralRhythmDiagnostics,
+}
 
 static SMALL_MODEL: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -189,6 +196,49 @@ pub fn analyze_neural_rhythm(
         &AtomicBool::new(false),
     )?;
     rhythm_analysis_from_neural(decoded)
+}
+
+/// Research-only observability boundary for Beat This!. The production entry
+/// point above remains unchanged; this additive API exposes bounded decoder
+/// evidence and rejection reasons without changing the returned rhythm.
+pub fn analyze_neural_rhythm_with_diagnostics(
+    samples: &[f32],
+    sample_rate: u32,
+    low_band_1khz: &[f32],
+) -> NeuralRhythmDiagnosticResult {
+    if sample_rate != NEURAL_SAMPLE_RATE
+        || samples.is_empty()
+        || samples.len() > MAX_NEURAL_SAMPLES
+        || low_band_1khz.len() > MAX_NEURAL_LOW_BAND_SAMPLES
+        || low_band_1khz.iter().any(|sample| !sample.is_finite())
+    {
+        return NeuralRhythmDiagnosticResult {
+            rhythm: None,
+            diagnostics: NeuralRhythmDiagnostics {
+                rejection_reason: Some("invalid_input".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        };
+    }
+    let Some(observations) = analyze_with_cancel(samples, sample_rate, &AtomicBool::new(false))
+    else {
+        return NeuralRhythmDiagnosticResult {
+            rhythm: None,
+            diagnostics: NeuralRhythmDiagnostics {
+                rejection_reason: Some("model_or_inference_unavailable".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        };
+    };
+    let (decoded, mut diagnostics) = diagnose_neural_rhythm(&observations, low_band_1khz);
+    let rhythm = decoded.and_then(rhythm_analysis_from_neural);
+    if rhythm.is_none() && diagnostics.rejection_reason.is_none() {
+        diagnostics.rejection_reason = Some("malformed_decoded_rhythm".into());
+    }
+    NeuralRhythmDiagnosticResult {
+        rhythm,
+        diagnostics,
+    }
 }
 
 /// Run Beat This! and decode its observations into the event-preserving core

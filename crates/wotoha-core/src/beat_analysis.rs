@@ -71,6 +71,33 @@ pub enum TempoRelation {
     Alternative,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeuralTempoCandidateDiagnostics {
+    pub bpm: f32,
+    pub relation: TempoRelation,
+    pub period_frames: usize,
+    pub available: bool,
+    pub normalized_weight: Option<f32>,
+    pub activation_evidence: f32,
+    pub continuity_evidence: f32,
+    pub periodic_support: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NeuralRhythmDiagnostics {
+    pub selected_period_frames: Option<usize>,
+    pub selected_bpm: Option<f32>,
+    pub path_marker_count: usize,
+    pub path_coverage: Option<f32>,
+    pub activation_mean: Option<f32>,
+    pub support: Option<f32>,
+    pub interval_residual: Option<f32>,
+    pub alias_margin: Option<f32>,
+    pub candidates: Vec<NeuralTempoCandidateDiagnostics>,
+    pub decoder_accepted: bool,
+    pub rejection_reason: Option<String>,
+}
+
 /// One valid member of the explicit half/native/double-time tempo family.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TempoHypothesis {
@@ -186,6 +213,11 @@ struct DecodedGrid {
     beat_confidence: f32,
     first_downbeat_ordinal: Option<usize>,
     downbeat_confidence: f32,
+    coverage: f32,
+    activation_mean: f32,
+    support: f32,
+    residual: f32,
+    alias_margin: f32,
 }
 
 /// Replace only beat-related fields in an existing classical analysis.
@@ -328,6 +360,125 @@ pub fn decode_neural_rhythm_with_low_frequency(
         &grid,
         Some(&refined_samples),
         Some(&refined_support),
+    )
+}
+
+/// Research-only decoder observability. This returns the same rhythm value as
+/// the normal decoder and a read-only explanation of the bounded decision.
+/// It does not alter acceptance, event timing, or tempo hypotheses.
+pub fn diagnose_neural_rhythm(
+    observations: &NeuralBeatObservations,
+    low_band_1khz: &[f32],
+) -> (Option<NeuralRhythmAnalysis>, NeuralRhythmDiagnostics) {
+    if observations.len() < MIN_PATH_MARKERS {
+        return (
+            None,
+            NeuralRhythmDiagnostics {
+                rejection_reason: Some("insufficient_markers".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        );
+    }
+    if !observations.frame_rate_hz.is_finite()
+        || observations.frame_rate_hz <= 0.0
+        || observations
+            .beat_logits
+            .iter()
+            .chain(observations.downbeat_logits.iter())
+            .any(|value| !value.is_finite())
+    {
+        return (
+            None,
+            NeuralRhythmDiagnostics {
+                rejection_reason: Some("invalid_input".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        );
+    }
+    let Some(grid) = decode_grid(observations) else {
+        return (
+            None,
+            NeuralRhythmDiagnostics {
+                rejection_reason: Some("decoder_rejected".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        );
+    };
+    let decoded = if low_band_1khz.is_empty() {
+        rhythm_from_grid(observations, &grid, None, None)
+    } else {
+        let low_onset = low_band_onset(low_band_1khz);
+        let (refined_samples, refined_support) =
+            refine_markers(&grid.frames, &low_onset, observations.frame_rate_hz);
+        rhythm_from_grid(
+            observations,
+            &grid,
+            Some(&refined_samples),
+            Some(&refined_support),
+        )
+    };
+    let Some(decoded) = decoded else {
+        return (
+            None,
+            NeuralRhythmDiagnostics {
+                selected_period_frames: Some(grid.period_frames),
+                selected_bpm: Some(grid.bpm),
+                path_marker_count: grid.frames.len(),
+                path_coverage: Some(grid.coverage),
+                activation_mean: Some(grid.activation_mean),
+                support: Some(grid.support),
+                interval_residual: Some(grid.residual),
+                alias_margin: Some(grid.alias_margin),
+                rejection_reason: Some("malformed_decoded_rhythm".into()),
+                ..NeuralRhythmDiagnostics::default()
+            },
+        );
+    };
+    let candidates = [
+        (
+            TempoRelation::HalfTime,
+            grid.period_frames.saturating_mul(2),
+        ),
+        (TempoRelation::Primary, grid.period_frames),
+        (TempoRelation::DoubleTime, grid.period_frames / 2),
+    ]
+    .into_iter()
+    .map(|(relation, period_frames)| {
+        let bpm = observations.frame_rate_hz * 60.0 / period_frames.max(1) as f32;
+        let normalized_weight = decoded
+            .tempo_hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis.relation == relation)
+            .map(|hypothesis| hypothesis.relative_weight);
+        NeuralTempoCandidateDiagnostics {
+            bpm,
+            relation,
+            period_frames,
+            available: period_frames > 0
+                && period_bounds(observations.frame_rate_hz)
+                    .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&period_frames)),
+            normalized_weight,
+            activation_evidence: grid.activation_mean,
+            continuity_evidence: (1.0 - grid.residual).clamp(0.0, 1.0),
+            periodic_support: grid.support,
+        }
+    })
+    .collect();
+    (
+        Some(decoded),
+        NeuralRhythmDiagnostics {
+            selected_period_frames: Some(grid.period_frames),
+            selected_bpm: Some(grid.bpm),
+            path_marker_count: grid.frames.len(),
+            path_coverage: Some(grid.coverage),
+            activation_mean: Some(grid.activation_mean),
+            support: Some(grid.support),
+            interval_residual: Some(grid.residual),
+            alias_margin: Some(grid.alias_margin),
+            candidates,
+            decoder_accepted: true,
+            rejection_reason: None,
+        },
     )
 }
 
@@ -690,6 +841,11 @@ fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
         beat_confidence,
         first_downbeat_ordinal,
         downbeat_confidence,
+        coverage,
+        activation_mean,
+        support,
+        residual,
+        alias_margin,
     })
 }
 

@@ -32,6 +32,10 @@ as `Traktor Pro 4`, version `4.1.1 (23)`, macOS. No binary is needed by this
 crate. A future Team A packet can be passed to `--external-observations` after
 its hashes and schema have been validated.
 
+The lab does not contain a Traktor implementation or a vendor-specific
+adapter. External records are generic observations, grouped by observer
+product/version/settings and matched by cryptographic audio identity.
+
 ## Synthetic corpus
 
 Synthetic fixtures generate canonical PCM audio and exact `AnalysisGroundTruth`
@@ -53,6 +57,21 @@ Sample-rate variants, for example 22,050 Hz and 16,000 Hz, are matched by
 `base_id` and shared truth rather than equal PCM hashes; duration may differ by
 at most sample-rounding tolerance. Lossy codec variants are intentionally not
 claimed until a repository-native codec fixture path is available.
+
+For portable clean-room work, export the exact corpus as canonical WAV files:
+
+```bash
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  export-blackbox --output /tmp/wotoha-blackbox-v1 --seed 246813579
+```
+
+The export contains `audio/*.wav`, `manifest.json`,
+`external-observations-template.json`, `checksums.sha256`, and a README for
+Team A. The manifest stores both the WAV file hash and decoded PCM hash, so a
+receiver can reject a changed or mismatched file before analysis. Package the
+directory with the platform's standard ZIP tool when transferring it; the
+directory itself is the reproducible source artifact and generated packages
+belong outside the repository.
 
 ## Commands
 
@@ -93,6 +112,15 @@ Metadata also records the evaluator/report versions, split, analyzer mode,
 optional source commit, and Hybrid backend counts (`native_neural` versus
 `classical_fallback`).
 
+When enabled by the CLI, `backend_comparison` evaluates Hybrid and Classical
+on the same generated audio and records per-fixture deltas and descriptive
+outcomes. It is not a production selector and is not reduced to one aggregate
+winner. `tempo_experiment` contains the lab-only independent candidate
+resolver: candidate BPM/half/double relations are scored from generated
+rhythm evidence with activation support, coverage, periodic consistency,
+phase, and ambiguity. Its result is observational and does not alter the
+production tempo hypotheses.
+
 Beat metrics use a deterministic monotonic one-to-one matcher and report MAE,
 p50, p95, and precision/recall at 10, 20, 40, and 70 ms. Per-track percentiles
 remain per-track; overall p50/p95 are pooled over every matched beat error, and
@@ -132,6 +160,11 @@ from model score, onset support, low-frequency support, downbeat evidence, and
 structure evidence; each timing bin reports matched and unmatched predicted
 beats so false positives cannot disappear from calibration.
 
+High-pass is classified under `evidence_ablation`, because it intentionally
+removes low-frequency rhythm evidence and is not an ordinary invariance claim.
+Gain, compression, EQ, low-pass, channel, and sample-rate transforms remain
+under `transform_invariance` unless their fixture semantics change.
+
 When external observations exist, the report separately records:
 
 ```text
@@ -165,6 +198,10 @@ any classical fallback per backend count; classical uses the existing
 classical adapter. The comparison is diagnostic across beat timing, tempo,
 phase, downbeat, meter, variable tempo, and transforms; it is not collapsed to
 one winner and it does not tune production thresholds.
+Both modes also run the independent tempo experiment and same-audio backend
+comparison when invoked by the CLI. Release reports should be kept outside the
+repository; their metadata records analyzer mode and optional source revision
+rather than relying on the filename.
 
 ## Baseline discipline
 

@@ -25,6 +25,7 @@ use wotoha_core::{
 pub const LAB_SCHEMA_VERSION: u32 = 1;
 pub const OBSERVATION_SCHEMA_VERSION: u32 = 1;
 pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const BLACKBOX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
 const DEFAULT_SAMPLE_RATE: u32 = 22_050;
@@ -126,6 +127,89 @@ pub fn load_manifest(path: &Path) -> Result<SyntheticCorpusManifest, LabError> {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlackboxManifest {
+    pub schema_version: u32,
+    pub corpus_schema_version: u32,
+    pub split: String,
+    pub seed: u64,
+    pub fixtures: Vec<BlackboxFixture>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlackboxFixture {
+    pub sample_id: String,
+    pub audio_file: String,
+    pub audio_sha256: String,
+    pub pcm_sha256: String,
+    pub fixture_audio_sha256: String,
+    pub sample_count: usize,
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub duration_micros: u64,
+    pub ground_truth_sha256: String,
+    pub spec: FixtureSpec,
+    pub truth: AnalysisGroundTruth,
+}
+
+impl BlackboxManifest {
+    pub fn load(path: &Path) -> Result<Self, LabError> {
+        let manifest: Self = serde_json::from_slice(&fs::read(path)?)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), LabError> {
+        if self.schema_version != BLACKBOX_SCHEMA_VERSION
+            || self.corpus_schema_version != LAB_SCHEMA_VERSION
+            || self.split.trim().is_empty()
+            || self.fixtures.is_empty()
+            || self.fixtures.len() > MAX_FIXTURES
+        {
+            return Err(LabError::InvalidInput(
+                "invalid black-box manifest schema or bounded fixture list".into(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for fixture in &self.fixtures {
+            if !ids.insert(fixture.sample_id.clone())
+                || fixture.sample_id != fixture.spec.id
+                || fixture.audio_file.contains("..")
+                || fixture.audio_file.starts_with('/')
+            {
+                return Err(LabError::InvalidInput(format!(
+                    "invalid or duplicate black-box fixture {}",
+                    fixture.sample_id
+                )));
+            }
+            fixture.spec.validate()?;
+            validate_sha256(&fixture.audio_sha256, "audio")?;
+            validate_sha256(&fixture.pcm_sha256, "PCM")?;
+            validate_sha256(&fixture.fixture_audio_sha256, "fixture")?;
+            validate_sha256(&fixture.ground_truth_sha256, "ground truth")?;
+            if fixture.sample_count == 0
+                || fixture.sample_rate == 0
+                || fixture.channels == 0
+                || fixture.duration_micros != fixture.truth.duration_micros
+            {
+                return Err(LabError::InvalidInput(format!(
+                    "invalid black-box metadata for {}",
+                    fixture.sample_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_sha256(value: &str, label: &str) -> Result<(), LabError> {
+    if value.len() == 64 && value.chars().all(|character| character.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(LabError::InvalidInput(format!("invalid {label} SHA-256")))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyntheticCorpusManifest {
     pub schema_version: u32,
     pub split: String,
@@ -135,6 +219,21 @@ pub struct SyntheticCorpusManifest {
 
 impl SyntheticCorpusManifest {
     pub fn validate(&self) -> Result<(), LabError> {
+        self.validate_structure()?;
+        for fixture in &self.fixtures {
+            let generated = generate_fixture(&fixture.spec)?;
+            if generated.audio_sha256 != fixture.audio_sha256 {
+                return Err(LabError::HashMismatch {
+                    sample_id: fixture.spec.id.clone(),
+                    expected: fixture.audio_sha256.clone(),
+                    actual: generated.audio_sha256,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<(), LabError> {
         if self.schema_version != LAB_SCHEMA_VERSION {
             return Err(LabError::InvalidInput(format!(
                 "unsupported synthetic corpus schema {}; expected {}",
@@ -158,14 +257,6 @@ impl SyntheticCorpusManifest {
                 )));
             }
             fixture.spec.validate()?;
-            let generated = generate_fixture(&fixture.spec)?;
-            if generated.audio_sha256 != fixture.audio_sha256 {
-                return Err(LabError::HashMismatch {
-                    sample_id: fixture.spec.id.clone(),
-                    expected: fixture.audio_sha256.clone(),
-                    actual: generated.audio_sha256,
-                });
-            }
         }
         Ok(())
     }
@@ -330,6 +421,7 @@ pub enum EventStyle {
     DisplacedAccent,
     Pickup,
     BreakdownReentry,
+    MeterClear,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -360,6 +452,21 @@ impl TransformKind {
             Self::SampleRate { .. } => "sample_rate",
         }
     }
+
+    fn expectation(&self) -> TransformExpectation {
+        match self {
+            Self::HighPass => TransformExpectation::EvidenceAblation,
+            _ => TransformExpectation::Invariant,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformExpectation {
+    #[default]
+    Invariant,
+    EvidenceAblation,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -534,21 +641,30 @@ pub fn generate_default_manifest(seed: u64) -> Result<SyntheticCorpusManifest, L
         ));
     }
     for (meter, id) in [
-        (2, "meter-2-4"),
-        (3, "meter-3-4"),
-        (4, "meter-4-4"),
-        (6, "meter-6-8"),
+        (2, "meter-clear-2-4"),
+        (3, "meter-clear-3-4"),
+        (4, "meter-clear-4-4"),
+        (6, "meter-clear-6-8"),
     ] {
         specs.push(spec(
             id,
             FixtureFamily::Meter,
             TempoProfile::Constant { bpm: 120.0 },
-            EventStyle::ClearDownbeat,
+            EventStyle::MeterClear,
             meter,
             450_000,
             seed,
         ));
     }
+    specs.push(spec(
+        "meter-ambiguous-4-4",
+        FixtureFamily::Meter,
+        TempoProfile::Constant { bpm: 120.0 },
+        EventStyle::Standard,
+        4,
+        450_000,
+        seed,
+    ));
     let transform_base = "constant-128.0";
     for (id, transform) in [
         ("transform-gain", TransformKind::Gain { factor: 0.35 }),
@@ -655,6 +771,362 @@ pub fn generate_fixture(spec: &FixtureSpec) -> Result<SyntheticFixture, LabError
     })
 }
 
+#[derive(Clone, Debug)]
+struct DecodedWav {
+    samples: Vec<f32>,
+    pcm: Vec<i16>,
+    sample_rate: u32,
+    channels: u8,
+    frame_count: usize,
+    pcm_sha256: String,
+}
+
+fn quantize_pcm16(samples: &[f32]) -> Vec<i16> {
+    samples
+        .iter()
+        .map(|sample| (sample.clamp(-1.0, 1.0) * 32_767.0).round() as i16)
+        .collect()
+}
+
+fn pcm16_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    bytes
+}
+
+fn pcm_sha256(samples: &[i16]) -> String {
+    hash_bytes(&pcm16_bytes(samples))
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn encode_wav_pcm16(samples: &[f32], sample_rate: u32, channels: u8) -> Vec<u8> {
+    let pcm = pcm16_bytes(&quantize_pcm16(samples));
+    let byte_rate = sample_rate
+        .saturating_mul(u32::from(channels))
+        .saturating_mul(2);
+    let block_align = u16::from(channels).saturating_mul(2);
+    let riff_size = 36_u32.saturating_add(pcm.len() as u32);
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&u16::from(channels).to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    wav.extend_from_slice(&pcm);
+    wav
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes([
+        *bytes.get(offset)?,
+        *bytes.get(offset + 1)?,
+    ]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes([
+        *bytes.get(offset)?,
+        *bytes.get(offset + 1)?,
+        *bytes.get(offset + 2)?,
+        *bytes.get(offset + 3)?,
+    ]))
+}
+
+fn decode_wav_pcm16(bytes: &[u8]) -> Result<DecodedWav, LabError> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(LabError::InvalidInput("WAV must be RIFF/WAVE".into()));
+    }
+    let mut offset = 12;
+    let mut channels = None;
+    let mut sample_rate = None;
+    let mut bits_per_sample = None;
+    let mut pcm = None;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = read_u32(bytes, offset + 4)
+            .ok_or_else(|| LabError::InvalidInput("truncated WAV chunk".into()))?
+            as usize;
+        let start = offset + 8;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| LabError::InvalidInput("WAV chunk is too large".into()))?;
+        if end > bytes.len() {
+            return Err(LabError::InvalidInput("WAV chunk exceeds file".into()));
+        }
+        match id {
+            b"fmt " if size >= 16 => {
+                if read_u16(bytes, start) != Some(1) {
+                    return Err(LabError::InvalidInput(
+                        "WAV must use uncompressed PCM".into(),
+                    ));
+                }
+                channels = read_u16(bytes, start + 2).map(|value| value as u8);
+                sample_rate = read_u32(bytes, start + 4);
+                bits_per_sample = read_u16(bytes, start + 14);
+            }
+            b"data" => pcm = Some(&bytes[start..end]),
+            _ => {}
+        }
+        offset = end + (size % 2);
+    }
+    let channels = channels
+        .filter(|channels| *channels > 0)
+        .ok_or_else(|| LabError::InvalidInput("WAV fmt chunk is missing".into()))?;
+    let sample_rate = sample_rate
+        .filter(|sample_rate| *sample_rate > 0)
+        .ok_or_else(|| LabError::InvalidInput("WAV sample rate is missing".into()))?;
+    if bits_per_sample != Some(16) {
+        return Err(LabError::InvalidInput(
+            "WAV must use signed 16-bit PCM".into(),
+        ));
+    }
+    let pcm = pcm.ok_or_else(|| LabError::InvalidInput("WAV data chunk is missing".into()))?;
+    if pcm.len() % 2 != 0 {
+        return Err(LabError::InvalidInput(
+            "WAV PCM payload is misaligned".into(),
+        ));
+    }
+    let mut integer_samples = Vec::with_capacity(pcm.len() / 2);
+    for bytes in pcm.chunks_exact(2) {
+        integer_samples.push(i16::from_le_bytes([bytes[0], bytes[1]]));
+    }
+    let channel_count = usize::from(channels);
+    if integer_samples.len() % channel_count != 0 {
+        return Err(LabError::InvalidInput(
+            "WAV payload does not contain complete frames".into(),
+        ));
+    }
+    let samples = integer_samples
+        .iter()
+        .map(|sample| *sample as f32 / 32_768.0)
+        .collect::<Vec<_>>();
+    let pcm_sha256 = pcm_sha256(&integer_samples);
+    Ok(DecodedWav {
+        frame_count: integer_samples.len() / channel_count,
+        samples,
+        pcm: integer_samples,
+        sample_rate,
+        channels,
+        pcm_sha256,
+    })
+}
+
+fn ground_truth_sha256(truth: &AnalysisGroundTruth) -> Result<String, LabError> {
+    Ok(hash_bytes(&serde_json::to_vec(truth)?))
+}
+
+pub fn export_blackbox(output: &Path, seed: u64) -> Result<BlackboxManifest, LabError> {
+    if output.exists() {
+        if !output.is_dir() {
+            return Err(LabError::InvalidInput(format!(
+                "black-box output is not a directory: {}",
+                output.display()
+            )));
+        }
+    } else {
+        fs::create_dir_all(output)?;
+    }
+    let audio_root = output.join("audio");
+    fs::create_dir_all(&audio_root)?;
+    let source = generate_default_manifest(seed)?;
+    let mut fixtures = Vec::with_capacity(source.fixtures.len());
+    for record in source.fixtures {
+        let fixture = generate_fixture(&record.spec)?;
+        let wav = encode_wav_pcm16(
+            &fixture.audio,
+            fixture.spec.sample_rate,
+            fixture.spec.channels,
+        );
+        let decoded = decode_wav_pcm16(&wav)?;
+        let expected_pcm = quantize_pcm16(&fixture.audio);
+        if decoded.sample_rate != fixture.spec.sample_rate
+            || decoded.channels != fixture.spec.channels
+            || decoded.frame_count != fixture.audio.len() / usize::from(fixture.spec.channels)
+            || expected_pcm != decoded.pcm
+        {
+            return Err(LabError::InvalidInput(format!(
+                "WAV round-trip mismatch for {}",
+                fixture.spec.id
+            )));
+        }
+        let relative_audio = format!("audio/{}.wav", fixture.spec.id);
+        fs::write(output.join(&relative_audio), &wav)?;
+        fixtures.push(BlackboxFixture {
+            sample_id: fixture.spec.id.clone(),
+            audio_file: relative_audio,
+            audio_sha256: hash_bytes(&wav),
+            pcm_sha256: decoded.pcm_sha256,
+            fixture_audio_sha256: fixture.audio_sha256,
+            sample_count: decoded.samples.len(),
+            sample_rate: decoded.sample_rate,
+            channels: decoded.channels,
+            duration_micros: fixture.truth.duration_micros,
+            ground_truth_sha256: ground_truth_sha256(&fixture.truth)?,
+            spec: fixture.spec,
+            truth: fixture.truth,
+        });
+    }
+    let manifest = BlackboxManifest {
+        schema_version: BLACKBOX_SCHEMA_VERSION,
+        corpus_schema_version: LAB_SCHEMA_VERSION,
+        split: source.split,
+        seed: source.seed,
+        fixtures,
+    };
+    manifest.validate()?;
+    write_json(&output.join("manifest.json"), &manifest)?;
+    let observations = manifest
+        .fixtures
+        .iter()
+        .map(|fixture| ExternalAnalysisObservation {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            sample_id: fixture.sample_id.clone(),
+            audio_file: Some(fixture.audio_file.clone()),
+            audio_sha256: fixture.audio_sha256.clone(),
+            pcm_sha256: Some(fixture.pcm_sha256.clone()),
+            ground_truth_sha256: Some(fixture.ground_truth_sha256.clone()),
+            observer: ObserverIdentity {
+                product: "external-observer".into(),
+                version: "fill-me".into(),
+                platform: Some("fill-me".into()),
+            },
+            analysis_settings: ObservationSettings {
+                beat_grid_enabled: None,
+                tempo_range_bpm: None,
+                meter_mode: None,
+                key_mode: None,
+            },
+            observed: ObservedAnalysis {
+                reported_bpm: None,
+                beatgrid_times_micros: None,
+                downbeat_indices: None,
+                grid_phase_micros: None,
+                musical_key: None,
+                meter: None,
+                analysis_complete: false,
+            },
+            timing: ObservationTiming {
+                analysis_elapsed_millis: None,
+                observed_duration_micros: Some(fixture.duration_micros),
+            },
+            notes: vec![
+                "Import the WAV and run normal public analysis without manual correction.".into(),
+                "Record only public observations; disagreements are not automatically errors."
+                    .into(),
+            ],
+        })
+        .collect();
+    write_json(
+        &output.join("external-observations-template.json"),
+        &ExternalObservationDocument {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            observations,
+        },
+    )?;
+    let mut checksum_lines = Vec::new();
+    for fixture in &manifest.fixtures {
+        let bytes = fs::read(output.join(&fixture.audio_file))?;
+        checksum_lines.push(format!("{}  {}", hash_bytes(&bytes), fixture.audio_file));
+    }
+    let manifest_bytes = fs::read(output.join("manifest.json"))?;
+    checksum_lines.push(format!("{}  manifest.json", hash_bytes(&manifest_bytes)));
+    let template_bytes = fs::read(output.join("external-observations-template.json"))?;
+    checksum_lines.push(format!(
+        "{}  external-observations-template.json",
+        hash_bytes(&template_bytes)
+    ));
+    checksum_lines.sort_unstable();
+    fs::write(
+        output.join("checksums.sha256"),
+        checksum_lines.join("\n") + "\n",
+    )?;
+    fs::write(
+        output.join("README.md"),
+        blackbox_readme(manifest.fixtures.len(), manifest.seed),
+    )?;
+    Ok(manifest)
+}
+
+pub fn evaluate_exported_manifest(
+    manifest_path: &Path,
+    audio_root: &Path,
+    external: Option<&ExternalObservationDocument>,
+    options: EvaluationOptions,
+) -> Result<EvaluationReport, LabError> {
+    let blackbox = BlackboxManifest::load(manifest_path)?;
+    let mut records = Vec::with_capacity(blackbox.fixtures.len());
+    let mut audio_overrides = BTreeMap::new();
+    for fixture in &blackbox.fixtures {
+        let path = audio_root.join(&fixture.audio_file);
+        let bytes = fs::read(&path)?;
+        let actual_file_sha256 = hash_bytes(&bytes);
+        if actual_file_sha256 != fixture.audio_sha256 {
+            return Err(LabError::HashMismatch {
+                sample_id: fixture.sample_id.clone(),
+                expected: fixture.audio_sha256.clone(),
+                actual: actual_file_sha256,
+            });
+        }
+        let decoded = decode_wav_pcm16(&bytes)?;
+        if decoded.pcm_sha256 != fixture.pcm_sha256
+            || decoded.samples.len() != fixture.sample_count
+            || decoded.sample_rate != fixture.sample_rate
+            || decoded.channels != fixture.channels
+        {
+            return Err(LabError::InvalidInput(format!(
+                "exported WAV metadata or PCM hash mismatch for {}",
+                fixture.sample_id
+            )));
+        }
+        if ground_truth_sha256(&fixture.truth)? != fixture.ground_truth_sha256 {
+            return Err(LabError::HashMismatch {
+                sample_id: fixture.sample_id.clone(),
+                expected: fixture.ground_truth_sha256.clone(),
+                actual: ground_truth_sha256(&fixture.truth)?,
+            });
+        }
+        records.push(FixtureRecord {
+            spec: fixture.spec.clone(),
+            truth: fixture.truth.clone(),
+            audio_sha256: fixture.audio_sha256.clone(),
+        });
+        audio_overrides.insert(fixture.sample_id.clone(), decoded.samples);
+    }
+    let manifest = SyntheticCorpusManifest {
+        schema_version: LAB_SCHEMA_VERSION,
+        split: blackbox.split,
+        seed: blackbox.seed,
+        fixtures: records,
+    };
+    evaluate_manifest_with_audio(
+        &manifest,
+        external,
+        options,
+        &AtomicBool::new(false),
+        Some(&audio_overrides),
+    )
+}
+
+fn blackbox_readme(fixture_count: usize, seed: u64) -> String {
+    format!(
+        "# Wotoha clean-room black-box corpus\n\nThis package contains {fixture_count} deterministic synthetic WAV fixtures generated with seed `{seed}`. The WAV PCM16 bytes are the canonical artifacts for external analysis. The manifest contains exact Ground Truth, file SHA-256, canonical decoded PCM SHA-256, sample metadata, and fixture identity.\n\n## Team A workflow\n\n1. Import each WAV into the public application.\n2. Trigger normal public track analysis.\n3. Do not manually correct the result before recording it.\n4. Record reported BPM, beatgrid, visible downbeat/grid phase, and musical key where available.\n5. Preserve public analysis settings and analysis timing.\n6. Fill `external-observations-template.json`; keep identity hashes unchanged.\n7. Do not interpret disagreement as error without comparing against Ground Truth.\n\nExternal software output is reference observation, never Ground Truth. This corpus and schema contain no proprietary implementation information.\n"
+    )
+}
+
 fn build_truth(spec: &FixtureSpec) -> AnalysisGroundTruth {
     let mut beats = Vec::new();
     let mut time = spec.lead_in_micros;
@@ -714,13 +1186,38 @@ fn build_truth(spec: &FixtureSpec) -> AnalysisGroundTruth {
             },
         ],
     };
+    let meter = (!spec.id.contains("ambiguous")).then_some(spec.meter);
     AnalysisGroundTruth {
         tempo,
-        meter: Some(spec.meter),
+        meter,
         beat_times_micros: beats,
         downbeats,
         tempo_segments,
         duration_micros: spec.duration_micros,
+    }
+}
+
+fn meter_accent(meter: u8, beat: usize) -> (f32, f32, f32) {
+    match meter {
+        2 => match beat {
+            0 => (0.95, 0.85, 0.75),
+            _ => (0.30, 0.25, 0.45),
+        },
+        3 => match beat {
+            0 => (0.95, 0.85, 0.75),
+            _ => (0.30, 0.25, 0.45),
+        },
+        4 => match beat {
+            0 => (0.95, 0.85, 0.75),
+            2 => (0.62, 0.55, 0.60),
+            _ => (0.28, 0.24, 0.42),
+        },
+        6 => match beat {
+            0 => (0.95, 0.85, 0.75),
+            3 => (0.62, 0.55, 0.60),
+            _ => (0.28, 0.24, 0.42),
+        },
+        _ => (0.0, 0.0, 0.0),
     }
 }
 
@@ -731,6 +1228,7 @@ fn synthesize_audio(spec: &FixtureSpec, truth: &AnalysisGroundTruth) -> Vec<f32>
     let mut rng = Lcg::new(spec.seed);
     for (index, &beat_micros) in truth.beat_times_micros.iter().enumerate() {
         let beat = index % spec.meter as usize;
+        let meter_clear = spec.event_style == EventStyle::MeterClear;
         let allow_kick = match spec.event_style {
             EventStyle::KickRemoved | EventStyle::SnareOnly | EventStyle::HatsOnly => false,
             EventStyle::StrongEverySecondBeat => beat.is_multiple_of(2),
@@ -742,10 +1240,14 @@ fn synthesize_audio(spec: &FixtureSpec, truth: &AnalysisGroundTruth) -> Vec<f32>
             EventStyle::SyncopatedKick => !beat.is_multiple_of(2),
             _ => true,
         };
-        let kick_gain = match spec.event_style {
-            EventStyle::AttenuatedKick => 0.20,
-            EventStyle::KickOnly | EventStyle::ClearDownbeat => 0.90,
-            _ => 0.65,
+        let kick_gain = if meter_clear {
+            meter_accent(spec.meter, beat).0
+        } else {
+            match spec.event_style {
+                EventStyle::AttenuatedKick => 0.20,
+                EventStyle::KickOnly | EventStyle::ClearDownbeat => 0.90,
+                _ => 0.65,
+            }
         };
         if allow_kick
             && !matches!(
@@ -754,6 +1256,17 @@ fn synthesize_audio(spec: &FixtureSpec, truth: &AnalysisGroundTruth) -> Vec<f32>
             )
         {
             add_burst(&mut audio, spec.sample_rate, beat_micros, 55.0, kick_gain);
+        }
+        if meter_clear {
+            let (_, mid_gain, high_gain) = meter_accent(spec.meter, beat);
+            add_burst(&mut audio, spec.sample_rate, beat_micros, 220.0, mid_gain);
+            add_burst(
+                &mut audio,
+                spec.sample_rate,
+                beat_micros,
+                3_600.0,
+                high_gain,
+            );
         }
         if matches!(
             spec.event_style,
@@ -960,7 +1473,13 @@ pub fn hash_pcm(audio: &[f32]) -> String {
 pub struct ExternalAnalysisObservation {
     pub schema_version: u32,
     pub sample_id: String,
+    #[serde(default)]
+    pub audio_file: Option<String>,
     pub audio_sha256: String,
+    #[serde(default)]
+    pub pcm_sha256: Option<String>,
+    #[serde(default)]
+    pub ground_truth_sha256: Option<String>,
     pub observer: ObserverIdentity,
     pub analysis_settings: ObservationSettings,
     pub observed: ObservedAnalysis,
@@ -1042,6 +1561,12 @@ impl ExternalObservationDocument {
                 return Err(LabError::InvalidInput(
                     "external observer identity is required".into(),
                 ));
+            }
+            if let Some(pcm_sha256) = observation.pcm_sha256.as_deref() {
+                validate_sha256(pcm_sha256, "external PCM")?;
+            }
+            if let Some(ground_truth_sha256) = observation.ground_truth_sha256.as_deref() {
+                validate_sha256(ground_truth_sha256, "external ground truth")?;
             }
             let settings_key = observation_settings_key(&observation.analysis_settings);
             let record_key = format!(
@@ -1356,13 +1881,44 @@ pub fn analyze_fixture(
     fixture: &SyntheticFixture,
     mode: AnalyzerMode,
 ) -> Result<NormalizedAnalysis, LabError> {
-    analyze_fixture_with_backend(fixture, mode).map(|(analysis, _)| analysis)
+    analyze_fixture_with_backend(fixture, mode).map(|(analysis, _, _)| analysis)
+}
+
+fn normalize_neural_diagnostics(
+    diagnostics: &wotoha_core::beat_analysis::NeuralRhythmDiagnostics,
+) -> NeuralDiagnostics {
+    NeuralDiagnostics {
+        selected_period_frames: diagnostics.selected_period_frames,
+        selected_bpm: diagnostics.selected_bpm,
+        path_marker_count: diagnostics.path_marker_count,
+        path_coverage: diagnostics.path_coverage,
+        activation_mean: diagnostics.activation_mean,
+        support: diagnostics.support,
+        interval_residual: diagnostics.interval_residual,
+        alias_margin: diagnostics.alias_margin,
+        candidates: diagnostics
+            .candidates
+            .iter()
+            .map(|candidate| NeuralCandidateDiagnostics {
+                bpm: candidate.bpm,
+                relation: format!("{:?}", candidate.relation).to_ascii_lowercase(),
+                period_frames: candidate.period_frames,
+                available: candidate.available,
+                normalized_weight: candidate.normalized_weight,
+                activation_evidence: candidate.activation_evidence,
+                continuity_evidence: candidate.continuity_evidence,
+                periodic_support: candidate.periodic_support,
+            })
+            .collect(),
+        decoder_accepted: diagnostics.decoder_accepted,
+        rejection_reason: diagnostics.rejection_reason.clone(),
+    }
 }
 
 fn analyze_fixture_with_backend(
     fixture: &SyntheticFixture,
     mode: AnalyzerMode,
-) -> Result<(NormalizedAnalysis, &'static str), LabError> {
+) -> Result<(NormalizedAnalysis, &'static str, Option<NeuralDiagnostics>), LabError> {
     let mono = downmix(&fixture.audio, fixture.spec.channels);
     let analysis_audio = if fixture.spec.sample_rate == DEFAULT_SAMPLE_RATE {
         mono
@@ -1377,31 +1933,38 @@ fn analyze_fixture_with_backend(
                     fixture.spec.id
                 ))
             })?;
-    let (v2, backend) = if mode == AnalyzerMode::Hybrid {
+    let (v2, backend, neural_diagnostics) = if mode == AnalyzerMode::Hybrid {
         let low_band = low_band_1khz(&analysis_audio);
-        if let Some(rhythm) =
-            wotoha_runtime::analyze_neural_rhythm(&analysis_audio, DEFAULT_SAMPLE_RATE, &low_band)
-        {
+        let diagnostic_result = wotoha_runtime::analyze_neural_rhythm_with_diagnostics(
+            &analysis_audio,
+            DEFAULT_SAMPLE_RATE,
+            &low_band,
+        );
+        let diagnostics = normalize_neural_diagnostics(&diagnostic_result.diagnostics);
+        if let Some(rhythm) = diagnostic_result.rhythm {
             (
                 wotoha_runtime::track_analysis_v2_from_legacy_rhythm(&legacy, rhythm, true),
                 "native_neural",
+                Some(diagnostics),
             )
         } else {
             (
                 wotoha_runtime::track_analysis_v2_from_legacy(&legacy),
                 "classical_fallback",
+                Some(diagnostics),
             )
         }
     } else {
         (
             wotoha_runtime::track_analysis_v2_from_legacy(&legacy),
             "classical",
+            None,
         )
     };
     let v2 = v2.ok_or_else(|| {
         LabError::InvalidInput(format!("Wotoha V2 adaptation rejected {}", fixture.spec.id))
     })?;
-    Ok((normalize_v2(&v2), backend))
+    Ok((normalize_v2(&v2), backend, neural_diagnostics))
 }
 
 fn downmix(samples: &[f32], channels: u8) -> Vec<f32> {
@@ -1450,6 +2013,8 @@ pub struct EvaluationOptions {
     pub split: String,
     #[serde(default)]
     pub source_commit: Option<String>,
+    #[serde(default)]
+    pub include_backend_comparison: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1465,6 +2030,10 @@ pub struct EvaluationReport {
     pub by_tempo_range: BTreeMap<String, GroupMetrics>,
     pub by_meter: BTreeMap<String, GroupMetrics>,
     pub by_transform: BTreeMap<String, TransformMetrics>,
+    pub transform_invariance: BTreeMap<String, TransformMetrics>,
+    pub evidence_ablation: BTreeMap<String, TransformMetrics>,
+    pub backend_comparison: BackendComparisonReport,
+    pub tempo_experiment: ExperimentalTempoReport,
     pub half_double_errors: BTreeMap<String, usize>,
     pub downbeat_errors: BTreeMap<String, usize>,
     pub variable_tempo: VariableTempoMetrics,
@@ -1472,6 +2041,104 @@ pub struct EvaluationReport {
     pub failure_clusters: BTreeMap<String, usize>,
     pub external: ExternalReport,
     pub per_track: Vec<TrackEvaluation>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BackendComparisonReport {
+    pub outcome_counts: BTreeMap<String, usize>,
+    pub by_fixture_family: BTreeMap<String, BTreeMap<String, usize>>,
+    pub per_fixture: Vec<BackendFixtureComparison>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendFixtureComparison {
+    pub sample_id: String,
+    pub family: String,
+    pub hybrid_backend: String,
+    pub hybrid: BackendMetricSnapshot,
+    pub classical: BackendMetricSnapshot,
+    pub deltas: BackendMetricDelta,
+    pub outcome: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendMetricSnapshot {
+    pub beat_mae_ms: Option<f64>,
+    pub beat_p95_ms: Option<f64>,
+    pub precision_at_40ms: Option<f64>,
+    pub recall_at_40ms: Option<f64>,
+    pub primary_tempo_correct: Option<bool>,
+    pub grid_phase_correct: Option<bool>,
+    pub downbeat_status: String,
+    pub meter_status: String,
+    pub core_valid: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendMetricDelta {
+    pub beat_mae_ms: Option<f64>,
+    pub beat_p95_ms: Option<f64>,
+    pub precision_at_40ms: Option<f64>,
+    pub recall_at_40ms: Option<f64>,
+}
+
+struct BackendRunSet {
+    hybrid: NormalizedAnalysis,
+    hybrid_backend: String,
+    classical: NormalizedAnalysis,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExperimentalTempoReport {
+    pub applicable_tracks: usize,
+    pub current_primary_correct_count: usize,
+    pub experimental_primary_correct_count: usize,
+    pub current_half_time_count: usize,
+    pub experimental_half_time_count: usize,
+    pub current_double_time_count: usize,
+    pub experimental_double_time_count: usize,
+    pub experimental_ambiguous_count: usize,
+    pub experimental_wrong_primary_count: usize,
+    pub by_fixture_family: BTreeMap<String, ExperimentalTempoFamilySummary>,
+    pub per_fixture: Vec<ExperimentalTempoFixture>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExperimentalTempoFamilySummary {
+    pub tracks: usize,
+    pub current_primary_correct_count: usize,
+    pub experimental_primary_correct_count: usize,
+    pub experimental_ambiguous_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExperimentalTempoFixture {
+    pub sample_id: String,
+    pub family: String,
+    pub truth_bpm: Option<f32>,
+    pub current_primary_bpm: Option<f32>,
+    pub current_relation: Option<String>,
+    pub experimental: ExperimentalTempoResolution,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExperimentalTempoResolution {
+    pub selected_bpm: Option<f32>,
+    pub selected_relation: Option<String>,
+    pub ambiguous: bool,
+    pub candidates: Vec<ExperimentalTempoCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExperimentalTempoCandidate {
+    pub bpm: f32,
+    pub relation: String,
+    pub score: f32,
+    pub phase_micros: u64,
+    pub activation_support: f32,
+    pub coverage: f32,
+    pub periodic_consistency: f32,
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1579,6 +2246,7 @@ pub struct CalibrationBin {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TransformMetrics {
     pub transform: String,
+    pub expectation: TransformExpectation,
     pub tracks: usize,
     pub matched_beats: usize,
     pub missing_beats: usize,
@@ -1625,11 +2293,54 @@ pub struct TrackEvaluation {
     pub family: String,
     pub audio_sha256: String,
     pub analysis_backend: String,
+    pub neural_diagnostics: Option<NeuralDiagnostics>,
+    pub meter_evidence: MeterEvidenceReport,
     pub truth: AnalysisGroundTruth,
     pub wotoha: NormalizedAnalysis,
     pub metrics: GroupMetrics,
     pub failure_clusters: Vec<String>,
     pub human_review: Option<HumanReviewLabel>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MeterEvidenceReport {
+    pub candidates: BTreeMap<String, MeterCandidateEvidence>,
+    pub resolved_meter: Option<u8>,
+    pub runner_up_margin: Option<f32>,
+    pub downbeat_confidence: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeterCandidateEvidence {
+    pub phase: u8,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeuralDiagnostics {
+    pub selected_period_frames: Option<usize>,
+    pub selected_bpm: Option<f32>,
+    pub path_marker_count: usize,
+    pub path_coverage: Option<f32>,
+    pub activation_mean: Option<f32>,
+    pub support: Option<f32>,
+    pub interval_residual: Option<f32>,
+    pub alias_margin: Option<f32>,
+    pub candidates: Vec<NeuralCandidateDiagnostics>,
+    pub decoder_accepted: bool,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeuralCandidateDiagnostics {
+    pub bpm: f32,
+    pub relation: String,
+    pub period_frames: usize,
+    pub available: bool,
+    pub normalized_weight: Option<f32>,
+    pub activation_evidence: f32,
+    pub continuity_evidence: f32,
+    pub periodic_support: f32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1647,7 +2358,7 @@ pub fn evaluate_manifest(
     external: Option<&ExternalObservationDocument>,
     options: EvaluationOptions,
 ) -> Result<EvaluationReport, LabError> {
-    evaluate_manifest_with_cancel(manifest, external, options, &AtomicBool::new(false))
+    evaluate_manifest_with_audio(manifest, external, options, &AtomicBool::new(false), None)
 }
 
 pub fn evaluate_manifest_with_cancel(
@@ -1656,26 +2367,85 @@ pub fn evaluate_manifest_with_cancel(
     options: EvaluationOptions,
     cancelled: &AtomicBool,
 ) -> Result<EvaluationReport, LabError> {
-    manifest.validate()?;
+    evaluate_manifest_with_audio(manifest, external, options, cancelled, None)
+}
+
+pub fn evaluate_manifest_with_audio(
+    manifest: &SyntheticCorpusManifest,
+    external: Option<&ExternalObservationDocument>,
+    options: EvaluationOptions,
+    cancelled: &AtomicBool,
+    audio_overrides: Option<&BTreeMap<String, Vec<f32>>>,
+) -> Result<EvaluationReport, LabError> {
+    if audio_overrides.is_some() {
+        manifest.validate_structure()?;
+    } else {
+        manifest.validate()?;
+    }
     if let Some(external) = external {
         external.validate()?;
     }
     let mut tracks = Vec::with_capacity(manifest.fixtures.len());
     let mut normalized_by_id = BTreeMap::new();
+    let mut backend_runs = BTreeMap::new();
+    let mut experimental_results = BTreeMap::new();
     for record in &manifest.fixtures {
         if cancelled.load(Ordering::Relaxed) {
             return Err(LabError::Cancelled);
         }
-        let fixture = generate_fixture(&record.spec)?;
-        if fixture.audio_sha256 != record.audio_sha256 {
+        let fixture =
+            if let Some(audio) = audio_overrides.and_then(|items| items.get(&record.spec.id)) {
+                if audio.len() > MAX_AUDIO_SAMPLES {
+                    return Err(LabError::InvalidInput(format!(
+                        "exported fixture {} exceeds bounded audio memory",
+                        record.spec.id
+                    )));
+                }
+                SyntheticFixture {
+                    spec: record.spec.clone(),
+                    audio: audio.clone(),
+                    truth: record.truth.clone(),
+                    audio_sha256: hash_pcm(audio),
+                }
+            } else {
+                generate_fixture(&record.spec)?
+            };
+        if audio_overrides.is_none() && fixture.audio_sha256 != record.audio_sha256 {
             return Err(LabError::HashMismatch {
                 sample_id: record.spec.id.clone(),
                 expected: record.audio_sha256.clone(),
                 actual: fixture.audio_sha256,
             });
         }
-        let (wotoha, analysis_backend) = analyze_fixture_with_backend(&fixture, options.mode)?;
+        let (wotoha, analysis_backend, neural_diagnostics) =
+            analyze_fixture_with_backend(&fixture, options.mode)?;
+        if options.include_backend_comparison {
+            let (hybrid, hybrid_backend, classical) = match options.mode {
+                AnalyzerMode::Hybrid => {
+                    let (classical, _, _) =
+                        analyze_fixture_with_backend(&fixture, AnalyzerMode::Classical)?;
+                    (wotoha.clone(), analysis_backend.to_string(), classical)
+                }
+                AnalyzerMode::Classical => {
+                    let (hybrid, hybrid_backend, _) =
+                        analyze_fixture_with_backend(&fixture, AnalyzerMode::Hybrid)?;
+                    (hybrid, hybrid_backend.to_string(), wotoha.clone())
+                }
+            };
+            backend_runs.insert(
+                record.spec.id.clone(),
+                BackendRunSet {
+                    hybrid,
+                    hybrid_backend,
+                    classical,
+                },
+            );
+        }
         normalized_by_id.insert(record.spec.id.clone(), wotoha.clone());
+        experimental_results.insert(
+            record.spec.id.clone(),
+            experimental_tempo_resolution(&fixture, &wotoha),
+        );
         let metrics = metrics_for(&record.truth, &wotoha);
         let failures = failure_clusters(&record.truth, &wotoha, &metrics);
         tracks.push(TrackEvaluation {
@@ -1683,6 +2453,8 @@ pub fn evaluate_manifest_with_cancel(
             family: record.spec.family.as_str().into(),
             audio_sha256: record.audio_sha256.clone(),
             analysis_backend: analysis_backend.into(),
+            neural_diagnostics,
+            meter_evidence: meter_evidence(&wotoha),
             truth: record.truth.clone(),
             wotoha,
             metrics,
@@ -1703,6 +2475,19 @@ pub fn evaluate_manifest_with_cancel(
             .unwrap_or_else(|| "unknown".into())
     });
     let by_transform = transform_metrics(&manifest.fixtures, &normalized_by_id);
+    let transform_invariance = by_transform
+        .iter()
+        .filter(|(_, metrics)| metrics.expectation == TransformExpectation::Invariant)
+        .map(|(key, metrics)| (key.clone(), metrics.clone()))
+        .collect();
+    let evidence_ablation = by_transform
+        .iter()
+        .filter(|(_, metrics)| metrics.expectation == TransformExpectation::EvidenceAblation)
+        .map(|(key, metrics)| (key.clone(), metrics.clone()))
+        .collect();
+    let backend_comparison = backend_comparison(manifest, &backend_runs);
+    let tempo_experiment =
+        experimental_tempo_report(manifest, &experimental_results, &normalized_by_id);
     let (half_double_errors, downbeat_errors, failure_clusters) = summarize_failures(&tracks);
     let confidence_calibration = calibration(&tracks);
     let variable_tempo = variable_tempo_metrics(&tracks);
@@ -1730,6 +2515,10 @@ pub fn evaluate_manifest_with_cancel(
         by_tempo_range,
         by_meter,
         by_transform,
+        transform_invariance,
+        evidence_ablation,
+        backend_comparison,
+        tempo_experiment,
         half_double_errors,
         downbeat_errors,
         variable_tempo,
@@ -1775,6 +2564,43 @@ fn metrics_for(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -> 
         grid_phase: phase_metrics(truth, prediction),
         downbeat: downbeat_metrics(truth, prediction),
         meter: meter_metrics(truth, prediction),
+    }
+}
+
+fn meter_evidence(prediction: &NormalizedAnalysis) -> MeterEvidenceReport {
+    let mut candidates = BTreeMap::new();
+    let mut scores = Vec::new();
+    for meter in [2_u8, 3, 4, 6] {
+        if let Some(hypothesis) = prediction
+            .meter_hypotheses
+            .iter()
+            .find(|hypothesis| hypothesis.beats_per_bar == meter)
+        {
+            candidates.insert(
+                meter.to_string(),
+                MeterCandidateEvidence {
+                    phase: hypothesis.downbeat_phase,
+                    score: hypothesis.score,
+                },
+            );
+            scores.push(hypothesis.score);
+        }
+    }
+    scores.sort_by(f32::total_cmp);
+    let runner_up_margin = scores
+        .last()
+        .zip(scores.iter().rev().nth(1))
+        .map(|(best, runner_up)| best - runner_up);
+    MeterEvidenceReport {
+        candidates,
+        resolved_meter: prediction.resolved_meter,
+        runner_up_margin,
+        downbeat_confidence: prediction
+            .confidence
+            .downbeat
+            .iter()
+            .copied()
+            .reduce(f32::max),
     }
 }
 
@@ -2368,6 +3194,7 @@ fn transform_metrics(
             .entry(key.clone())
             .or_insert_with(|| TransformMetrics {
                 transform: key,
+                expectation: spec.spec.transform.expectation(),
                 ..TransformMetrics::default()
             });
         entry.tracks += 1;
@@ -2383,6 +3210,292 @@ fn transform_metrics(
         entry.confidence_change = combine_means(entry.confidence_change, confidence, entry.tracks);
     }
     result
+}
+
+fn backend_snapshot(
+    truth: &AnalysisGroundTruth,
+    prediction: &NormalizedAnalysis,
+) -> BackendMetricSnapshot {
+    let metrics = metrics_for(truth, prediction);
+    let recall = metrics.beat.recall_at_tolerance.get("40ms").copied();
+    let core_valid = recall.is_some_and(|value| value >= 0.5)
+        && truth
+            .tempo
+            .as_ref()
+            .is_none_or(|_| metrics.tempo.primary_correct == Some(true));
+    BackendMetricSnapshot {
+        beat_mae_ms: metrics.beat.mae_ms,
+        beat_p95_ms: metrics.beat.p95_ms,
+        precision_at_40ms: metrics.beat.precision_at_tolerance.get("40ms").copied(),
+        recall_at_40ms: recall,
+        primary_tempo_correct: metrics.tempo.primary_correct,
+        grid_phase_correct: metrics.grid_phase.correct,
+        downbeat_status: metrics
+            .downbeat
+            .phase_correct
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unscored".into()),
+        meter_status: metrics.meter.status,
+        core_valid,
+    }
+}
+
+fn metric_delta(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    left.zip(right).map(|(left, right)| left - right)
+}
+
+fn classify_backend_outcome(
+    hybrid: &BackendMetricSnapshot,
+    classical: &BackendMetricSnapshot,
+    hybrid_backend: &str,
+) -> &'static str {
+    if !hybrid.core_valid && !classical.core_valid {
+        return "both_failed";
+    }
+    if hybrid_backend == "classical_fallback" && classical.core_valid {
+        return "fallback_classical_rescued";
+    }
+    let recall_delta = metric_delta(hybrid.recall_at_40ms, classical.recall_at_40ms).unwrap_or(0.0);
+    let mae_delta = metric_delta(hybrid.beat_mae_ms, classical.beat_mae_ms).unwrap_or(0.0);
+    let tempo_delta = match (
+        hybrid.primary_tempo_correct,
+        classical.primary_tempo_correct,
+    ) {
+        (Some(true), Some(false)) => 1,
+        (Some(false), Some(true)) => -1,
+        _ => 0,
+    };
+    if (recall_delta >= 0.05 && mae_delta <= 1.0) || tempo_delta > 0 {
+        "native_neural_improved"
+    } else if (recall_delta <= -0.05 && mae_delta >= -1.0) || tempo_delta < 0 {
+        "native_neural_regressed"
+    } else {
+        "mixed_or_equal"
+    }
+}
+
+fn backend_comparison(
+    manifest: &SyntheticCorpusManifest,
+    runs: &BTreeMap<String, BackendRunSet>,
+) -> BackendComparisonReport {
+    let mut report = BackendComparisonReport::default();
+    for record in &manifest.fixtures {
+        let Some(run) = runs.get(&record.spec.id) else {
+            continue;
+        };
+        let hybrid = backend_snapshot(&record.truth, &run.hybrid);
+        let classical = backend_snapshot(&record.truth, &run.classical);
+        let outcome = classify_backend_outcome(&hybrid, &classical, &run.hybrid_backend);
+        *report.outcome_counts.entry(outcome.into()).or_default() += 1;
+        *report
+            .by_fixture_family
+            .entry(record.spec.family.as_str().into())
+            .or_default()
+            .entry(outcome.into())
+            .or_default() += 1;
+        report.per_fixture.push(BackendFixtureComparison {
+            sample_id: record.spec.id.clone(),
+            family: record.spec.family.as_str().into(),
+            hybrid_backend: run.hybrid_backend.clone(),
+            deltas: BackendMetricDelta {
+                beat_mae_ms: metric_delta(hybrid.beat_mae_ms, classical.beat_mae_ms),
+                beat_p95_ms: metric_delta(hybrid.beat_p95_ms, classical.beat_p95_ms),
+                precision_at_40ms: metric_delta(
+                    hybrid.precision_at_40ms,
+                    classical.precision_at_40ms,
+                ),
+                recall_at_40ms: metric_delta(hybrid.recall_at_40ms, classical.recall_at_40ms),
+            },
+            hybrid,
+            classical,
+            outcome: outcome.into(),
+        });
+    }
+    report
+}
+
+fn experimental_tempo_resolution(
+    fixture: &SyntheticFixture,
+    prediction: &NormalizedAnalysis,
+) -> ExperimentalTempoResolution {
+    let mut candidates = Vec::new();
+    let mut seen = Vec::new();
+    for hypothesis in &prediction.tempo_hypotheses {
+        if !hypothesis.bpm.is_finite()
+            || !(wotoha_core::beat_analysis::MIN_BPM..=wotoha_core::beat_analysis::MAX_BPM)
+                .contains(&hypothesis.bpm)
+            || seen
+                .iter()
+                .any(|bpm: &f32| (*bpm - hypothesis.bpm).abs() < 0.01)
+        {
+            continue;
+        }
+        seen.push(hypothesis.bpm);
+        if let Some(candidate) = score_raw_periodic_candidate(
+            fixture,
+            hypothesis.bpm,
+            format_relation_name(&hypothesis.relation),
+        ) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+    let ambiguous = candidates
+        .first()
+        .zip(candidates.get(1))
+        .is_some_and(|(best, runner_up)| best.score - runner_up.score < 0.03);
+    let selected = (!ambiguous).then(|| candidates.first()).flatten();
+    ExperimentalTempoResolution {
+        selected_bpm: selected.map(|candidate| candidate.bpm),
+        selected_relation: selected.map(|candidate| candidate.relation.clone()),
+        ambiguous,
+        candidates,
+    }
+}
+
+fn format_relation_name(relation: &str) -> String {
+    relation.to_owned()
+}
+
+fn score_raw_periodic_candidate(
+    fixture: &SyntheticFixture,
+    bpm: f32,
+    relation: String,
+) -> Option<ExperimentalTempoCandidate> {
+    let mono = downmix(&fixture.audio, fixture.spec.channels);
+    let samples = if fixture.spec.sample_rate == DEFAULT_SAMPLE_RATE {
+        mono
+    } else {
+        resample(&mono, fixture.spec.sample_rate, DEFAULT_SAMPLE_RATE)
+    };
+    let frame_size = (DEFAULT_SAMPLE_RATE as usize / 100).max(1);
+    let envelope = samples
+        .chunks(frame_size)
+        .map(|chunk| {
+            (chunk.iter().map(|sample| sample * sample).sum::<f32>() / chunk.len().max(1) as f32)
+                .sqrt()
+        })
+        .collect::<Vec<_>>();
+    if envelope.len() < 8 {
+        return None;
+    }
+    let period_frames = (6_000.0 / bpm).round() as usize;
+    if period_frames == 0 || period_frames >= envelope.len() {
+        return None;
+    }
+    let global = envelope.iter().sum::<f32>() / envelope.len() as f32;
+    if !global.is_finite() || global <= f32::EPSILON {
+        return None;
+    }
+    let mut best = None;
+    for phase in 0..period_frames {
+        let selected = (phase..envelope.len())
+            .step_by(period_frames)
+            .map(|index| {
+                let from = index.saturating_sub(1);
+                let to = (index + 2).min(envelope.len());
+                envelope[from..to].iter().copied().fold(0.0, f32::max)
+            })
+            .collect::<Vec<_>>();
+        if selected.len() < 3 {
+            continue;
+        }
+        let activation_support =
+            (selected.iter().sum::<f32>() / selected.len() as f32 / global).clamp(0.0, 1.0);
+        let coverage = selected
+            .iter()
+            .filter(|value| **value >= global * 1.15)
+            .count() as f32
+            / selected.len() as f32;
+        let paired = (phase..envelope.len().saturating_sub(period_frames))
+            .map(|index| envelope[index] * envelope[index + period_frames])
+            .sum::<f32>();
+        let energy = envelope
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .max(f32::EPSILON);
+        let periodic_consistency = (paired / energy).clamp(0.0, 1.0);
+        let score = (0.45 * activation_support + 0.30 * coverage + 0.25 * periodic_consistency)
+            .clamp(0.0, 1.0);
+        let candidate = ExperimentalTempoCandidate {
+            bpm,
+            relation: relation.clone(),
+            score,
+            phase_micros: phase as u64 * 10_000,
+            activation_support,
+            coverage,
+            periodic_consistency,
+            available: true,
+        };
+        if best
+            .as_ref()
+            .is_none_or(|current: &ExperimentalTempoCandidate| candidate.score > current.score)
+        {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn experimental_tempo_report(
+    manifest: &SyntheticCorpusManifest,
+    results: &BTreeMap<String, ExperimentalTempoResolution>,
+    predictions: &BTreeMap<String, NormalizedAnalysis>,
+) -> ExperimentalTempoReport {
+    let mut report = ExperimentalTempoReport::default();
+    for record in &manifest.fixtures {
+        let Some(experimental) = results.get(&record.spec.id) else {
+            continue;
+        };
+        let Some(prediction) = predictions.get(&record.spec.id) else {
+            continue;
+        };
+        let Some(truth) = record.truth.tempo.as_ref() else {
+            continue;
+        };
+        report.applicable_tracks += 1;
+        let current_bpm = primary_tempo_bpm(prediction);
+        let current_relation = prediction
+            .tempo_hypotheses
+            .first()
+            .map(|hypothesis| hypothesis.relation.clone());
+        let current_correct = current_bpm
+            .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
+        let experimental_correct = experimental
+            .selected_bpm
+            .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
+        report.current_primary_correct_count += usize::from(current_correct);
+        report.experimental_primary_correct_count += usize::from(experimental_correct);
+        report.current_half_time_count +=
+            usize::from(current_relation.as_deref() == Some("half_time"));
+        report.current_double_time_count +=
+            usize::from(current_relation.as_deref() == Some("double_time"));
+        report.experimental_ambiguous_count += usize::from(experimental.ambiguous);
+        report.experimental_wrong_primary_count +=
+            usize::from(!experimental.ambiguous && !experimental_correct);
+        if experimental.selected_relation.as_deref() == Some("half_time") {
+            report.experimental_half_time_count += 1;
+        }
+        if experimental.selected_relation.as_deref() == Some("double_time") {
+            report.experimental_double_time_count += 1;
+        }
+        let family = record.spec.family.as_str().to_owned();
+        let family_summary = report.by_fixture_family.entry(family.clone()).or_default();
+        family_summary.tracks += 1;
+        family_summary.current_primary_correct_count += usize::from(current_correct);
+        family_summary.experimental_primary_correct_count += usize::from(experimental_correct);
+        family_summary.experimental_ambiguous_count += usize::from(experimental.ambiguous);
+        report.per_fixture.push(ExperimentalTempoFixture {
+            sample_id: record.spec.id.clone(),
+            family,
+            truth_bpm: Some(truth.primary_bpm),
+            current_primary_bpm: current_bpm,
+            current_relation,
+            experimental: experimental.clone(),
+        });
+    }
+    report
 }
 
 fn calibration(tracks: &[TrackEvaluation]) -> Vec<CalibrationBin> {
@@ -2997,7 +4110,10 @@ mod tests {
         let observation = ExternalAnalysisObservation {
             schema_version: OBSERVATION_SCHEMA_VERSION,
             sample_id: "sample".into(),
+            audio_file: None,
             audio_sha256: "a".repeat(64),
+            pcm_sha256: None,
+            ground_truth_sha256: None,
             observer: ObserverIdentity {
                 product: "observer".into(),
                 version: "1".into(),
@@ -3122,6 +4238,225 @@ mod tests {
     }
 
     #[test]
+    fn meter_clear_fixtures_have_distinct_truth_and_accents() {
+        let manifest = generate_default_manifest(42).unwrap();
+        let mut hashes = BTreeSet::new();
+        for (id, meter) in [
+            ("meter-clear-2-4", 2_usize),
+            ("meter-clear-3-4", 3),
+            ("meter-clear-4-4", 4),
+            ("meter-clear-6-8", 6),
+        ] {
+            let record = manifest
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.spec.id == id)
+                .unwrap();
+            assert_eq!(record.truth.meter, Some(meter as u8));
+            assert_eq!(
+                record.truth.downbeats,
+                (0..record.truth.beat_times_micros.len())
+                    .step_by(meter)
+                    .collect::<Vec<_>>()
+            );
+            assert!(hashes.insert(record.audio_sha256.clone()));
+            let fixture = generate_fixture(&record.spec).unwrap();
+            let energy = |beat_index: usize| {
+                let center = record.truth.beat_times_micros[beat_index] as usize
+                    * fixture.spec.sample_rate as usize
+                    / 1_000_000;
+                let radius = fixture.spec.sample_rate as usize / 100;
+                fixture.audio
+                    [center.saturating_sub(radius)..=(center + radius).min(fixture.audio.len() - 1)]
+                    .iter()
+                    .map(|sample| sample.abs())
+                    .fold(0.0, f32::max)
+            };
+            assert!(energy(0) > energy(1));
+            if meter == 4 || meter == 6 {
+                assert!(energy(meter / 2) > energy(1));
+            }
+        }
+        let ambiguous = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.spec.id == "meter-ambiguous-4-4")
+            .unwrap();
+        assert_eq!(ambiguous.truth.meter, None);
+    }
+
+    #[test]
+    fn blackbox_export_is_deterministic_and_round_trips_exported_audio() {
+        let root =
+            std::env::temp_dir().join(format!("wotoha-analysis-lab-export-{}", std::process::id()));
+        let repeat = root.with_extension("repeat");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&repeat);
+        let first = export_blackbox(&root, 17).unwrap();
+        let second = export_blackbox(&repeat, 17).unwrap();
+        assert_eq!(first.fixtures.len(), second.fixtures.len());
+        assert_eq!(
+            fs::read(root.join("manifest.json")).unwrap(),
+            fs::read(repeat.join("manifest.json")).unwrap()
+        );
+        let first_fixture = first.fixtures.first().unwrap();
+        let wav = fs::read(root.join(&first_fixture.audio_file)).unwrap();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        let decoded = decode_wav_pcm16(&wav).unwrap();
+        assert_eq!(decoded.sample_rate, first_fixture.sample_rate);
+        assert_eq!(decoded.channels, first_fixture.channels);
+        assert_eq!(
+            decoded.frame_count,
+            first_fixture.sample_count / usize::from(decoded.channels)
+        );
+        assert_eq!(decoded.pcm_sha256, first_fixture.pcm_sha256);
+        let template: ExternalObservationDocument = serde_json::from_slice(
+            &fs::read(root.join("external-observations-template.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(template.observations.len(), first.fixtures.len());
+        assert_eq!(
+            template
+                .observations
+                .iter()
+                .map(|observation| observation.sample_id.clone())
+                .collect::<BTreeSet<_>>(),
+            first
+                .fixtures
+                .iter()
+                .map(|fixture| fixture.sample_id.clone())
+                .collect::<BTreeSet<_>>()
+        );
+        let report = evaluate_exported_manifest(
+            &root.join("manifest.json"),
+            &root,
+            None,
+            EvaluationOptions {
+                mode: AnalyzerMode::Classical,
+                split: "development".into(),
+                source_commit: None,
+                include_backend_comparison: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.overall.tracks, first.fixtures.len());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&repeat);
+    }
+
+    #[test]
+    fn neural_diagnostics_are_observational_and_bounded() {
+        let mut beat_logits = vec![-6.0; 400];
+        let downbeat_logits = vec![-6.0; 400];
+        for frame in (10..390).step_by(25) {
+            beat_logits[frame] = 7.0;
+        }
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            beat_logits,
+            downbeat_logits,
+        )
+        .unwrap();
+        let normal = wotoha_core::beat_analysis::decode_neural_rhythm(&observations);
+        let (diagnostic, evidence) =
+            wotoha_core::beat_analysis::diagnose_neural_rhythm(&observations, &[]);
+        assert_eq!(diagnostic, normal);
+        assert!(evidence.decoder_accepted);
+        assert!(
+            evidence
+                .candidates
+                .iter()
+                .all(|candidate| candidate.bpm.is_finite()
+                    && candidate.activation_evidence.is_finite()
+                    && candidate.continuity_evidence.is_finite())
+        );
+    }
+
+    #[test]
+    fn experimental_tempo_resolver_reports_independent_candidate_evidence() {
+        let spec = spec(
+            "tempo-experiment",
+            FixtureFamily::HalfDouble,
+            TempoProfile::Constant { bpm: 128.0 },
+            EventStyle::WeakSubdivision,
+            4,
+            0,
+            8,
+        );
+        let fixture = generate_fixture(&spec).unwrap();
+        let mut prediction = normalized_prediction(&[0, 500_000, 1_000_000, 1_500_000]);
+        prediction.tempo_hypotheses = vec![
+            NormalizedTempoHypothesis {
+                bpm: 64.0,
+                relative_weight: 0.3,
+                relation: "half_time".into(),
+            },
+            NormalizedTempoHypothesis {
+                bpm: 128.0,
+                relative_weight: 0.5,
+                relation: "primary".into(),
+            },
+            NormalizedTempoHypothesis {
+                bpm: 256.0,
+                relative_weight: 0.2,
+                relation: "double_time".into(),
+            },
+        ];
+        let result = experimental_tempo_resolution(&fixture, &prediction);
+        assert!(result.candidates.len() >= 2);
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.score.is_finite())
+        );
+    }
+
+    #[test]
+    fn backend_outcomes_are_dimension_aware_and_not_one_aggregate_score() {
+        let snapshot = |recall: f64, valid: bool| BackendMetricSnapshot {
+            beat_mae_ms: Some(if valid { 5.0 } else { 200.0 }),
+            beat_p95_ms: Some(10.0),
+            precision_at_40ms: Some(recall),
+            recall_at_40ms: Some(recall),
+            primary_tempo_correct: Some(valid),
+            grid_phase_correct: None,
+            downbeat_status: "unscored".into(),
+            meter_status: "unknown".into(),
+            core_valid: valid,
+        };
+        assert_eq!(
+            classify_backend_outcome(&snapshot(0.8, true), &snapshot(0.6, true), "native_neural"),
+            "native_neural_improved"
+        );
+        assert_eq!(
+            classify_backend_outcome(&snapshot(0.4, false), &snapshot(0.7, true), "native_neural"),
+            "native_neural_regressed"
+        );
+        assert_eq!(
+            classify_backend_outcome(
+                &snapshot(0.2, false),
+                &snapshot(0.3, false),
+                "native_neural"
+            ),
+            "both_failed"
+        );
+        assert_eq!(
+            classify_backend_outcome(
+                &snapshot(0.7, true),
+                &snapshot(0.7, true),
+                "classical_fallback"
+            ),
+            "fallback_classical_rescued"
+        );
+        assert_eq!(
+            classify_backend_outcome(&snapshot(0.7, true), &snapshot(0.7, true), "native_neural"),
+            "mixed_or_equal"
+        );
+    }
+
+    #[test]
     fn transform_fixture_keeps_identity_to_base_truth() {
         let mut spec = spec(
             "gain",
@@ -3156,7 +4491,10 @@ mod tests {
         let observation = ExternalAnalysisObservation {
             schema_version: 1,
             sample_id: first.spec.id.clone(),
+            audio_file: None,
             audio_sha256: "b".repeat(64),
+            pcm_sha256: None,
+            ground_truth_sha256: None,
             observer: ObserverIdentity {
                 product: "observer".into(),
                 version: "1".into(),
@@ -3217,7 +4555,10 @@ mod tests {
         let observation = ExternalAnalysisObservation {
             schema_version: OBSERVATION_SCHEMA_VERSION,
             sample_id: fixture.spec.id.clone(),
+            audio_file: None,
             audio_sha256: fixture.audio_sha256.clone(),
+            pcm_sha256: None,
+            ground_truth_sha256: None,
             observer: ObserverIdentity {
                 product: "neutral-observer".into(),
                 version: "1.0".into(),
@@ -3254,6 +4595,7 @@ mod tests {
                 mode: AnalyzerMode::Classical,
                 split: "development".into(),
                 source_commit: None,
+                include_backend_comparison: false,
             },
         )
         .unwrap();
@@ -3376,7 +4718,10 @@ mod tests {
         ExternalAnalysisObservation {
             schema_version: OBSERVATION_SCHEMA_VERSION,
             sample_id: sample_id.into(),
+            audio_file: None,
             audio_sha256: "a".repeat(64),
+            pcm_sha256: None,
+            ground_truth_sha256: None,
             observer: ObserverIdentity {
                 product: "observer".into(),
                 version: "1".into(),
@@ -3736,6 +5081,7 @@ mod tests {
                 mode: AnalyzerMode::Classical,
                 split: "development".into(),
                 source_commit: None,
+                include_backend_comparison: false,
             },
         )
         .unwrap();
@@ -3896,6 +5242,8 @@ mod tests {
             family: "test".into(),
             audio_sha256: "a".repeat(64),
             analysis_backend: "test".into(),
+            neural_diagnostics: None,
+            meter_evidence: MeterEvidenceReport::default(),
             truth,
             wotoha: prediction,
             metrics,

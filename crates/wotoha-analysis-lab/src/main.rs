@@ -1,8 +1,8 @@
 use std::{env, error::Error, path::PathBuf};
 
 use wotoha_analysis_lab::{
-    AnalyzerMode, EvaluationOptions, ExternalObservationDocument, evaluate_manifest,
-    generate_default_manifest, load_manifest, write_json,
+    AnalyzerMode, EvaluationOptions, ExternalObservationDocument, evaluate_exported_manifest,
+    evaluate_manifest, export_blackbox, generate_default_manifest, load_manifest, write_json,
 };
 
 fn main() {
@@ -26,6 +26,15 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 output.display()
             );
         }
+        "export-blackbox" => {
+            let (output, seed) = parse_generate_args(&mut args)?;
+            let manifest = export_blackbox(&output, seed)?;
+            println!(
+                "exported {} WAV fixtures at {}",
+                manifest.fixtures.len(),
+                output.display()
+            );
+        }
         "evaluate" | "baseline" => {
             let evaluate = parse_evaluate_args(command == "baseline", &mut args)?;
             reject_unknown(args)?;
@@ -45,6 +54,29 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                     mode: evaluate.mode,
                     split: evaluate.split.unwrap_or_else(|| manifest.split.clone()),
                     source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
+                    include_backend_comparison: true,
+                },
+            )?;
+            write_json(&evaluate.output, &report)?;
+            println!("{}", report.human_summary());
+            println!("report={}", evaluate.output.display());
+        }
+        "evaluate-exported" => {
+            let evaluate = parse_exported_args(&mut args)?;
+            reject_unknown(args)?;
+            let external = evaluate
+                .external
+                .map(|path| ExternalObservationDocument::load(&path))
+                .transpose()?;
+            let report = evaluate_exported_manifest(
+                &evaluate.manifest,
+                &evaluate.audio_root,
+                external.as_ref(),
+                EvaluationOptions {
+                    mode: evaluate.mode,
+                    split: evaluate.split.unwrap_or_else(|| "development".into()),
+                    source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
+                    include_backend_comparison: true,
                 },
             )?;
             write_json(&evaluate.output, &report)?;
@@ -63,6 +95,48 @@ struct EvaluateArgs {
     external: Option<PathBuf>,
     mode: AnalyzerMode,
     split: Option<String>,
+}
+
+struct ExportedArgs {
+    manifest: PathBuf,
+    audio_root: PathBuf,
+    output: PathBuf,
+    external: Option<PathBuf>,
+    mode: AnalyzerMode,
+    split: Option<String>,
+}
+
+fn parse_exported_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<ExportedArgs, Box<dyn Error + Send + Sync>> {
+    let mut manifest = None;
+    let mut audio_root = None;
+    let mut output = PathBuf::from("analysis-lab-exported-report.json");
+    let mut external = None;
+    let mut mode = AnalyzerMode::Hybrid;
+    let mut split = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--manifest" => manifest = Some(next_path(args, "--manifest")?),
+            "--audio-root" => audio_root = Some(next_path(args, "--audio-root")?),
+            "--external-observations" => {
+                external = Some(next_path(args, "--external-observations")?)
+            }
+            "--report" => output = next_path(args, "--report")?,
+            "--mode" => mode = next_value(args, "--mode")?.parse()?,
+            "--split" => split = Some(next_value(args, "--split")?),
+            "--help" | "-h" => return Err(usage().into()),
+            _ => return Err(format!("unknown option: {argument}").into()),
+        }
+    }
+    Ok(ExportedArgs {
+        manifest: manifest.ok_or("--manifest is required")?,
+        audio_root: audio_root.ok_or("--audio-root is required")?,
+        output,
+        external,
+        mode,
+        split,
+    })
 }
 
 fn parse_evaluate_args(
@@ -152,5 +226,5 @@ fn reject_unknown(
 }
 
 fn usage() -> &'static str {
-    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]"
+    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]"
 }

@@ -27,8 +27,9 @@ pub use automix_preview::{
 pub use beat_this_analysis::{
     BEAT_MODEL_ASSETS, BEAT_THIS_VCS, BeatModelAssetMetadata, MAX_NEURAL_DURATION,
     MAX_NEURAL_LOW_BAND_SAMPLES, MAX_NEURAL_SAMPLES, NEURAL_SAMPLE_RATE,
-    adapt_legacy_track_analysis, analyze_neural_rhythm, analyze_neural_rhythm_with_fallback,
-    model_assets, self_check_embedded_models, track_analysis_v2_from_legacy,
+    NeuralRhythmDiagnosticResult, adapt_legacy_track_analysis, analyze_neural_rhythm,
+    analyze_neural_rhythm_with_diagnostics, analyze_neural_rhythm_with_fallback, model_assets,
+    self_check_embedded_models, track_analysis_v2_from_legacy,
     track_analysis_v2_from_legacy_rhythm, track_analysis_v2_from_legacy_with_backend,
     track_analysis_v2_from_legacy_with_neural_rhythm,
 };
