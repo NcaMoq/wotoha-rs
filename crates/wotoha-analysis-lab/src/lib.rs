@@ -22,10 +22,10 @@ use wotoha_core::{
     audio_analysis::LowBandFilter,
 };
 
-pub const LAB_SCHEMA_VERSION: u32 = 1;
-pub const OBSERVATION_SCHEMA_VERSION: u32 = 1;
-pub const REPORT_SCHEMA_VERSION: u32 = 4;
-pub const BLACKBOX_SCHEMA_VERSION: u32 = 1;
+pub const LAB_SCHEMA_VERSION: u32 = 2;
+pub const OBSERVATION_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 5;
+pub const BLACKBOX_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
 const DEFAULT_SAMPLE_RATE: u32 = 22_050;
@@ -40,10 +40,6 @@ const BEAT_MATCH_WINDOW: Duration = Duration::from_millis(120);
 // rounding and a modest isolated timing outlier, while rejecting visible
 // tempo drift in this evaluation layer.
 const EXTERNAL_PERIOD_STABILITY: f64 = 0.03;
-
-fn default_meter_truth() -> Option<u8> {
-    Some(4)
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,8 +142,13 @@ pub struct BlackboxManifest {
 pub struct BlackboxFixture {
     pub sample_id: String,
     pub audio_file: String,
+    /// SHA-256 of the exact transferred RIFF/WAVE file.
+    #[serde(rename = "wav_file_sha256")]
     pub audio_sha256: String,
     pub pcm_sha256: String,
+    /// SHA-256 of the pre-quantization generated f32 fixture, never the
+    /// identity used by an external observer.
+    #[serde(rename = "generated_float_fixture_sha256")]
     pub fixture_audio_sha256: String,
     pub sample_count: usize,
     pub sample_rate: u32,
@@ -180,8 +181,7 @@ impl BlackboxManifest {
         for fixture in &self.fixtures {
             if !ids.insert(fixture.sample_id.clone())
                 || fixture.sample_id != fixture.spec.id
-                || fixture.audio_file.contains("..")
-                || fixture.audio_file.starts_with('/')
+                || !is_safe_relative_path(&fixture.audio_file)
             {
                 return Err(LabError::InvalidInput(format!(
                     "invalid or duplicate black-box fixture {}",
@@ -273,6 +273,9 @@ impl SyntheticCorpusManifest {
 pub struct FixtureRecord {
     pub spec: FixtureSpec,
     pub truth: AnalysisGroundTruth,
+    /// SHA-256 of generated, pre-quantization f32 samples. This is only an
+    /// internal corpus identity; exported WAV identity is separate.
+    #[serde(rename = "generated_float_fixture_sha256")]
     pub audio_sha256: String,
 }
 
@@ -287,7 +290,7 @@ pub struct FixtureSpec {
     pub meter: u8,
     /// Evaluation truth is explicit and may intentionally be unknown even
     /// when synthesis uses a valid meter for pulse placement.
-    #[serde(default = "default_meter_truth")]
+    #[serde(default)]
     pub meter_truth: Option<u8>,
     pub tempo: TempoProfile,
     pub event_style: EventStyle,
@@ -1595,7 +1598,7 @@ pub fn evaluate_exported_manifest(
 
 fn blackbox_readme(fixture_count: usize, seed: u64) -> String {
     format!(
-        "# Wotoha clean-room black-box corpus\n\nThis package contains {fixture_count} deterministic synthetic WAV fixtures generated with seed `{seed}`. The WAV PCM16 bytes are the canonical artifacts for external analysis. The manifest contains exact Ground Truth, file SHA-256, canonical decoded PCM SHA-256, sample metadata, and fixture identity.\n\n## Team A workflow\n\n1. Import each WAV into the public application.\n2. Trigger normal public track analysis.\n3. Do not manually correct the result before recording it.\n4. Record reported BPM, beatgrid, visible downbeat/grid phase, and musical key where available.\n5. Preserve public analysis settings and analysis timing.\n6. Fill `external-observations-template.json`; keep identity hashes unchanged.\n7. Do not interpret disagreement as error without comparing against Ground Truth.\n\nExternal software output is reference observation, never Ground Truth. This corpus and schema contain no proprietary implementation information.\n"
+        "# Wotoha clean-room black-box corpus\n\nThis package contains {fixture_count} deterministic synthetic WAV fixtures generated with seed `{seed}`. The WAV PCM16 bytes are the canonical artifacts for external analysis. The manifest labels the WAV file SHA-256, decoded PCM SHA-256, generated fixture SHA-256, and Ground Truth SHA-256 separately.\n\n## Team A workflow\n\n1. Import each WAV into the public application.\n2. Trigger normal public track analysis.\n3. Do not manually correct the result before recording it.\n4. Record reported BPM, beatgrid, visible downbeat/grid phase, and musical key where available.\n5. Preserve public analysis settings and analysis timing.\n6. Fill `external-observations-template.json`; keep identity hashes unchanged.\n7. Record external analysis output before inspecting Ground Truth.\n8. Do not interpret disagreement as error without comparing against Ground Truth.\n\nExternal software output is reference observation, never Ground Truth. This corpus and schema contain no proprietary implementation information.\n"
     )
 }
 
@@ -1947,6 +1950,8 @@ pub struct ExternalAnalysisObservation {
     pub sample_id: String,
     #[serde(default)]
     pub audio_file: Option<String>,
+    /// SHA-256 of the actual transferred WAV artifact observed externally.
+    #[serde(rename = "wav_file_sha256")]
     pub audio_sha256: String,
     #[serde(default)]
     pub pcm_sha256: Option<String>,
@@ -2641,8 +2646,15 @@ pub struct ExperimentalTempoFixture {
     pub family: String,
     pub truth_bpm: Option<f32>,
     pub current_primary_bpm: Option<f32>,
-    pub current_relation: Option<String>,
-    pub experimental: ExperimentalTempoResolution,
+    /// Relation of the production result to known truth. This is never an
+    /// internal candidate label.
+    pub current_relation_to_truth: String,
+    /// Relation of the PCM-envelope experiment to known truth.
+    pub pcm_relation_to_truth: String,
+    /// Relation of the activation experiment to known truth, when raw
+    /// activations were available.
+    pub activation_relation_to_truth: Option<String>,
+    pub pcm: ExperimentalTempoResolution,
     pub activation: Option<ActivationTempoResolution>,
 }
 
@@ -2856,6 +2868,7 @@ pub struct ExternalObserverReport {
 pub struct TrackEvaluation {
     pub sample_id: String,
     pub family: String,
+    #[serde(rename = "input_artifact_sha256")]
     pub audio_sha256: String,
     pub analysis_backend: String,
     pub neural_diagnostics: Option<NeuralDiagnostics>,
@@ -4209,17 +4222,12 @@ fn experimental_tempo_report(
         let current_bpm = primary_tempo_bpm(prediction);
         let current_correct = current_bpm
             .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
-        let current_relation = current_bpm.map(|bpm| {
-            tempo_relation_to_truth(bpm, truth.primary_bpm)
-                .map(str::to_owned)
-                .unwrap_or_else(|| {
-                    prediction
-                        .tempo_hypotheses
-                        .first()
-                        .map(|hypothesis| canonical_relation_name(&hypothesis.relation).to_owned())
-                        .unwrap_or_else(|| "absent".into())
-                })
-        });
+        let current_relation_to_truth = relation_to_truth(current_bpm, truth.primary_bpm, false);
+        let pcm_relation_to_truth = relation_to_truth(
+            experimental.selected_bpm,
+            truth.primary_bpm,
+            experimental.ambiguous,
+        );
         let experimental_correct = experimental
             .selected_bpm
             .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
@@ -4230,11 +4238,16 @@ fn experimental_tempo_report(
                 .selected_bpm
                 .map(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005)
         });
+        let activation_relation_to_truth = resolvers.activation.as_ref().map(|activation| {
+            relation_to_truth(
+                activation.selected_bpm,
+                truth.primary_bpm,
+                activation.ambiguous,
+            )
+        });
         report.activation_primary_correct_count += usize::from(activation_correct == Some(true));
-        report.current_half_time_count +=
-            usize::from(current_relation.as_deref() == Some("half_time"));
-        report.current_double_time_count +=
-            usize::from(current_relation.as_deref() == Some("double_time"));
+        report.current_half_time_count += usize::from(current_relation_to_truth == "half_time");
+        report.current_double_time_count += usize::from(current_relation_to_truth == "double_time");
         report.experimental_ambiguous_count += usize::from(experimental.ambiguous);
         report.experimental_wrong_primary_count +=
             usize::from(!experimental.ambiguous && !experimental_correct);
@@ -4295,12 +4308,27 @@ fn experimental_tempo_report(
             family,
             truth_bpm: Some(truth.primary_bpm),
             current_primary_bpm: current_bpm,
-            current_relation,
-            experimental: experimental.clone(),
+            current_relation_to_truth,
+            pcm_relation_to_truth,
+            activation_relation_to_truth,
+            pcm: experimental.clone(),
             activation: resolvers.activation.clone(),
         });
     }
     report
+}
+
+fn relation_to_truth(bpm: Option<f32>, truth_bpm: f32, ambiguous: bool) -> String {
+    if ambiguous {
+        return "ambiguous".into();
+    }
+    bpm.and_then(|bpm| tempo_relation_to_truth(bpm, truth_bpm))
+        .unwrap_or(if bpm.is_some() {
+            "other_wrong"
+        } else {
+            "absent"
+        })
+        .into()
 }
 
 fn tempo_relation_to_truth(bpm: f32, truth_bpm: f32) -> Option<&'static str> {
@@ -5144,6 +5172,23 @@ mod tests {
     }
 
     #[test]
+    fn meter_truth_accepts_only_explicit_supported_values_and_schema_is_versioned() {
+        let mut manifest = generate_default_manifest(42).unwrap();
+        for meter in [2_u8, 3, 4, 6] {
+            let mut fixture = manifest.fixtures[0].spec.clone();
+            fixture.id = format!("meter-truth-{meter}");
+            fixture.meter = meter;
+            fixture.meter_truth = Some(meter);
+            assert!(generate_fixture(&fixture).is_ok());
+        }
+        let mut invalid = manifest.fixtures[0].spec.clone();
+        invalid.meter_truth = Some(5);
+        assert!(generate_fixture(&invalid).is_err());
+        manifest.schema_version = LAB_SCHEMA_VERSION - 1;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
     fn half_double_corpus_covers_requested_tempo_families() {
         let manifest = generate_default_manifest(42).unwrap();
         for (id, bpm) in [
@@ -5201,6 +5246,11 @@ mod tests {
             fs::read(root.join("manifest.json")).unwrap(),
             fs::read(repeat.join("manifest.json")).unwrap()
         );
+        let manifest_json =
+            String::from_utf8(fs::read(root.join("manifest.json")).unwrap()).unwrap();
+        assert!(manifest_json.contains("\"wav_file_sha256\""));
+        assert!(manifest_json.contains("\"generated_float_fixture_sha256\""));
+        assert!(!manifest_json.contains("\"audio_sha256\""));
         let first_fixture = first.fixtures.first().unwrap();
         let wav = fs::read(root.join(&first_fixture.audio_file)).unwrap();
         assert_eq!(&wav[0..4], b"RIFF");
@@ -5217,6 +5267,11 @@ mod tests {
             &fs::read(root.join("external-observations-template.json")).unwrap(),
         )
         .unwrap();
+        let template_json =
+            String::from_utf8(fs::read(root.join("external-observations-template.json")).unwrap())
+                .unwrap();
+        assert!(template_json.contains("\"wav_file_sha256\""));
+        assert!(!template_json.contains("\"audio_sha256\""));
         assert_eq!(template.observations.len(), first.fixtures.len());
         assert_eq!(
             template
@@ -5296,6 +5351,10 @@ mod tests {
     #[test]
     fn blackbox_zip_rejects_unsafe_duplicate_and_oversized_entries() {
         assert!(read_stored_zip(&test_stored_zip(&[("../escape", b"x")])).is_err());
+        assert!(read_stored_zip(&test_stored_zip(&[("../../escape", b"x")])).is_err());
+        assert!(read_stored_zip(&test_stored_zip(&[("/absolute/path", b"x")])).is_err());
+        assert!(read_stored_zip(&test_stored_zip(&[("C:/absolute/path", b"x")])).is_err());
+        assert!(read_stored_zip(&test_stored_zip(&[("C:\\absolute\\path", b"x")])).is_err());
         assert!(
             read_stored_zip(&test_stored_zip(&[
                 ("audio/a.wav", b"x"),
@@ -5489,6 +5548,12 @@ mod tests {
         let (selected, ambiguous) = choose_experimental_candidate(&candidates);
         assert!(ambiguous);
         assert_eq!(selected, None);
+        assert_eq!(
+            relation_to_truth(Some(128.0), 128.0, ambiguous),
+            "ambiguous"
+        );
+        assert_eq!(relation_to_truth(Some(96.0), 128.0, false), "other_wrong");
+        assert_eq!(relation_to_truth(None, 128.0, false), "absent");
     }
 
     #[test]
@@ -5597,7 +5662,7 @@ mod tests {
         let manifest = generate_default_manifest(1).unwrap();
         let first = &manifest.fixtures[0];
         let observation = ExternalAnalysisObservation {
-            schema_version: 1,
+            schema_version: OBSERVATION_SCHEMA_VERSION,
             sample_id: first.spec.id.clone(),
             audio_file: None,
             audio_sha256: "b".repeat(64),
@@ -5628,7 +5693,7 @@ mod tests {
         };
         let result = compare_external(
             &ExternalObservationDocument {
-                schema_version: 1,
+                schema_version: OBSERVATION_SCHEMA_VERSION,
                 observations: vec![observation],
             },
             &manifest,

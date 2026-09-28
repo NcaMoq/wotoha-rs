@@ -15,8 +15,9 @@ decompile, run `strings` against, or copy implementation details from an
 external application. External DJ software is an observation reference, not
 ground truth.
 
-The observation schema is vendor-neutral. It records `sample_id`, canonical
-audio SHA-256, observer product/version/platform, public analysis settings,
+The observation schema is vendor-neutral. It records `sample_id`, the exact
+transferred WAV file SHA-256 and optional decoded PCM SHA-256, observer
+product/version/platform, public analysis settings,
 optional reported BPM, optional beatgrid/downbeat/key/meter results, completion
 state, timing, and notes. Optional fields are `Option` values where absence
 must remain distinguishable from an observed empty result. For example,
@@ -68,11 +69,11 @@ cargo run --release --locked -p wotoha-analysis-lab -- \
 
 The export contains `audio/*.wav`, `manifest.json`,
 `external-observations-template.json`, `checksums.sha256`, and a README for
-Team A. The manifest stores both the WAV file hash and decoded PCM hash, so a
-receiver can reject a changed or mismatched file before analysis. Package the
-directory with the platform's standard ZIP tool when transferring it; the
-directory itself is the reproducible source artifact and generated packages
-belong outside the repository.
+Team A. The manifest labels the exact `wav_file_sha256`, decoded `pcm_sha256`,
+generated `generated_float_fixture_sha256`, and `ground_truth_sha256` separately,
+so a receiver can reject a changed or mismatched file before analysis. Use the
+lab's `package-blackbox` command for deterministic stored-ZIP packaging; the
+directory and generated package belong outside the repository.
 
 ## Commands
 
@@ -131,10 +132,14 @@ unavailable rather than being confused with a zero score.
 When enabled by the CLI, `backend_comparison` evaluates Hybrid and Classical
 on the same generated audio and records per-fixture deltas and descriptive
 outcomes. It is not a production selector and is not reduced to one aggregate
-winner. `tempo_experiment` contains the lab-only independent candidate
-resolver: candidate BPM/half/double relations are scored from generated
-rhythm evidence with activation support, coverage, periodic consistency,
-phase, and ambiguity. Its result is observational and does not alter the
+winner. `tempo_experiment` contains two explicitly named lab-only resolvers
+on every fixture: `pcm` for the PCM-envelope experiment and `activation` for
+the raw Beat This activation experiment. Candidate BPM/half/double relations
+are scored with activation support, coverage, periodic consistency, phase,
+off-grid leakage where applicable, and ambiguity. Truth-relative relations
+are reported separately as `primary`, `half_time`, `double_time`,
+`other_wrong`, `ambiguous`, or `absent`; internal candidate labels are never
+used as truth relations. These results are observational and do not alter the
 production tempo hypotheses.
 
 Beat metrics use a deterministic monotonic one-to-one matcher and report MAE,
@@ -227,9 +232,13 @@ change must be justified by synthetic error, signal-processing rationale,
 public literature, or human validation, and must preserve the existing
 `TrackAnalysisV2` evidence separation and beat-event timeline truth.
 
-The external observation schema remains at version 1. The report schema is
-version 4 because neural tempo candidate evidence now has candidate-specific
-semantics; old reports must not be compared silently with new reports.
+The synthetic corpus schema is version 2 because meter truth is now explicit;
+the external observation schema is version 2 because transferred identity is
+named `wav_file_sha256`; the black-box schema is version 2 for the same explicit
+hash semantics. The report schema is version 5 because neural tempo candidate
+evidence and truth-relative relation fields have candidate-specific semantics;
+old manifests, observations, and reports must not be compared silently with
+new schemas.
 
 ## Final clean-room handoff
 
@@ -242,7 +251,9 @@ change production beat events, tempo selection, or confidence.
 
 Synthetic meter truth is explicit in `FixtureSpec.meter_truth`. The synthesis
 meter may be known while evaluation truth is unknown; fixture IDs have no
-semantic effect.
+semantic effect. The current neural downbeat decoder still uses a four-phase
+prior, so 3/4 and 6/8 results must be interpreted with that limitation in
+mind.
 
 Generate and package the handoff with the same fixed seed:
 
@@ -259,6 +270,8 @@ cargo run --release --locked -p wotoha-analysis-lab -- \
 Packaging uses stable ordering, normalized timestamps, stored entries, bounded
 file sizes, safe relative paths, duplicate detection, CRC checks, manifest and
 PCM/Ground Truth hash verification, and observation-template identity checks.
+The packaged README explicitly instructs observers: **Record external analysis
+output before inspecting Ground Truth.**
 The ZIP, WAVs, and reports belong under `/tmp` and are not repository or
 container artifacts.
 

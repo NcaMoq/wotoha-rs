@@ -390,39 +390,17 @@ pub fn diagnose_neural_rhythm(
     observations: &NeuralBeatObservations,
     low_band_1khz: &[f32],
 ) -> (Option<NeuralRhythmAnalysis>, NeuralRhythmDiagnostics) {
-    if observations.len() < MIN_PATH_MARKERS {
-        return (
-            None,
-            NeuralRhythmDiagnostics {
-                rejection_reason: Some("insufficient_markers".into()),
-                ..NeuralRhythmDiagnostics::default()
-            },
-        );
-    }
-    if !observations.frame_rate_hz.is_finite()
-        || observations.frame_rate_hz <= 0.0
-        || observations
-            .beat_logits
-            .iter()
-            .chain(observations.downbeat_logits.iter())
-            .any(|value| !value.is_finite())
-    {
-        return (
-            None,
-            NeuralRhythmDiagnostics {
-                rejection_reason: Some("invalid_input".into()),
-                ..NeuralRhythmDiagnostics::default()
-            },
-        );
-    }
-    let Some(grid) = decode_grid(observations) else {
-        return (
-            None,
-            NeuralRhythmDiagnostics {
-                rejection_reason: Some("decoder_rejected".into()),
-                ..NeuralRhythmDiagnostics::default()
-            },
-        );
+    let grid = match decode_grid_with_reason(observations) {
+        Ok(grid) => grid,
+        Err(reason) => {
+            return (
+                None,
+                NeuralRhythmDiagnostics {
+                    rejection_reason: Some(reason.as_str().into()),
+                    ..NeuralRhythmDiagnostics::default()
+                },
+            );
+        }
     };
     let decoded = if low_band_1khz.is_empty() {
         rhythm_from_grid(observations, &grid, None, None)
@@ -665,6 +643,37 @@ pub fn decode_neural_grid(observations: &NeuralBeatObservations) -> Option<Vec<D
 }
 
 fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
+    decode_grid_with_reason(observations).ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecodeRejection {
+    InsufficientMarkers,
+    InvalidInput,
+    TempoOutOfRange,
+    Support,
+    IntervalResidual,
+    Coverage,
+    Activation,
+}
+
+impl DecodeRejection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientMarkers => "insufficient_markers",
+            Self::InvalidInput => "invalid_input",
+            Self::TempoOutOfRange => "tempo_out_of_range",
+            Self::Support => "support",
+            Self::IntervalResidual => "interval_residual",
+            Self::Coverage => "coverage",
+            Self::Activation => "activation",
+        }
+    }
+}
+
+fn decode_grid_with_reason(
+    observations: &NeuralBeatObservations,
+) -> Result<DecodedGrid, DecodeRejection> {
     if observations.len() < MIN_PATH_MARKERS
         || !observations.frame_rate_hz.is_finite()
         || observations.frame_rate_hz <= 0.0
@@ -674,7 +683,14 @@ fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
             .chain(observations.downbeat_logits.iter())
             .any(|value| !value.is_finite())
     {
-        return None;
+        return Err(if observations.len() < MIN_PATH_MARKERS {
+            DecodeRejection::InsufficientMarkers
+        } else {
+            DecodeRejection::InvalidInput
+        });
+    }
+    if period_bounds(observations.frame_rate_hz).is_none() {
+        return Err(DecodeRejection::TempoOutOfRange);
     }
     let beat: Vec<f32> = observations
         .beat_logits
@@ -688,16 +704,17 @@ fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
         .copied()
         .map(logit_probability)
         .collect();
-    let frames = bounded_dp(&beat, observations.frame_rate_hz)?;
+    let frames = bounded_dp(&beat, observations.frame_rate_hz).ok_or(DecodeRejection::Support)?;
     let intervals = frames
         .windows(2)
         .map(|pair| pair[1] - pair[0])
         .collect::<Vec<_>>();
-    let period = robust_period(&intervals, observations.frame_rate_hz)?;
+    let period = robust_period(&intervals, observations.frame_rate_hz)
+        .ok_or(DecodeRejection::IntervalResidual)?;
     let alias_margin = alias_hypothesis_margin(&beat, &frames, period, observations.frame_rate_hz);
     let bpm = 60.0 * observations.frame_rate_hz / period as f32;
     if !(MIN_BPM..=MAX_BPM).contains(&bpm) {
-        return None;
+        return Err(DecodeRejection::TempoOutOfRange);
     }
     let coverage = frames.iter().filter(|frame| beat[**frame] >= 0.5).count() as f32
         / frames.len().max(1) as f32;
@@ -724,13 +741,19 @@ fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
             .filter(|activation| **activation >= 0.5)
             .count()
             .max(1) as f32;
-    if coverage < MIN_COVERAGE || support < 0.55 || residual > 0.28 {
-        return None;
+    if coverage < MIN_COVERAGE {
+        return Err(DecodeRejection::Coverage);
+    }
+    if support < 0.55 {
+        return Err(DecodeRejection::Support);
+    }
+    if residual > 0.28 {
+        return Err(DecodeRejection::IntervalResidual);
     }
     let activation_mean =
         frames.iter().map(|frame| beat[*frame]).sum::<f32>() / frames.len().max(1) as f32;
     if activation_mean < 0.20 {
-        return None;
+        return Err(DecodeRejection::Activation);
     }
     let beat_confidence = ((0.45 * coverage + 0.35 * activation_mean + 0.20 * (1.0 - residual))
         * (0.55 + 0.45 * alias_margin))
@@ -846,7 +869,7 @@ fn decode_grid(observations: &NeuralBeatObservations) -> Option<DecodedGrid> {
             .unwrap_or(best_phase.min(frames.len().saturating_sub(1)))
     });
 
-    Some(DecodedGrid {
+    Ok(DecodedGrid {
         frames,
         marker_confidences,
         period_frames: period,
