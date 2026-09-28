@@ -24,6 +24,7 @@ use wotoha_core::{
 
 pub const LAB_SCHEMA_VERSION: u32 = 1;
 pub const OBSERVATION_SCHEMA_VERSION: u32 = 1;
+pub const REPORT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
 const DEFAULT_SAMPLE_RATE: u32 = 22_050;
@@ -1015,6 +1016,7 @@ impl ExternalObservationDocument {
                 self.schema_version, OBSERVATION_SCHEMA_VERSION
             )));
         }
+        let mut records = BTreeSet::new();
         for observation in &self.observations {
             if observation.schema_version != OBSERVATION_SCHEMA_VERSION
                 || observation.sample_id.trim().is_empty()
@@ -1036,6 +1038,32 @@ impl ExternalObservationDocument {
                     "external observer identity is required".into(),
                 ));
             }
+            let settings_key = observation_settings_key(&observation.analysis_settings);
+            let record_key = format!(
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                observation.sample_id,
+                observation.observer.product,
+                observation.observer.version,
+                settings_key
+            );
+            if !records.insert(record_key) {
+                return Err(LabError::InvalidInput(format!(
+                    "duplicate external observation for {} {}@{} with identical settings",
+                    observation.sample_id,
+                    observation.observer.product,
+                    observation.observer.version
+                )));
+            }
+            if let Some((minimum, maximum)) = observation.analysis_settings.tempo_range_bpm
+                && (!minimum.is_finite()
+                    || !maximum.is_finite()
+                    || minimum <= 0.0
+                    || maximum < minimum)
+            {
+                return Err(LabError::InvalidInput(
+                    "external tempo range must be finite, positive, and ordered".into(),
+                ));
+            }
             if let Some(bpm) = observation.observed.reported_bpm
                 && (!bpm.is_finite() || bpm <= 0.0)
             {
@@ -1053,9 +1081,60 @@ impl ExternalObservationDocument {
                     "external beatgrid must be strictly increasing".into(),
                 ));
             }
+            if let Some(meter) = observation.observed.meter
+                && !matches!(meter, 2 | 3 | 4 | 6)
+            {
+                return Err(LabError::InvalidInput(
+                    "external meter must be one of 2, 3, 4, or 6".into(),
+                ));
+            }
+            if let Some(indices) = observation.observed.downbeat_indices.as_ref() {
+                if let Some(beats) = observation.observed.beatgrid_times_micros.as_ref() {
+                    if indices.iter().any(|index| *index >= beats.len()) {
+                        return Err(LabError::InvalidInput(
+                            "external downbeat index is outside the supplied beatgrid".into(),
+                        ));
+                    }
+                } else if !indices.is_empty() {
+                    return Err(LabError::InvalidInput(
+                        "external downbeats require a supplied beatgrid".into(),
+                    ));
+                }
+            }
+            if let Some(duration) = observation.timing.observed_duration_micros {
+                if observation
+                    .observed
+                    .beatgrid_times_micros
+                    .as_ref()
+                    .is_some_and(|beats| beats.iter().any(|beat| *beat > duration))
+                {
+                    return Err(LabError::InvalidInput(
+                        "external beatgrid exceeds the observed duration".into(),
+                    ));
+                }
+                if observation
+                    .observed
+                    .grid_phase_micros
+                    .is_some_and(|phase| phase > duration)
+                {
+                    return Err(LabError::InvalidInput(
+                        "external grid phase exceeds the observed duration".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
+}
+
+fn observation_settings_key(settings: &ObservationSettings) -> String {
+    format!(
+        "beats={:?};tempo={:?};meter={:?};key={:?}",
+        settings.beat_grid_enabled,
+        settings.tempo_range_bpm,
+        settings.meter_mode,
+        settings.key_mode
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1065,9 +1144,28 @@ pub struct NormalizedAnalysis {
     pub beats: Vec<NormalizedBeat>,
     pub tempo_hypotheses: Vec<NormalizedTempoHypothesis>,
     pub meter_hypotheses: Vec<NormalizedMeterHypothesis>,
+    pub resolved_meter: Option<u8>,
+    pub resolved_meter_phase: Option<u8>,
     pub structure: NormalizedStructure,
     pub confidence: ConfidenceEvidence,
     pub provenance: BTreeMap<String, ProvenanceView>,
+}
+
+/// Availability-preserving representation of an external observation.
+///
+/// This intentionally is not `NormalizedAnalysis`: an external observer may
+/// omit one field while reporting another, and `Some(vec![])` is a meaningful
+/// completed zero-result observation rather than absence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NormalizedExternalAnalysis {
+    pub analyzer: String,
+    pub duration_micros: u64,
+    pub beats: Option<Vec<NormalizedBeat>>,
+    pub reported_bpm: Option<f32>,
+    pub downbeat_indices: Option<Vec<usize>>,
+    pub grid_phase_micros: Option<u64>,
+    pub meter: Option<u8>,
+    pub analysis_complete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1210,6 +1308,11 @@ pub fn normalize_v2(analysis: &TrackAnalysisV2) -> NormalizedAnalysis {
                 score: hypothesis.score.get(),
             })
             .collect(),
+        resolved_meter: analysis.rhythm.resolved_meter(),
+        resolved_meter_phase: analysis
+            .rhythm
+            .resolved_meter_hypothesis()
+            .map(|hypothesis| hypothesis.downbeat_phase),
         structure: NormalizedStructure {
             phrase_boundaries: analysis
                 .structure
@@ -1365,6 +1468,10 @@ pub struct BeatMetrics {
     pub p95_ms: Option<f64>,
     pub precision_at_tolerance: BTreeMap<String, f64>,
     pub recall_at_tolerance: BTreeMap<String, f64>,
+    #[serde(skip)]
+    matched_errors_ms: Vec<f64>,
+    #[serde(skip)]
+    matched_by_tolerance: BTreeMap<String, usize>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1378,7 +1485,11 @@ pub struct TempoMetrics {
     pub primary_correct_count: usize,
     pub primary_correct_rate: Option<f64>,
     pub correct_hypothesis_top_n: BTreeMap<String, bool>,
+    pub top_n_scored_tracks: BTreeMap<String, usize>,
+    pub top_n_correct_count: BTreeMap<String, usize>,
     pub correct_hypothesis_top_n_rate: BTreeMap<String, f64>,
+    pub canonical_hypothesis_present: Option<bool>,
+    pub musically_valid_hypothesis_present: Option<bool>,
     pub relation_counts: BTreeMap<String, usize>,
     pub relation_error: Option<String>,
 }
@@ -1430,6 +1541,9 @@ pub struct CalibrationBin {
     pub lower: f32,
     pub upper: f32,
     pub observations: usize,
+    pub matched_count: usize,
+    pub unmatched_predicted_count: usize,
+    pub match_rate: Option<f64>,
     pub mean_confidence: Option<f64>,
     pub mean_absolute_error_ms: Option<f64>,
 }
@@ -1438,16 +1552,24 @@ pub struct CalibrationBin {
 pub struct TransformMetrics {
     pub transform: String,
     pub tracks: usize,
+    pub matched_beats: usize,
+    pub missing_beats: usize,
+    pub extra_beats: usize,
     pub mean_beat_displacement_ms: Option<f64>,
+    pub p95_beat_displacement_ms: Option<f64>,
     pub tempo_interpretation_changes: usize,
     pub downbeat_changes: usize,
     pub meter_changes: usize,
     pub confidence_change: Option<f64>,
+    #[serde(skip)]
+    displacement_ms: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExternalReport {
     pub observations: usize,
+    pub complete_observations: usize,
+    pub incomplete_observations: usize,
     pub by_observer: BTreeMap<String, ExternalObserverReport>,
 }
 
@@ -1455,6 +1577,15 @@ pub struct ExternalReport {
 pub struct ExternalObserverReport {
     pub product: String,
     pub version: String,
+    pub settings: String,
+    pub observations: usize,
+    pub complete_observations: usize,
+    pub incomplete_observations: usize,
+    pub beat_observations: usize,
+    pub tempo_observations: usize,
+    pub meter_observations: usize,
+    pub downbeat_observations: usize,
+    pub grid_phase_observations: usize,
     pub wotoha_vs_truth: GroupMetrics,
     pub external_vs_truth: GroupMetrics,
     pub wotoha_vs_external: GroupMetrics,
@@ -1550,7 +1681,7 @@ pub fn evaluate_manifest_with_cancel(
         .transpose()?
         .unwrap_or_default();
     Ok(EvaluationReport {
-        schema_version: LAB_SCHEMA_VERSION,
+        schema_version: REPORT_SCHEMA_VERSION,
         evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
         split: options.split,
         overall,
@@ -1612,29 +1743,66 @@ fn match_errors(
     tolerance: Duration,
 ) -> Vec<(usize, usize, Duration)> {
     let tolerance = duration_micros(tolerance);
+    #[derive(Clone, Copy, Default)]
+    struct Score {
+        matches: usize,
+        error: u64,
+        choice: u8,
+    }
+
+    fn better(candidate: Score, current: Score, priority: u8) -> bool {
+        candidate.matches > current.matches
+            || (candidate.matches == current.matches
+                && (candidate.error < current.error
+                    || (candidate.error == current.error && priority < current.choice)))
+    }
+
+    let columns = predicted.len() + 1;
+    let mut table = vec![Score::default(); (truth.len() + 1) * columns];
+    let index =
+        |truth_index: usize, predicted_index: usize| truth_index * columns + predicted_index;
+    for truth_index in (0..truth.len()).rev() {
+        for predicted_index in (0..predicted.len()).rev() {
+            let mut best = table[index(truth_index + 1, predicted_index)];
+            best.choice = 1;
+            let skip_predicted = table[index(truth_index, predicted_index + 1)];
+            if better(skip_predicted, best, 2) {
+                best = skip_predicted;
+                best.choice = 2;
+            }
+            let error = truth[truth_index].abs_diff(predicted[predicted_index]);
+            if error <= tolerance {
+                let following = table[index(truth_index + 1, predicted_index + 1)];
+                let matched = Score {
+                    matches: following.matches + 1,
+                    error: following.error.saturating_add(error),
+                    choice: 0,
+                };
+                if better(matched, best, 0) {
+                    best = matched;
+                }
+            }
+            table[index(truth_index, predicted_index)] = best;
+        }
+    }
     let mut pairs = Vec::new();
-    let mut truth_index = 0;
-    let mut predicted_index = 0;
+    let (mut truth_index, mut predicted_index) = (0, 0);
     while truth_index < truth.len() && predicted_index < predicted.len() {
-        let t = truth[truth_index];
-        let p = predicted[predicted_index];
-        if p + tolerance < t {
-            predicted_index += 1;
-            continue;
-        }
-        if t + tolerance < p {
-            truth_index += 1;
-            continue;
-        }
-        let error = p.abs_diff(t);
-        if error <= tolerance {
-            pairs.push((truth_index, predicted_index, duration_from_micros(error)));
-            truth_index += 1;
-            predicted_index += 1;
-        } else if p < t {
-            predicted_index += 1;
-        } else {
-            truth_index += 1;
+        let score = table[index(truth_index, predicted_index)];
+        match score.choice {
+            0 => {
+                let error = truth[truth_index].abs_diff(predicted[predicted_index]);
+                if error <= tolerance {
+                    pairs.push((truth_index, predicted_index, duration_from_micros(error)));
+                    truth_index += 1;
+                    predicted_index += 1;
+                } else {
+                    break;
+                }
+            }
+            1 => truth_index += 1,
+            2 => predicted_index += 1,
+            _ => break,
         }
     }
     pairs
@@ -1648,8 +1816,10 @@ fn beat_metrics(truth: &[u64], predicted: &[u64]) -> BeatMetrics {
         .collect::<Vec<_>>();
     let mut precision = BTreeMap::new();
     let mut recall = BTreeMap::new();
+    let mut matched_by_tolerance = BTreeMap::new();
     for tolerance in [10_u64, 20, 40, 70] {
         let count = match_errors(truth, predicted, Duration::from_millis(tolerance)).len() as f64;
+        matched_by_tolerance.insert(format!("{tolerance}ms"), count as usize);
         precision.insert(
             format!("{tolerance}ms"),
             safe_ratio(count, predicted.len() as f64),
@@ -1668,6 +1838,8 @@ fn beat_metrics(truth: &[u64], predicted: &[u64]) -> BeatMetrics {
         p95_ms: percentile(&errors, 0.95),
         precision_at_tolerance: precision,
         recall_at_tolerance: recall,
+        matched_errors_ms: errors,
+        matched_by_tolerance,
     }
 }
 
@@ -1685,18 +1857,38 @@ fn tempo_metrics(
         .map(|hypothesis| hypothesis.bpm);
     let absolute = primary.map(|bpm| (bpm - truth.primary_bpm).abs());
     let relative = absolute.map(|error| error / truth.primary_bpm.max(f32::EPSILON));
+    let canonical_present = hypotheses
+        .iter()
+        .any(|hypothesis| (hypothesis.bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
+    let musically_valid_present = hypotheses.iter().any(|hypothesis| {
+        (hypothesis.bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005
+            || truth.valid_alternates_bpm.iter().any(|alternate| {
+                (hypothesis.bpm - *alternate).abs() / alternate.max(f32::EPSILON) < 0.005
+            })
+    });
     let mut top_n = BTreeMap::new();
+    let mut top_n_scored_tracks = BTreeMap::new();
+    let mut top_n_correct_count = BTreeMap::new();
     for n in [1, 3, 5] {
-        top_n.insert(
-            n.to_string(),
-            hypotheses.iter().take(n).any(|hypothesis| {
-                (hypothesis.bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005
-            }),
-        );
+        let correct = hypotheses.iter().take(n).any(|hypothesis| {
+            (hypothesis.bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005
+        });
+        top_n.insert(n.to_string(), correct);
+        top_n_scored_tracks.insert(n.to_string(), 1);
+        top_n_correct_count.insert(n.to_string(), usize::from(correct));
     }
-    let relation_error = primary.map(|bpm| relation_label(bpm, truth.primary_bpm));
-    let primary_correct =
-        primary.map(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
+    let top_n_rate = top_n
+        .iter()
+        .map(|(n, correct)| (n.clone(), bool_fraction(*correct)))
+        .collect();
+    let relation_error = Some(
+        primary
+            .map(|bpm| relation_label(bpm, truth.primary_bpm))
+            .unwrap_or_else(|| "absent".into()),
+    );
+    let primary_correct = Some(
+        primary.is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005),
+    );
     let mut relation_counts = BTreeMap::new();
     if let Some(relation) = relation_error.as_ref() {
         relation_counts.insert(relation.clone(), 1);
@@ -1707,31 +1899,32 @@ fn tempo_metrics(
         absolute_error_bpm: absolute,
         relative_error: relative,
         primary_correct,
-        scored_tracks: usize::from(primary.is_some()),
+        scored_tracks: 1,
         primary_correct_count: usize::from(primary_correct == Some(true)),
         primary_correct_rate: primary_correct.map(bool_fraction),
         correct_hypothesis_top_n: top_n,
-        correct_hypothesis_top_n_rate: [1, 3, 5]
-            .into_iter()
-            .map(|n| {
-                (
-                    n.to_string(),
-                    bool_fraction(hypotheses.iter().take(n).any(|hypothesis| {
-                        (hypothesis.bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005
-                    })),
-                )
-            })
-            .collect(),
+        top_n_scored_tracks,
+        top_n_correct_count,
+        correct_hypothesis_top_n_rate: top_n_rate,
+        canonical_hypothesis_present: Some(canonical_present),
+        musically_valid_hypothesis_present: Some(musically_valid_present),
         relation_counts,
         relation_error,
     }
 }
 
 fn phase_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -> PhaseMetrics {
+    if truth.tempo.is_none() {
+        return PhaseMetrics::default();
+    }
+    phase_metrics_at(truth, prediction.beats.first().map(|beat| beat.time_micros))
+}
+
+fn phase_metrics_at(truth: &AnalysisGroundTruth, predicted_phase: Option<u64>) -> PhaseMetrics {
     let Some(&truth_first) = truth.beat_times_micros.first() else {
         return PhaseMetrics::default();
     };
-    let Some(predicted_first) = prediction.beats.first().map(|beat| beat.time_micros) else {
+    let Some(predicted_first) = predicted_phase else {
         return PhaseMetrics::default();
     };
     let period = truth
@@ -1744,6 +1937,22 @@ fn phase_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -
         return PhaseMetrics::default();
     };
     let raw = predicted_first.abs_diff(truth_first) % period;
+    let error = raw.min(period - raw);
+    PhaseMetrics {
+        error_ms: Some(error as f64 / 1_000.0),
+        period_ms: Some(period as f64 / 1_000.0),
+        correct: Some(error <= 20_000),
+        scored_tracks: 1,
+        correct_count: usize::from(error <= 20_000),
+        correct_rate: Some(bool_fraction(error <= 20_000)),
+    }
+}
+
+fn phase_metrics_between(predicted_phase: u64, reference_phase: u64, period: u64) -> PhaseMetrics {
+    if period == 0 {
+        return PhaseMetrics::default();
+    }
+    let raw = predicted_phase.abs_diff(reference_phase) % period;
     let error = raw.min(period - raw);
     PhaseMetrics {
         error_ms: Some(error as f64 / 1_000.0),
@@ -1769,14 +1978,30 @@ fn downbeat_metrics(
                 .map(|_| index)
         })
         .collect::<Vec<_>>();
+    if prediction.resolved_meter.is_none() {
+        return DownbeatMetrics {
+            truth_count: truth.downbeats.len(),
+            predicted_count: predicted.len(),
+            ..DownbeatMetrics::default()
+        };
+    }
+    downbeat_metrics_from_indices(truth, &predicted)
+}
+
+fn downbeat_metrics_from_indices(
+    truth: &AnalysisGroundTruth,
+    predicted: &[usize],
+) -> DownbeatMetrics {
     let offset = truth
         .downbeats
         .first()
         .zip(predicted.first())
         .map(|(truth, predicted)| *predicted as i32 - *truth as i32);
-    let phase_correct = offset
+    let phase_correct = truth
+        .downbeats
+        .first()
         .zip(truth.meter)
-        .map(|(offset, meter)| offset.rem_euclid(meter as i32) == 0);
+        .map(|(_, meter)| offset.is_some_and(|offset| offset.rem_euclid(meter as i32) == 0));
     DownbeatMetrics {
         truth_count: truth.downbeats.len(),
         predicted_count: predicted.len(),
@@ -1789,12 +2014,11 @@ fn downbeat_metrics(
 }
 
 fn meter_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -> MeterMetrics {
-    let predicted = prediction
-        .meter_hypotheses
-        .iter()
-        .max_by(|left, right| left.score.total_cmp(&right.score))
-        .map(|hypothesis| hypothesis.beats_per_bar);
-    let status = match (truth.meter, predicted) {
+    meter_metrics_value(truth.meter, prediction.resolved_meter)
+}
+
+fn meter_metrics_value(truth: Option<u8>, predicted: Option<u8>) -> MeterMetrics {
+    let status = match (truth, predicted) {
         (Some(truth), Some(predicted)) if truth == predicted => "correct",
         (Some(_), Some(_)) => "wrong",
         (Some(_), None) => "unknown",
@@ -1802,14 +2026,14 @@ fn meter_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -
     }
     .into();
     MeterMetrics {
-        truth: truth.meter,
+        truth,
         predicted,
         correct_count: usize::from(status == "correct"),
         unknown_count: usize::from(status == "unknown"),
         wrong_count: usize::from(status == "wrong"),
         correct_rate: (status == "correct").then_some(1.0),
         unknown_rate: (status == "unknown").then_some(1.0),
-        scored_tracks: usize::from(truth.meter.is_some()),
+        scored_tracks: usize::from(truth.is_some()),
         status,
     }
 }
@@ -1817,55 +2041,42 @@ fn meter_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -
 fn aggregate_groups<'a>(groups: impl Iterator<Item = &'a GroupMetrics>) -> GroupMetrics {
     let groups = groups.collect::<Vec<_>>();
     let mut aggregate = GroupMetrics {
-        tracks: groups.len(),
+        tracks: groups.iter().map(|group| group.tracks).sum(),
         ..GroupMetrics::default()
     };
     aggregate.beat.predicted = groups.iter().map(|group| group.beat.predicted).sum();
     aggregate.beat.truth = groups.iter().map(|group| group.beat.truth).sum();
     aggregate.beat.matched = groups.iter().map(|group| group.beat.matched).sum();
-    aggregate.beat.mae_ms = weighted_metric(
-        groups
-            .iter()
-            .map(|group| (group.beat.mae_ms, group.beat.matched)),
-    );
-    aggregate.beat.p50_ms = pooled_percentile(groups.iter().filter_map(|group| group.beat.p50_ms));
-    aggregate.beat.p95_ms = pooled_percentile(groups.iter().filter_map(|group| group.beat.p95_ms));
+    aggregate.beat.matched_errors_ms = groups
+        .iter()
+        .flat_map(|group| group.beat.matched_errors_ms.iter().copied())
+        .collect();
+    aggregate.beat.mae_ms = mean(&aggregate.beat.matched_errors_ms);
+    aggregate.beat.p50_ms = percentile(&aggregate.beat.matched_errors_ms, 0.50);
+    aggregate.beat.p95_ms = percentile(&aggregate.beat.matched_errors_ms, 0.95);
     for tolerance in ["10ms", "20ms", "40ms", "70ms"] {
+        let matched = groups
+            .iter()
+            .map(|group| {
+                group
+                    .beat
+                    .matched_by_tolerance
+                    .get(tolerance)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum::<usize>();
+        aggregate
+            .beat
+            .matched_by_tolerance
+            .insert(tolerance.into(), matched);
         aggregate.beat.precision_at_tolerance.insert(
             tolerance.into(),
-            safe_ratio(
-                groups
-                    .iter()
-                    .map(|group| {
-                        group
-                            .beat
-                            .precision_at_tolerance
-                            .get(tolerance)
-                            .copied()
-                            .unwrap_or_default()
-                            * group.beat.predicted as f64
-                    })
-                    .sum(),
-                aggregate.beat.predicted as f64,
-            ),
+            safe_ratio(matched as f64, aggregate.beat.predicted as f64),
         );
         aggregate.beat.recall_at_tolerance.insert(
             tolerance.into(),
-            safe_ratio(
-                groups
-                    .iter()
-                    .map(|group| {
-                        group
-                            .beat
-                            .recall_at_tolerance
-                            .get(tolerance)
-                            .copied()
-                            .unwrap_or_default()
-                            * group.beat.truth as f64
-                    })
-                    .sum(),
-                aggregate.beat.truth as f64,
-            ),
+            safe_ratio(matched as f64, aggregate.beat.truth as f64),
         );
     }
     aggregate.tempo.scored_tracks = groups.iter().map(|group| group.tempo.scored_tracks).sum();
@@ -1883,47 +2094,52 @@ fn aggregate_groups<'a>(groups: impl Iterator<Item = &'a GroupMetrics>) -> Group
             *counts.entry(relation.clone()).or_default() += count;
             counts
         });
-    aggregate.tempo.correct_hypothesis_top_n = [1, 3, 5]
-        .into_iter()
-        .map(|n| {
-            (
-                n.to_string(),
-                groups
-                    .iter()
-                    .filter(|group| {
-                        group
-                            .tempo
-                            .correct_hypothesis_top_n
-                            .get(&n.to_string())
-                            .copied()
-                            .unwrap_or(false)
-                    })
-                    .count() as f32
-                    / groups.len().max(1) as f32
-                    > 0.5,
-            )
-        })
-        .collect();
-    aggregate.tempo.correct_hypothesis_top_n_rate = [1, 3, 5]
-        .into_iter()
-        .map(|n| {
-            let key = n.to_string();
-            let count = groups
-                .iter()
-                .filter(|group| {
-                    group
-                        .tempo
-                        .correct_hypothesis_top_n
-                        .get(&key)
-                        .copied()
-                        .unwrap_or(false)
-                })
-                .count();
-            (key, safe_ratio(count as f64, groups.len() as f64))
-        })
-        .collect();
-    aggregate.grid_phase.error_ms =
-        weighted_metric(groups.iter().map(|group| (group.grid_phase.error_ms, 1)));
+    for n in [1, 3, 5] {
+        let key = n.to_string();
+        let scored = groups
+            .iter()
+            .map(|group| {
+                group
+                    .tempo
+                    .top_n_scored_tracks
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum::<usize>();
+        let correct = groups
+            .iter()
+            .map(|group| {
+                group
+                    .tempo
+                    .top_n_correct_count
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .sum::<usize>();
+        aggregate
+            .tempo
+            .top_n_scored_tracks
+            .insert(key.clone(), scored);
+        aggregate
+            .tempo
+            .top_n_correct_count
+            .insert(key.clone(), correct);
+        aggregate
+            .tempo
+            .correct_hypothesis_top_n
+            .insert(key.clone(), scored > 0 && correct == scored);
+        aggregate
+            .tempo
+            .correct_hypothesis_top_n_rate
+            .insert(key, safe_ratio(correct as f64, scored as f64));
+    }
+    aggregate.grid_phase.error_ms = weighted_metric(
+        groups
+            .iter()
+            .map(|group| (group.grid_phase.error_ms, group.grid_phase.scored_tracks)),
+    );
     aggregate.grid_phase.scored_tracks = groups
         .iter()
         .map(|group| group.grid_phase.scored_tracks)
@@ -1991,22 +2207,33 @@ fn transform_metrics(
         else {
             continue;
         };
-        let displacement = transformed
+        let base_times = base
             .beats
             .iter()
-            .zip(&base.beats)
-            .map(|(left, right)| left.time_micros.abs_diff(right.time_micros) as f64 / 1_000.0)
+            .map(|beat| beat.time_micros)
+            .collect::<Vec<_>>();
+        let transformed_times = transformed
+            .beats
+            .iter()
+            .map(|beat| beat.time_micros)
+            .collect::<Vec<_>>();
+        let pairs = match_errors(&base_times, &transformed_times, BEAT_MATCH_WINDOW);
+        let displacement = pairs
+            .iter()
+            .map(|(_, _, error)| error.as_secs_f64() * 1_000.0)
             .collect::<Vec<_>>();
         let tempo_changes = primary_tempo(base) != primary_tempo(transformed);
         let downbeat_changes = downbeat_signature(base) != downbeat_signature(transformed);
-        let meter_changes = meter_signature(base) != meter_signature(transformed);
+        let meter_changes = base.resolved_meter != transformed.resolved_meter;
         let confidence = mean(
-            &transformed
-                .confidence
-                .timing
+            &pairs
                 .iter()
-                .zip(&base.confidence.timing)
-                .map(|(left, right)| f64::from(*left - *right))
+                .map(|(base_index, transformed_index, _)| {
+                    f64::from(
+                        transformed.beats[*transformed_index].timing_confidence
+                            - base.beats[*base_index].timing_confidence,
+                    )
+                })
                 .collect::<Vec<_>>(),
         );
         let key = spec.spec.transform.label().to_owned();
@@ -2017,11 +2244,12 @@ fn transform_metrics(
                 ..TransformMetrics::default()
             });
         entry.tracks += 1;
-        entry.mean_beat_displacement_ms = combine_means(
-            entry.mean_beat_displacement_ms,
-            mean(&displacement),
-            entry.tracks,
-        );
+        entry.matched_beats += pairs.len();
+        entry.missing_beats += base.beats.len().saturating_sub(pairs.len());
+        entry.extra_beats += transformed.beats.len().saturating_sub(pairs.len());
+        entry.displacement_ms.extend(displacement.iter().copied());
+        entry.mean_beat_displacement_ms = mean(&entry.displacement_ms);
+        entry.p95_beat_displacement_ms = percentile(&entry.displacement_ms, 0.95);
         entry.tempo_interpretation_changes += usize::from(tempo_changes);
         entry.downbeat_changes += usize::from(downbeat_changes);
         entry.meter_changes += usize::from(meter_changes);
@@ -2037,6 +2265,8 @@ fn calibration(tracks: &[TrackEvaluation]) -> Vec<CalibrationBin> {
             let upper = if index == 4 { 1.01 } else { lower + 0.2 };
             let mut confidence = Vec::new();
             let mut errors = Vec::new();
+            let mut matched_count = 0;
+            let mut unmatched_predicted_count = 0;
             for track in tracks {
                 let predictions = track
                     .wotoha
@@ -2044,23 +2274,42 @@ fn calibration(tracks: &[TrackEvaluation]) -> Vec<CalibrationBin> {
                     .iter()
                     .map(|beat| (beat.time_micros, beat.timing_confidence))
                     .collect::<Vec<_>>();
-                for (truth_index, predicted_index, error) in match_errors(
+                let pairs = match_errors(
                     &track.truth.beat_times_micros,
                     &predictions.iter().map(|beat| beat.0).collect::<Vec<_>>(),
                     BEAT_MATCH_WINDOW,
-                ) {
+                );
+                let matched_predictions = pairs
+                    .iter()
+                    .map(|(_, predicted_index, _)| *predicted_index)
+                    .collect::<BTreeSet<_>>();
+                for (truth_index, predicted_index, error) in pairs {
                     let confidence_value = predictions[predicted_index].1;
                     if confidence_value >= lower && confidence_value < upper {
+                        matched_count += 1;
                         confidence.push(f64::from(confidence_value));
                         errors.push(error.as_secs_f64() * 1_000.0);
                     }
                     let _ = truth_index;
                 }
+                for (index, (_, confidence_value)) in predictions.iter().enumerate() {
+                    if *confidence_value >= lower
+                        && *confidence_value < upper
+                        && !matched_predictions.contains(&index)
+                    {
+                        unmatched_predicted_count += 1;
+                    }
+                }
             }
             CalibrationBin {
                 lower,
                 upper: upper.min(1.0),
-                observations: confidence.len(),
+                observations: matched_count + unmatched_predicted_count,
+                matched_count,
+                unmatched_predicted_count,
+                match_rate: (matched_count + unmatched_predicted_count > 0).then(|| {
+                    matched_count as f64 / (matched_count + unmatched_predicted_count) as f64
+                }),
                 mean_confidence: mean(&confidence),
                 mean_absolute_error_ms: mean(&errors),
             }
@@ -2157,6 +2406,8 @@ fn compare_external(
         .map(|track| (track.sample_id.as_str(), track))
         .collect::<BTreeMap<_, _>>();
     let mut by_observer = BTreeMap::new();
+    let mut complete_observations = 0;
+    let mut incomplete_observations = 0;
     for observation in &document.observations {
         let Some(record) = records.get(observation.sample_id.as_str()) else {
             return Err(LabError::UnknownSample(observation.sample_id.clone()));
@@ -2173,70 +2424,71 @@ fn compare_external(
             .expect("track was evaluated");
         let external = normalized_external(observation);
         let wotoha_vs_external = metrics_between_predictions(&track.wotoha, &external);
-        let external_vs_truth = metrics_for(&record.truth, &external);
+        let external_vs_truth = external_metrics_for(&record.truth, &external);
+        let settings = observation_settings_key(&observation.analysis_settings);
         let key = format!(
-            "{}@{}",
-            observation.observer.product, observation.observer.version
+            "{}@{} [{}]",
+            observation.observer.product, observation.observer.version, settings
         );
         let entry = by_observer
             .entry(key)
             .or_insert_with(|| ExternalObserverReport {
                 product: observation.observer.product.clone(),
                 version: observation.observer.version.clone(),
+                settings: settings.clone(),
                 ..ExternalObserverReport::default()
             });
+        entry.observations += 1;
+        if observation.observed.analysis_complete {
+            entry.complete_observations += 1;
+            complete_observations += 1;
+        } else {
+            entry.incomplete_observations += 1;
+            incomplete_observations += 1;
+        }
+        entry.beat_observations +=
+            usize::from(observation.observed.beatgrid_times_micros.is_some());
+        entry.tempo_observations += usize::from(observation.observed.reported_bpm.is_some());
+        entry.meter_observations += usize::from(observation.observed.meter.is_some());
+        entry.downbeat_observations += usize::from(observation.observed.downbeat_indices.is_some());
+        entry.grid_phase_observations +=
+            usize::from(observation.observed.grid_phase_micros.is_some());
         entry.wotoha_vs_truth = merge_group(&entry.wotoha_vs_truth, &track.metrics);
         entry.external_vs_truth = merge_group(&entry.external_vs_truth, &external_vs_truth);
         entry.wotoha_vs_external = merge_group(&entry.wotoha_vs_external, &wotoha_vs_external);
     }
     Ok(ExternalReport {
         observations: document.observations.len(),
+        complete_observations,
+        incomplete_observations,
         by_observer,
     })
 }
 
-fn normalized_external(observation: &ExternalAnalysisObservation) -> NormalizedAnalysis {
+fn normalized_external(observation: &ExternalAnalysisObservation) -> NormalizedExternalAnalysis {
     let beats = observation
         .observed
         .beatgrid_times_micros
         .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-        .map(|(index, time_micros)| NormalizedBeat {
-            time_micros,
-            timing_confidence: 1.0,
-            beat_model_score: None,
-            onset_support: None,
-            low_frequency_support: None,
-            downbeat_evidence: observation
-                .observed
-                .downbeat_indices
-                .as_ref()
-                .and_then(|indices| indices.contains(&index).then_some(1.0)),
-        })
-        .collect();
-    let tempo_hypotheses = observation
-        .observed
-        .reported_bpm
-        .into_iter()
-        .map(|bpm| NormalizedTempoHypothesis {
-            bpm,
-            relative_weight: 1.0,
-            relation: "primary".into(),
-        })
-        .collect();
-    let meter_hypotheses = observation
-        .observed
-        .meter
-        .into_iter()
-        .map(|meter| NormalizedMeterHypothesis {
-            beats_per_bar: meter,
-            downbeat_phase: 0,
-            score: 1.0,
-        })
-        .collect();
-    NormalizedAnalysis {
+        .map(|times| {
+            times
+                .into_iter()
+                .enumerate()
+                .map(|(index, time_micros)| NormalizedBeat {
+                    time_micros,
+                    timing_confidence: 1.0,
+                    beat_model_score: None,
+                    onset_support: None,
+                    low_frequency_support: None,
+                    downbeat_evidence: observation
+                        .observed
+                        .downbeat_indices
+                        .as_ref()
+                        .and_then(|indices| indices.contains(&index).then_some(1.0)),
+                })
+                .collect()
+        });
+    NormalizedExternalAnalysis {
         analyzer: format!(
             "external:{}@{}",
             observation.observer.product, observation.observer.version
@@ -2246,27 +2498,184 @@ fn normalized_external(observation: &ExternalAnalysisObservation) -> NormalizedA
             .observed_duration_micros
             .unwrap_or_default(),
         beats,
-        tempo_hypotheses,
-        meter_hypotheses,
-        structure: NormalizedStructure::default(),
-        confidence: ConfidenceEvidence::default(),
-        provenance: BTreeMap::new(),
+        reported_bpm: observation.observed.reported_bpm,
+        downbeat_indices: observation.observed.downbeat_indices.clone(),
+        grid_phase_micros: observation.observed.grid_phase_micros,
+        meter: observation.observed.meter,
+        analysis_complete: observation.observed.analysis_complete,
     }
 }
 
-fn metrics_between_predictions(
-    left: &NormalizedAnalysis,
-    right: &NormalizedAnalysis,
+fn external_field_available<T>(field: &Option<T>, complete: bool, is_empty: bool) -> bool {
+    field.is_some() && (complete || !is_empty)
+}
+
+fn external_metrics_for(
+    truth: &AnalysisGroundTruth,
+    prediction: &NormalizedExternalAnalysis,
 ) -> GroupMetrics {
-    let truth = AnalysisGroundTruth {
-        tempo: primary_tempo_truth(left),
-        meter: meter_signature(left),
-        beat_times_micros: left.beats.iter().map(|beat| beat.time_micros).collect(),
-        downbeats: downbeat_signature(left),
-        tempo_segments: Vec::new(),
-        duration_micros: left.duration_micros,
+    let beats_available = external_field_available(
+        &prediction.beats,
+        prediction.analysis_complete,
+        prediction.beats.as_ref().is_some_and(Vec::is_empty),
+    );
+    let downbeats_available = external_field_available(
+        &prediction.downbeat_indices,
+        prediction.analysis_complete,
+        prediction
+            .downbeat_indices
+            .as_ref()
+            .is_some_and(Vec::is_empty),
+    );
+    let beat_values = prediction.beats.as_ref().map(|beats| {
+        beats
+            .iter()
+            .map(|beat| beat.time_micros)
+            .collect::<Vec<_>>()
+    });
+    GroupMetrics {
+        tracks: 1,
+        beat: if beats_available {
+            beat_metrics(
+                &truth.beat_times_micros,
+                beat_values.as_deref().unwrap_or_default(),
+            )
+        } else {
+            BeatMetrics::default()
+        },
+        tempo: external_tempo_metrics(truth.tempo.as_ref(), prediction.reported_bpm),
+        grid_phase: if prediction.grid_phase_micros.is_some() {
+            phase_metrics_at(truth, prediction.grid_phase_micros)
+        } else if beats_available {
+            phase_metrics_at(
+                truth,
+                beat_values
+                    .as_deref()
+                    .and_then(|beats| beats.first().copied()),
+            )
+        } else {
+            PhaseMetrics::default()
+        },
+        downbeat: if downbeats_available && beats_available {
+            downbeat_metrics_from_indices(
+                truth,
+                prediction.downbeat_indices.as_deref().unwrap_or_default(),
+            )
+        } else {
+            DownbeatMetrics::default()
+        },
+        meter: prediction.meter.map_or_else(
+            || meter_metrics_value(None, None),
+            |meter| meter_metrics_value(truth.meter, Some(meter)),
+        ),
+    }
+}
+
+fn external_tempo_metrics(truth: Option<&TempoTruth>, bpm: Option<f32>) -> TempoMetrics {
+    let Some(bpm) = bpm else {
+        return TempoMetrics::default();
     };
-    metrics_for(&truth, right)
+    tempo_metrics(
+        truth,
+        &[NormalizedTempoHypothesis {
+            bpm,
+            relative_weight: 1.0,
+            relation: "primary".into(),
+        }],
+    )
+}
+
+fn metrics_between_predictions(
+    wotoha: &NormalizedAnalysis,
+    external: &NormalizedExternalAnalysis,
+) -> GroupMetrics {
+    let beats_available = external_field_available(
+        &external.beats,
+        external.analysis_complete,
+        external.beats.as_ref().is_some_and(Vec::is_empty),
+    );
+    let downbeats_available = external_field_available(
+        &external.downbeat_indices,
+        external.analysis_complete,
+        external
+            .downbeat_indices
+            .as_ref()
+            .is_some_and(Vec::is_empty),
+    );
+    let external_beats = external.beats.as_ref().map(|beats| {
+        beats
+            .iter()
+            .map(|beat| beat.time_micros)
+            .collect::<Vec<_>>()
+    });
+    let external_phase = external.grid_phase_micros.or_else(|| {
+        beats_available
+            .then(|| {
+                external_beats
+                    .as_deref()
+                    .and_then(|beats| beats.first().copied())
+            })
+            .flatten()
+    });
+    let period = external
+        .reported_bpm
+        .map(|bpm| (60_000_000.0 / f64::from(bpm)).round() as u64)
+        .or_else(|| {
+            external_beats
+                .as_deref()
+                .and_then(|beats| beats.windows(2).next().map(|window| window[1] - window[0]))
+        });
+    GroupMetrics {
+        tracks: 1,
+        beat: if beats_available {
+            beat_metrics(
+                external_beats.as_deref().unwrap_or_default(),
+                &wotoha
+                    .beats
+                    .iter()
+                    .map(|beat| beat.time_micros)
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            BeatMetrics::default()
+        },
+        tempo: external_tempo_metrics(
+            external
+                .reported_bpm
+                .map(|bpm| TempoTruth {
+                    primary_bpm: bpm,
+                    valid_alternates_bpm: Vec::new(),
+                })
+                .as_ref(),
+            primary_tempo_bpm(wotoha),
+        ),
+        grid_phase: match (wotoha.beats.first(), external_phase, period) {
+            (Some(predicted), Some(reference), Some(period)) if period > 0 => {
+                phase_metrics_between(predicted.time_micros, reference, period)
+            }
+            _ => PhaseMetrics::default(),
+        },
+        downbeat: if downbeats_available && beats_available {
+            downbeat_metrics_from_indices(
+                &AnalysisGroundTruth {
+                    tempo: None,
+                    meter: external.meter,
+                    beat_times_micros: external_beats.clone().unwrap_or_default(),
+                    downbeats: external.downbeat_indices.clone().unwrap_or_default(),
+                    tempo_segments: Vec::new(),
+                    duration_micros: external.duration_micros,
+                },
+                &downbeat_signature(wotoha),
+            )
+        } else {
+            DownbeatMetrics::default()
+        },
+        meter: if external.meter.is_some() {
+            meter_metrics_value(external.meter, wotoha.resolved_meter)
+        } else {
+            MeterMetrics::default()
+        },
+    }
 }
 fn merge_group(left: &GroupMetrics, right: &GroupMetrics) -> GroupMetrics {
     if left.tracks == 0 {
@@ -2363,14 +2772,11 @@ fn primary_tempo(analysis: &NormalizedAnalysis) -> Option<i32> {
         .first()
         .map(|hypothesis| (hypothesis.bpm * 100.0).round() as i32)
 }
-fn primary_tempo_truth(analysis: &NormalizedAnalysis) -> Option<TempoTruth> {
+fn primary_tempo_bpm(analysis: &NormalizedAnalysis) -> Option<f32> {
     analysis
         .tempo_hypotheses
         .first()
-        .map(|hypothesis| TempoTruth {
-            primary_bpm: hypothesis.bpm,
-            valid_alternates_bpm: Vec::new(),
-        })
+        .map(|hypothesis| hypothesis.bpm)
 }
 fn downbeat_signature(analysis: &NormalizedAnalysis) -> Vec<usize> {
     analysis
@@ -2382,23 +2788,16 @@ fn downbeat_signature(analysis: &NormalizedAnalysis) -> Vec<usize> {
         })
         .collect()
 }
-fn meter_signature(analysis: &NormalizedAnalysis) -> Option<u8> {
-    analysis
-        .meter_hypotheses
-        .iter()
-        .max_by(|left, right| left.score.total_cmp(&right.score))
-        .map(|hypothesis| hypothesis.beats_per_bar)
-}
 fn relation_label(bpm: f32, truth: f32) -> String {
     let ratio = bpm / truth;
     if (ratio - 1.0).abs() < 0.005 {
-        "correct"
+        "canonical"
     } else if (ratio - 0.5).abs() < 0.01 {
         "half_time"
     } else if (ratio - 2.0).abs() < 0.02 {
         "double_time"
     } else {
-        "other"
+        "alternative"
     }
     .into()
 }
@@ -2445,10 +2844,6 @@ fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
     values.sort_by(f64::total_cmp);
     let index = ((values.len() - 1) as f64 * percentile).round() as usize;
     values.get(index).copied()
-}
-fn pooled_percentile(values: impl Iterator<Item = f64>) -> Option<f64> {
-    let values = values.collect::<Vec<_>>();
-    percentile(&values, 0.5)
 }
 fn weighted_metric(values: impl Iterator<Item = (Option<f64>, usize)>) -> Option<f64> {
     let mut numerator = 0.0;
@@ -2746,11 +3141,7 @@ mod tests {
             },
         )
         .unwrap();
-        let observer = report
-            .external
-            .by_observer
-            .get("neutral-observer@1.0")
-            .unwrap();
+        let observer = report.external.by_observer.values().next().unwrap();
         assert_eq!(report.external.observations, 1);
         assert_eq!(observer.external_vs_truth.tracks, 1);
         assert_eq!(observer.wotoha_vs_external.tracks, 1);
@@ -2796,15 +3187,516 @@ mod tests {
                 relation: "primary".into(),
             }],
             meter_hypotheses: Vec::new(),
+            resolved_meter: None,
+            resolved_meter_phase: None,
             structure: NormalizedStructure::default(),
             confidence: ConfidenceEvidence::default(),
             provenance: BTreeMap::new(),
         };
         let metrics = metrics_for(&truth, &prediction);
         assert_eq!(metrics.grid_phase.correct, Some(false));
-        assert_eq!(metrics.downbeat.first_offset_beats, Some(1));
-        assert_eq!(metrics.downbeat.phase_correct, Some(false));
+        assert_eq!(metrics.downbeat.first_offset_beats, None);
+        assert_eq!(metrics.downbeat.phase_correct, None);
+        assert_eq!(metrics.downbeat.scored_tracks, 0);
         assert_eq!(metrics.meter.status, "unknown");
         assert_eq!(metrics.meter.correct_count, 0);
+
+        let mut resolved_prediction = prediction.clone();
+        resolved_prediction.resolved_meter = Some(4);
+        resolved_prediction.beats[1].downbeat_evidence = Some(1.0);
+        let resolved_metrics = metrics_for(&truth, &resolved_prediction);
+        assert_eq!(resolved_metrics.downbeat.first_offset_beats, Some(1));
+        assert_eq!(resolved_metrics.downbeat.phase_correct, Some(false));
+        assert_eq!(resolved_metrics.downbeat.scored_tracks, 1);
+    }
+
+    fn truth_with_meter(meter: Option<u8>) -> AnalysisGroundTruth {
+        AnalysisGroundTruth {
+            tempo: Some(TempoTruth {
+                primary_bpm: 120.0,
+                valid_alternates_bpm: vec![60.0, 240.0],
+            }),
+            meter,
+            beat_times_micros: vec![0, 500_000, 1_000_000, 1_500_000],
+            downbeats: vec![0],
+            tempo_segments: vec![TempoSegmentTruth {
+                start_micros: 0,
+                end_micros: 2_000_000,
+                start_bpm: 120.0,
+                end_bpm: 120.0,
+            }],
+            duration_micros: 2_000_000,
+        }
+    }
+
+    fn observation_with(
+        sample_id: &str,
+        beats: Option<Vec<u64>>,
+        downbeats: Option<Vec<usize>>,
+        bpm: Option<f32>,
+        meter: Option<u8>,
+        phase: Option<u64>,
+        complete: bool,
+    ) -> ExternalAnalysisObservation {
+        ExternalAnalysisObservation {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            sample_id: sample_id.into(),
+            audio_sha256: "a".repeat(64),
+            observer: ObserverIdentity {
+                product: "observer".into(),
+                version: "1".into(),
+                platform: Some("test".into()),
+            },
+            analysis_settings: ObservationSettings {
+                beat_grid_enabled: Some(true),
+                tempo_range_bpm: None,
+                meter_mode: None,
+                key_mode: None,
+            },
+            observed: ObservedAnalysis {
+                reported_bpm: bpm,
+                beatgrid_times_micros: beats,
+                downbeat_indices: downbeats,
+                grid_phase_micros: phase,
+                musical_key: None,
+                meter,
+                analysis_complete: complete,
+            },
+            timing: ObservationTiming {
+                analysis_elapsed_millis: None,
+                observed_duration_micros: Some(2_000_000),
+            },
+            notes: Vec::new(),
+        }
+    }
+
+    fn normalized_beats(times: &[u64]) -> Vec<NormalizedBeat> {
+        times
+            .iter()
+            .map(|time_micros| NormalizedBeat {
+                time_micros: *time_micros,
+                timing_confidence: 0.9,
+                beat_model_score: None,
+                onset_support: None,
+                low_frequency_support: None,
+                downbeat_evidence: None,
+            })
+            .collect()
+    }
+
+    fn normalized_prediction(times: &[u64]) -> NormalizedAnalysis {
+        NormalizedAnalysis {
+            analyzer: "test".into(),
+            duration_micros: 2_000_000,
+            beats: normalized_beats(times),
+            tempo_hypotheses: vec![NormalizedTempoHypothesis {
+                bpm: 120.0,
+                relative_weight: 1.0,
+                relation: "primary".into(),
+            }],
+            meter_hypotheses: Vec::new(),
+            resolved_meter: Some(4),
+            resolved_meter_phase: Some(0),
+            structure: NormalizedStructure::default(),
+            confidence: ConfidenceEvidence::default(),
+            provenance: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn meter_metrics_uses_canonical_resolved_meter_and_preserves_unknown() {
+        use wotoha_core::analysis::{MeterHypothesis, RhythmAnalysis, UnitInterval};
+
+        let mut analysis = TrackAnalysisV2::unanalyzed(Duration::from_secs(2));
+        analysis.rhythm = RhythmAnalysis::new(
+            Vec::new(),
+            Vec::new(),
+            vec![
+                MeterHypothesis::new(4, 0, UnitInterval::new(0.85).unwrap()).unwrap(),
+                MeterHypothesis::new(3, 0, UnitInterval::new(0.10).unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let resolved = normalize_v2(&analysis);
+        assert_eq!(resolved.resolved_meter, Some(4));
+        assert_eq!(
+            meter_metrics(&truth_with_meter(Some(4)), &resolved).status,
+            "correct"
+        );
+
+        for scores in [(0.55, 0.50), (0.70, 0.62)] {
+            analysis.rhythm.meter_hypotheses = vec![
+                MeterHypothesis::new(4, 0, UnitInterval::new(scores.0).unwrap()).unwrap(),
+                MeterHypothesis::new(3, 0, UnitInterval::new(scores.1).unwrap()).unwrap(),
+            ];
+            let resolved = normalize_v2(&analysis);
+            assert_eq!(resolved.resolved_meter, None);
+            assert_eq!(
+                meter_metrics(&truth_with_meter(Some(4)), &resolved).status,
+                "unknown"
+            );
+        }
+
+        analysis.rhythm.meter_hypotheses = vec![
+            MeterHypothesis::new(4, 0, UnitInterval::new(0.90).unwrap()).unwrap(),
+            MeterHypothesis::new(3, 0, UnitInterval::new(0.05).unwrap()).unwrap(),
+        ];
+        let resolved = normalize_v2(&analysis);
+        assert_eq!(
+            meter_metrics(&truth_with_meter(Some(3)), &resolved).status,
+            "wrong"
+        );
+        assert_eq!(resolved.meter_hypotheses.len(), 2);
+    }
+
+    #[test]
+    fn external_none_empty_and_incomplete_fields_are_not_collapsed() {
+        let truth = truth_with_meter(Some(4));
+        let absent = normalized_external(&observation_with(
+            "sample", None, None, None, None, None, true,
+        ));
+        let absent_metrics = external_metrics_for(&truth, &absent);
+        assert_eq!(absent_metrics.beat.truth, 0);
+        assert_eq!(absent_metrics.beat.predicted, 0);
+        assert_eq!(absent_metrics.meter.status, "not_scored");
+
+        let empty = normalized_external(&observation_with(
+            "sample",
+            Some(Vec::new()),
+            Some(Vec::new()),
+            None,
+            None,
+            None,
+            true,
+        ));
+        let empty_metrics = external_metrics_for(&truth, &empty);
+        assert_eq!(empty_metrics.beat.truth, truth.beat_times_micros.len());
+        assert_eq!(empty_metrics.beat.predicted, 0);
+        assert_eq!(empty_metrics.beat.recall_at_tolerance["40ms"], 0.0);
+        assert_eq!(empty_metrics.downbeat.scored_tracks, 1);
+
+        let incomplete = normalized_external(&observation_with(
+            "sample",
+            Some(Vec::new()),
+            Some(Vec::new()),
+            Some(120.0),
+            None,
+            None,
+            false,
+        ));
+        let incomplete_metrics = external_metrics_for(&truth, &incomplete);
+        assert_eq!(incomplete_metrics.beat.truth, 0);
+        assert_eq!(incomplete_metrics.downbeat.scored_tracks, 0);
+        assert_eq!(incomplete_metrics.tempo.scored_tracks, 1);
+    }
+
+    #[test]
+    fn external_explicit_phase_and_downbeat_availability_are_scored_independently() {
+        let truth = truth_with_meter(Some(4));
+        let phase_only = normalized_external(&observation_with(
+            "sample",
+            None,
+            None,
+            Some(120.0),
+            None,
+            Some(0),
+            true,
+        ));
+        let metrics = external_metrics_for(&truth, &phase_only);
+        assert_eq!(metrics.grid_phase.scored_tracks, 1);
+        assert_eq!(metrics.beat.truth, 0);
+        assert_eq!(metrics.downbeat.scored_tracks, 0);
+
+        let no_downbeats = normalized_external(&observation_with(
+            "sample",
+            Some(truth.beat_times_micros.clone()),
+            None,
+            None,
+            None,
+            None,
+            true,
+        ));
+        assert_eq!(
+            external_metrics_for(&truth, &no_downbeats)
+                .downbeat
+                .scored_tracks,
+            0
+        );
+        let empty_downbeats = normalized_external(&observation_with(
+            "sample",
+            Some(truth.beat_times_micros.clone()),
+            Some(Vec::new()),
+            None,
+            None,
+            None,
+            true,
+        ));
+        assert_eq!(
+            external_metrics_for(&truth, &empty_downbeats)
+                .downbeat
+                .scored_tracks,
+            1
+        );
+        assert_eq!(
+            external_metrics_for(&truth, &empty_downbeats)
+                .downbeat
+                .phase_correct,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn external_validation_rejects_duplicates_invalid_indices_and_invalid_settings() {
+        let mut first = observation_with(
+            "sample",
+            Some(vec![0, 500_000]),
+            Some(vec![0]),
+            None,
+            None,
+            None,
+            true,
+        );
+        first.audio_sha256 = "a".repeat(64);
+        let duplicate = ExternalObservationDocument {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            observations: vec![first.clone(), first],
+        };
+        assert!(duplicate.validate().is_err());
+
+        let mut invalid_index = observation_with(
+            "sample",
+            Some(vec![0, 500_000]),
+            Some(vec![2]),
+            None,
+            None,
+            None,
+            true,
+        );
+        invalid_index.audio_sha256 = "a".repeat(64);
+        assert!(
+            ExternalObservationDocument {
+                schema_version: OBSERVATION_SCHEMA_VERSION,
+                observations: vec![invalid_index],
+            }
+            .validate()
+            .is_err()
+        );
+
+        let mut invalid_settings = observation_with("sample", None, None, None, None, None, true);
+        invalid_settings.analysis_settings.tempo_range_bpm = Some((140.0, 100.0));
+        assert!(
+            ExternalObservationDocument {
+                schema_version: OBSERVATION_SCHEMA_VERSION,
+                observations: vec![invalid_settings],
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn different_observation_settings_are_grouped_without_silent_pooling() {
+        let manifest = generate_default_manifest(7).unwrap();
+        let first = &manifest.fixtures[0];
+        let mut one = observation_with(
+            &first.spec.id,
+            Some(first.truth.beat_times_micros.clone()),
+            Some(first.truth.downbeats.clone()),
+            Some(first.truth.tempo.as_ref().unwrap().primary_bpm),
+            Some(4),
+            first.truth.beat_times_micros.first().copied(),
+            true,
+        );
+        one.audio_sha256 = first.audio_sha256.clone();
+        one.timing.observed_duration_micros = Some(first.truth.duration_micros);
+        let mut two = one.clone();
+        two.analysis_settings.tempo_range_bpm = Some((100.0, 200.0));
+        let document = ExternalObservationDocument {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            observations: vec![one, two],
+        };
+        let report = evaluate_manifest(
+            &manifest,
+            Some(&document),
+            EvaluationOptions {
+                mode: AnalyzerMode::Classical,
+                split: "development".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(report.external.observations, 2);
+        assert_eq!(report.external.by_observer.len(), 2);
+    }
+
+    #[test]
+    fn aggregate_beat_statistics_are_pooled_and_micro_aggregated() {
+        let first = beat_metrics(&[0, 500_000], &[0, 510_000]);
+        let second = beat_metrics(&[0, 500_000, 1_000_000], &[20_000, 530_000, 1_040_000]);
+        let aggregate = aggregate_groups(
+            [
+                GroupMetrics {
+                    tracks: 1,
+                    beat: first,
+                    ..GroupMetrics::default()
+                },
+                GroupMetrics {
+                    tracks: 1,
+                    beat: second,
+                    ..GroupMetrics::default()
+                },
+            ]
+            .iter(),
+        );
+        assert_eq!(aggregate.beat.matched, 5);
+        assert_eq!(aggregate.beat.mae_ms, Some(20.0));
+        assert_eq!(aggregate.beat.p50_ms, Some(20.0));
+        assert_eq!(aggregate.beat.p95_ms, Some(40.0));
+        assert_eq!(aggregate.beat.precision_at_tolerance["20ms"], 3.0 / 5.0);
+        assert_eq!(aggregate.beat.recall_at_tolerance["20ms"], 3.0 / 5.0);
+    }
+
+    #[test]
+    fn tempo_top_n_excludes_variable_truth_and_reports_alternates() {
+        let constant = GroupMetrics {
+            tracks: 1,
+            tempo: tempo_metrics(
+                Some(&TempoTruth {
+                    primary_bpm: 128.0,
+                    valid_alternates_bpm: vec![64.0],
+                }),
+                &[NormalizedTempoHypothesis {
+                    bpm: 64.0,
+                    relative_weight: 1.0,
+                    relation: "primary".into(),
+                }],
+            ),
+            ..GroupMetrics::default()
+        };
+        let variable = GroupMetrics {
+            tracks: 1,
+            ..GroupMetrics::default()
+        };
+        let aggregate = aggregate_groups([constant.clone(), variable].iter());
+        assert_eq!(aggregate.tempo.scored_tracks, 1);
+        assert_eq!(aggregate.tempo.top_n_scored_tracks["1"], 1);
+        assert_eq!(aggregate.tempo.correct_hypothesis_top_n_rate["1"], 0.0);
+        assert_eq!(constant.tempo.canonical_hypothesis_present, Some(false));
+        assert_eq!(
+            constant.tempo.musically_valid_hypothesis_present,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn transform_matching_does_not_index_shift_on_extra_or_missing_beats() {
+        let base = normalized_prediction(&[0, 500_000, 1_000_000]);
+        let extra = normalized_prediction(&[0, 250_000, 500_000, 1_000_000]);
+        let missing = normalized_prediction(&[0, 1_000_000]);
+        let mut specs = Vec::new();
+        let mut normalized = BTreeMap::new();
+        for (id, transform, prediction) in [
+            ("base", TransformKind::None, base.clone()),
+            ("extra", TransformKind::Gain { factor: 1.0 }, extra),
+            ("missing", TransformKind::Compression, missing),
+        ] {
+            let mut fixture_spec = spec(
+                id,
+                FixtureFamily::Transform,
+                TempoProfile::Constant { bpm: 120.0 },
+                EventStyle::Standard,
+                4,
+                0,
+                1,
+            );
+            fixture_spec.transform = transform;
+            fixture_spec.base_id = (id != "base").then(|| "base".into());
+            specs.push(FixtureRecord {
+                spec: fixture_spec,
+                truth: truth_with_meter(Some(4)),
+                audio_sha256: "a".repeat(64),
+            });
+            normalized.insert(id.into(), prediction);
+        }
+        let metrics = transform_metrics(&specs, &normalized);
+        assert_eq!(metrics["gain"].matched_beats, 3);
+        assert_eq!(metrics["gain"].extra_beats, 1);
+        assert_eq!(metrics["gain"].mean_beat_displacement_ms, Some(0.0));
+        assert_eq!(metrics["compression"].matched_beats, 2);
+        assert_eq!(metrics["compression"].missing_beats, 1);
+        assert_eq!(metrics["compression"].mean_beat_displacement_ms, Some(0.0));
+    }
+
+    #[test]
+    fn sample_rate_transform_preserves_duration_and_truth_timing() {
+        let mut transformed = spec(
+            "sample-rate",
+            FixtureFamily::Transform,
+            TempoProfile::Constant { bpm: 120.0 },
+            EventStyle::Standard,
+            4,
+            0,
+            1,
+        );
+        transformed.transform = TransformKind::SampleRate {
+            sample_rate: 16_000,
+        };
+        transformed.sample_rate = 16_000;
+        let base = generate_fixture(&FixtureSpec {
+            transform: TransformKind::None,
+            id: "base".into(),
+            ..transformed.clone()
+        })
+        .unwrap();
+        let converted = generate_fixture(&transformed).unwrap();
+        let base_duration = base.audio.len() as f64 / f64::from(base.spec.sample_rate);
+        let converted_duration =
+            converted.audio.len() as f64 / f64::from(converted.spec.sample_rate);
+        assert!((base_duration - converted_duration).abs() < 1.0 / 16_000.0);
+        assert_eq!(
+            base.truth.beat_times_micros,
+            converted.truth.beat_times_micros
+        );
+    }
+
+    #[test]
+    fn confidence_calibration_counts_high_confidence_unmatched_predictions() {
+        let truth = truth_with_meter(Some(4));
+        let mut prediction = normalized_prediction(&[3_000_000]);
+        prediction.beats[0].timing_confidence = 0.9;
+        let metrics = metrics_for(&truth, &prediction);
+        let track = TrackEvaluation {
+            sample_id: "sample".into(),
+            family: "test".into(),
+            audio_sha256: "a".repeat(64),
+            truth,
+            wotoha: prediction,
+            metrics,
+            failure_clusters: Vec::new(),
+            human_review: None,
+        };
+        let bin = &calibration(&[track])[4];
+        assert_eq!(bin.matched_count, 0);
+        assert_eq!(bin.unmatched_predicted_count, 1);
+        assert_eq!(bin.match_rate, Some(0.0));
+    }
+
+    #[test]
+    fn adversarial_matcher_is_monotonic_deterministic_and_minimizes_error() {
+        let pairs = match_errors(
+            &[0, 500_000, 1_000_000],
+            &[490_000, 510_000, 1_000_000],
+            Duration::from_millis(20),
+        );
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].0, 1);
+        assert_eq!(pairs[0].1, 0);
+        assert_eq!(pairs[0].2, Duration::from_millis(10));
+        assert_eq!(pairs[1].0, 2);
+        assert_eq!(pairs[1].1, 2);
+        assert!(
+            pairs
+                .windows(2)
+                .all(|window| window[0].0 < window[1].0 && window[0].1 < window[1].1)
+        );
     }
 }

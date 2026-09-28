@@ -19,8 +19,13 @@ The observation schema is vendor-neutral. It records `sample_id`, canonical
 audio SHA-256, observer product/version/platform, public analysis settings,
 optional reported BPM, optional beatgrid/downbeat/key/meter results, completion
 state, timing, and notes. Optional fields are `Option` values where absence
-must remain distinguishable from an observed empty result. A record or
-document with an unsupported schema version is rejected.
+must remain distinguishable from an observed empty result. For example,
+`beatgrid_times_micros: null` means unobserved, while `[]` means a completed
+observation explicitly produced zero beats. The same rule applies to
+downbeats. Incomplete observations are counted separately and incomplete empty
+results are not scored as authoritative failures. A record or document with
+an unsupported schema version is rejected. Duplicate sample/observer/version/
+settings records are rejected.
 
 The current clean-room target can be represented by an observer identity such
 as `Traktor Pro 4`, version `4.1.1 (23)`, macOS. No binary is needed by this
@@ -83,19 +88,37 @@ Reports are JSON with concise CLI summaries and the following sections:
 `half_double_errors`, `downbeat_errors`, `variable_tempo`,
 `confidence_calibration`, `failure_clusters`, `external`, and `per_track`.
 
-Beat metrics use deterministic one-to-one matching and report MAE, p50, p95,
-and precision/recall at 10, 20, 40, and 70 ms. Tempo metrics retain primary
-correctness, exact correct-hypothesis top-N credit, relative/absolute error,
-and half-time/double-time/other relation counts. Grid phase is measured modulo
-the expected beat period. Downbeat/bar phase and meter are evaluated separately;
-`Unknown` is not counted as `wrong`.
+Beat metrics use a deterministic monotonic one-to-one matcher and report MAE,
+p50, p95, and precision/recall at 10, 20, 40, and 70 ms. Per-track percentiles
+remain per-track; overall p50/p95 are pooled over every matched beat error, and
+overall MAE and precision/recall are observation-weighted micro metrics. Tempo
+metrics retain primary correctness, canonical correct-hypothesis top-N credit,
+relative/absolute error, and explicit canonical/half-time/double-time/
+alternative/absent relation counts. Top-N denominators include only fixtures
+with defined scalar tempo truth; variable-tempo fixtures are not failed
+predictions. `valid_alternates_bpm` is reported separately from canonical
+presence so a musically valid half/double interpretation receives appropriate
+credit without becoming canonical correctness.
+
+Meter scoring consumes Wotoha's canonical `RhythmAnalysis::resolved_meter()`
+decision, not the highest raw hypothesis. The domain's confidence and margin
+rules therefore preserve `Unknown`; raw meter hypotheses remain in the
+normalized result. Truth meter plus a resolved prediction is scored as correct,
+wrong, or unknown, while absent external meter is unobserved and not scored.
+Grid phase is measured modulo the expected period only for constant-tempo truth;
+an explicit external phase is used even when no external beat grid is present.
+Downbeat/bar phase and meter are evaluated separately; `Unknown` is not counted
+as `wrong`. Wotoha downbeat phase is not scored as resolved bar evidence when
+Wotoha's resolved meter is `None`; raw downbeat evidence remains preserved.
 
 Variable-tempo metrics report local BPM error, phase drift, and change-tracking
-delay where a step change exists. Transform metrics compare beat displacement,
-tempo interpretation, downbeat, meter, and confidence changes against the
-unmodified base. Confidence calibration bins timing confidence separately from
-model score, onset support, low-frequency support, downbeat evidence, and
-structure evidence.
+delay where a step change exists. Transform metrics match transformed beats to
+the base timeline instead of zipping indexes, and report matched, missing, and
+extra beats, mean/p95 displacement, tempo interpretation, downbeat, meter, and
+confidence changes. Confidence calibration bins timing confidence separately
+from model score, onset support, low-frequency support, downbeat evidence, and
+structure evidence; each timing bin reports matched and unmatched predicted
+beats so false positives cannot disappear from calibration.
 
 When external observations exist, the report separately records:
 
@@ -105,11 +128,30 @@ External observer/version ↔ synthetic truth
 Wotoha ↔ External observer/version
 ```
 
-Observer versions are grouped separately rather than silently combined. Real
+Observer versions are grouped separately rather than silently combined, and
+materially different public analysis settings are separate report groups. The
+report includes total, complete/incomplete, beat, tempo, meter, downbeat, and
+grid-phase observation counts per group. Real
 music without exact truth should be labeled `disagreement`, not `error`, and a
 future human review may attach `WotohaCorrect`, `ExternalCorrect`,
 `BothAcceptable`, `Ambiguous`, or `NeitherCorrect`. No Memory Cue training is
 performed here; absence of a human cue is not a negative label.
+
+## Baseline commands
+
+Run both descriptive baselines after correctness changes:
+
+```bash
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  baseline --mode hybrid --report /tmp/wotoha-analysis-baseline-hybrid.json
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  baseline --mode classical --report /tmp/wotoha-analysis-baseline-classical.json
+```
+
+Hybrid uses the existing CPU Beat This! adapter and classical uses the existing
+classical adapter. The comparison is diagnostic across beat timing, tempo,
+phase, downbeat, meter, variable tempo, and transforms; it is not collapsed to
+one winner and it does not tune production thresholds.
 
 ## Baseline discipline
 
@@ -118,3 +160,8 @@ tune Wotoha to agree with an external DJ application. Any future production
 change must be justified by synthetic error, signal-processing rationale,
 public literature, or human validation, and must preserve the existing
 `TrackAnalysisV2` evidence separation and beat-event timeline truth.
+
+The external observation schema remains at version 1 because this pass changes
+evaluation interpretation without changing its JSON shape. The report schema
+is version 2 because aggregate percentile and availability meanings changed;
+old reports must not be compared silently with new reports.
