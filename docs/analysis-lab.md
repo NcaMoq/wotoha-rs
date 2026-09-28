@@ -228,6 +228,42 @@ public literature, or human validation, and must preserve the existing
 `TrackAnalysisV2` evidence separation and beat-event timeline truth.
 
 The external observation schema remains at version 1. The report schema is
-version 3 because meter candidate availability is now explicit in addition to
-the aggregate percentile and availability meanings introduced previously; old
-reports must not be compared silently with new reports.
+version 4 because neural tempo candidate evidence now has candidate-specific
+semantics; old reports must not be compared silently with new reports.
+
+## Final clean-room handoff
+
+The lab keeps three tempo interpretations separate: the current production
+resolver, the PCM-envelope research resolver, and the raw Beat This activation
+resolver. The latter scores each half/native/double candidate directly from
+the activation stream with its own phase search, coverage, off-grid leakage,
+periodic consistency, and bounded score. It is observational only and cannot
+change production beat events, tempo selection, or confidence.
+
+Synthetic meter truth is explicit in `FixtureSpec.meter_truth`. The synthesis
+meter may be known while evaluation truth is unknown; fixture IDs have no
+semantic effect.
+
+Generate and package the handoff with the same fixed seed:
+
+```bash
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  export-blackbox --output /tmp/wotoha-blackbox-v1 --seed 246813579
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  package-blackbox --input /tmp/wotoha-blackbox-v1 \
+  --output /tmp/wotoha-traktor-blackbox-v1.zip
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  verify-blackbox /tmp/wotoha-traktor-blackbox-v1.zip
+```
+
+Packaging uses stable ordering, normalized timestamps, stored entries, bounded
+file sizes, safe relative paths, duplicate detection, CRC checks, manifest and
+PCM/Ground Truth hash verification, and observation-template identity checks.
+The ZIP, WAVs, and reports belong under `/tmp` and are not repository or
+container artifacts.
+
+Final exported-WAV baselines use `evaluate-exported` in both Hybrid and
+Classical modes. Reports contain schema version, analyzer mode, source commit,
+production/PCM/activation tempo results, explicit regressions, meter evidence,
+and high-pass evidence-ablation metrics. External DJ software remains a
+reference observation, never Ground Truth.

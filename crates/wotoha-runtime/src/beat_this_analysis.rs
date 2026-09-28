@@ -56,6 +56,10 @@ pub const MAX_NEURAL_LOW_BAND_SAMPLES: usize = 1_000 * MAX_NEURAL_DURATION.as_se
 pub struct NeuralRhythmDiagnosticResult {
     pub rhythm: Option<RhythmAnalysis>,
     pub diagnostics: NeuralRhythmDiagnostics,
+    /// Raw activations from the same bounded inference used for diagnostics.
+    /// This is exposed for research-only resolvers; production callers continue
+    /// to use `analyze_neural_rhythm` and never consume this field.
+    pub observations: Option<NeuralBeatObservations>,
 }
 
 static SMALL_MODEL: &[u8] = include_bytes!(concat!(
@@ -218,6 +222,7 @@ pub fn analyze_neural_rhythm_with_diagnostics(
                 rejection_reason: Some("invalid_input".into()),
                 ..NeuralRhythmDiagnostics::default()
             },
+            observations: None,
         };
     }
     let Some(observations) = analyze_with_cancel(samples, sample_rate, &AtomicBool::new(false))
@@ -228,6 +233,7 @@ pub fn analyze_neural_rhythm_with_diagnostics(
                 rejection_reason: Some("model_or_inference_unavailable".into()),
                 ..NeuralRhythmDiagnostics::default()
             },
+            observations: None,
         };
     };
     let (decoded, mut diagnostics) = diagnose_neural_rhythm(&observations, low_band_1khz);
@@ -238,6 +244,7 @@ pub fn analyze_neural_rhythm_with_diagnostics(
     NeuralRhythmDiagnosticResult {
         rhythm,
         diagnostics,
+        observations: Some(observations),
     }
 }
 

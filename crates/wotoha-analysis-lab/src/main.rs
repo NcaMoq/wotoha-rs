@@ -3,7 +3,8 @@ use std::{env, error::Error, path::PathBuf};
 use wotoha_analysis_lab::{
     AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
-    generate_default_manifest, load_manifest, write_json,
+    generate_default_manifest, load_manifest, package_blackbox, verify_blackbox_package,
+    write_json,
 };
 
 fn main() {
@@ -35,6 +36,21 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 manifest.fixtures.len(),
                 output.display()
             );
+        }
+        "package-blackbox" => {
+            let (input, output) = parse_package_args(&mut args)?;
+            reject_unknown(args)?;
+            package_blackbox(&input, &output)?;
+            println!("packaged black-box corpus at {}", output.display());
+        }
+        "verify-blackbox" => {
+            let path = args
+                .next()
+                .map(PathBuf::from)
+                .ok_or("verify-blackbox requires a ZIP path")?;
+            reject_unknown(args)?;
+            verify_blackbox_package(&path)?;
+            println!("verified black-box package {}", path.display());
         }
         "evaluate" | "baseline" => {
             let evaluate = parse_evaluate_args(command == "baseline", &mut args)?;
@@ -87,21 +103,38 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
         "research-tempo" => {
             let evaluate = parse_evaluate_args(false, &mut args)?;
             reject_unknown(args)?;
-            let manifest = if let Some(path) = evaluate.manifest {
-                load_manifest(&path)?
+            let report = if let Some(audio_root) = evaluate.audio_root {
+                let manifest = evaluate
+                    .manifest
+                    .ok_or("research-tempo --audio-root requires --manifest")?;
+                evaluate_exported_manifest(
+                    &manifest,
+                    &audio_root,
+                    None,
+                    EvaluationOptions {
+                        mode: evaluate.mode,
+                        split: evaluate.split.unwrap_or_else(|| "development".into()),
+                        source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
+                        include_backend_comparison: true,
+                    },
+                )?
             } else {
-                generate_default_manifest(0x57_4f_54_4f_48_41)?
+                let manifest = if let Some(path) = evaluate.manifest {
+                    load_manifest(&path)?
+                } else {
+                    generate_default_manifest(0x57_4f_54_4f_48_41)?
+                };
+                evaluate_manifest(
+                    &manifest,
+                    None,
+                    EvaluationOptions {
+                        mode: evaluate.mode,
+                        split: evaluate.split.unwrap_or_else(|| manifest.split.clone()),
+                        source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
+                        include_backend_comparison: true,
+                    },
+                )?
             };
-            let report = evaluate_manifest(
-                &manifest,
-                None,
-                EvaluationOptions {
-                    mode: evaluate.mode,
-                    split: evaluate.split.unwrap_or_else(|| manifest.split.clone()),
-                    source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
-                    include_backend_comparison: true,
-                },
-            )?;
             write_json(
                 &evaluate.output,
                 &TempoExperimentReportDocument {
@@ -123,6 +156,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
 
 struct EvaluateArgs {
     manifest: Option<PathBuf>,
+    audio_root: Option<PathBuf>,
     output: PathBuf,
     external: Option<PathBuf>,
     mode: AnalyzerMode,
@@ -176,6 +210,7 @@ fn parse_evaluate_args(
     args: &mut impl Iterator<Item = String>,
 ) -> Result<EvaluateArgs, Box<dyn Error + Send + Sync>> {
     let mut manifest = None;
+    let mut audio_root = None;
     let mut output = PathBuf::from("analysis-lab-report.json");
     let mut external = None;
     let mut mode = AnalyzerMode::Hybrid;
@@ -183,6 +218,7 @@ fn parse_evaluate_args(
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--manifest" => manifest = Some(next_path(args, "--manifest")?),
+            "--audio-root" => audio_root = Some(next_path(args, "--audio-root")?),
             "--external-observations" => {
                 external = Some(next_path(args, "--external-observations")?)
             }
@@ -198,6 +234,7 @@ fn parse_evaluate_args(
     }
     Ok(EvaluateArgs {
         manifest,
+        audio_root,
         output,
         external,
         mode,
@@ -233,6 +270,25 @@ fn parse_generate_args(
     ))
 }
 
+fn parse_package_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(PathBuf, PathBuf), Box<dyn Error + Send + Sync>> {
+    let mut input = None;
+    let mut output = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--input" => input = Some(next_path(args, "--input")?),
+            "--output" => output = Some(next_path(args, "--output")?),
+            "--help" | "-h" => return Err(usage().into()),
+            _ => return Err(format!("unknown option: {argument}").into()),
+        }
+    }
+    Ok((
+        input.ok_or("--input is required")?,
+        output.ok_or("--output is required")?,
+    ))
+}
+
 fn next_path(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
@@ -258,5 +314,5 @@ fn reject_unknown(
 }
 
 fn usage() -> &'static str {
-    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]"
+    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab package-blackbox --input DIRECTORY --output ZIP\n       analysis_lab verify-blackbox ZIP\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--audio-root DIRECTORY] [--report PATH] [--mode hybrid|classical] [--split NAME]"
 }

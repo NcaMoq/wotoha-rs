@@ -78,9 +78,29 @@ pub struct NeuralTempoCandidateDiagnostics {
     pub period_frames: usize,
     pub available: bool,
     pub normalized_weight: Option<f32>,
+    pub best_phase_frames: Option<usize>,
     pub activation_evidence: f32,
-    pub continuity_evidence: f32,
-    pub periodic_support: f32,
+    pub coverage: f32,
+    pub off_grid_leakage: f32,
+    pub periodic_consistency: f32,
+    pub candidate_score: f32,
+}
+
+/// Candidate evidence calculated directly from the raw Beat This activation
+/// stream. This is intentionally separate from the selected DP path: callers
+/// may use it for research comparisons without changing production decoding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NeuralTempoCandidateEvidence {
+    pub bpm: f32,
+    pub relation: TempoRelation,
+    pub period_frames: usize,
+    pub available: bool,
+    pub best_phase_frames: Option<usize>,
+    pub activation_evidence: f32,
+    pub coverage: f32,
+    pub off_grid_leakage: f32,
+    pub periodic_consistency: f32,
+    pub candidate_score: f32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -434,36 +454,29 @@ pub fn diagnose_neural_rhythm(
             },
         );
     };
-    let candidates = [
-        (
-            TempoRelation::HalfTime,
-            grid.period_frames.saturating_mul(2),
-        ),
-        (TempoRelation::Primary, grid.period_frames),
-        (TempoRelation::DoubleTime, grid.period_frames / 2),
-    ]
-    .into_iter()
-    .map(|(relation, period_frames)| {
-        let bpm = observations.frame_rate_hz * 60.0 / period_frames.max(1) as f32;
-        let normalized_weight = decoded
-            .tempo_hypotheses
-            .iter()
-            .find(|hypothesis| hypothesis.relation == relation)
-            .map(|hypothesis| hypothesis.relative_weight);
-        NeuralTempoCandidateDiagnostics {
-            bpm,
-            relation,
-            period_frames,
-            available: period_frames > 0
-                && period_bounds(observations.frame_rate_hz)
-                    .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&period_frames)),
-            normalized_weight,
-            activation_evidence: grid.activation_mean,
-            continuity_evidence: (1.0 - grid.residual).clamp(0.0, 1.0),
-            periodic_support: grid.support,
-        }
-    })
-    .collect();
+    let candidates = score_neural_tempo_family(observations, grid.period_frames)
+        .into_iter()
+        .map(|evidence| {
+            let normalized_weight = decoded
+                .tempo_hypotheses
+                .iter()
+                .find(|hypothesis| hypothesis.relation == evidence.relation)
+                .map(|hypothesis| hypothesis.relative_weight);
+            NeuralTempoCandidateDiagnostics {
+                bpm: evidence.bpm,
+                relation: evidence.relation,
+                period_frames: evidence.period_frames,
+                available: evidence.available,
+                normalized_weight,
+                best_phase_frames: evidence.best_phase_frames,
+                activation_evidence: evidence.activation_evidence,
+                coverage: evidence.coverage,
+                off_grid_leakage: evidence.off_grid_leakage,
+                periodic_consistency: evidence.periodic_consistency,
+                candidate_score: evidence.candidate_score,
+            }
+        })
+        .collect();
     (
         Some(decoded),
         NeuralRhythmDiagnostics {
@@ -875,6 +888,136 @@ fn period_bounds(frame_rate_hz: f32) -> Option<(usize, usize)> {
         return None;
     }
     Some((minimum as usize, maximum as usize))
+}
+
+/// Score the half/native/double family independently against raw activation.
+/// The selected DP path is used only to supply the family anchor period; none
+/// of the evidence below reads selected frame positions or selected residuals.
+pub fn score_neural_tempo_family(
+    observations: &NeuralBeatObservations,
+    primary_period_frames: usize,
+) -> Vec<NeuralTempoCandidateEvidence> {
+    let beat = observations
+        .beat_logits
+        .iter()
+        .copied()
+        .map(logit_probability)
+        .collect::<Vec<_>>();
+    [
+        (
+            TempoRelation::HalfTime,
+            primary_period_frames.saturating_mul(2),
+        ),
+        (TempoRelation::Primary, primary_period_frames),
+        (TempoRelation::DoubleTime, primary_period_frames / 2),
+    ]
+    .into_iter()
+    .map(|(relation, period_frames)| {
+        let bpm = if period_frames == 0 {
+            0.0
+        } else {
+            observations.frame_rate_hz * 60.0 / period_frames as f32
+        };
+        let available = period_frames > 0
+            && period_frames < beat.len()
+            && period_bounds(observations.frame_rate_hz)
+                .is_some_and(|(minimum, maximum)| (minimum..=maximum).contains(&period_frames));
+        let evidence = available
+            .then(|| score_candidate_period(&beat, period_frames))
+            .flatten();
+        NeuralTempoCandidateEvidence {
+            bpm,
+            relation,
+            period_frames,
+            available,
+            best_phase_frames: evidence.as_ref().map(|value| value.best_phase),
+            activation_evidence: evidence
+                .as_ref()
+                .map_or(0.0, |value| value.activation_evidence),
+            coverage: evidence.as_ref().map_or(0.0, |value| value.coverage),
+            off_grid_leakage: evidence
+                .as_ref()
+                .map_or(0.0, |value| value.off_grid_leakage),
+            periodic_consistency: evidence
+                .as_ref()
+                .map_or(0.0, |value| value.periodic_consistency),
+            candidate_score: evidence.as_ref().map_or(0.0, |value| value.score),
+        }
+    })
+    .collect()
+}
+
+#[derive(Clone, Copy)]
+struct CandidatePeriodEvidence {
+    best_phase: usize,
+    activation_evidence: f32,
+    coverage: f32,
+    off_grid_leakage: f32,
+    periodic_consistency: f32,
+    score: f32,
+}
+
+fn score_candidate_period(activations: &[f32], period: usize) -> Option<CandidatePeriodEvidence> {
+    if period == 0 || period >= activations.len() {
+        return None;
+    }
+    let mut best = None;
+    for phase in 0..period {
+        let on_grid = (phase..activations.len())
+            .step_by(period)
+            .collect::<Vec<_>>();
+        if on_grid.len() < 3 {
+            continue;
+        }
+        let activation_evidence =
+            on_grid.iter().map(|index| activations[*index]).sum::<f32>() / on_grid.len() as f32;
+        let coverage = on_grid
+            .iter()
+            .filter(|index| activations[**index] >= 0.5)
+            .count() as f32
+            / on_grid.len() as f32;
+        let mut total_activation = 0.0;
+        let mut off_grid_activation = 0.0;
+        for (index, activation) in activations.iter().copied().enumerate() {
+            total_activation += activation;
+            let nearest =
+                (index.abs_diff(phase) % period).min(period - index.abs_diff(phase) % period);
+            if nearest > 2 {
+                off_grid_activation += activation;
+            }
+        }
+        let off_grid_leakage =
+            (off_grid_activation / total_activation.max(f32::EPSILON)).clamp(0.0, 1.0);
+        let paired = (0..activations.len().saturating_sub(period))
+            .map(|index| activations[index] * activations[index + period])
+            .sum::<f32>();
+        let energy = activations
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .max(f32::EPSILON);
+        let periodic_consistency = (paired / energy).clamp(0.0, 1.0);
+        let score = (0.35 * activation_evidence
+            + 0.25 * coverage
+            + 0.20 * periodic_consistency
+            + 0.20 * (1.0 - off_grid_leakage))
+            .clamp(0.0, 1.0);
+        let candidate = CandidatePeriodEvidence {
+            best_phase: phase,
+            activation_evidence,
+            coverage,
+            off_grid_leakage,
+            periodic_consistency,
+            score,
+        };
+        if best.is_none_or(|current: CandidatePeriodEvidence| {
+            candidate.score > current.score
+                || (candidate.score == current.score && candidate.best_phase < current.best_phase)
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 fn bounded_dp(activations: &[f32], frame_rate_hz: f32) -> Option<Vec<usize>> {
@@ -1467,6 +1610,39 @@ mod tests {
             let grid = decode_grid(&observations).expect("edge tempo should decode");
             assert!((grid.bpm - bpm).abs() < 0.1, "bpm={bpm} grid={grid:?}");
         }
+    }
+
+    #[test]
+    fn candidate_diagnostics_are_independent_and_do_not_change_decode() {
+        let observations = click_logits(25, 900);
+        let production = decode_neural_rhythm(&observations);
+        let (diagnostic_decode, diagnostics) = diagnose_neural_rhythm(&observations, &[]);
+        assert_eq!(diagnostic_decode, production);
+        let available = diagnostics
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.available)
+            .collect::<Vec<_>>();
+        assert!(available.len() >= 2);
+        assert!(
+            available
+                .windows(2)
+                .any(|pair| pair[0].candidate_score != pair[1].candidate_score
+                    || pair[0].best_phase_frames != pair[1].best_phase_frames)
+        );
+        assert!(available.iter().all(|candidate| {
+            candidate.best_phase_frames.is_some()
+                && candidate.off_grid_leakage.is_finite()
+                && (0.0..=1.0).contains(&candidate.off_grid_leakage)
+                && (0.0..=1.0).contains(&candidate.candidate_score)
+        }));
+        let unavailable = diagnostics
+            .candidates
+            .iter()
+            .find(|candidate| !candidate.available)
+            .expect("one alias is outside the supported range");
+        assert_eq!(unavailable.best_phase_frames, None);
+        assert_eq!(unavailable.candidate_score, 0.0);
     }
 
     #[test]
