@@ -1463,6 +1463,8 @@ pub struct BeatMetrics {
     pub predicted: usize,
     pub truth: usize,
     pub matched: usize,
+    pub scored_tracks: usize,
+    pub unobserved_tracks: usize,
     pub mae_ms: Option<f64>,
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
@@ -1833,6 +1835,8 @@ fn beat_metrics(truth: &[u64], predicted: &[u64]) -> BeatMetrics {
         predicted: predicted.len(),
         truth: truth.len(),
         matched: pairs.len(),
+        scored_tracks: 1,
+        unobserved_tracks: 0,
         mae_ms: mean(&errors),
         p50_ms: percentile(&errors, 0.50),
         p95_ms: percentile(&errors, 0.95),
@@ -1840,6 +1844,13 @@ fn beat_metrics(truth: &[u64], predicted: &[u64]) -> BeatMetrics {
         recall_at_tolerance: recall,
         matched_errors_ms: errors,
         matched_by_tolerance,
+    }
+}
+
+fn unobserved_beat_metrics() -> BeatMetrics {
+    BeatMetrics {
+        unobserved_tracks: 1,
+        ..BeatMetrics::default()
     }
 }
 
@@ -2047,6 +2058,11 @@ fn aggregate_groups<'a>(groups: impl Iterator<Item = &'a GroupMetrics>) -> Group
     aggregate.beat.predicted = groups.iter().map(|group| group.beat.predicted).sum();
     aggregate.beat.truth = groups.iter().map(|group| group.beat.truth).sum();
     aggregate.beat.matched = groups.iter().map(|group| group.beat.matched).sum();
+    aggregate.beat.scored_tracks = groups.iter().map(|group| group.beat.scored_tracks).sum();
+    aggregate.beat.unobserved_tracks = groups
+        .iter()
+        .map(|group| group.beat.unobserved_tracks)
+        .sum();
     aggregate.beat.matched_errors_ms = groups
         .iter()
         .flat_map(|group| group.beat.matched_errors_ms.iter().copied())
@@ -2541,7 +2557,7 @@ fn external_metrics_for(
                 beat_values.as_deref().unwrap_or_default(),
             )
         } else {
-            BeatMetrics::default()
+            unobserved_beat_metrics()
         },
         tempo: external_tempo_metrics(truth.tempo.as_ref(), prediction.reported_bpm),
         grid_phase: if prediction.grid_phase_micros.is_some() {
@@ -2637,7 +2653,7 @@ fn metrics_between_predictions(
                     .collect::<Vec<_>>(),
             )
         } else {
-            BeatMetrics::default()
+            unobserved_beat_metrics()
         },
         tempo: external_tempo_metrics(
             external
@@ -3358,6 +3374,8 @@ mod tests {
         let absent_metrics = external_metrics_for(&truth, &absent);
         assert_eq!(absent_metrics.beat.truth, 0);
         assert_eq!(absent_metrics.beat.predicted, 0);
+        assert_eq!(absent_metrics.beat.scored_tracks, 0);
+        assert_eq!(absent_metrics.beat.unobserved_tracks, 1);
         assert_eq!(absent_metrics.meter.status, "not_scored");
 
         let empty = normalized_external(&observation_with(
@@ -3372,6 +3390,8 @@ mod tests {
         let empty_metrics = external_metrics_for(&truth, &empty);
         assert_eq!(empty_metrics.beat.truth, truth.beat_times_micros.len());
         assert_eq!(empty_metrics.beat.predicted, 0);
+        assert_eq!(empty_metrics.beat.scored_tracks, 1);
+        assert_eq!(empty_metrics.beat.unobserved_tracks, 0);
         assert_eq!(empty_metrics.beat.recall_at_tolerance["40ms"], 0.0);
         assert_eq!(empty_metrics.downbeat.scored_tracks, 1);
 
