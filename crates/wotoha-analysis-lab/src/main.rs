@@ -44,6 +44,7 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 EvaluationOptions {
                     mode: evaluate.mode,
                     split: evaluate.split.unwrap_or_else(|| manifest.split.clone()),
+                    source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
                 },
             )?;
             write_json(&evaluate.output, &report)?;

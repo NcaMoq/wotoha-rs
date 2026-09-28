@@ -31,6 +31,11 @@ const DEFAULT_SAMPLE_RATE: u32 = 22_050;
 const MAX_FIXTURES: usize = 256;
 const MAX_AUDIO_SAMPLES: usize = DEFAULT_SAMPLE_RATE as usize * 30;
 const BEAT_MATCH_WINDOW: Duration = Duration::from_millis(120);
+// A global phase is meaningful only when the observed grid is effectively
+// periodic. Three percent is deliberately broad enough to tolerate sample
+// rounding and a modest isolated timing outlier, while rejecting visible
+// tempo drift in this evaluation layer.
+const EXTERNAL_PERIOD_STABILITY: f64 = 0.03;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1351,6 +1356,13 @@ pub fn analyze_fixture(
     fixture: &SyntheticFixture,
     mode: AnalyzerMode,
 ) -> Result<NormalizedAnalysis, LabError> {
+    analyze_fixture_with_backend(fixture, mode).map(|(analysis, _)| analysis)
+}
+
+fn analyze_fixture_with_backend(
+    fixture: &SyntheticFixture,
+    mode: AnalyzerMode,
+) -> Result<(NormalizedAnalysis, &'static str), LabError> {
     let mono = downmix(&fixture.audio, fixture.spec.channels);
     let analysis_audio = if fixture.spec.sample_rate == DEFAULT_SAMPLE_RATE {
         mono
@@ -1365,22 +1377,31 @@ pub fn analyze_fixture(
                     fixture.spec.id
                 ))
             })?;
-    let v2 = if mode == AnalyzerMode::Hybrid {
+    let (v2, backend) = if mode == AnalyzerMode::Hybrid {
         let low_band = low_band_1khz(&analysis_audio);
         if let Some(rhythm) =
             wotoha_runtime::analyze_neural_rhythm(&analysis_audio, DEFAULT_SAMPLE_RATE, &low_band)
         {
-            wotoha_runtime::track_analysis_v2_from_legacy_rhythm(&legacy, rhythm, true)
+            (
+                wotoha_runtime::track_analysis_v2_from_legacy_rhythm(&legacy, rhythm, true),
+                "native_neural",
+            )
         } else {
-            wotoha_runtime::track_analysis_v2_from_legacy(&legacy)
+            (
+                wotoha_runtime::track_analysis_v2_from_legacy(&legacy),
+                "classical_fallback",
+            )
         }
     } else {
-        wotoha_runtime::track_analysis_v2_from_legacy(&legacy)
-    }
-    .ok_or_else(|| {
+        (
+            wotoha_runtime::track_analysis_v2_from_legacy(&legacy),
+            "classical",
+        )
+    };
+    let v2 = v2.ok_or_else(|| {
         LabError::InvalidInput(format!("Wotoha V2 adaptation rejected {}", fixture.spec.id))
     })?;
-    Ok(normalize_v2(&v2))
+    Ok((normalize_v2(&v2), backend))
 }
 
 fn downmix(samples: &[f32], channels: u8) -> Vec<f32> {
@@ -1427,6 +1448,8 @@ fn resample(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
 pub struct EvaluationOptions {
     pub mode: AnalyzerMode,
     pub split: String,
+    #[serde(default)]
+    pub source_commit: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1434,6 +1457,9 @@ pub struct EvaluationReport {
     pub schema_version: u32,
     pub evaluator: String,
     pub split: String,
+    pub analyzer_mode: AnalyzerMode,
+    pub source_commit: Option<String>,
+    pub analysis_backends: BTreeMap<String, usize>,
     pub overall: GroupMetrics,
     pub by_fixture_family: BTreeMap<String, GroupMetrics>,
     pub by_tempo_range: BTreeMap<String, GroupMetrics>,
@@ -1598,6 +1624,7 @@ pub struct TrackEvaluation {
     pub sample_id: String,
     pub family: String,
     pub audio_sha256: String,
+    pub analysis_backend: String,
     pub truth: AnalysisGroundTruth,
     pub wotoha: NormalizedAnalysis,
     pub metrics: GroupMetrics,
@@ -1647,7 +1674,7 @@ pub fn evaluate_manifest_with_cancel(
                 actual: fixture.audio_sha256,
             });
         }
-        let wotoha = analyze_fixture(&fixture, options.mode)?;
+        let (wotoha, analysis_backend) = analyze_fixture_with_backend(&fixture, options.mode)?;
         normalized_by_id.insert(record.spec.id.clone(), wotoha.clone());
         let metrics = metrics_for(&record.truth, &wotoha);
         let failures = failure_clusters(&record.truth, &wotoha, &metrics);
@@ -1655,6 +1682,7 @@ pub fn evaluate_manifest_with_cancel(
             sample_id: record.spec.id.clone(),
             family: record.spec.family.as_str().into(),
             audio_sha256: record.audio_sha256.clone(),
+            analysis_backend: analysis_backend.into(),
             truth: record.truth.clone(),
             wotoha,
             metrics,
@@ -1678,6 +1706,14 @@ pub fn evaluate_manifest_with_cancel(
     let (half_double_errors, downbeat_errors, failure_clusters) = summarize_failures(&tracks);
     let confidence_calibration = calibration(&tracks);
     let variable_tempo = variable_tempo_metrics(&tracks);
+    let mut analysis_backends = BTreeMap::new();
+    for track in &tracks {
+        *analysis_backends
+            .entry(track.analysis_backend.clone())
+            .or_insert(0) += 1;
+    }
+    let analyzer_mode = options.mode;
+    let source_commit = options.source_commit;
     let external_report = external
         .map(|document| compare_external(document, manifest, &tracks))
         .transpose()?
@@ -1686,6 +1722,9 @@ pub fn evaluate_manifest_with_cancel(
         schema_version: REPORT_SCHEMA_VERSION,
         evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
         split: options.split,
+        analyzer_mode,
+        source_commit,
+        analysis_backends,
         overall,
         by_fixture_family,
         by_tempo_range,
@@ -1932,6 +1971,9 @@ fn phase_metrics(truth: &AnalysisGroundTruth, prediction: &NormalizedAnalysis) -
 }
 
 fn phase_metrics_at(truth: &AnalysisGroundTruth, predicted_phase: Option<u64>) -> PhaseMetrics {
+    if truth.tempo.is_none() {
+        return PhaseMetrics::default();
+    }
     let Some(&truth_first) = truth.beat_times_micros.first() else {
         return PhaseMetrics::default();
     };
@@ -1957,6 +1999,75 @@ fn phase_metrics_at(truth: &AnalysisGroundTruth, predicted_phase: Option<u64>) -
         correct_count: usize::from(error <= 20_000),
         correct_rate: Some(bool_fraction(error <= 20_000)),
     }
+}
+
+fn robust_median_u64(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[sorted.len() / 2])
+}
+
+/// Infer a constant period only from a sufficiently stable external beatgrid.
+///
+/// The median makes the estimate insensitive to one modest outlier. Requiring
+/// every valid interval to remain within the generic three-percent stability
+/// band prevents a drifting grid from being reduced to its first interval.
+fn stable_external_period(beat_times: &[u64]) -> Option<u64> {
+    let intervals = beat_times
+        .windows(2)
+        .filter_map(|window| {
+            let interval = window[1].checked_sub(window[0])?;
+            (interval > 0).then_some(interval)
+        })
+        .collect::<Vec<_>>();
+    if intervals.len() < 2 {
+        return None;
+    }
+    let median = robust_median_u64(&intervals)?;
+    let median_f64 = median as f64;
+    let stable = intervals.iter().all(|interval| {
+        (*interval as f64 - median_f64).abs() / median_f64 <= EXTERNAL_PERIOD_STABILITY
+    });
+    stable.then_some(median)
+}
+
+fn bpm_period_micros(bpm: Option<f32>) -> Option<u64> {
+    bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+        .map(|bpm| (60_000_000.0 / f64::from(bpm)).round() as u64)
+        .filter(|period| *period > 0)
+}
+
+/// Return the period and phase reference that make a global Wotoha↔external
+/// phase comparison legitimate. An explicit BPM+phase pair is sufficient
+/// without a beatgrid; a supplied beatgrid must first pass stable-period and,
+/// when present, reported-BPM compatibility checks.
+fn external_phase_reference(
+    beat_times: Option<&[u64]>,
+    reported_bpm: Option<f32>,
+    explicit_phase: Option<u64>,
+) -> Option<(u64, u64)> {
+    let reported_period = bpm_period_micros(reported_bpm);
+    let (period, inferred_phase) = match beat_times {
+        Some(beat_times) => {
+            let stable_period = stable_external_period(beat_times)?;
+            if let Some(reported_period) = reported_period {
+                let deviation =
+                    stable_period.abs_diff(reported_period) as f64 / reported_period.max(1) as f64;
+                if deviation > EXTERNAL_PERIOD_STABILITY {
+                    return None;
+                }
+                (reported_period, beat_times.first().copied())
+            } else {
+                (stable_period, beat_times.first().copied())
+            }
+        }
+        None => (reported_period?, None),
+    };
+    let phase = explicit_phase.or(inferred_phase)?;
+    Some((phase, period))
 }
 
 fn phase_metrics_between(predicted_phase: u64, reference_phase: u64, period: u64) -> PhaseMetrics {
@@ -2624,23 +2735,11 @@ fn metrics_between_predictions(
             .map(|beat| beat.time_micros)
             .collect::<Vec<_>>()
     });
-    let external_phase = external.grid_phase_micros.or_else(|| {
-        beats_available
-            .then(|| {
-                external_beats
-                    .as_deref()
-                    .and_then(|beats| beats.first().copied())
-            })
-            .flatten()
-    });
-    let period = external
-        .reported_bpm
-        .map(|bpm| (60_000_000.0 / f64::from(bpm)).round() as u64)
-        .or_else(|| {
-            external_beats
-                .as_deref()
-                .and_then(|beats| beats.windows(2).next().map(|window| window[1] - window[0]))
-        });
+    let phase_reference = external_phase_reference(
+        beats_available.then_some(external_beats.as_deref().unwrap_or_default()),
+        external.reported_bpm,
+        external.grid_phase_micros,
+    );
     GroupMetrics {
         tracks: 1,
         beat: if beats_available {
@@ -2665,8 +2764,8 @@ fn metrics_between_predictions(
                 .as_ref(),
             primary_tempo_bpm(wotoha),
         ),
-        grid_phase: match (wotoha.beats.first(), external_phase, period) {
-            (Some(predicted), Some(reference), Some(period)) if period > 0 => {
+        grid_phase: match (wotoha.beats.first(), phase_reference) {
+            (Some(predicted), Some((reference, period))) if period > 0 => {
                 phase_metrics_between(predicted.time_micros, reference, period)
             }
             _ => PhaseMetrics::default(),
@@ -3154,11 +3253,15 @@ mod tests {
             EvaluationOptions {
                 mode: AnalyzerMode::Classical,
                 split: "development".into(),
+                source_commit: None,
             },
         )
         .unwrap();
         let observer = report.external.by_observer.values().next().unwrap();
         assert_eq!(report.external.observations, 1);
+        assert_eq!(report.analyzer_mode, AnalyzerMode::Classical);
+        assert_eq!(report.source_commit, None);
+        assert_eq!(report.analysis_backends.get("classical"), Some(&1));
         assert_eq!(observer.external_vs_truth.tracks, 1);
         assert_eq!(observer.wotoha_vs_external.tracks, 1);
     }
@@ -3240,6 +3343,22 @@ mod tests {
                 end_micros: 2_000_000,
                 start_bpm: 120.0,
                 end_bpm: 120.0,
+            }],
+            duration_micros: 2_000_000,
+        }
+    }
+
+    fn variable_truth() -> AnalysisGroundTruth {
+        AnalysisGroundTruth {
+            tempo: None,
+            meter: Some(4),
+            beat_times_micros: vec![0, 500_000, 995_000, 1_480_000, 1_950_000],
+            downbeats: vec![0],
+            tempo_segments: vec![TempoSegmentTruth {
+                start_micros: 0,
+                end_micros: 2_000_000,
+                start_bpm: 120.0,
+                end_bpm: 126.0,
             }],
             duration_micros: 2_000_000,
         }
@@ -3466,6 +3585,81 @@ mod tests {
     }
 
     #[test]
+    fn external_variable_tempo_phase_is_not_scored() {
+        let metrics = external_metrics_for(
+            &variable_truth(),
+            &normalized_external(&observation_with(
+                "sample",
+                Some(vec![0, 500_000, 995_000, 1_480_000, 1_950_000]),
+                None,
+                Some(123.0),
+                None,
+                Some(0),
+                true,
+            )),
+        );
+        assert_eq!(metrics.grid_phase.scored_tracks, 0);
+    }
+
+    #[test]
+    fn stable_external_grid_can_score_wotoha_phase() {
+        let external = normalized_external(&observation_with(
+            "sample",
+            Some(vec![0, 500_000, 1_000_000, 1_500_000]),
+            None,
+            None,
+            None,
+            None,
+            true,
+        ));
+        let metrics = metrics_between_predictions(
+            &normalized_prediction(&[0, 500_000, 1_000_000, 1_500_000]),
+            &external,
+        );
+        assert_eq!(metrics.grid_phase.scored_tracks, 1);
+        assert_eq!(metrics.grid_phase.correct, Some(true));
+
+        let explicit_phase = normalized_external(&observation_with(
+            "sample",
+            None,
+            None,
+            Some(120.0),
+            None,
+            Some(0),
+            true,
+        ));
+        let explicit_metrics = metrics_between_predictions(
+            &normalized_prediction(&[0, 500_000, 1_000_000, 1_500_000]),
+            &explicit_phase,
+        );
+        assert_eq!(explicit_metrics.grid_phase.scored_tracks, 1);
+    }
+
+    #[test]
+    fn drifting_external_grid_does_not_score_global_phase() {
+        let external = normalized_external(&observation_with(
+            "sample",
+            Some(vec![0, 500_000, 995_000, 1_480_000, 1_950_000]),
+            None,
+            None,
+            None,
+            None,
+            true,
+        ));
+        let metrics = metrics_between_predictions(
+            &normalized_prediction(&[0, 500_000, 1_000_000, 1_500_000]),
+            &external,
+        );
+        assert_eq!(metrics.grid_phase.scored_tracks, 0);
+    }
+
+    #[test]
+    fn stable_external_period_uses_median_and_tolerates_one_modest_outlier() {
+        let period = stable_external_period(&[0, 500_000, 1_000_000, 1_510_000, 2_010_000]);
+        assert_eq!(period, Some(500_000));
+    }
+
+    #[test]
     fn external_validation_rejects_duplicates_invalid_indices_and_invalid_settings() {
         let mut first = observation_with(
             "sample",
@@ -3541,6 +3735,7 @@ mod tests {
             EvaluationOptions {
                 mode: AnalyzerMode::Classical,
                 split: "development".into(),
+                source_commit: None,
             },
         )
         .unwrap();
@@ -3657,25 +3852,37 @@ mod tests {
             0,
             1,
         );
+        transformed.base_id = Some("base".into());
         transformed.transform = TransformKind::SampleRate {
             sample_rate: 16_000,
         };
         transformed.sample_rate = 16_000;
-        let base = generate_fixture(&FixtureSpec {
+        let base_spec = FixtureSpec {
             transform: TransformKind::None,
+            base_id: None,
             id: "base".into(),
+            sample_rate: DEFAULT_SAMPLE_RATE,
             ..transformed.clone()
-        })
-        .unwrap();
+        };
+        let base = generate_fixture(&base_spec).unwrap();
         let converted = generate_fixture(&transformed).unwrap();
         let base_duration = base.audio.len() as f64 / f64::from(base.spec.sample_rate);
         let converted_duration =
             converted.audio.len() as f64 / f64::from(converted.spec.sample_rate);
-        assert!((base_duration - converted_duration).abs() < 1.0 / 16_000.0);
+        let duration_tolerance =
+            1.0 / f64::from(base.spec.sample_rate.min(converted.spec.sample_rate));
+        assert!((base_duration - converted_duration).abs() <= duration_tolerance);
+        assert_eq!(base.spec.sample_rate, 22_050);
+        assert_eq!(converted.spec.sample_rate, 16_000);
+        assert_eq!(converted.spec.base_id.as_deref(), Some("base"));
+        assert_ne!(base.audio_sha256, converted.audio_sha256);
         assert_eq!(
             base.truth.beat_times_micros,
             converted.truth.beat_times_micros
         );
+        assert_eq!(base.truth.downbeats, converted.truth.downbeats);
+        assert_eq!(base.truth.tempo, converted.truth.tempo);
+        assert_eq!(base.truth.meter, converted.truth.meter);
     }
 
     #[test]
@@ -3688,6 +3895,7 @@ mod tests {
             sample_id: "sample".into(),
             family: "test".into(),
             audio_sha256: "a".repeat(64),
+            analysis_backend: "test".into(),
             truth,
             wotoha: prediction,
             metrics,

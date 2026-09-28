@@ -48,8 +48,10 @@ drift fixtures. The default development corpus includes:
 - deterministic gain, compression, EQ, high-pass, low-pass, mono, stereo, and
   sample-rate variants.
 
-Transform fixtures retain the same truth and are matched to their base by
-fixture identity and audio hash. Lossy codec variants are intentionally not
+Transform fixtures retain the same musical truth even when the PCM changes.
+Sample-rate variants, for example 22,050 Hz and 16,000 Hz, are matched by
+`base_id` and shared truth rather than equal PCM hashes; duration may differ by
+at most sample-rounding tolerance. Lossy codec variants are intentionally not
 claimed until a repository-native codec fixture path is available.
 
 ## Commands
@@ -87,6 +89,9 @@ Reports are JSON with concise CLI summaries and the following sections:
 `overall`, `by_fixture_family`, `by_tempo_range`, `by_meter`, `by_transform`,
 `half_double_errors`, `downbeat_errors`, `variable_tempo`,
 `confidence_calibration`, `failure_clusters`, `external`, and `per_track`.
+Metadata also records the evaluator/report versions, split, analyzer mode,
+optional source commit, and Hybrid backend counts (`native_neural` versus
+`classical_fallback`).
 
 Beat metrics use a deterministic monotonic one-to-one matcher and report MAE,
 p50, p95, and precision/recall at 10, 20, 40, and 70 ms. Per-track percentiles
@@ -106,7 +111,14 @@ rules therefore preserve `Unknown`; raw meter hypotheses remain in the
 normalized result. Truth meter plus a resolved prediction is scored as correct,
 wrong, or unknown, while absent external meter is unobserved and not scored.
 Grid phase is measured modulo the expected period only for constant-tempo truth;
-an explicit external phase is used even when no external beat grid is present.
+variable-tempo truth returns an unscored global phase and is evaluated through
+the local timeline and phase-drift metrics instead. For Wotoha↔external
+comparisons, a global phase is allowed only for an explicit BPM+phase pair
+without a grid, or for a beatgrid whose positive intervals have a robust median
+and all remain within the generic three-percent stability band. The median
+tolerates sample rounding and one modest outlier; the first external interval
+is never treated as a universal period. An explicit external phase is still
+used for constant truth even when no external beat grid is present.
 Downbeat/bar phase and meter are evaluated separately; `Unknown` is not counted
 as `wrong`. Wotoha downbeat phase is not scored as resolved bar evidence when
 Wotoha's resolved meter is `None`; raw downbeat evidence remains preserved.
@@ -148,7 +160,8 @@ cargo run --release --locked -p wotoha-analysis-lab -- \
   baseline --mode classical --report /tmp/wotoha-analysis-baseline-classical.json
 ```
 
-Hybrid uses the existing CPU Beat This! adapter and classical uses the existing
+Hybrid uses the existing CPU Beat This! adapter where available and reports
+any classical fallback per backend count; classical uses the existing
 classical adapter. The comparison is diagnostic across beat timing, tempo,
 phase, downbeat, meter, variable tempo, and transforms; it is not collapsed to
 one winner and it does not tune production thresholds.
