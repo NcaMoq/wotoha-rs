@@ -24,7 +24,7 @@ use wotoha_core::{
 
 pub const LAB_SCHEMA_VERSION: u32 = 1;
 pub const OBSERVATION_SCHEMA_VERSION: u32 = 1;
-pub const REPORT_SCHEMA_VERSION: u32 = 2;
+pub const REPORT_SCHEMA_VERSION: u32 = 3;
 pub const BLACKBOX_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
@@ -537,6 +537,32 @@ pub fn generate_default_manifest(seed: u64) -> Result<SyntheticCorpusManifest, L
             id,
             FixtureFamily::HalfDouble,
             TempoProfile::Constant { bpm: 128.0 },
+            style,
+            4,
+            400_000,
+            seed,
+        ));
+    }
+    for (id, bpm, style) in [
+        (
+            "half-double-64-128",
+            128.0,
+            EventStyle::StrongEverySecondBeat,
+        ),
+        ("half-double-70-140", 140.0, EventStyle::WeakSubdivision),
+        ("half-double-75-150", 150.0, EventStyle::HatsOnly),
+        (
+            "half-double-80-160",
+            160.0,
+            EventStyle::StrongEverySecondBeat,
+        ),
+        ("half-double-85-170", 170.0, EventStyle::WeakSubdivision),
+        ("half-double-90-180", 180.0, EventStyle::HatsOnly),
+    ] {
+        specs.push(spec(
+            id,
+            FixtureFamily::HalfDouble,
+            TempoProfile::Constant { bpm },
             style,
             4,
             400_000,
@@ -2103,6 +2129,16 @@ pub struct ExperimentalTempoReport {
     pub per_fixture: Vec<ExperimentalTempoFixture>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoExperimentReportDocument {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub analyzer_mode: AnalyzerMode,
+    pub source_commit: Option<String>,
+    pub experiment: ExperimentalTempoReport,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExperimentalTempoFamilySummary {
     pub tracks: usize,
@@ -2121,7 +2157,7 @@ pub struct ExperimentalTempoFixture {
     pub experimental: ExperimentalTempoResolution,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentalTempoResolution {
     pub selected_bpm: Option<f32>,
     pub selected_relation: Option<String>,
@@ -2129,7 +2165,7 @@ pub struct ExperimentalTempoResolution {
     pub candidates: Vec<ExperimentalTempoCandidate>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ExperimentalTempoCandidate {
     pub bpm: f32,
     pub relation: String,
@@ -2248,11 +2284,20 @@ pub struct TransformMetrics {
     pub transform: String,
     pub expectation: TransformExpectation,
     pub tracks: usize,
+    pub base_beat_count: usize,
+    pub transformed_beat_count: usize,
     pub matched_beats: usize,
     pub missing_beats: usize,
     pub extra_beats: usize,
     pub mean_beat_displacement_ms: Option<f64>,
     pub p95_beat_displacement_ms: Option<f64>,
+    pub tempo_before_bpm: Option<f32>,
+    pub tempo_after_bpm: Option<f32>,
+    pub backend_before: Option<String>,
+    pub backend_after: Option<String>,
+    pub low_frequency_support_change: Option<f64>,
+    pub confidence_before: Option<f64>,
+    pub confidence_after: Option<f64>,
     pub tempo_interpretation_changes: usize,
     pub downbeat_changes: usize,
     pub meter_changes: usize,
@@ -2312,8 +2357,8 @@ pub struct MeterEvidenceReport {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeterCandidateEvidence {
-    pub phase: u8,
-    pub score: f32,
+    pub phase: Option<u8>,
+    pub score: Option<f32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2387,6 +2432,7 @@ pub fn evaluate_manifest_with_audio(
     }
     let mut tracks = Vec::with_capacity(manifest.fixtures.len());
     let mut normalized_by_id = BTreeMap::new();
+    let mut backends_by_id = BTreeMap::new();
     let mut backend_runs = BTreeMap::new();
     let mut experimental_results = BTreeMap::new();
     for record in &manifest.fixtures {
@@ -2442,6 +2488,7 @@ pub fn evaluate_manifest_with_audio(
             );
         }
         normalized_by_id.insert(record.spec.id.clone(), wotoha.clone());
+        backends_by_id.insert(record.spec.id.clone(), analysis_backend.to_owned());
         experimental_results.insert(
             record.spec.id.clone(),
             experimental_tempo_resolution(&fixture, &wotoha),
@@ -2474,7 +2521,7 @@ pub fn evaluate_manifest_with_audio(
             .map(|meter| meter.to_string())
             .unwrap_or_else(|| "unknown".into())
     });
-    let by_transform = transform_metrics(&manifest.fixtures, &normalized_by_id);
+    let by_transform = transform_metrics(&manifest.fixtures, &normalized_by_id, &backends_by_id);
     let transform_invariance = by_transform
         .iter()
         .filter(|(_, metrics)| metrics.expectation == TransformExpectation::Invariant)
@@ -2571,20 +2618,22 @@ fn meter_evidence(prediction: &NormalizedAnalysis) -> MeterEvidenceReport {
     let mut candidates = BTreeMap::new();
     let mut scores = Vec::new();
     for meter in [2_u8, 3, 4, 6] {
-        if let Some(hypothesis) = prediction
+        let evidence = prediction
             .meter_hypotheses
             .iter()
             .find(|hypothesis| hypothesis.beats_per_bar == meter)
-        {
-            candidates.insert(
-                meter.to_string(),
+            .map(|hypothesis| {
+                scores.push(hypothesis.score);
                 MeterCandidateEvidence {
-                    phase: hypothesis.downbeat_phase,
-                    score: hypothesis.score,
-                },
-            );
-            scores.push(hypothesis.score);
-        }
+                    phase: Some(hypothesis.downbeat_phase),
+                    score: Some(hypothesis.score),
+                }
+            })
+            .unwrap_or(MeterCandidateEvidence {
+                phase: None,
+                score: None,
+            });
+        candidates.insert(meter.to_string(), evidence);
     }
     scores.sort_by(f32::total_cmp);
     let runner_up_margin = scores
@@ -3149,6 +3198,7 @@ fn group_tracks<'a>(
 fn transform_metrics(
     specs: &[FixtureRecord],
     normalized: &BTreeMap<String, NormalizedAnalysis>,
+    backends: &BTreeMap<String, String>,
 ) -> BTreeMap<String, TransformMetrics> {
     let mut result = BTreeMap::new();
     for spec in specs.iter().filter(|spec| spec.spec.base_id.is_some()) {
@@ -3189,6 +3239,38 @@ fn transform_metrics(
                 })
                 .collect::<Vec<_>>(),
         );
+        let base_low_frequency = mean(
+            &base
+                .confidence
+                .low_frequency
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        let transformed_low_frequency = mean(
+            &transformed
+                .confidence
+                .low_frequency
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        let base_confidence = mean(
+            &base
+                .confidence
+                .timing
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        let transformed_confidence = mean(
+            &transformed
+                .confidence
+                .timing
+                .iter()
+                .map(|value| f64::from(*value))
+                .collect::<Vec<_>>(),
+        );
         let key = spec.spec.transform.label().to_owned();
         let entry = result
             .entry(key.clone())
@@ -3198,12 +3280,41 @@ fn transform_metrics(
                 ..TransformMetrics::default()
             });
         entry.tracks += 1;
+        entry.base_beat_count += base.beats.len();
+        entry.transformed_beat_count += transformed.beats.len();
         entry.matched_beats += pairs.len();
         entry.missing_beats += base.beats.len().saturating_sub(pairs.len());
         entry.extra_beats += transformed.beats.len().saturating_sub(pairs.len());
         entry.displacement_ms.extend(displacement.iter().copied());
         entry.mean_beat_displacement_ms = mean(&entry.displacement_ms);
         entry.p95_beat_displacement_ms = percentile(&entry.displacement_ms, 0.95);
+        entry.tempo_before_bpm = entry.tempo_before_bpm.or_else(|| primary_tempo_bpm(base));
+        entry.tempo_after_bpm = entry
+            .tempo_after_bpm
+            .or_else(|| primary_tempo_bpm(transformed));
+        entry.backend_before = entry.backend_before.clone().or_else(|| {
+            backends
+                .get(base_id)
+                .cloned()
+                .or_else(|| Some(base.analyzer.clone()))
+        });
+        entry.backend_after = entry.backend_after.clone().or_else(|| {
+            backends
+                .get(&spec.spec.id)
+                .cloned()
+                .or_else(|| Some(transformed.analyzer.clone()))
+        });
+        entry.low_frequency_support_change = combine_means(
+            entry.low_frequency_support_change,
+            transformed_low_frequency
+                .zip(base_low_frequency)
+                .map(|(after, before)| after - before),
+            entry.tracks,
+        );
+        entry.confidence_before =
+            combine_means(entry.confidence_before, base_confidence, entry.tracks);
+        entry.confidence_after =
+            combine_means(entry.confidence_after, transformed_confidence, entry.tracks);
         entry.tempo_interpretation_changes += usize::from(tempo_changes);
         entry.downbeat_changes += usize::from(downbeat_changes);
         entry.meter_changes += usize::from(meter_changes);
@@ -3318,33 +3429,54 @@ fn experimental_tempo_resolution(
     fixture: &SyntheticFixture,
     prediction: &NormalizedAnalysis,
 ) -> ExperimentalTempoResolution {
+    let mut seeds = Vec::new();
+    let base_bpm = prediction
+        .tempo_hypotheses
+        .iter()
+        .find(|hypothesis| canonical_relation_name(&hypothesis.relation) == "primary")
+        .or_else(|| prediction.tempo_hypotheses.first())
+        .map(|hypothesis| hypothesis.bpm);
+    if let Some(base_bpm) = base_bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0) {
+        seeds.extend([
+            (base_bpm / 2.0, "half_time".to_owned()),
+            (base_bpm, "primary".to_owned()),
+            (base_bpm * 2.0, "double_time".to_owned()),
+        ]);
+    }
+    seeds.extend(prediction.tempo_hypotheses.iter().map(|hypothesis| {
+        (
+            hypothesis.bpm,
+            canonical_relation_name(&hypothesis.relation).to_owned(),
+        )
+    }));
+
     let mut candidates = Vec::new();
-    let mut seen = Vec::new();
-    for hypothesis in &prediction.tempo_hypotheses {
-        if !hypothesis.bpm.is_finite()
-            || !(wotoha_core::beat_analysis::MIN_BPM..=wotoha_core::beat_analysis::MAX_BPM)
-                .contains(&hypothesis.bpm)
-            || seen
+    for (bpm, relation) in seeds {
+        if !bpm.is_finite()
+            || bpm <= 0.0
+            || candidates
                 .iter()
-                .any(|bpm: &f32| (*bpm - hypothesis.bpm).abs() < 0.01)
+                .any(|candidate: &ExperimentalTempoCandidate| (candidate.bpm - bpm).abs() < 0.01)
         {
             continue;
         }
-        seen.push(hypothesis.bpm);
-        if let Some(candidate) = score_raw_periodic_candidate(
-            fixture,
-            hypothesis.bpm,
-            format_relation_name(&hypothesis.relation),
-        ) {
-            candidates.push(candidate);
-        }
+        let available = (wotoha_core::beat_analysis::MIN_BPM..=wotoha_core::beat_analysis::MAX_BPM)
+            .contains(&bpm);
+        let candidate = if available {
+            score_raw_periodic_candidate(fixture, bpm, relation.clone())
+                .unwrap_or_else(|| unavailable_tempo_candidate(bpm, relation.clone()))
+        } else {
+            unavailable_tempo_candidate(bpm, relation)
+        };
+        candidates.push(candidate);
     }
-    candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
-    let ambiguous = candidates
-        .first()
-        .zip(candidates.get(1))
-        .is_some_and(|(best, runner_up)| best.score - runner_up.score < 0.03);
-    let selected = (!ambiguous).then(|| candidates.first()).flatten();
+    candidates.sort_by(|left, right| {
+        right
+            .available
+            .cmp(&left.available)
+            .then_with(|| right.score.total_cmp(&left.score))
+    });
+    let (selected, ambiguous) = choose_experimental_candidate(&candidates);
     ExperimentalTempoResolution {
         selected_bpm: selected.map(|candidate| candidate.bpm),
         selected_relation: selected.map(|candidate| candidate.relation.clone()),
@@ -3353,8 +3485,42 @@ fn experimental_tempo_resolution(
     }
 }
 
-fn format_relation_name(relation: &str) -> String {
-    relation.to_owned()
+fn choose_experimental_candidate(
+    candidates: &[ExperimentalTempoCandidate],
+) -> (Option<&ExperimentalTempoCandidate>, bool) {
+    let mut available = candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .collect::<Vec<_>>();
+    available.sort_by(|left, right| right.score.total_cmp(&left.score));
+    let ambiguous = available
+        .first()
+        .zip(available.get(1))
+        .is_some_and(|(best, runner_up)| best.score - runner_up.score < 0.03);
+    let selected = (!ambiguous).then(|| available.first()).flatten().copied();
+    (selected, ambiguous)
+}
+
+fn canonical_relation_name(relation: &str) -> &str {
+    match relation {
+        "halftime" | "half_time" => "half_time",
+        "doubletime" | "double_time" => "double_time",
+        "primary" => "primary",
+        _ => relation,
+    }
+}
+
+fn unavailable_tempo_candidate(bpm: f32, relation: String) -> ExperimentalTempoCandidate {
+    ExperimentalTempoCandidate {
+        bpm,
+        relation,
+        score: 0.0,
+        phase_micros: 0,
+        activation_support: 0.0,
+        coverage: 0.0,
+        periodic_consistency: 0.0,
+        available: false,
+    }
 }
 
 fn score_raw_periodic_candidate(
@@ -3459,7 +3625,7 @@ fn experimental_tempo_report(
         let current_relation = prediction
             .tempo_hypotheses
             .first()
-            .map(|hypothesis| hypothesis.relation.clone());
+            .map(|hypothesis| canonical_relation_name(&hypothesis.relation).to_owned());
         let current_correct = current_bpm
             .is_some_and(|bpm| (bpm - truth.primary_bpm).abs() / truth.primary_bpm < 0.005);
         let experimental_correct = experimental
@@ -4276,6 +4442,30 @@ mod tests {
             if meter == 4 || meter == 6 {
                 assert!(energy(meter / 2) > energy(1));
             }
+            let expected = match meter {
+                2 | 3 => vec![
+                    meter_accent(meter as u8, 0),
+                    meter_accent(meter as u8, 1),
+                    meter_accent(meter as u8, 2),
+                ],
+                4 => (0..4).map(|beat| meter_accent(meter as u8, beat)).collect(),
+                6 => (0..6).map(|beat| meter_accent(meter as u8, beat)).collect(),
+                _ => unreachable!(),
+            };
+            assert_eq!(expected[0], (0.95, 0.85, 0.75));
+            if meter == 4 || meter == 6 {
+                assert_eq!(expected[meter / 2], (0.62, 0.55, 0.60));
+            }
+            let weak = if meter == 2 || meter == 3 {
+                (0.30, 0.25, 0.45)
+            } else {
+                (0.28, 0.24, 0.42)
+            };
+            for (beat, accent) in expected.iter().enumerate() {
+                if beat != 0 && beat != meter / 2 {
+                    assert_eq!(*accent, weak);
+                }
+            }
         }
         let ambiguous = manifest
             .fixtures
@@ -4283,6 +4473,46 @@ mod tests {
             .find(|fixture| fixture.spec.id == "meter-ambiguous-4-4")
             .unwrap();
         assert_eq!(ambiguous.truth.meter, None);
+    }
+
+    #[test]
+    fn half_double_corpus_covers_requested_tempo_families() {
+        let manifest = generate_default_manifest(42).unwrap();
+        for (id, bpm) in [
+            ("half-double-64-128", 128.0),
+            ("half-double-70-140", 140.0),
+            ("half-double-75-150", 150.0),
+            ("half-double-80-160", 160.0),
+            ("half-double-85-170", 170.0),
+            ("half-double-90-180", 180.0),
+        ] {
+            let fixture = manifest
+                .fixtures
+                .iter()
+                .find(|fixture| fixture.spec.id == id)
+                .unwrap();
+            let truth = fixture.truth.tempo.as_ref().unwrap();
+            assert_eq!(truth.primary_bpm, bpm);
+            assert!(truth.valid_alternates_bpm.contains(&(bpm / 2.0)));
+            assert!(truth.valid_alternates_bpm.contains(&(bpm * 2.0)));
+        }
+    }
+
+    #[test]
+    fn meter_evidence_reports_all_candidate_slots_and_absence() {
+        let mut prediction = normalized_prediction(&[0, 500_000, 1_000_000]);
+        prediction.meter_hypotheses = vec![NormalizedMeterHypothesis {
+            beats_per_bar: 4,
+            downbeat_phase: 2,
+            score: 0.8,
+        }];
+        let evidence = meter_evidence(&prediction);
+        assert_eq!(evidence.candidates.len(), 4);
+        assert_eq!(evidence.candidates["2"].score, None);
+        assert_eq!(evidence.candidates["3"].phase, None);
+        assert_eq!(evidence.candidates["4"].score, Some(0.8));
+        assert_eq!(evidence.candidates["4"].phase, Some(2));
+        assert_eq!(evidence.candidates["6"].score, None);
     }
 
     #[test]
@@ -4328,6 +4558,14 @@ mod tests {
                 .map(|fixture| fixture.sample_id.clone())
                 .collect::<BTreeSet<_>>()
         );
+        let mut ids = BTreeSet::new();
+        for fixture in &first.fixtures {
+            assert!(ids.insert(fixture.sample_id.clone()));
+            assert_eq!(fixture.audio_sha256.len(), 64);
+            assert_eq!(fixture.pcm_sha256.len(), 64);
+            let bytes = fs::read(root.join(&fixture.audio_file)).unwrap();
+            assert_eq!(hash_bytes(&bytes), fixture.audio_sha256);
+        }
         let report = evaluate_exported_manifest(
             &root.join("manifest.json"),
             &root,
@@ -4371,6 +4609,41 @@ mod tests {
                     && candidate.activation_evidence.is_finite()
                     && candidate.continuity_evidence.is_finite())
         );
+        assert!(evidence.candidates.iter().any(|candidate| {
+            candidate.relation == wotoha_core::beat_analysis::TempoRelation::HalfTime
+                && candidate.available
+        }));
+        assert!(evidence.candidates.iter().any(|candidate| {
+            candidate.relation == wotoha_core::beat_analysis::TempoRelation::DoubleTime
+                && !candidate.available
+        }));
+    }
+
+    #[test]
+    fn neural_diagnostics_preserve_rejection_reasons() {
+        let insufficient = wotoha_core::beat_analysis::NeuralBeatObservations {
+            frame_rate_hz: 50.0,
+            beat_logits: vec![0.0; 2],
+            downbeat_logits: vec![0.0; 2],
+        };
+        let (decoded, diagnostics) =
+            wotoha_core::beat_analysis::diagnose_neural_rhythm(&insufficient, &[]);
+        assert_eq!(decoded, None);
+        assert_eq!(
+            diagnostics.rejection_reason.as_deref(),
+            Some("insufficient_markers")
+        );
+
+        let invalid = wotoha_core::beat_analysis::NeuralBeatObservations {
+            frame_rate_hz: 50.0,
+            beat_logits: vec![f32::NAN; 32],
+            downbeat_logits: vec![0.0; 32],
+        };
+        let (_, diagnostics) = wotoha_core::beat_analysis::diagnose_neural_rhythm(&invalid, &[]);
+        assert_eq!(
+            diagnostics.rejection_reason.as_deref(),
+            Some("invalid_input")
+        );
     }
 
     #[test]
@@ -4411,6 +4684,66 @@ mod tests {
                 .iter()
                 .all(|candidate| candidate.score.is_finite())
         );
+    }
+
+    #[test]
+    fn experimental_tempo_resolver_exposes_family_edges_and_unavailable_aliases() {
+        let spec = spec(
+            "tempo-edge",
+            FixtureFamily::HalfDouble,
+            TempoProfile::Constant { bpm: 180.0 },
+            EventStyle::HatsOnly,
+            4,
+            0,
+            1,
+        );
+        let fixture = generate_fixture(&spec).unwrap();
+        let mut prediction = normalized_prediction(&[0, 333_333, 666_666]);
+        prediction.tempo_hypotheses = vec![NormalizedTempoHypothesis {
+            bpm: 180.0,
+            relative_weight: 1.0,
+            relation: "primary".into(),
+        }];
+        let result = experimental_tempo_resolution(&fixture, &prediction);
+        let family = result
+            .candidates
+            .iter()
+            .map(|candidate| (candidate.relation.as_str(), candidate))
+            .collect::<BTreeMap<_, _>>();
+        assert!(family["half_time"].available);
+        assert!(family["primary"].available);
+        assert!(!family["double_time"].available);
+        assert_eq!(family["double_time"].score, 0.0);
+        assert_eq!(result, experimental_tempo_resolution(&fixture, &prediction));
+    }
+
+    #[test]
+    fn experimental_tempo_resolver_can_return_ambiguity_without_a_winner() {
+        let candidates = vec![
+            ExperimentalTempoCandidate {
+                bpm: 64.0,
+                relation: "half_time".into(),
+                score: 0.80,
+                phase_micros: 0,
+                activation_support: 0.8,
+                coverage: 0.8,
+                periodic_consistency: 0.8,
+                available: true,
+            },
+            ExperimentalTempoCandidate {
+                bpm: 128.0,
+                relation: "primary".into(),
+                score: 0.79,
+                phase_micros: 0,
+                activation_support: 0.79,
+                coverage: 0.79,
+                periodic_consistency: 0.79,
+                available: true,
+            },
+        ];
+        let (selected, ambiguous) = choose_experimental_candidate(&candidates);
+        assert!(ambiguous);
+        assert_eq!(selected, None);
     }
 
     #[test]
@@ -5178,7 +5511,7 @@ mod tests {
             });
             normalized.insert(id.into(), prediction);
         }
-        let metrics = transform_metrics(&specs, &normalized);
+        let metrics = transform_metrics(&specs, &normalized, &BTreeMap::new());
         assert_eq!(metrics["gain"].matched_beats, 3);
         assert_eq!(metrics["gain"].extra_beats, 1);
         assert_eq!(metrics["gain"].mean_beat_displacement_ms, Some(0.0));

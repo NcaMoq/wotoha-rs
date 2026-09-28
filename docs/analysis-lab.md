@@ -44,7 +44,8 @@ alternates, and variable-tempo segments; it is not reduced to one BPM for
 drift fixtures. The default development corpus includes:
 
 - constant tempos from 60 through 180 BPM, including 127.5 BPM;
-- half/double-time and accent ambiguity;
+- half/double-time and accent ambiguity, including 64↔128, 70↔140,
+  75↔150, 80↔160, 85↔170, and 90↔180 BPM families;
 - missing beats and extra off-grid transients;
 - linear ramps of ±0.1%, ±0.25%, ±0.5%, ±1%, ±2%, and ±4%, plus a step/return;
 - kick, snare, hats, attenuated/removed/syncopated kick evidence;
@@ -97,6 +98,19 @@ is useful for fast deterministic fixture iteration. Each fixture is generated,
 hashed, analyzed, and released before the next one. The evaluator has a
 cancellation-aware library entry point and bounded fixture/audio limits.
 
+Run the lab-only tempo-family experiment directly when a standalone artifact
+is useful:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+  cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-tempo --mode hybrid --report /tmp/wotoha-tempo-experiment-v1.json
+```
+
+This report compares the current production hypothesis with independent
+half/native/double candidate evidence. It may return `ambiguous`; it never
+replaces the production tempo label or BeatEvent timeline.
+
 Runs do not use `.wotoha-analysis/` or the production analysis cache. Generated
 manifests, reports, and run directories belong in `/tmp`, `target`, or the
 ignored lab paths.
@@ -110,7 +124,9 @@ Reports are JSON with concise CLI summaries and the following sections:
 `confidence_calibration`, `failure_clusters`, `external`, and `per_track`.
 Metadata also records the evaluator/report versions, split, analyzer mode,
 optional source commit, and Hybrid backend counts (`native_neural` versus
-`classical_fallback`).
+`classical_fallback`). Meter evidence always contains explicit 2-, 3-, 4-,
+and 6-beat candidate slots; an absent raw hypothesis is serialized as
+unavailable rather than being confused with a zero score.
 
 When enabled by the CLI, `backend_comparison` evaluates Hybrid and Classical
 on the same generated audio and records per-fixture deltas and descriptive
@@ -211,7 +227,7 @@ change must be justified by synthetic error, signal-processing rationale,
 public literature, or human validation, and must preserve the existing
 `TrackAnalysisV2` evidence separation and beat-event timeline truth.
 
-The external observation schema remains at version 1 because this pass changes
-evaluation interpretation without changing its JSON shape. The report schema
-is version 2 because aggregate percentile and availability meanings changed;
-old reports must not be compared silently with new reports.
+The external observation schema remains at version 1. The report schema is
+version 3 because meter candidate availability is now explicit in addition to
+the aggregate percentile and availability meanings introduced previously; old
+reports must not be compared silently with new reports.

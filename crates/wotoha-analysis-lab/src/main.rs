@@ -1,8 +1,9 @@
 use std::{env, error::Error, path::PathBuf};
 
 use wotoha_analysis_lab::{
-    AnalyzerMode, EvaluationOptions, ExternalObservationDocument, evaluate_exported_manifest,
-    evaluate_manifest, export_blackbox, generate_default_manifest, load_manifest, write_json,
+    AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
+    TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
+    generate_default_manifest, load_manifest, write_json,
 };
 
 fn main() {
@@ -82,6 +83,37 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             write_json(&evaluate.output, &report)?;
             println!("{}", report.human_summary());
             println!("report={}", evaluate.output.display());
+        }
+        "research-tempo" => {
+            let evaluate = parse_evaluate_args(false, &mut args)?;
+            reject_unknown(args)?;
+            let manifest = if let Some(path) = evaluate.manifest {
+                load_manifest(&path)?
+            } else {
+                generate_default_manifest(0x57_4f_54_4f_48_41)?
+            };
+            let report = evaluate_manifest(
+                &manifest,
+                None,
+                EvaluationOptions {
+                    mode: evaluate.mode,
+                    split: evaluate.split.unwrap_or_else(|| manifest.split.clone()),
+                    source_commit: env::var("WOTOHA_SOURCE_COMMIT").ok(),
+                    include_backend_comparison: true,
+                },
+            )?;
+            write_json(
+                &evaluate.output,
+                &TempoExperimentReportDocument {
+                    schema_version: REPORT_SCHEMA_VERSION,
+                    evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+                    split: report.split,
+                    analyzer_mode: report.analyzer_mode,
+                    source_commit: report.source_commit,
+                    experiment: report.tempo_experiment,
+                },
+            )?;
+            println!("tempo experiment report={}", evaluate.output.display());
         }
         "--help" | "-h" => println!("{}", usage()),
         _ => return Err(usage().into()),
@@ -226,5 +258,5 @@ fn reject_unknown(
 }
 
 fn usage() -> &'static str {
-    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]"
+    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]"
 }
