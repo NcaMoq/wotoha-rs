@@ -158,21 +158,33 @@ required in the report metadata.
 
 The backend oracle is truth-only and cannot select a production backend. It
 reports Always Classical, current Hybrid, Always Neural where native output
-exists, independent beat/tempo/phase oracle choices, and dimension-aware joint
-labels. A backend dominates only with no material regression (1 ms beat MAE,
-5 ms beat p95, or 0.02 precision/recall thresholds) and at least one material
-improvement; otherwise the result is `mixed` or `equal`.
+exists, and separate beat, tempo, and grid-phase oracle summaries. There is no
+single combined oracle score: each dimension selects its own truth-relative
+backend. The dimension-aware joint label is `neural_dominates`,
+`classical_dominates`, `mixed`, `equal`, or `both_invalid`. A backend dominates
+only with no material regression (1 ms beat MAE, 5 ms beat p95, or 0.02
+precision/recall thresholds) and at least one material improvement.
 
-The gate uses only pre-decision diagnostics. Exact PCM duplicates and practical
-base/transform lineages are grouped for validation, with leave-family-out
-folds. Fixture ID, filename, family, transform, expected BPM, and Ground Truth
-are not inference features. Its risk-first threshold search minimizes false
-accepts of bad neural output; zero neural coverage is reported directly as an
-Always Classical result.
+The gate uses only pre-decision diagnostics. Primary validation is deterministic
+leave-one-connected-leakage-group-out cross-validation. Exact PCM hashes and
+base/transform lineage roots are joined transitively into one connected
+partition, with a stable group ID. Every fixture receives exactly one primary
+OOF decision fitted without its group. Each fold reports direct PCM-hash and
+lineage-root overlap checks; both must be empty. Leave-family-out remains a
+secondary stress test. Fixture ID, filename, family, transform, expected BPM,
+PCM hash, and Ground Truth are not inference features. Full-data refit metrics,
+if present, are explicitly non-held-out. Its risk-first threshold search
+minimizes false accepts of bad neural output; zero neural coverage is reported
+directly as an Always Classical result.
 
 Tempo refinement searches a bounded fractional period neighborhood at
 0.1-frame resolution and interpolates activation while jointly searching phase.
-It preserves the current half/native/double relation and changes only a
+Its primary cohort is scalar-tempo fixtures accepted by native neural
+analysis, with raw neural observations and a production neural BPM. Classical
+fallbacks are excluded from the primary cohort and may only appear in a
+separately labeled exploratory section. It preserves the production selection
+family (`selection_relation_before/after`) while truth-relative outcomes
+(`truth_relation_before/after`) are evaluated independently. It changes only a
 research tempo label; production `BeatEvent[]` is never regenerated. Variable
 tempo is excluded from global BPM accuracy. The existing PCM-envelope and
 activation-domain experiments remain diagnostic and are not combined or
@@ -180,9 +192,14 @@ promoted.
 
 Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
 downbeat evidence, off-phase leakage, periodic consistency, bar-cycle
-consistency, and beat-event confidence. A minimum score and margin may return
-`Unknown`; the ambiguous 4/4 fixture is not forced to a guess. The production
-four-phase downbeat prior and production meter resolver remain unchanged.
+consistency, and beat-event confidence. Its primary set is only the `Meter`
+fixture family: explicit `meter_truth` values are clear scored fixtures and
+explicit `meter_truth: null` values are ambiguous. Ordinary 4/4 constant and
+transform fixtures are excluded, and no fixture ID has semantic meaning. A
+minimum score and margin may return `Unknown`. Recovering or failing to recover
+3/4 or 6/8 in this downstream experiment does not by itself prove that the
+upstream four-phase prior is causal; the report records descriptive evidence
+and retains the production prior/resolver unchanged.
 
 ## Metrics and reports
 
@@ -213,7 +230,10 @@ production tempo hypotheses.
 Beat metrics use a deterministic monotonic one-to-one matcher and report MAE,
 p50, p95, and precision/recall at 10, 20, 40, and 70 ms. Per-track percentiles
 remain per-track; overall p50/p95 are pooled over every matched beat error, and
-overall MAE and precision/recall are observation-weighted micro metrics. Tempo
+overall MAE and precision/recall are observation-weighted micro metrics. The
+same canonical pooled/micro aggregator is used for selected-backend research
+baselines, OOF gate results, and the beat oracle; no per-track macro average is
+substituted. Tempo
 metrics retain primary correctness, canonical correct-hypothesis top-N credit,
 relative/absolute error, and explicit canonical/half-time/double-time/
 alternative/absent relation counts. Top-N denominators include only fixtures
@@ -262,10 +282,11 @@ External observer/version ↔ synthetic truth
 Wotoha ↔ External observer/version
 ```
 
-Observer versions are grouped separately rather than silently combined, and
-materially different public analysis settings are separate report groups. The
-report includes total, complete/incomplete, beat, tempo, meter, downbeat, and
-grid-phase observation counts per group. Real
+Observer product, version, platform, and materially different public analysis
+settings are grouped separately rather than silently combined. Platform is
+serialized in every observer report. The report includes total,
+complete/incomplete, beat, tempo, meter, downbeat, and grid-phase observation
+counts per group. Real
 music without exact truth should be labeled `disagreement`, not `error`, and a
 future human review may attach `WotohaCorrect`, `ExternalCorrect`,
 `BothAcceptable`, `Ambiguous`, or `NeitherCorrect`. No Memory Cue training is
@@ -304,9 +325,10 @@ The synthetic corpus schema is version 2 because meter truth is now explicit;
 the external observation schema is version 2 because transferred identity is
 named `wav_file_sha256`; the black-box schema is version 2 for the same explicit
 hash semantics. The report schema is version 6 because neural tempo candidate
-evidence and truth-relative relation fields have candidate-specific semantics;
-old manifests, observations, and reports must not be compared silently with
-new schemas.
+evidence and truth-relative relation fields have candidate-specific semantics.
+Research artifacts use research schema version 2 because their gate, oracle,
+meter, and tempo semantics changed in this audit. Old manifests, observations,
+and reports must not be compared silently with new schemas.
 
 ## Final clean-room handoff
 
