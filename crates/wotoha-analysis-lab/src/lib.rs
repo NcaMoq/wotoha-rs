@@ -2711,6 +2711,7 @@ pub struct TempoExperimentReportDocument {
 pub struct TempoRefinementCase {
     pub sample_id: String,
     pub family: String,
+    pub current_backend: String,
     pub truth_bpm: f32,
     pub current_neural_bpm: Option<f32>,
     pub refined_bpm: Option<f32>,
@@ -2718,6 +2719,7 @@ pub struct TempoRefinementCase {
     pub refined_absolute_error_bpm: Option<f32>,
     pub relation_before: String,
     pub relation_after: String,
+    pub refined_truth_relation: String,
     pub refinement: Option<FractionalTempoRefinement>,
 }
 
@@ -6156,13 +6158,19 @@ fn build_tempo_refinement_report(
         cases.push(TempoRefinementCase {
             sample_id: fixture.sample_id.clone(),
             family: fixture.family.clone(),
+            current_backend: current_backend.clone(),
             truth_bpm,
             current_neural_bpm: fixture.current_primary_bpm,
             refined_bpm,
             current_absolute_error_bpm: current_error,
             refined_absolute_error_bpm: refined_error,
-            relation_before: format!("{} ({current_backend})", current_relation),
-            relation_after: refined_relation,
+            relation_before: current_relation.clone(),
+            // The first experiment explicitly preserves the current octave
+            // family. The truth-relative refined label is reported
+            // separately so an in-family numerical miss cannot masquerade as
+            // a new half/double decision.
+            relation_after: current_relation,
+            refined_truth_relation: refined_relation,
             refinement: fractional_refinement,
         });
     }
