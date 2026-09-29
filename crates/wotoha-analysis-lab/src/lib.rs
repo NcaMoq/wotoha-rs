@@ -24,7 +24,7 @@ use wotoha_core::{
 
 pub const LAB_SCHEMA_VERSION: u32 = 2;
 pub const OBSERVATION_SCHEMA_VERSION: u32 = 2;
-pub const REPORT_SCHEMA_VERSION: u32 = 5;
+pub const REPORT_SCHEMA_VERSION: u32 = 6;
 pub const BLACKBOX_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
@@ -89,7 +89,7 @@ impl fmt::Display for LabError {
                 actual,
             } => write!(
                 f,
-                "audio SHA-256 mismatch for {sample_id}: expected {expected}, actual {actual}"
+                "artifact SHA-256 mismatch for {sample_id}: expected {expected}, actual {actual}"
             ),
             Self::UnknownSample(sample_id) => write!(
                 f,
@@ -279,7 +279,7 @@ pub struct FixtureRecord {
     pub audio_sha256: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FixtureSpec {
     pub id: String,
     pub family: FixtureFamily,
@@ -290,13 +290,68 @@ pub struct FixtureSpec {
     pub meter: u8,
     /// Evaluation truth is explicit and may intentionally be unknown even
     /// when synthesis uses a valid meter for pulse placement.
-    #[serde(default)]
     pub meter_truth: Option<u8>,
     pub tempo: TempoProfile,
     pub event_style: EventStyle,
     pub transform: TransformKind,
     pub base_id: Option<String>,
     pub seed: u64,
+}
+
+impl<'de> Deserialize<'de> for FixtureSpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            id: String,
+            family: FixtureFamily,
+            duration_micros: u64,
+            sample_rate: u32,
+            channels: u8,
+            lead_in_micros: u64,
+            meter: u8,
+            // `Option<Option<T>>` preserves the distinction between an
+            // omitted field and an explicit JSON null.
+            #[serde(default, deserialize_with = "deserialize_nullable_presence")]
+            meter_truth: Option<Option<u8>>,
+            tempo: TempoProfile,
+            event_style: EventStyle,
+            transform: TransformKind,
+            base_id: Option<String>,
+            seed: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let meter_truth = wire.meter_truth.ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "schema-v2 fixture spec requires an explicit meter_truth field",
+            )
+        })?;
+        Ok(Self {
+            id: wire.id,
+            family: wire.family,
+            duration_micros: wire.duration_micros,
+            sample_rate: wire.sample_rate,
+            channels: wire.channels,
+            lead_in_micros: wire.lead_in_micros,
+            meter: wire.meter,
+            meter_truth,
+            tempo: wire.tempo,
+            event_style: wire.event_style,
+            transform: wire.transform,
+            base_id: wire.base_id,
+            seed: wire.seed,
+        })
+    }
+}
+
+fn deserialize_nullable_presence<'de, D>(deserializer: D) -> Result<Option<Option<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<u8>::deserialize(deserializer)?))
 }
 
 impl FixtureSpec {
@@ -1545,6 +1600,20 @@ pub fn evaluate_exported_manifest(
     let blackbox = BlackboxManifest::load(manifest_path)?;
     let mut records = Vec::with_capacity(blackbox.fixtures.len());
     let mut audio_overrides = BTreeMap::new();
+    let external_identities = blackbox
+        .fixtures
+        .iter()
+        .map(|fixture| {
+            (
+                fixture.sample_id.clone(),
+                ExternalIdentity {
+                    wav_file_sha256: fixture.audio_sha256.clone(),
+                    pcm_sha256: fixture.pcm_sha256.clone(),
+                    ground_truth_sha256: fixture.ground_truth_sha256.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for fixture in &blackbox.fixtures {
         let path = audio_root.join(&fixture.audio_file);
         let bytes = fs::read(&path)?;
@@ -1587,12 +1656,13 @@ pub fn evaluate_exported_manifest(
         seed: blackbox.seed,
         fixtures: records,
     };
-    evaluate_manifest_with_audio(
+    evaluate_manifest_with_context(
         &manifest,
         external,
         options,
         &AtomicBool::new(false),
         Some(&audio_overrides),
+        Some(&external_identities),
     )
 }
 
@@ -2021,6 +2091,11 @@ impl ExternalObservationDocument {
         for observation in &self.observations {
             if observation.schema_version != OBSERVATION_SCHEMA_VERSION
                 || observation.sample_id.trim().is_empty()
+                || observation.audio_file.is_none()
+                || !observation
+                    .audio_file
+                    .as_deref()
+                    .is_some_and(is_safe_relative_path)
                 || observation.audio_sha256.len() != 64
                 || !observation
                     .audio_sha256
@@ -2047,10 +2122,11 @@ impl ExternalObservationDocument {
             }
             let settings_key = observation_settings_key(&observation.analysis_settings);
             let record_key = format!(
-                "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
                 observation.sample_id,
                 observation.observer.product,
                 observation.observer.version,
+                observation.observer.platform.as_deref().unwrap_or(""),
                 settings_key
             );
             if !records.insert(record_key) {
@@ -2574,6 +2650,7 @@ pub struct BackendFixtureComparison {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BackendMetricSnapshot {
     pub beat_mae_ms: Option<f64>,
+    pub beat_p50_ms: Option<f64>,
     pub beat_p95_ms: Option<f64>,
     pub precision_at_40ms: Option<f64>,
     pub recall_at_40ms: Option<f64>,
@@ -2630,6 +2707,60 @@ pub struct TempoExperimentReportDocument {
     pub experiment: ExperimentalTempoReport,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoRefinementCase {
+    pub sample_id: String,
+    pub family: String,
+    pub truth_bpm: f32,
+    pub current_neural_bpm: Option<f32>,
+    pub refined_bpm: Option<f32>,
+    pub current_absolute_error_bpm: Option<f32>,
+    pub refined_absolute_error_bpm: Option<f32>,
+    pub relation_before: String,
+    pub relation_after: String,
+    pub refinement: Option<FractionalTempoRefinement>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TempoRefinementGroupSummary {
+    pub tracks: usize,
+    pub current_mean_absolute_error_bpm: Option<f64>,
+    pub refined_mean_absolute_error_bpm: Option<f64>,
+    pub current_correct: usize,
+    pub refined_correct: usize,
+    pub half_time_count: usize,
+    pub double_time_count: usize,
+    pub other_wrong_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoRefinementReport {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub source_commit: Option<String>,
+    pub algorithm: String,
+    pub fractional_resolution_frames: f32,
+    pub applicable_scalar_tracks: usize,
+    pub current_neural_mean_absolute_error_bpm: Option<f64>,
+    pub refined_mean_absolute_error_bpm: Option<f64>,
+    pub refined_median_absolute_error_bpm: Option<f64>,
+    pub refined_p95_absolute_error_bpm: Option<f64>,
+    pub current_canonical_correctness: usize,
+    pub refined_canonical_correctness: usize,
+    pub current_half_time_count: usize,
+    pub refined_half_time_count: usize,
+    pub current_double_time_count: usize,
+    pub refined_double_time_count: usize,
+    pub refined_other_wrong_count: usize,
+    pub by_fixture_family: BTreeMap<String, TempoRefinementGroupSummary>,
+    pub required_cases: BTreeMap<String, TempoRefinementCase>,
+    pub per_fixture: Vec<TempoRefinementCase>,
+    pub variable_tempo_excluded_from_global_bpm: bool,
+    pub beat_events_changed: bool,
+    pub production_recommendation: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExperimentalTempoFamilySummary {
     pub tracks: usize,
@@ -2656,6 +2787,9 @@ pub struct ExperimentalTempoFixture {
     pub activation_relation_to_truth: Option<String>,
     pub pcm: ExperimentalTempoResolution,
     pub activation: Option<ActivationTempoResolution>,
+    pub fractional_refinement: Option<FractionalTempoRefinement>,
+    #[serde(skip)]
+    raw_observations: Option<wotoha_core::beat_analysis::NeuralBeatObservations>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2703,10 +2837,28 @@ pub struct ActivationTempoCandidate {
     pub candidate_score: f32,
 }
 
+/// Research-only sub-frame tempo refinement. It changes a tempo label only;
+/// it never supplies replacement BeatEvent timestamps to production analysis.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FractionalTempoRefinement {
+    pub selected_bpm: Option<f32>,
+    pub selected_period_frames: Option<f32>,
+    pub selected_phase_frames: Option<f32>,
+    pub relation: String,
+    pub score: f32,
+    pub activation_support: f32,
+    pub coverage: f32,
+    pub off_grid_leakage: f32,
+    pub periodic_consistency: f32,
+    pub phase_stability: f32,
+    pub resolution_frames: f32,
+}
+
 #[derive(Clone, Debug, Default)]
 struct TempoResolverResults {
     pcm: ExperimentalTempoResolution,
     activation: Option<ActivationTempoResolution>,
+    raw_observations: Option<wotoha_core::beat_analysis::NeuralBeatObservations>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2958,12 +3110,42 @@ pub fn evaluate_manifest_with_audio(
     cancelled: &AtomicBool,
     audio_overrides: Option<&BTreeMap<String, Vec<f32>>>,
 ) -> Result<EvaluationReport, LabError> {
+    evaluate_manifest_with_context(
+        manifest,
+        external,
+        options,
+        cancelled,
+        audio_overrides,
+        None,
+    )
+}
+
+#[derive(Clone, Debug)]
+struct ExternalIdentity {
+    wav_file_sha256: String,
+    pcm_sha256: String,
+    ground_truth_sha256: String,
+}
+
+fn evaluate_manifest_with_context(
+    manifest: &SyntheticCorpusManifest,
+    external: Option<&ExternalObservationDocument>,
+    options: EvaluationOptions,
+    cancelled: &AtomicBool,
+    audio_overrides: Option<&BTreeMap<String, Vec<f32>>>,
+    external_identities: Option<&BTreeMap<String, ExternalIdentity>>,
+) -> Result<EvaluationReport, LabError> {
     if audio_overrides.is_some() {
         manifest.validate_structure()?;
     } else {
         manifest.validate()?;
     }
     if let Some(external) = external {
+        if external_identities.is_none() {
+            return Err(LabError::InvalidInput(
+                "external observations are exported-WAV-only; use evaluate-exported with a BlackboxManifest".into(),
+            ));
+        }
         external.validate()?;
     }
     let mut tracks = Vec::with_capacity(manifest.fixtures.len());
@@ -3026,15 +3208,16 @@ pub fn evaluate_manifest_with_audio(
         }
         normalized_by_id.insert(record.spec.id.clone(), wotoha.clone());
         backends_by_id.insert(record.spec.id.clone(), analysis_backend.to_owned());
-        experimental_results.insert(
-            record.spec.id.clone(),
+        experimental_results.insert(record.spec.id.clone(), {
+            let activation = activation_observations.as_ref().and_then(|observations| {
+                activation_tempo_resolution(observations, primary_tempo_bpm(&wotoha))
+            });
             TempoResolverResults {
                 pcm: experimental_tempo_resolution(&fixture, &wotoha),
-                activation: activation_observations.as_ref().and_then(|observations| {
-                    activation_tempo_resolution(observations, primary_tempo_bpm(&wotoha))
-                }),
-            },
-        );
+                activation,
+                raw_observations: activation_observations.clone(),
+            }
+        });
         let metrics = metrics_for(&record.truth, &wotoha);
         let failures = failure_clusters(&record.truth, &wotoha, &metrics);
         tracks.push(TrackEvaluation {
@@ -3089,7 +3272,7 @@ pub fn evaluate_manifest_with_audio(
     let analyzer_mode = options.mode;
     let source_commit = options.source_commit;
     let external_report = external
-        .map(|document| compare_external(document, manifest, &tracks))
+        .map(|document| compare_external(document, manifest, &tracks, external_identities))
         .transpose()?
         .unwrap_or_default();
     Ok(EvaluationReport {
@@ -3193,6 +3376,598 @@ fn meter_evidence(prediction: &NormalizedAnalysis) -> MeterEvidenceReport {
             .copied()
             .reduce(f32::max),
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeterPhaseCandidateResearch {
+    pub meter: u8,
+    pub phase: u8,
+    pub target_phase_downbeat_evidence: f32,
+    pub off_phase_downbeat_leakage: f32,
+    pub accent_periodic_consistency: f32,
+    pub bar_cycle_consistency: f32,
+    pub beat_event_confidence: f32,
+    pub score: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeterResearchFixture {
+    pub sample_id: String,
+    pub truth: Option<u8>,
+    pub current_resolved_meter: Option<u8>,
+    pub experimental_resolved_meter: Option<u8>,
+    pub current_hypotheses: BTreeMap<String, MeterCandidateEvidence>,
+    pub experimental_candidates: Vec<MeterPhaseCandidateResearch>,
+    pub best_score: Option<f32>,
+    pub runner_up_score: Option<f32>,
+    pub margin: Option<f32>,
+    pub unknown_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MeterResearchReport {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub source_commit: Option<String>,
+    pub candidate_meters: Vec<u8>,
+    pub candidate_count: usize,
+    pub clear_fixture_count: usize,
+    pub current_clear_correct: usize,
+    pub current_clear_unknown: usize,
+    pub current_clear_wrong: usize,
+    pub experimental_clear_correct: usize,
+    pub experimental_clear_unknown: usize,
+    pub experimental_clear_wrong: usize,
+    pub ambiguous_fixture: Option<MeterResearchFixture>,
+    pub four_phase_prior_remaining_blocker: bool,
+    pub per_fixture: Vec<MeterResearchFixture>,
+    pub production_recommendation: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FailureLineageRecord {
+    pub sample_id: String,
+    pub production_backend: String,
+    pub classical_core_valid: bool,
+    pub neural_core_valid: bool,
+    pub backend_outcome: String,
+    pub tempo_issue: String,
+    pub beat_issue: String,
+    pub meter_issue: String,
+    pub research_gate_decision: String,
+    pub oracle_decision: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchSummary {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub source_commit: Option<String>,
+    pub starting_commit: Option<String>,
+    pub corpus_seed: u64,
+    pub fixture_count: usize,
+    pub current_classical: ResearchBackendSummary,
+    pub current_hybrid: ResearchBackendSummary,
+    pub backend_outcome_counts: BTreeMap<String, usize>,
+    pub oracle_joint_outcome_counts: BTreeMap<String, usize>,
+    pub gate_production_recommendation: String,
+    pub tempo_refinement_production_recommendation: String,
+    pub meter_production_recommendation: String,
+    pub old_pcm_experiment_primary_correct: usize,
+    pub old_activation_experiment_primary_correct: usize,
+    pub failure_lineage: Vec<FailureLineageRecord>,
+    pub scope_guarantees: Vec<String>,
+}
+
+fn meter_phase_candidate(
+    prediction: &NormalizedAnalysis,
+    meter: u8,
+    phase: u8,
+) -> MeterPhaseCandidateResearch {
+    let mut target = Vec::new();
+    let mut off_phase = Vec::new();
+    let mut target_confidence = Vec::new();
+    for (index, beat) in prediction.beats.iter().enumerate() {
+        if index % usize::from(meter) == usize::from(phase) {
+            target.push(beat.downbeat_evidence.unwrap_or_default());
+            target_confidence.push(beat.timing_confidence);
+        } else {
+            off_phase.push(beat.downbeat_evidence.unwrap_or_default());
+        }
+    }
+    let target_evidence = mean_f32(&target);
+    let leakage = mean_f32(&off_phase).unwrap_or_default();
+    let target_mean = target_evidence.unwrap_or_default();
+    let periodic = if target.len() > 1 {
+        let mean = target_mean;
+        (1.0 - target.iter().map(|value| (value - mean).abs()).sum::<f32>() / target.len() as f32)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let bar_cycle = if target.len() >= 2 && prediction.beats.len() >= usize::from(meter) * 2 {
+        let first = target.iter().step_by(2).copied().collect::<Vec<_>>();
+        let second = target
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .copied()
+            .collect::<Vec<_>>();
+        (1.0 - (mean_f32(&first).unwrap_or_default() - mean_f32(&second).unwrap_or_default()).abs())
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let confidence = mean_f32(&target_confidence).unwrap_or_default();
+    let score =
+        (target_mean - 1.80 * leakage + 0.20 * periodic + 0.15 * bar_cycle + 0.10 * confidence)
+            .max(-1.0);
+    MeterPhaseCandidateResearch {
+        meter,
+        phase,
+        target_phase_downbeat_evidence: target_mean,
+        off_phase_downbeat_leakage: leakage,
+        accent_periodic_consistency: periodic,
+        bar_cycle_consistency: bar_cycle,
+        beat_event_confidence: confidence,
+        score,
+    }
+}
+
+fn mean_f32(values: &[f32]) -> Option<f32> {
+    (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
+}
+
+fn experimental_meter_resolution(
+    prediction: &NormalizedAnalysis,
+) -> (
+    Option<u8>,
+    Vec<MeterPhaseCandidateResearch>,
+    Option<f32>,
+    Option<String>,
+) {
+    let mut candidates = Vec::new();
+    for meter in [2_u8, 3, 4, 6] {
+        for phase in 0..meter {
+            candidates.push(meter_phase_candidate(prediction, meter, phase));
+        }
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.meter.cmp(&right.meter))
+            .then_with(|| left.phase.cmp(&right.phase))
+    });
+    let best = candidates.first();
+    let runner_up = candidates.get(1);
+    let margin = best
+        .zip(runner_up)
+        .map(|(best, runner)| best.score - runner.score);
+    let unknown_reason = if best.is_none() {
+        Some("no beat events".into())
+    } else if best.is_some_and(|candidate| candidate.score < 0.18) {
+        Some("best meter×phase score below minimum".into())
+    } else if margin.is_some_and(|value| value < 0.04) {
+        Some("meter×phase candidates are too close".into())
+    } else {
+        None
+    };
+    let resolved = unknown_reason.is_none().then(|| best.unwrap().meter);
+    (resolved, candidates, margin, unknown_reason)
+}
+
+fn build_meter_research(
+    report: &EvaluationReport,
+    source_commit: Option<String>,
+) -> MeterResearchReport {
+    let mut per_fixture = Vec::new();
+    let mut clear_fixture_count = 0;
+    let mut current_clear_correct = 0;
+    let mut current_clear_unknown = 0;
+    let mut current_clear_wrong = 0;
+    let mut experimental_clear_correct = 0;
+    let mut experimental_clear_unknown = 0;
+    let mut experimental_clear_wrong = 0;
+    let mut ambiguous_fixture = None;
+    for track in &report.per_track {
+        let (experimental, candidates, margin, unknown_reason) =
+            experimental_meter_resolution(&track.wotoha);
+        let best_score = candidates.first().map(|candidate| candidate.score);
+        let runner_up_score = candidates.get(1).map(|candidate| candidate.score);
+        let fixture = MeterResearchFixture {
+            sample_id: track.sample_id.clone(),
+            truth: track.truth.meter,
+            current_resolved_meter: track.meter_evidence.resolved_meter,
+            experimental_resolved_meter: experimental,
+            current_hypotheses: track.meter_evidence.candidates.clone(),
+            experimental_candidates: candidates,
+            best_score,
+            runner_up_score,
+            margin,
+            unknown_reason,
+        };
+        if track.truth.meter.is_none() {
+            if track.sample_id == "meter-ambiguous-4-4" {
+                ambiguous_fixture = Some(fixture.clone());
+            }
+        } else {
+            clear_fixture_count += 1;
+            match track.meter_evidence.resolved_meter {
+                Some(value) if Some(value) == track.truth.meter => current_clear_correct += 1,
+                None => current_clear_unknown += 1,
+                Some(_) => current_clear_wrong += 1,
+            }
+            match experimental {
+                Some(value) if Some(value) == track.truth.meter => experimental_clear_correct += 1,
+                None => experimental_clear_unknown += 1,
+                Some(_) => experimental_clear_wrong += 1,
+            }
+        }
+        per_fixture.push(fixture);
+    }
+    let four_phase_prior_remaining_blocker = per_fixture.iter().any(|fixture| {
+        matches!(fixture.truth, Some(3 | 6))
+            && fixture.experimental_resolved_meter == fixture.truth
+            && fixture.current_resolved_meter != fixture.truth
+    });
+    per_fixture.sort_by(|left, right| left.sample_id.cmp(&right.sample_id));
+    MeterResearchReport {
+        schema_version: 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        split: report.split.clone(),
+        source_commit,
+        candidate_meters: vec![2, 3, 4, 6],
+        candidate_count: 2 + 3 + 4 + 6,
+        clear_fixture_count,
+        current_clear_correct,
+        current_clear_unknown,
+        current_clear_wrong,
+        experimental_clear_correct,
+        experimental_clear_unknown,
+        experimental_clear_wrong,
+        ambiguous_fixture,
+        four_phase_prior_remaining_blocker,
+        per_fixture,
+        production_recommendation:
+            "do-not-promote: contrastive meter×phase scorer remains research-only".into(),
+    }
+}
+
+fn lineage_group_map(blackbox: &BlackboxManifest) -> BTreeMap<String, String> {
+    let parents = blackbox
+        .fixtures
+        .iter()
+        .map(|fixture| (fixture.sample_id.clone(), fixture.spec.base_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    blackbox
+        .fixtures
+        .iter()
+        .map(|fixture| {
+            let mut current = fixture.sample_id.clone();
+            let mut seen = BTreeSet::new();
+            while let Some(Some(parent)) = parents.get(&current) {
+                if !seen.insert(current.clone()) {
+                    break;
+                }
+                current = parent.clone();
+            }
+            (fixture.sample_id.clone(), current)
+        })
+        .collect()
+}
+
+fn build_failure_lineage(
+    report: &EvaluationReport,
+    oracle: &BackendOracleReport,
+    gate: &GateResearchReport,
+    tempo: &TempoRefinementReport,
+) -> Vec<FailureLineageRecord> {
+    let oracle_by_id = oracle
+        .per_fixture
+        .iter()
+        .map(|item| (item.sample_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let gate_by_id = gate
+        .per_fixture
+        .iter()
+        .map(|item| (item.sample_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let tempo_by_id = tempo
+        .per_fixture
+        .iter()
+        .map(|item| (item.sample_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .filter_map(|comparison| {
+            let track = report
+                .per_track
+                .iter()
+                .find(|track| track.sample_id == comparison.sample_id)?;
+            let tempo_issue = tempo_by_id
+                .get(comparison.sample_id.as_str())
+                .map(|tempo| {
+                    match tempo
+                        .relation_before
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("none")
+                    {
+                        "half_time" => "half_time",
+                        "double_time" => "double_time",
+                        "primary"
+                            if tempo.current_absolute_error_bpm.unwrap_or_default() > 0.25 =>
+                        {
+                            "frame_quantization"
+                        }
+                        "primary" | "none" => "none",
+                        _ => "other",
+                    }
+                })
+                .unwrap_or("none")
+                .into();
+            let beat_issue = if track.metrics.beat.predicted == 0 {
+                "missing"
+            } else if track.metrics.beat.truth == 0 {
+                "extra"
+            } else if track.metrics.beat.mae_ms.unwrap_or_default() > 10.0 {
+                "timing"
+            } else {
+                "none"
+            }
+            .into();
+            let meter_issue =
+                if track.truth.meter.is_some() && track.metrics.meter.status != "correct" {
+                    track.metrics.meter.status.clone()
+                } else {
+                    "none".into()
+                };
+            let gate_decision = gate_by_id
+                .get(comparison.sample_id.as_str())
+                .map(|row| {
+                    if row.neural_available && row.diagnostic_score >= gate.candidate_threshold {
+                        "neural"
+                    } else {
+                        "classical"
+                    }
+                })
+                .unwrap_or("classical")
+                .into();
+            Some(FailureLineageRecord {
+                sample_id: comparison.sample_id.clone(),
+                production_backend: comparison.hybrid_backend.clone(),
+                classical_core_valid: comparison.classical.core_valid,
+                neural_core_valid: comparison.hybrid_backend == "native_neural"
+                    && comparison.hybrid.core_valid,
+                backend_outcome: comparison.outcome.clone(),
+                tempo_issue,
+                beat_issue,
+                meter_issue,
+                research_gate_decision: gate_decision,
+                oracle_decision: oracle_by_id
+                    .get(comparison.sample_id.as_str())
+                    .map(|item| item.joint_dominance.clone())
+                    .unwrap_or_else(|| "unknown".into()),
+            })
+        })
+        .collect()
+}
+
+pub fn run_ground_truth_research(
+    manifest_path: &Path,
+    audio_root: &Path,
+    output_dir: &Path,
+    source_commit: String,
+    starting_commit: Option<String>,
+) -> Result<ResearchSummary, LabError> {
+    let blackbox = BlackboxManifest::load(manifest_path)?;
+    fs::create_dir_all(output_dir)?;
+    let hybrid = evaluate_exported_manifest(
+        manifest_path,
+        audio_root,
+        None,
+        EvaluationOptions {
+            mode: AnalyzerMode::Hybrid,
+            split: blackbox.split.clone(),
+            source_commit: Some(source_commit.clone()),
+            include_backend_comparison: true,
+        },
+    )?;
+    let classical = evaluate_exported_manifest(
+        manifest_path,
+        audio_root,
+        None,
+        EvaluationOptions {
+            mode: AnalyzerMode::Classical,
+            split: blackbox.split.clone(),
+            source_commit: Some(source_commit.clone()),
+            include_backend_comparison: false,
+        },
+    )?;
+    write_json(&output_dir.join("current-classical.json"), &classical)?;
+    write_json(&output_dir.join("current-hybrid.json"), &hybrid)?;
+    let mut oracle = build_backend_oracle(&hybrid, Some(source_commit.clone()));
+    oracle.always_classical = summary_from_group_metrics(&classical.overall);
+    oracle.current_hybrid = summary_from_group_metrics(&hybrid.overall);
+    write_json(&output_dir.join("backend-oracle.json"), &oracle)?;
+    let pcm_groups = blackbox
+        .fixtures
+        .iter()
+        .map(|fixture| (fixture.sample_id.clone(), fixture.pcm_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let lineage_groups = lineage_group_map(&blackbox);
+    let mut gate = build_gate_research(
+        &hybrid,
+        &pcm_groups,
+        &lineage_groups,
+        Some(source_commit.clone()),
+    );
+    gate.always_classical = summary_from_group_metrics(&classical.overall);
+    gate.current_hybrid = summary_from_group_metrics(&hybrid.overall);
+    write_json(&output_dir.join("gate-research.json"), &gate)?;
+    let tempo = build_tempo_refinement_report(&hybrid, Some(source_commit.clone()));
+    write_json(&output_dir.join("tempo-refinement.json"), &tempo)?;
+    let meter = build_meter_research(&hybrid, Some(source_commit.clone()));
+    write_json(&output_dir.join("meter-research.json"), &meter)?;
+    let failure_lineage = build_failure_lineage(&hybrid, &oracle, &gate, &tempo);
+    let summary = ResearchSummary {
+        schema_version: 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        split: hybrid.split.clone(),
+        source_commit: Some(source_commit.clone()),
+        starting_commit,
+        corpus_seed: blackbox.seed,
+        fixture_count: blackbox.fixtures.len(),
+        current_classical: oracle.always_classical.clone(),
+        current_hybrid: oracle.current_hybrid.clone(),
+        backend_outcome_counts: hybrid.backend_comparison.outcome_counts.clone(),
+        oracle_joint_outcome_counts: oracle.joint_outcome_counts.clone(),
+        gate_production_recommendation: gate.production_recommendation.clone(),
+        tempo_refinement_production_recommendation: tempo.production_recommendation.clone(),
+        meter_production_recommendation: meter.production_recommendation.clone(),
+        old_pcm_experiment_primary_correct: hybrid
+            .tempo_experiment
+            .experimental_primary_correct_count,
+        old_activation_experiment_primary_correct: hybrid
+            .tempo_experiment
+            .activation_primary_correct_count,
+        failure_lineage,
+        scope_guarantees: vec![
+            "production Hybrid gate unchanged".into(),
+            "production BeatEvent timing unchanged".into(),
+            "production tempo and meter resolvers unchanged".into(),
+            "research algorithms are not production-callable".into(),
+            "Traktor binary and proprietary resources were not inspected".into(),
+            "Rekordbox automatic analysis was not used".into(),
+            "reports and WAVs remain outside Git and Docker".into(),
+        ],
+    };
+    write_json(&output_dir.join("research-summary.json"), &summary)?;
+    let markdown = research_summary_markdown(&summary, &oracle, &gate, &tempo, &meter);
+    fs::write(output_dir.join("research-summary.md"), markdown)?;
+    Ok(summary)
+}
+
+fn research_summary_markdown(
+    summary: &ResearchSummary,
+    oracle: &BackendOracleReport,
+    gate: &GateResearchReport,
+    tempo: &TempoRefinementReport,
+    meter: &MeterResearchReport,
+) -> String {
+    format!(
+        "# Wotoha ground-truth analyzer research\n\nSource commit: `{}`\nStarting commit: `{}`\nCorpus: {} exported WAV fixtures, seed `{}`\n\n## Decision\n\nAlways Classical is the first-class null hypothesis. The gate recommendation is **{}**. Tempo refinement: **{}**. Meter scorer: **{}**.\n\n## Current baselines\n\n| Backend | beat MAE ms | beat p50 ms | beat p95 ms | P@40 | R@40 | tempo | grid phase |\n|---|---:|---:|---:|---:|---:|---:|---:|\n| Always Classical | {:?} | {:?} | {:?} | {:?} | {:?} | {}/{} ({:?}) | {}/{} ({:?}) |\n| Current Hybrid | {:?} | {:?} | {:?} | {:?} | {:?} | {}/{} ({:?}) | {}/{} ({:?}) |\n| Always Neural when available | {:?} | {:?} | {:?} | {:?} | {:?} | {}/{} ({:?}) | {}/{} ({:?}) |\n| Truth beat oracle | {:?} | {:?} | {:?} | {:?} | {:?} | — | — |\n\nBackend outcomes: {:?}\nOracle joint outcomes: {:?}\nNeural-dominant fixtures: {:?}\nClassical-dominant fixtures: {:?}\n\n## Gate research\n\nFeatures: {:?}\nGrouping: {}\nExact PCM duplicate leakage across folds: {}\nCandidate threshold: {:.4}\nCandidate neural coverage: {}\nCandidate native regression count: {}\nCandidate Classical fallback/use count: {}\nCandidate beat MAE/p50/p95: {:?}/{:?}/{:?}\nCandidate P@40/R@40: {:?}/{:?}\nCandidate tempo: {}/{} ({:?})\nCandidate grid phase: {}/{} ({:?})\nValidation folds: {} grouped, {} leave-family-out\nRecommendation: {}\n\n## Fractional tempo refinement\n\nAlgorithm: {}\nResolution: {:.2} frame\nCurrent MAE: {:?}; refined MAE: {:?}; refined median/p95: {:?}/{:?}\nCanonical correctness current/refined: {}/{}\nHalf-time current/refined: {}/{}; double-time current/refined: {}/{}; refined other-wrong: {}\nRequired cases are recorded in `tempo-refinement.json`. Variable-tempo fixtures are excluded from global BPM accuracy; BeatEvent timing is unchanged by construction.\nRecommendation: {}\n\n## Meter×phase\n\nClear fixtures current correct/unknown/wrong: {}/{}/{}\nExperimental clear fixtures correct/unknown/wrong: {}/{}/{}\nAmbiguous fixture: {:?}\nFour-phase prior appears to remain a blocker: {}\nCandidate count: {}\nRecommendation: {}\n\n## Old experiments\n\nPCM resolver correct: {}; activation resolver correct: {}. They remain diagnostic only and are not promoted.\n\n## Scope guarantees\n\n{}\n",
+        summary.source_commit.as_deref().unwrap_or("null"),
+        summary.starting_commit.as_deref().unwrap_or("unknown"),
+        summary.fixture_count,
+        summary.corpus_seed,
+        gate.production_recommendation,
+        tempo.production_recommendation,
+        meter.production_recommendation,
+        oracle.always_classical.beat_mae_ms,
+        oracle.always_classical.beat_p50_ms,
+        oracle.always_classical.beat_p95_ms,
+        oracle.always_classical.precision_at_40ms,
+        oracle.always_classical.recall_at_40ms,
+        oracle.always_classical.tempo_correct,
+        oracle.always_classical.tempo_scored,
+        oracle.always_classical.tempo_accuracy,
+        oracle.always_classical.grid_phase_correct,
+        oracle.always_classical.grid_phase_scored,
+        oracle.always_classical.grid_phase_accuracy,
+        oracle.current_hybrid.beat_mae_ms,
+        oracle.current_hybrid.beat_p50_ms,
+        oracle.current_hybrid.beat_p95_ms,
+        oracle.current_hybrid.precision_at_40ms,
+        oracle.current_hybrid.recall_at_40ms,
+        oracle.current_hybrid.tempo_correct,
+        oracle.current_hybrid.tempo_scored,
+        oracle.current_hybrid.tempo_accuracy,
+        oracle.current_hybrid.grid_phase_correct,
+        oracle.current_hybrid.grid_phase_scored,
+        oracle.current_hybrid.grid_phase_accuracy,
+        oracle.always_neural_where_available.beat_mae_ms,
+        oracle.always_neural_where_available.beat_p50_ms,
+        oracle.always_neural_where_available.beat_p95_ms,
+        oracle.always_neural_where_available.precision_at_40ms,
+        oracle.always_neural_where_available.recall_at_40ms,
+        oracle.always_neural_where_available.tempo_correct,
+        oracle.always_neural_where_available.tempo_scored,
+        oracle.always_neural_where_available.tempo_accuracy,
+        oracle.always_neural_where_available.grid_phase_correct,
+        oracle.always_neural_where_available.grid_phase_scored,
+        oracle.always_neural_where_available.grid_phase_accuracy,
+        oracle.truth_oracle_upper_bound.beat_mae_ms,
+        oracle.truth_oracle_upper_bound.beat_p50_ms,
+        oracle.truth_oracle_upper_bound.beat_p95_ms,
+        oracle.truth_oracle_upper_bound.precision_at_40ms,
+        oracle.truth_oracle_upper_bound.recall_at_40ms,
+        summary.backend_outcome_counts,
+        summary.oracle_joint_outcome_counts,
+        oracle.neural_dominates,
+        oracle.classical_dominates,
+        gate.feature_names,
+        gate.validation_grouping,
+        gate.exact_pcm_duplicate_leakage,
+        gate.candidate_threshold,
+        gate.candidate_gate_neural_coverage,
+        gate.candidate_gate_native_regression_count,
+        gate.candidate_gate_fallback_use_classical_count,
+        gate.candidate_gate.beat_mae_ms,
+        gate.candidate_gate.beat_p50_ms,
+        gate.candidate_gate.beat_p95_ms,
+        gate.candidate_gate.precision_at_40ms,
+        gate.candidate_gate.recall_at_40ms,
+        gate.candidate_gate.tempo_correct,
+        gate.candidate_gate.tempo_scored,
+        gate.candidate_gate.tempo_accuracy,
+        gate.candidate_gate.grid_phase_correct,
+        gate.candidate_gate.grid_phase_scored,
+        gate.candidate_gate.grid_phase_accuracy,
+        gate.validation_folds.len(),
+        gate.leave_family_out_folds.len(),
+        gate.production_recommendation,
+        tempo.algorithm,
+        tempo.fractional_resolution_frames,
+        tempo.current_neural_mean_absolute_error_bpm,
+        tempo.refined_mean_absolute_error_bpm,
+        tempo.refined_median_absolute_error_bpm,
+        tempo.refined_p95_absolute_error_bpm,
+        tempo.current_canonical_correctness,
+        tempo.refined_canonical_correctness,
+        tempo.current_half_time_count,
+        tempo.refined_half_time_count,
+        tempo.current_double_time_count,
+        tempo.refined_double_time_count,
+        tempo.refined_other_wrong_count,
+        tempo.production_recommendation,
+        meter.current_clear_correct,
+        meter.current_clear_unknown,
+        meter.current_clear_wrong,
+        meter.experimental_clear_correct,
+        meter.experimental_clear_unknown,
+        meter.experimental_clear_wrong,
+        meter
+            .ambiguous_fixture
+            .as_ref()
+            .and_then(|fixture| fixture.experimental_resolved_meter),
+        meter.four_phase_prior_remaining_blocker,
+        meter.candidate_count,
+        meter.production_recommendation,
+        summary.old_pcm_experiment_primary_correct,
+        summary.old_activation_experiment_primary_correct,
+        summary
+            .scope_guarantees
+            .iter()
+            .map(|value| format!("- {value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
 }
 
 fn match_errors(
@@ -3878,6 +4653,7 @@ fn backend_snapshot(
             .is_none_or(|_| metrics.tempo.primary_correct == Some(true));
     BackendMetricSnapshot {
         beat_mae_ms: metrics.beat.mae_ms,
+        beat_p50_ms: metrics.beat.p50_ms,
         beat_p95_ms: metrics.beat.p95_ms,
         precision_at_40ms: metrics.beat.precision_at_tolerance.get("40ms").copied(),
         recall_at_40ms: recall,
@@ -3965,6 +4741,786 @@ fn backend_comparison(
         });
     }
     report
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendMaterialThresholds {
+    pub beat_mae_ms: f64,
+    pub beat_p95_ms: f64,
+    pub precision_recall: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ResearchBackendSummary {
+    pub available_tracks: usize,
+    pub beat_mae_ms: Option<f64>,
+    pub beat_p50_ms: Option<f64>,
+    pub beat_p95_ms: Option<f64>,
+    pub precision_at_40ms: Option<f64>,
+    pub recall_at_40ms: Option<f64>,
+    pub tempo_scored: usize,
+    pub tempo_correct: usize,
+    pub tempo_accuracy: Option<f64>,
+    pub grid_phase_scored: usize,
+    pub grid_phase_correct: usize,
+    pub grid_phase_accuracy: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OracleFixtureResearch {
+    pub sample_id: String,
+    pub family: String,
+    pub neural_available: bool,
+    pub joint_dominance: String,
+    pub beat_backend: String,
+    pub tempo_backend: String,
+    pub grid_phase_backend: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendOracleReport {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub source_commit: Option<String>,
+    pub material_thresholds: BackendMaterialThresholds,
+    pub always_classical: ResearchBackendSummary,
+    pub current_hybrid: ResearchBackendSummary,
+    pub always_neural_where_available: ResearchBackendSummary,
+    pub truth_oracle_upper_bound: ResearchBackendSummary,
+    pub joint_outcome_counts: BTreeMap<String, usize>,
+    pub neural_dominates: Vec<String>,
+    pub classical_dominates: Vec<String>,
+    pub per_fixture: Vec<OracleFixtureResearch>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GateFeatureRow {
+    pub sample_id: String,
+    pub family: String,
+    pub pcm_group: String,
+    pub lineage_group: String,
+    pub neural_available: bool,
+    /// This map is deliberately limited to pre-decision neural diagnostics;
+    /// it contains no fixture ID, family, transform, or Ground Truth field.
+    pub features: BTreeMap<String, f64>,
+    pub diagnostic_score: f64,
+    pub truth_side_label: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GateValidationFold {
+    pub grouping_rule: String,
+    pub train_split: Vec<String>,
+    pub validation_split: Vec<String>,
+    pub train_groups: Vec<String>,
+    pub validation_groups: Vec<String>,
+    pub threshold: f64,
+    pub false_accept_bad_neural_count: usize,
+    pub false_reject_useful_neural_count: usize,
+    pub exact_pcm_group_overlap: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GateResearchReport {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub split: String,
+    pub source_commit: Option<String>,
+    pub feature_names: Vec<String>,
+    pub validation_grouping: String,
+    pub exact_pcm_duplicate_leakage: bool,
+    pub current_hybrid_neural_coverage: usize,
+    pub current_hybrid_native_regression_count: usize,
+    pub always_classical: ResearchBackendSummary,
+    pub always_neural_where_available: ResearchBackendSummary,
+    pub current_hybrid: ResearchBackendSummary,
+    pub truth_oracle_upper_bound: ResearchBackendSummary,
+    pub candidate_threshold: f64,
+    pub candidate_gate_neural_coverage: usize,
+    pub candidate_gate_native_regression_count: usize,
+    pub candidate_gate_fallback_use_classical_count: usize,
+    pub candidate_gate: ResearchBackendSummary,
+    pub validation_folds: Vec<GateValidationFold>,
+    pub leave_family_out_folds: Vec<GateValidationFold>,
+    pub per_fixture: Vec<GateFeatureRow>,
+    pub production_recommendation: String,
+}
+
+const GATE_FEATURE_NAMES: [&str; 13] = [
+    "path_marker_count",
+    "path_coverage",
+    "activation_mean",
+    "support",
+    "interval_residual",
+    "alias_margin",
+    "selected_period_frames",
+    "candidate_score",
+    "candidate_score_margin",
+    "half_native_double_disagreement",
+    "off_grid_leakage",
+    "periodic_consistency",
+    "downbeat_confidence",
+];
+
+fn gate_features(track: &TrackEvaluation) -> (BTreeMap<String, f64>, f64, bool) {
+    let mut features = BTreeMap::new();
+    let Some(diagnostics) = track.neural_diagnostics.as_ref() else {
+        return (features, 0.0, false);
+    };
+    let candidate = diagnostics
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .max_by(|left, right| left.candidate_score.total_cmp(&right.candidate_score));
+    let mut candidate_scores = diagnostics
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.available)
+        .map(|candidate| candidate.candidate_score)
+        .collect::<Vec<_>>();
+    candidate_scores.sort_by(f32::total_cmp);
+    let candidate_score = candidate
+        .map(|value| value.candidate_score)
+        .unwrap_or_default();
+    let candidate_score_margin = candidate_scores
+        .iter()
+        .rev()
+        .nth(1)
+        .map_or(0.0, |second| candidate_score - second);
+    let selected_candidate = diagnostics.selected_period_frames.and_then(|period| {
+        diagnostics
+            .candidates
+            .iter()
+            .find(|candidate| candidate.available && candidate.period_frames == period)
+    });
+    let disagreement = candidate
+        .map(|candidate| {
+            (selected_candidate.map(|selected| selected.relation.as_str())
+                != Some(candidate.relation.as_str())) as u8 as f64
+        })
+        .unwrap_or(0.0);
+    let selected_evidence =
+        candidate.map(|candidate| (candidate.off_grid_leakage, candidate.periodic_consistency));
+    let values = [
+        ("path_marker_count", diagnostics.path_marker_count as f64),
+        (
+            "path_coverage",
+            f64::from(diagnostics.path_coverage.unwrap_or_default()),
+        ),
+        (
+            "activation_mean",
+            f64::from(diagnostics.activation_mean.unwrap_or_default()),
+        ),
+        (
+            "support",
+            f64::from(diagnostics.support.unwrap_or_default()),
+        ),
+        (
+            "interval_residual",
+            f64::from(diagnostics.interval_residual.unwrap_or(1.0)),
+        ),
+        (
+            "alias_margin",
+            f64::from(diagnostics.alias_margin.unwrap_or_default()),
+        ),
+        (
+            "selected_period_frames",
+            diagnostics.selected_period_frames.unwrap_or_default() as f64,
+        ),
+        ("candidate_score", f64::from(candidate_score)),
+        ("candidate_score_margin", f64::from(candidate_score_margin)),
+        ("half_native_double_disagreement", disagreement),
+        (
+            "off_grid_leakage",
+            f64::from(selected_evidence.map_or(1.0, |value| value.0)),
+        ),
+        (
+            "periodic_consistency",
+            f64::from(selected_evidence.map_or(0.0, |value| value.1)),
+        ),
+        (
+            "downbeat_confidence",
+            f64::from(track.meter_evidence.downbeat_confidence.unwrap_or_default()),
+        ),
+    ];
+    for (name, value) in values {
+        features.insert(name.into(), value);
+    }
+    let normalized_residual = (1.0
+        - features
+            .get("interval_residual")
+            .copied()
+            .unwrap_or(1.0)
+            .min(1.0))
+    .clamp(0.0, 1.0);
+    let score = (0.12 * (features["path_coverage"]).clamp(0.0, 1.0)
+        + 0.12 * features["activation_mean"].clamp(0.0, 1.0)
+        + 0.12 * features["support"].clamp(0.0, 1.0)
+        + 0.10 * features["alias_margin"].clamp(0.0, 1.0)
+        + 0.12 * features["candidate_score"].clamp(0.0, 1.0)
+        + 0.10 * features["candidate_score_margin"].clamp(0.0, 1.0)
+        + 0.08 * features["periodic_consistency"].clamp(0.0, 1.0)
+        + 0.07 * normalized_residual
+        + 0.05 * features["downbeat_confidence"].clamp(0.0, 1.0)
+        - 0.08 * features["off_grid_leakage"].clamp(0.0, 1.0)
+        - 0.04 * features["half_native_double_disagreement"])
+        .clamp(0.0, 1.0);
+    (features, score, track.analysis_backend == "native_neural")
+}
+
+fn gate_label(item: &BackendFixtureComparison) -> &'static str {
+    if item.hybrid_backend != "native_neural" {
+        return "classical_dominates";
+    }
+    truth_dominance(
+        &item.hybrid,
+        &item.classical,
+        &BackendMaterialThresholds {
+            beat_mae_ms: 1.0,
+            beat_p95_ms: 5.0,
+            precision_recall: 0.02,
+        },
+    )
+}
+
+fn fit_gate_threshold(rows: &[GateFeatureRow]) -> f64 {
+    let mut candidates = vec![0.0, 1.0];
+    candidates.extend(rows.iter().map(|row| row.diagnostic_score));
+    candidates.sort_by(f64::total_cmp);
+    candidates.dedup_by(|left, right| (*left - *right).abs() < f64::EPSILON);
+    candidates
+        .into_iter()
+        .min_by(|left, right| {
+            let left_bad = rows
+                .iter()
+                .filter(|row| {
+                    row.neural_available
+                        && row.diagnostic_score >= *left
+                        && row.truth_side_label == "classical_dominates"
+                })
+                .count();
+            let right_bad = rows
+                .iter()
+                .filter(|row| {
+                    row.neural_available
+                        && row.diagnostic_score >= *right
+                        && row.truth_side_label == "classical_dominates"
+                })
+                .count();
+            let left_useful = rows
+                .iter()
+                .filter(|row| {
+                    row.neural_available
+                        && row.diagnostic_score >= *left
+                        && row.truth_side_label == "neural_dominates"
+                })
+                .count();
+            let right_useful = rows
+                .iter()
+                .filter(|row| {
+                    row.neural_available
+                        && row.diagnostic_score >= *right
+                        && row.truth_side_label == "neural_dominates"
+                })
+                .count();
+            left_bad
+                .cmp(&right_bad)
+                .then_with(|| right_useful.cmp(&left_useful))
+                .then_with(|| left.total_cmp(right))
+        })
+        .unwrap_or(1.0)
+}
+
+fn gate_validation_fold(
+    rows: &[GateFeatureRow],
+    validation_indices: &[usize],
+    grouping_rule: &str,
+) -> GateValidationFold {
+    let validation = validation_indices.iter().copied().collect::<BTreeSet<_>>();
+    let train_indices = (0..rows.len())
+        .filter(|index| !validation.contains(index))
+        .collect::<Vec<_>>();
+    let train_rows = train_indices
+        .iter()
+        .map(|index| rows[*index].clone())
+        .collect::<Vec<_>>();
+    let threshold = fit_gate_threshold(&train_rows);
+    let false_accept = validation_indices
+        .iter()
+        .filter(|index| {
+            let row = &rows[**index];
+            row.neural_available
+                && row.diagnostic_score >= threshold
+                && row.truth_side_label == "classical_dominates"
+        })
+        .count();
+    let false_reject = validation_indices
+        .iter()
+        .filter(|index| {
+            let row = &rows[**index];
+            row.neural_available
+                && row.diagnostic_score < threshold
+                && row.truth_side_label == "neural_dominates"
+        })
+        .count();
+    let train_groups = train_indices
+        .iter()
+        .map(|index| gate_group(&rows[*index], grouping_rule))
+        .collect::<BTreeSet<_>>();
+    let validation_groups = validation_indices
+        .iter()
+        .map(|index| gate_group(&rows[*index], grouping_rule))
+        .collect::<BTreeSet<_>>();
+    GateValidationFold {
+        grouping_rule: grouping_rule.into(),
+        train_split: train_indices
+            .iter()
+            .map(|index| rows[*index].sample_id.clone())
+            .collect(),
+        validation_split: validation_indices
+            .iter()
+            .map(|index| rows[*index].sample_id.clone())
+            .collect(),
+        train_groups: train_groups.iter().cloned().collect(),
+        validation_groups: validation_groups.iter().cloned().collect(),
+        threshold,
+        false_accept_bad_neural_count: false_accept,
+        false_reject_useful_neural_count: false_reject,
+        exact_pcm_group_overlap: !train_groups.is_disjoint(&validation_groups),
+    }
+}
+
+fn gate_group(row: &GateFeatureRow, grouping_rule: &str) -> String {
+    match grouping_rule {
+        "exact_pcm" => row.pcm_group.clone(),
+        "lineage" => row.lineage_group.clone(),
+        "family" => row.family.clone(),
+        _ => row.sample_id.clone(),
+    }
+}
+
+fn build_gate_research(
+    report: &EvaluationReport,
+    pcm_groups: &BTreeMap<String, String>,
+    lineage_groups: &BTreeMap<String, String>,
+    source_commit: Option<String>,
+) -> GateResearchReport {
+    let comparisons = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| (item.sample_id.as_str(), item))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for track in &report.per_track {
+        let Some(comparison) = comparisons.get(track.sample_id.as_str()) else {
+            continue;
+        };
+        let (features, diagnostic_score, neural_available) = gate_features(track);
+        rows.push(GateFeatureRow {
+            sample_id: track.sample_id.clone(),
+            family: track.family.clone(),
+            pcm_group: pcm_groups
+                .get(&track.sample_id)
+                .cloned()
+                .unwrap_or_else(|| track.sample_id.clone()),
+            lineage_group: lineage_groups
+                .get(&track.sample_id)
+                .cloned()
+                .unwrap_or_else(|| track.sample_id.clone()),
+            neural_available,
+            features,
+            diagnostic_score,
+            truth_side_label: gate_label(comparison).into(),
+        });
+    }
+    rows.sort_by(|left, right| left.sample_id.cmp(&right.sample_id));
+    let threshold = fit_gate_threshold(&rows);
+    let mut selected = Vec::new();
+    let mut candidate_coverage = 0;
+    let mut candidate_regressions = 0;
+    let mut fallback = 0;
+    for row in &rows {
+        let comparison = comparisons[row.sample_id.as_str()];
+        let accept = row.neural_available && row.diagnostic_score >= threshold;
+        if accept {
+            candidate_coverage += 1;
+            selected.push((&comparison.hybrid, true));
+            if row.truth_side_label == "classical_dominates" {
+                candidate_regressions += 1;
+            }
+        } else {
+            fallback += 1;
+            selected.push((&comparison.classical, true));
+        }
+    }
+    let mut grouped_validation = Vec::new();
+    for grouping_rule in ["exact_pcm", "lineage"] {
+        let mut groups = BTreeMap::<String, Vec<usize>>::new();
+        for (index, row) in rows.iter().enumerate() {
+            groups
+                .entry(gate_group(row, grouping_rule))
+                .or_default()
+                .push(index);
+        }
+        for indices in groups.into_values() {
+            grouped_validation.push(gate_validation_fold(&rows, &indices, grouping_rule));
+        }
+    }
+    let mut family_validation = Vec::new();
+    let families = rows
+        .iter()
+        .map(|row| row.family.clone())
+        .collect::<BTreeSet<_>>();
+    for family in families {
+        let indices = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| (row.family == family).then_some(index))
+            .collect::<Vec<_>>();
+        family_validation.push(gate_validation_fold(&rows, &indices, "family"));
+    }
+    let exact_pcm_duplicate_leakage = grouped_validation
+        .iter()
+        .any(|fold| fold.exact_pcm_group_overlap);
+    let neural_coverage = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .filter(|item| item.hybrid_backend == "native_neural")
+        .count();
+    let current_regressions = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .filter(|item| item.outcome == "native_neural_regressed")
+        .count();
+    let all_classical = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| (&item.classical, true))
+        .collect::<Vec<_>>();
+    let all_neural = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .filter(|item| item.hybrid_backend == "native_neural")
+        .map(|item| (&item.hybrid, true))
+        .collect::<Vec<_>>();
+    let current = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| (&item.hybrid, true))
+        .collect::<Vec<_>>();
+    let oracle = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| {
+            if choose_backend_for_lower(item.hybrid.beat_mae_ms, item.classical.beat_mae_ms)
+                == "neural"
+            {
+                (&item.hybrid, true)
+            } else {
+                (&item.classical, true)
+            }
+        })
+        .collect::<Vec<_>>();
+    GateResearchReport {
+        schema_version: 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        split: report.split.clone(),
+        source_commit,
+        feature_names: GATE_FEATURE_NAMES.iter().map(|name| (*name).into()).collect(),
+        validation_grouping: "exact PCM hash and base/transform lineage; leave-family-out additionally".into(),
+        exact_pcm_duplicate_leakage,
+        current_hybrid_neural_coverage: neural_coverage,
+        current_hybrid_native_regression_count: current_regressions,
+        always_classical: summary_from_snapshots(&all_classical),
+        always_neural_where_available: summary_from_snapshots(&all_neural),
+        current_hybrid: summary_from_snapshots(&current),
+        truth_oracle_upper_bound: summary_from_snapshots(&oracle),
+        candidate_threshold: threshold,
+        candidate_gate_neural_coverage: candidate_coverage,
+        candidate_gate_native_regression_count: candidate_regressions,
+        candidate_gate_fallback_use_classical_count: fallback,
+        candidate_gate: summary_from_snapshots(&selected),
+        validation_folds: grouped_validation,
+        leave_family_out_folds: family_validation,
+        per_fixture: rows,
+        production_recommendation: "do-not-promote: research-only gate; compare against Always Classical on held-out groups".into(),
+    }
+}
+
+fn summary_from_snapshots(snapshots: &[(&BackendMetricSnapshot, bool)]) -> ResearchBackendSummary {
+    let beat_mae = snapshots
+        .iter()
+        .filter_map(|(snapshot, _)| snapshot.beat_mae_ms)
+        .collect::<Vec<_>>();
+    let beat_p50 = snapshots
+        .iter()
+        .filter_map(|(snapshot, _)| snapshot.beat_p50_ms)
+        .collect::<Vec<_>>();
+    let beat_p95 = snapshots
+        .iter()
+        .filter_map(|(snapshot, _)| snapshot.beat_p95_ms)
+        .collect::<Vec<_>>();
+    let precision = snapshots
+        .iter()
+        .filter_map(|(snapshot, _)| snapshot.precision_at_40ms)
+        .collect::<Vec<_>>();
+    let recall = snapshots
+        .iter()
+        .filter_map(|(snapshot, _)| snapshot.recall_at_40ms)
+        .collect::<Vec<_>>();
+    let tempo_scored = snapshots
+        .iter()
+        .filter(|(snapshot, _)| snapshot.primary_tempo_correct.is_some())
+        .count();
+    let tempo_correct = snapshots
+        .iter()
+        .filter(|(snapshot, _)| snapshot.primary_tempo_correct == Some(true))
+        .count();
+    let grid_phase_scored = snapshots
+        .iter()
+        .filter(|(snapshot, _)| snapshot.grid_phase_correct.is_some())
+        .count();
+    let grid_phase_correct = snapshots
+        .iter()
+        .filter(|(snapshot, _)| snapshot.grid_phase_correct == Some(true))
+        .count();
+    ResearchBackendSummary {
+        available_tracks: snapshots.len(),
+        beat_mae_ms: mean(&beat_mae),
+        beat_p50_ms: percentile(&beat_p50, 0.50),
+        beat_p95_ms: percentile(&beat_p95, 0.95),
+        precision_at_40ms: mean(&precision),
+        recall_at_40ms: mean(&recall),
+        tempo_scored,
+        tempo_correct,
+        tempo_accuracy: safe_ratio_option(tempo_correct, tempo_scored),
+        grid_phase_scored,
+        grid_phase_correct,
+        grid_phase_accuracy: safe_ratio_option(grid_phase_correct, grid_phase_scored),
+    }
+}
+
+fn safe_ratio_option(numerator: usize, denominator: usize) -> Option<f64> {
+    (denominator > 0).then(|| numerator as f64 / denominator as f64)
+}
+
+fn summary_from_group_metrics(metrics: &GroupMetrics) -> ResearchBackendSummary {
+    ResearchBackendSummary {
+        available_tracks: metrics.tracks,
+        beat_mae_ms: metrics.beat.mae_ms,
+        beat_p50_ms: metrics.beat.p50_ms,
+        beat_p95_ms: metrics.beat.p95_ms,
+        precision_at_40ms: metrics.beat.precision_at_tolerance.get("40ms").copied(),
+        recall_at_40ms: metrics.beat.recall_at_tolerance.get("40ms").copied(),
+        tempo_scored: metrics.tempo.scored_tracks,
+        tempo_correct: metrics.tempo.primary_correct_count,
+        tempo_accuracy: metrics.tempo.primary_correct_rate,
+        grid_phase_scored: metrics.grid_phase.scored_tracks,
+        grid_phase_correct: metrics.grid_phase.correct_count,
+        grid_phase_accuracy: metrics.grid_phase.correct_rate,
+    }
+}
+
+fn truth_dominance(
+    neural: &BackendMetricSnapshot,
+    classical: &BackendMetricSnapshot,
+    thresholds: &BackendMaterialThresholds,
+) -> &'static str {
+    if !neural.core_valid && !classical.core_valid {
+        return "both_invalid";
+    }
+    if neural.core_valid && !classical.core_valid {
+        return "neural_dominates";
+    }
+    if classical.core_valid && !neural.core_valid {
+        return "classical_dominates";
+    }
+    let mut neural_better = false;
+    let mut classical_better = false;
+    for (neural_value, classical_value, threshold, lower_is_better) in [
+        (
+            neural.beat_mae_ms,
+            classical.beat_mae_ms,
+            thresholds.beat_mae_ms,
+            true,
+        ),
+        (
+            neural.beat_p95_ms,
+            classical.beat_p95_ms,
+            thresholds.beat_p95_ms,
+            true,
+        ),
+    ] {
+        if let (Some(neural_value), Some(classical_value)) = (neural_value, classical_value)
+            && lower_is_better
+        {
+            neural_better |= neural_value <= classical_value - threshold;
+            classical_better |= classical_value <= neural_value - threshold;
+        }
+    }
+    for (neural_value, classical_value) in [
+        (neural.precision_at_40ms, classical.precision_at_40ms),
+        (neural.recall_at_40ms, classical.recall_at_40ms),
+    ] {
+        if let (Some(neural_value), Some(classical_value)) = (neural_value, classical_value) {
+            neural_better |= neural_value >= classical_value + thresholds.precision_recall;
+            classical_better |= classical_value >= neural_value + thresholds.precision_recall;
+        }
+    }
+    if neural.primary_tempo_correct == Some(true) && classical.primary_tempo_correct == Some(false)
+    {
+        neural_better = true;
+    }
+    if classical.primary_tempo_correct == Some(true) && neural.primary_tempo_correct == Some(false)
+    {
+        classical_better = true;
+    }
+    if neural.grid_phase_correct == Some(true) && classical.grid_phase_correct == Some(false) {
+        neural_better = true;
+    }
+    if classical.grid_phase_correct == Some(true) && neural.grid_phase_correct == Some(false) {
+        classical_better = true;
+    }
+    match (neural_better, classical_better) {
+        (true, false) => "neural_dominates",
+        (false, true) => "classical_dominates",
+        (false, false) => "equal",
+        (true, true) => "mixed",
+    }
+}
+
+fn choose_backend_for_lower(left: Option<f64>, right: Option<f64>) -> &'static str {
+    match (left, right) {
+        (Some(left), Some(right)) if left < right => "neural",
+        (Some(left), Some(right)) if right < left => "classical",
+        (Some(_), None) => "neural",
+        (None, Some(_)) => "classical",
+        _ => "equal",
+    }
+}
+
+fn build_backend_oracle(
+    report: &EvaluationReport,
+    source_commit: Option<String>,
+) -> BackendOracleReport {
+    let thresholds = BackendMaterialThresholds {
+        beat_mae_ms: 1.0,
+        beat_p95_ms: 5.0,
+        precision_recall: 0.02,
+    };
+    let all_classical = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| (&item.classical, true))
+        .collect::<Vec<_>>();
+    let current_hybrid = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| (&item.hybrid, true))
+        .collect::<Vec<_>>();
+    let always_neural = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .filter(|item| item.hybrid_backend == "native_neural")
+        .map(|item| (&item.hybrid, true))
+        .collect::<Vec<_>>();
+    let mut oracle = Vec::new();
+    let mut joint_outcome_counts = BTreeMap::new();
+    let mut neural_dominates = Vec::new();
+    let mut classical_dominates = Vec::new();
+    for item in &report.backend_comparison.per_fixture {
+        let neural_available = item.hybrid_backend == "native_neural";
+        let joint = if neural_available {
+            truth_dominance(&item.hybrid, &item.classical, &thresholds)
+        } else if item.classical.core_valid {
+            "classical_dominates"
+        } else {
+            "both_invalid"
+        };
+        *joint_outcome_counts.entry(joint.into()).or_default() += 1;
+        if joint == "neural_dominates" {
+            neural_dominates.push(item.sample_id.clone());
+        }
+        if joint == "classical_dominates" {
+            classical_dominates.push(item.sample_id.clone());
+        }
+        oracle.push(OracleFixtureResearch {
+            sample_id: item.sample_id.clone(),
+            family: item.family.clone(),
+            neural_available,
+            joint_dominance: joint.into(),
+            beat_backend: choose_backend_for_lower(
+                item.hybrid.beat_mae_ms,
+                item.classical.beat_mae_ms,
+            )
+            .into(),
+            tempo_backend: match (
+                item.hybrid.primary_tempo_correct,
+                item.classical.primary_tempo_correct,
+            ) {
+                (Some(true), Some(false)) => "neural",
+                (Some(false), Some(true)) => "classical",
+                (Some(true), Some(true)) => "equal",
+                (Some(_), None) => "neural",
+                (None, Some(_)) => "classical",
+                _ => "invalid",
+            }
+            .into(),
+            grid_phase_backend: match (
+                item.hybrid.grid_phase_correct,
+                item.classical.grid_phase_correct,
+            ) {
+                (Some(true), Some(false)) => "neural",
+                (Some(false), Some(true)) => "classical",
+                (Some(true), Some(true)) => "equal",
+                (Some(_), None) => "neural",
+                (None, Some(_)) => "classical",
+                _ => "invalid",
+            }
+            .into(),
+        });
+    }
+    let oracle_beat = report
+        .backend_comparison
+        .per_fixture
+        .iter()
+        .map(|item| {
+            if item.hybrid.beat_mae_ms.is_some()
+                && choose_backend_for_lower(item.hybrid.beat_mae_ms, item.classical.beat_mae_ms)
+                    == "neural"
+            {
+                (&item.hybrid, true)
+            } else {
+                (&item.classical, true)
+            }
+        })
+        .collect::<Vec<_>>();
+    BackendOracleReport {
+        schema_version: 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        split: report.split.clone(),
+        source_commit,
+        material_thresholds: thresholds,
+        always_classical: summary_from_snapshots(&all_classical),
+        current_hybrid: summary_from_snapshots(&current_hybrid),
+        always_neural_where_available: summary_from_snapshots(&always_neural),
+        truth_oracle_upper_bound: summary_from_snapshots(&oracle_beat),
+        joint_outcome_counts,
+        neural_dominates,
+        classical_dominates,
+        per_fixture: oracle,
+    }
 }
 
 fn experimental_tempo_resolution(
@@ -4095,6 +5651,197 @@ fn activation_tempo_resolution(
         selected_relation: selected.map(|candidate| candidate.relation.clone()),
         ambiguous,
         candidates,
+    })
+}
+
+fn sigmoid(value: f32) -> f32 {
+    if value >= 0.0 {
+        1.0 / (1.0 + (-value).exp())
+    } else {
+        let exponential = value.exp();
+        exponential / (1.0 + exponential)
+    }
+}
+
+fn interpolate(values: &[f32], position: f32) -> f32 {
+    if values.is_empty() || !position.is_finite() || position < 0.0 {
+        return 0.0;
+    }
+    let left = position.floor() as usize;
+    if left >= values.len() {
+        return 0.0;
+    }
+    let right = (left + 1).min(values.len().saturating_sub(1));
+    let fraction = position - left as f32;
+    values[left] * (1.0 - fraction) + values[right] * fraction
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FractionalTempoScore {
+    score: f32,
+    activation_support: f32,
+    coverage: f32,
+    off_grid_leakage: f32,
+    periodic_consistency: f32,
+    phase_stability: f32,
+}
+
+fn score_fractional_period(
+    activations: &[f32],
+    period: f32,
+    phase: f32,
+) -> Option<FractionalTempoScore> {
+    if activations.len() < 8
+        || !period.is_finite()
+        || !(1.0..=activations.len() as f32).contains(&period)
+    {
+        return None;
+    }
+    let probabilities = activations
+        .iter()
+        .map(|value| sigmoid(*value))
+        .collect::<Vec<_>>();
+    let mut on_grid = Vec::new();
+    let mut position = phase;
+    while position < probabilities.len() as f32 {
+        on_grid.push(interpolate(&probabilities, position));
+        position += period;
+    }
+    if on_grid.len() < 3 {
+        return None;
+    }
+    let activation_support = on_grid.iter().sum::<f32>() / on_grid.len() as f32;
+    let coverage =
+        on_grid.iter().filter(|value| **value >= 0.55).count() as f32 / on_grid.len() as f32;
+    let mut leakage_sum = 0.0;
+    for (index, activation) in probabilities.iter().enumerate() {
+        let frame = index as f32;
+        let nearest = ((frame - phase) / period).round();
+        let distance = (frame - (phase + nearest * period)).abs();
+        if distance > 0.35 {
+            leakage_sum += *activation;
+        }
+    }
+    let off_grid_leakage = (leakage_sum / probabilities.len() as f32).clamp(0.0, 1.0);
+    let mut paired = 0.0;
+    let mut energy = 0.0;
+    for index in 0..probabilities.len() {
+        let next = interpolate(&probabilities, index as f32 + period);
+        paired += probabilities[index] * next;
+        energy += probabilities[index] * probabilities[index];
+    }
+    let periodic_consistency = if energy > f32::EPSILON {
+        (paired / energy).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let left =
+        score_fractional_period_without_stability(activations, period, phase - 0.25).unwrap_or(0.0);
+    let right =
+        score_fractional_period_without_stability(activations, period, phase + 0.25).unwrap_or(0.0);
+    let phase_stability = (1.0 - (left - right).abs()).clamp(0.0, 1.0);
+    let score = (0.42 * activation_support
+        + 0.18 * coverage
+        + 0.18 * periodic_consistency
+        + 0.12 * phase_stability
+        - 0.35 * off_grid_leakage)
+        .clamp(0.0, 1.0);
+    Some(FractionalTempoScore {
+        score,
+        activation_support,
+        coverage,
+        off_grid_leakage,
+        periodic_consistency,
+        phase_stability,
+    })
+}
+
+fn score_fractional_period_without_stability(
+    activations: &[f32],
+    period: f32,
+    phase: f32,
+) -> Option<f32> {
+    if phase < 0.0 {
+        return None;
+    }
+    let probabilities = activations
+        .iter()
+        .map(|value| sigmoid(*value))
+        .collect::<Vec<_>>();
+    let mut position = phase;
+    let mut sum = 0.0;
+    let mut count = 0;
+    while position < probabilities.len() as f32 {
+        sum += interpolate(&probabilities, position);
+        count += 1;
+        position += period;
+    }
+    (count >= 3).then_some(sum / count as f32)
+}
+
+fn fractional_tempo_refinement(
+    observations: &wotoha_core::beat_analysis::NeuralBeatObservations,
+    current_bpm: Option<f32>,
+    relation: &str,
+) -> Option<FractionalTempoRefinement> {
+    let current_bpm = current_bpm.filter(|value| value.is_finite() && *value > 0.0)?;
+    let integer_period = (observations.frame_rate_hz * 60.0 / current_bpm).round() as i32;
+    if integer_period < 2 {
+        return None;
+    }
+    let resolution = 0.1_f32;
+    let mut best: Option<(f32, f32, FractionalTempoScore)> = None;
+    let mut period = (integer_period - 1).max(2) as f32;
+    let maximum_period = (integer_period + 1) as f32;
+    while period <= maximum_period + f32::EPSILON {
+        let mut coarse_best: Option<(f32, FractionalTempoScore)> = None;
+        let mut coarse_phase = 0.0;
+        while coarse_phase < period {
+            if let Some(score) =
+                score_fractional_period(&observations.beat_logits, period, coarse_phase)
+                && coarse_best
+                    .as_ref()
+                    .is_none_or(|(_, current)| score.score > current.score)
+            {
+                coarse_best = Some((coarse_phase, score));
+                coarse_phase += 0.5;
+                continue;
+            }
+            coarse_phase += 0.5;
+        }
+        if let Some((coarse_phase, _)) = coarse_best {
+            let start = (coarse_phase - 1.0).max(0.0);
+            let end = (coarse_phase + 1.0).min(period);
+            let mut phase = start;
+            while phase <= end + f32::EPSILON {
+                if let Some(score) =
+                    score_fractional_period(&observations.beat_logits, period, phase)
+                    && best.as_ref().is_none_or(
+                        |(_, _, current): &(f32, f32, FractionalTempoScore)| {
+                            score.score > current.score
+                        },
+                    )
+                {
+                    best = Some((period, phase, score));
+                }
+                phase += resolution;
+            }
+        }
+        period += resolution;
+    }
+    let (period, phase, score) = best?;
+    Some(FractionalTempoRefinement {
+        selected_bpm: Some(observations.frame_rate_hz * 60.0 / period),
+        selected_period_frames: Some(period),
+        selected_phase_frames: Some(phase),
+        relation: relation.to_owned(),
+        score: score.score,
+        activation_support: score.activation_support,
+        coverage: score.coverage,
+        off_grid_leakage: score.off_grid_leakage,
+        periodic_consistency: score.periodic_consistency,
+        phase_stability: score.phase_stability,
+        resolution_frames: resolution,
     })
 }
 
@@ -4313,9 +6060,174 @@ fn experimental_tempo_report(
             activation_relation_to_truth,
             pcm: experimental.clone(),
             activation: resolvers.activation.clone(),
+            fractional_refinement: None,
+            raw_observations: resolvers.raw_observations.clone(),
         });
     }
     report
+}
+
+fn build_tempo_refinement_report(
+    report: &EvaluationReport,
+    source_commit: Option<String>,
+) -> TempoRefinementReport {
+    let mut cases = Vec::new();
+    let mut current_errors = Vec::new();
+    let mut refined_errors = Vec::new();
+    let mut current_correct = 0;
+    let mut refined_correct = 0;
+    let mut current_half = 0;
+    let mut refined_half = 0;
+    let mut current_double = 0;
+    let mut refined_double = 0;
+    let mut refined_other_wrong = 0;
+    let mut by_fixture_family = BTreeMap::<String, TempoRefinementGroupSummary>::new();
+    let per_track = report
+        .per_track
+        .iter()
+        .map(|track| (track.sample_id.as_str(), track))
+        .collect::<BTreeMap<_, _>>();
+    for fixture in &report.tempo_experiment.per_fixture {
+        let Some(truth_bpm) = fixture.truth_bpm else {
+            continue;
+        };
+        let fractional_refinement = fixture.raw_observations.as_ref().and_then(|observations| {
+            fractional_tempo_refinement(
+                observations,
+                fixture.current_primary_bpm,
+                fixture
+                    .activation
+                    .as_ref()
+                    .and_then(|resolution| resolution.selected_relation.as_deref())
+                    .unwrap_or("primary"),
+            )
+        });
+        let refined_bpm = fractional_refinement
+            .as_ref()
+            .and_then(|refinement| refinement.selected_bpm);
+        let current_error = fixture
+            .current_primary_bpm
+            .map(|bpm| (bpm - truth_bpm).abs());
+        let refined_error = refined_bpm.map(|bpm| (bpm - truth_bpm).abs());
+        if let Some(error) = current_error {
+            current_errors.push(f64::from(error));
+        }
+        if let Some(error) = refined_error {
+            refined_errors.push(f64::from(error));
+        }
+        let current_relation = relation_to_truth(fixture.current_primary_bpm, truth_bpm, false);
+        let refined_relation = relation_to_truth(refined_bpm, truth_bpm, false);
+        current_correct += usize::from(current_relation == "primary");
+        refined_correct += usize::from(refined_relation == "primary");
+        current_half += usize::from(current_relation == "half_time");
+        refined_half += usize::from(refined_relation == "half_time");
+        current_double += usize::from(current_relation == "double_time");
+        refined_double += usize::from(refined_relation == "double_time");
+        refined_other_wrong +=
+            usize::from(refined_relation == "other_wrong" || refined_relation == "absent");
+        let family_summary = by_fixture_family.entry(fixture.family.clone()).or_default();
+        family_summary.tracks += 1;
+        family_summary.current_correct += usize::from(current_relation == "primary");
+        family_summary.refined_correct += usize::from(refined_relation == "primary");
+        family_summary.current_mean_absolute_error_bpm = mean(
+            &cases
+                .iter()
+                .filter(|case: &&TempoRefinementCase| case.family == fixture.family)
+                .filter_map(|case| case.current_absolute_error_bpm.map(f64::from))
+                .chain(current_error.into_iter().map(f64::from))
+                .collect::<Vec<_>>(),
+        );
+        family_summary.refined_mean_absolute_error_bpm = mean(
+            &cases
+                .iter()
+                .filter(|case: &&TempoRefinementCase| case.family == fixture.family)
+                .filter_map(|case| case.refined_absolute_error_bpm.map(f64::from))
+                .chain(refined_error.into_iter().map(f64::from))
+                .collect::<Vec<_>>(),
+        );
+        family_summary.half_time_count += usize::from(refined_relation == "half_time");
+        family_summary.double_time_count += usize::from(refined_relation == "double_time");
+        family_summary.other_wrong_count +=
+            usize::from(refined_relation == "other_wrong" || refined_relation == "absent");
+        let current_backend = per_track
+            .get(fixture.sample_id.as_str())
+            .map(|track| track.analysis_backend.clone())
+            .unwrap_or_else(|| "unknown".into());
+        cases.push(TempoRefinementCase {
+            sample_id: fixture.sample_id.clone(),
+            family: fixture.family.clone(),
+            truth_bpm,
+            current_neural_bpm: fixture.current_primary_bpm,
+            refined_bpm,
+            current_absolute_error_bpm: current_error,
+            refined_absolute_error_bpm: refined_error,
+            relation_before: format!("{} ({current_backend})", current_relation),
+            relation_after: refined_relation,
+            refinement: fractional_refinement,
+        });
+    }
+    cases.sort_by(|left, right| left.sample_id.cmp(&right.sample_id));
+    let required_ids = [
+        "constant-120.0",
+        "constant-127.5",
+        "constant-128.0",
+        "constant-130.0",
+        "constant-140.0",
+        "constant-150.0",
+        "constant-160.0",
+        "constant-180.0",
+        "half-double-64-128",
+        "half-double-70-140",
+        "half-double-75-150",
+        "half-double-80-160",
+        "half-double-85-170",
+        "half-double-90-180",
+    ];
+    let required_cases = required_ids
+        .into_iter()
+        .filter_map(|id| {
+            cases
+                .iter()
+                .find(|case| case.sample_id == id)
+                .cloned()
+                .map(|case| (id.into(), case))
+        })
+        .collect();
+    let resolution = cases
+        .iter()
+        .filter_map(|case| {
+            case.refinement
+                .as_ref()
+                .map(|refinement| refinement.resolution_frames)
+        })
+        .next()
+        .unwrap_or(0.1);
+    TempoRefinementReport {
+        schema_version: 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        split: report.split.clone(),
+        source_commit,
+        algorithm: "local fractional period and phase search over raw Beat This activation logits; current octave relation preserved".into(),
+        fractional_resolution_frames: resolution,
+        applicable_scalar_tracks: current_errors.len(),
+        current_neural_mean_absolute_error_bpm: mean(&current_errors),
+        refined_mean_absolute_error_bpm: mean(&refined_errors),
+        refined_median_absolute_error_bpm: percentile(&refined_errors, 0.50),
+        refined_p95_absolute_error_bpm: percentile(&refined_errors, 0.95),
+        current_canonical_correctness: current_correct,
+        refined_canonical_correctness: refined_correct,
+        current_half_time_count: current_half,
+        refined_half_time_count: refined_half,
+        current_double_time_count: current_double,
+        refined_double_time_count: refined_double,
+        refined_other_wrong_count: refined_other_wrong,
+        by_fixture_family,
+        required_cases,
+        per_fixture: cases,
+        variable_tempo_excluded_from_global_bpm: true,
+        beat_events_changed: false,
+        production_recommendation: "do-not-promote: label-only refinement; require held-out regression evidence before any production proposal".into(),
+    }
 }
 
 fn relation_to_truth(bpm: Option<f32>, truth_bpm: f32, ambiguous: bool) -> String {
@@ -4481,6 +6393,7 @@ fn compare_external(
     document: &ExternalObservationDocument,
     manifest: &SyntheticCorpusManifest,
     tracks: &[TrackEvaluation],
+    identities: Option<&BTreeMap<String, ExternalIdentity>>,
 ) -> Result<ExternalReport, LabError> {
     let records = manifest
         .fixtures
@@ -4498,7 +6411,9 @@ fn compare_external(
         let Some(record) = records.get(observation.sample_id.as_str()) else {
             return Err(LabError::UnknownSample(observation.sample_id.clone()));
         };
-        if record.audio_sha256 != observation.audio_sha256 {
+        if let Some(identity) = identities.and_then(|items| items.get(&observation.sample_id)) {
+            verify_external_observation_identity(observation, identity)?;
+        } else if record.audio_sha256 != observation.audio_sha256 {
             return Err(LabError::HashMismatch {
                 sample_id: observation.sample_id.clone(),
                 expected: record.audio_sha256.clone(),
@@ -4549,6 +6464,38 @@ fn compare_external(
         incomplete_observations,
         by_observer,
     })
+}
+
+fn verify_external_observation_identity(
+    observation: &ExternalAnalysisObservation,
+    identity: &ExternalIdentity,
+) -> Result<(), LabError> {
+    if observation.audio_sha256 != identity.wav_file_sha256 {
+        return Err(LabError::HashMismatch {
+            sample_id: observation.sample_id.clone(),
+            expected: identity.wav_file_sha256.clone(),
+            actual: observation.audio_sha256.clone(),
+        });
+    }
+    if let Some(pcm_sha256) = observation.pcm_sha256.as_deref()
+        && pcm_sha256 != identity.pcm_sha256
+    {
+        return Err(LabError::HashMismatch {
+            sample_id: observation.sample_id.clone(),
+            expected: identity.pcm_sha256.clone(),
+            actual: pcm_sha256.to_owned(),
+        });
+    }
+    if let Some(ground_truth_sha256) = observation.ground_truth_sha256.as_deref()
+        && ground_truth_sha256 != identity.ground_truth_sha256
+    {
+        return Err(LabError::HashMismatch {
+            sample_id: observation.sample_id.clone(),
+            expected: identity.ground_truth_sha256.clone(),
+            actual: ground_truth_sha256.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn normalized_external(observation: &ExternalAnalysisObservation) -> NormalizedExternalAnalysis {
@@ -5590,6 +7537,7 @@ mod tests {
     fn backend_outcomes_are_dimension_aware_and_not_one_aggregate_score() {
         let snapshot = |recall: f64, valid: bool| BackendMetricSnapshot {
             beat_mae_ms: Some(if valid { 5.0 } else { 200.0 }),
+            beat_p50_ms: Some(4.0),
             beat_p95_ms: Some(10.0),
             precision_at_40ms: Some(recall),
             recall_at_40ms: Some(recall),
@@ -5698,8 +7646,92 @@ mod tests {
             },
             &manifest,
             &[],
+            None,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn external_identity_checks_wav_pcm_and_ground_truth_independently() {
+        let identity = ExternalIdentity {
+            wav_file_sha256: "a".repeat(64),
+            pcm_sha256: "b".repeat(64),
+            ground_truth_sha256: "c".repeat(64),
+        };
+        let mut observation = observation_with("sample", None, None, None, None, None, false);
+        observation.audio_file = Some("audio/sample.wav".into());
+        observation.audio_sha256 = identity.wav_file_sha256.clone();
+        observation.pcm_sha256 = Some(identity.pcm_sha256.clone());
+        observation.ground_truth_sha256 = Some(identity.ground_truth_sha256.clone());
+        assert!(verify_external_observation_identity(&observation, &identity).is_ok());
+        observation.audio_sha256 = "d".repeat(64);
+        assert!(verify_external_observation_identity(&observation, &identity).is_err());
+        observation.audio_sha256 = identity.wav_file_sha256.clone();
+        observation.pcm_sha256 = Some("d".repeat(64));
+        assert!(verify_external_observation_identity(&observation, &identity).is_err());
+        observation.pcm_sha256 = Some(identity.pcm_sha256.clone());
+        observation.ground_truth_sha256 = Some("d".repeat(64));
+        assert!(verify_external_observation_identity(&observation, &identity).is_err());
+    }
+
+    #[test]
+    fn generated_float_external_identity_is_rejected_by_public_evaluator() {
+        let manifest = generate_default_manifest(1).unwrap();
+        let observation = observation_with(
+            &manifest.fixtures[0].spec.id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        let result = evaluate_manifest(
+            &manifest,
+            Some(&ExternalObservationDocument {
+                schema_version: OBSERVATION_SCHEMA_VERSION,
+                observations: vec![observation],
+            }),
+            EvaluationOptions {
+                mode: AnalyzerMode::Classical,
+                split: manifest.split.clone(),
+                source_commit: None,
+                include_backend_comparison: false,
+            },
+        );
+        assert!(
+            matches!(result, Err(LabError::InvalidInput(message)) if message.contains("exported-WAV-only"))
+        );
+    }
+
+    #[test]
+    fn schema_v2_requires_meter_truth_presence_but_accepts_null() {
+        let manifest = generate_default_manifest(3).unwrap();
+        let mut value = serde_json::to_value(&manifest.fixtures[0].spec).unwrap();
+        value.as_object_mut().unwrap().remove("meter_truth");
+        assert!(serde_json::from_value::<FixtureSpec>(value).is_err());
+        let ambiguous = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.spec.id == "meter-ambiguous-4-4")
+            .unwrap();
+        let value = serde_json::to_value(&ambiguous.spec).unwrap();
+        let decoded: FixtureSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.meter_truth, None);
+    }
+
+    #[test]
+    fn platform_participates_in_external_observer_grouping() {
+        let mut mac = observation_with("sample", None, None, None, None, None, false);
+        mac.audio_file = Some("audio/sample.wav".into());
+        let mut windows = mac.clone();
+        windows.observer.platform = Some("windows".into());
+        mac.observer.platform = Some("macos".into());
+        let document = ExternalObservationDocument {
+            schema_version: OBSERVATION_SCHEMA_VERSION,
+            observations: vec![mac, windows],
+        };
+        assert!(document.validate().is_ok());
     }
 
     #[test]
@@ -5758,7 +7790,7 @@ mod tests {
             },
             notes: Vec::new(),
         };
-        let report = evaluate_manifest(
+        let result = evaluate_manifest(
             &manifest,
             Some(&ExternalObservationDocument {
                 schema_version: OBSERVATION_SCHEMA_VERSION,
@@ -5770,15 +7802,8 @@ mod tests {
                 source_commit: None,
                 include_backend_comparison: false,
             },
-        )
-        .unwrap();
-        let observer = report.external.by_observer.values().next().unwrap();
-        assert_eq!(report.external.observations, 1);
-        assert_eq!(report.analyzer_mode, AnalyzerMode::Classical);
-        assert_eq!(report.source_commit, None);
-        assert_eq!(report.analysis_backends.get("classical"), Some(&1));
-        assert_eq!(observer.external_vs_truth.tracks, 1);
-        assert_eq!(observer.wotoha_vs_external.tracks, 1);
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -6247,7 +8272,7 @@ mod tests {
             schema_version: OBSERVATION_SCHEMA_VERSION,
             observations: vec![one, two],
         };
-        let report = evaluate_manifest(
+        let result = evaluate_manifest(
             &manifest,
             Some(&document),
             EvaluationOptions {
@@ -6256,10 +8281,8 @@ mod tests {
                 source_commit: None,
                 include_backend_comparison: false,
             },
-        )
-        .unwrap();
-        assert_eq!(report.external.observations, 2);
-        assert_eq!(report.external.by_observer.len(), 2);
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -6447,5 +8470,163 @@ mod tests {
                 .windows(2)
                 .all(|window| window[0].0 < window[1].0 && window[0].1 < window[1].1)
         );
+    }
+
+    fn synthetic_activation(period: f32, phase: f32, length: usize) -> Vec<f32> {
+        (0..length)
+            .map(|index| {
+                let frame = index as f32;
+                let nearest = ((frame - phase) / period).round();
+                let distance = (frame - (phase + nearest * period)).abs();
+                7.0 - 3.0 * distance.min(4.0)
+            })
+            .collect()
+    }
+
+    fn meter_prediction(meter: u8) -> NormalizedAnalysis {
+        let beats = (0..48)
+            .map(|index| NormalizedBeat {
+                time_micros: index as u64 * 500_000,
+                timing_confidence: 0.9,
+                beat_model_score: Some(0.8),
+                onset_support: None,
+                low_frequency_support: None,
+                downbeat_evidence: Some(if index % usize::from(meter) == 0 {
+                    0.95
+                } else {
+                    0.05
+                }),
+            })
+            .collect();
+        NormalizedAnalysis {
+            analyzer: "research-test".into(),
+            duration_micros: 24_000_000,
+            beats,
+            tempo_hypotheses: Vec::new(),
+            meter_hypotheses: Vec::new(),
+            resolved_meter: None,
+            resolved_meter_phase: None,
+            structure: NormalizedStructure::default(),
+            confidence: ConfidenceEvidence::default(),
+            provenance: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn fractional_refinement_is_deterministic_and_does_not_change_events() {
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            synthetic_activation(24.0, 2.0, 600),
+            vec![-7.0; 600],
+        )
+        .unwrap();
+        let first = fractional_tempo_refinement(&observations, Some(125.0), "primary").unwrap();
+        let second = fractional_tempo_refinement(&observations, Some(125.0), "primary").unwrap();
+        assert_eq!(first, second);
+        assert!((first.selected_period_frames.unwrap() - 24.0).abs() < 0.15);
+        assert_eq!(first.relation, "primary");
+        assert_eq!(observations.beat_logits.len(), 600);
+    }
+
+    #[test]
+    fn fractional_refinement_recovers_between_frame_period_and_128_case() {
+        let between = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            synthetic_activation(24.25, 2.0, 600),
+            vec![-7.0; 600],
+        )
+        .unwrap();
+        let refined = fractional_tempo_refinement(&between, Some(125.0), "half_time").unwrap();
+        assert!((refined.selected_period_frames.unwrap() - 24.25).abs() < 0.25);
+        assert_eq!(refined.relation, "half_time");
+
+        let one_twenty_eight = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            synthetic_activation(50.0 * 60.0 / 128.0, 2.0, 600),
+            vec![-7.0; 600],
+        )
+        .unwrap();
+        let refined =
+            fractional_tempo_refinement(&one_twenty_eight, Some(125.0), "primary").unwrap();
+        assert!((refined.selected_bpm.unwrap() - 128.0).abs() < 1.5);
+    }
+
+    #[test]
+    fn fractional_refinement_rejects_out_of_range_period() {
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            vec![0.0; 100],
+            vec![0.0; 100],
+        )
+        .unwrap();
+        assert!(fractional_tempo_refinement(&observations, Some(5_000.0), "primary").is_none());
+    }
+
+    #[test]
+    fn contrastive_meter_phase_resolves_clear_meters_and_allows_unknown() {
+        for meter in [2_u8, 3, 4, 6] {
+            let prediction = meter_prediction(meter);
+            let (resolved, candidates, margin, reason) = experimental_meter_resolution(&prediction);
+            assert_eq!(resolved, Some(meter));
+            assert_eq!(candidates.len(), 15);
+            assert!(margin.is_some());
+            assert!(reason.is_none());
+        }
+        let mut ambiguous = meter_prediction(4);
+        for beat in &mut ambiguous.beats {
+            beat.downbeat_evidence = Some(0.5);
+        }
+        let (resolved, _, margin, reason) = experimental_meter_resolution(&ambiguous);
+        assert!(resolved.is_none());
+        assert!(margin.is_some_and(|value| value < 0.04));
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn meter_off_phase_leakage_lowers_contrastive_score_and_production_is_unchanged() {
+        let prediction = meter_prediction(4);
+        let clean = meter_phase_candidate(&prediction, 4, 0);
+        let mut leaky = prediction.clone();
+        for (index, beat) in leaky.beats.iter_mut().enumerate() {
+            if index % 4 == 1 {
+                beat.downbeat_evidence = Some(0.8);
+            }
+        }
+        let leaky = meter_phase_candidate(&leaky, 4, 0);
+        assert!(leaky.off_phase_downbeat_leakage > clean.off_phase_downbeat_leakage);
+        assert!(leaky.score < clean.score);
+        assert_eq!(prediction.resolved_meter, None);
+    }
+
+    #[test]
+    fn gate_features_are_predecision_only_and_grouped_duplicates_do_not_split() {
+        let rows = vec![
+            GateFeatureRow {
+                sample_id: "a".into(),
+                family: "constant_tempo".into(),
+                pcm_group: "same".into(),
+                lineage_group: "root".into(),
+                neural_available: true,
+                features: BTreeMap::from([("candidate_score".into(), 0.8)]),
+                diagnostic_score: 0.8,
+                truth_side_label: "neural_dominates".into(),
+            },
+            GateFeatureRow {
+                sample_id: "b".into(),
+                family: "transform".into(),
+                pcm_group: "same".into(),
+                lineage_group: "root".into(),
+                neural_available: true,
+                features: BTreeMap::from([("candidate_score".into(), 0.2)]),
+                diagnostic_score: 0.2,
+                truth_side_label: "classical_dominates".into(),
+            },
+        ];
+        let fold = gate_validation_fold(&rows, &[0, 1], "exact_pcm");
+        assert!(!fold.exact_pcm_group_overlap);
+        assert!(!GATE_FEATURE_NAMES.iter().any(|name| {
+            ["fixture_id", "family", "ground_truth", "expected_bpm"].contains(name)
+        }));
+        assert!(!rows[0].features.contains_key("fixture_id"));
     }
 }

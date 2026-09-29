@@ -26,7 +26,13 @@ observation explicitly produced zero beats. The same rule applies to
 downbeats. Incomplete observations are counted separately and incomplete empty
 results are not scored as authoritative failures. A record or document with
 an unsupported schema version is rejected. Duplicate sample/observer/version/
-settings records are rejected.
+settings records are rejected; platform participates in the grouping key.
+External observations are accepted only by the exported-WAV evaluator. The
+normal in-memory `evaluate` path rejects them explicitly, preventing a WAV
+identity from being compared with the generated floating-point fixture hash.
+When importing an observation against a `BlackboxManifest`, the evaluator
+checks sample ID, `wav_file_sha256`, supplied `pcm_sha256`, and supplied
+`ground_truth_sha256` before scoring.
 
 The current clean-room target can be represented by an observer identity such
 as `Traktor Pro 4`, version `4.1.1 (23)`, macOS. No binary is needed by this
@@ -84,16 +90,25 @@ cargo run --locked -p wotoha-analysis-lab -- generate \
   --output /tmp/wotoha-analysis-fixtures.json --seed 123
 ```
 
-Evaluate the current Wotoha V2 adapter and optionally import external records:
+Evaluate the current Wotoha V2 adapter:
 
 ```bash
 cargo run --locked -p wotoha-analysis-lab -- evaluate \
   --manifest /tmp/wotoha-analysis-fixtures.json \
-  --external-observations /tmp/observations.json \
   --report /tmp/wotoha-analysis-report.json
 ```
 
-`--external-observations` is optional. `--mode hybrid` exercises the existing
+Use the exported-WAV path for external observations:
+
+```bash
+cargo run --locked -p wotoha-analysis-lab -- evaluate-exported \
+  --manifest /tmp/wotoha-blackbox-v1/manifest.json \
+  --audio-root /tmp/wotoha-blackbox-v1 \
+  --external-observations /tmp/observations.json \
+  --report /tmp/wotoha-exported-report.json
+```
+
+`--mode hybrid` exercises the existing
 CPU Beat This! V2 rhythm path with its established fallback; `--mode classical`
 is useful for fast deterministic fixture iteration. Each fixture is generated,
 hashed, analyzed, and released before the next one. The evaluator has a
@@ -112,9 +127,62 @@ This report compares the current production hypothesis with independent
 half/native/double candidate evidence. It may return `ambiguous`; it never
 replaces the production tempo label or BeatEvent timeline.
 
+Schema-v2 fixture specs require a present `meter_truth` field. Values `2`,
+`3`, `4`, `6`, and explicit `null` are valid; omission is rejected. This
+preserves the distinction between unknown evaluation truth and an invalid
+fixture.
+
 Runs do not use `.wotoha-analysis/` or the production analysis cache. Generated
 manifests, reports, and run directories belong in `/tmp`, `target`, or the
 ignored lab paths.
+
+## Ground-truth research pass
+
+The complete exported-WAV research pass writes all required artifacts under a
+directory outside Git:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=6c4fa27887c33eb640314099046315149e706262 \
+cargo run --release --locked -p wotoha-analysis-lab -- research-pass \
+  --manifest /tmp/wotoha-blackbox-v1/manifest.json \
+  --audio-root /tmp/wotoha-blackbox-v1 \
+  --output /tmp/wotoha-groundtruth-research
+```
+
+This decodes each exported WAV and runs both backends on the same PCM. It
+writes `current-classical.json`, `current-hybrid.json`, `backend-oracle.json`,
+`gate-research.json`, `tempo-refinement.json`, `meter-research.json`,
+`research-summary.json`, and `research-summary.md`. The source commit is
+required in the report metadata.
+
+The backend oracle is truth-only and cannot select a production backend. It
+reports Always Classical, current Hybrid, Always Neural where native output
+exists, independent beat/tempo/phase oracle choices, and dimension-aware joint
+labels. A backend dominates only with no material regression (1 ms beat MAE,
+5 ms beat p95, or 0.02 precision/recall thresholds) and at least one material
+improvement; otherwise the result is `mixed` or `equal`.
+
+The gate uses only pre-decision diagnostics. Exact PCM duplicates and practical
+base/transform lineages are grouped for validation, with leave-family-out
+folds. Fixture ID, filename, family, transform, expected BPM, and Ground Truth
+are not inference features. Its risk-first threshold search minimizes false
+accepts of bad neural output; zero neural coverage is reported directly as an
+Always Classical result.
+
+Tempo refinement searches a bounded fractional period neighborhood at
+0.1-frame resolution and interpolates activation while jointly searching phase.
+It preserves the current half/native/double relation and changes only a
+research tempo label; production `BeatEvent[]` is never regenerated. Variable
+tempo is excluded from global BPM accuracy. The existing PCM-envelope and
+activation-domain experiments remain diagnostic and are not combined or
+promoted.
+
+Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
+downbeat evidence, off-phase leakage, periodic consistency, bar-cycle
+consistency, and beat-event confidence. A minimum score and margin may return
+`Unknown`; the ambiguous 4/4 fixture is not forced to a guess. The production
+four-phase downbeat prior and production meter resolver remain unchanged.
 
 ## Metrics and reports
 
@@ -235,7 +303,7 @@ public literature, or human validation, and must preserve the existing
 The synthetic corpus schema is version 2 because meter truth is now explicit;
 the external observation schema is version 2 because transferred identity is
 named `wav_file_sha256`; the black-box schema is version 2 for the same explicit
-hash semantics. The report schema is version 5 because neural tempo candidate
+hash semantics. The report schema is version 6 because neural tempo candidate
 evidence and truth-relative relation fields have candidate-specific semantics;
 old manifests, observations, and reports must not be compared silently with
 new schemas.
