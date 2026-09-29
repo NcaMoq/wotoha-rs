@@ -143,7 +143,7 @@ directory outside Git:
 
 ```bash
 WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
-WOTOHA_STARTING_COMMIT=6c4fa27887c33eb640314099046315149e706262 \
+WOTOHA_STARTING_COMMIT=c61fb55a0ead23837ee5b1470438324b2b793294 \
 cargo run --release --locked -p wotoha-analysis-lab -- research-pass \
   --manifest /tmp/wotoha-blackbox-v1/manifest.json \
   --audio-root /tmp/wotoha-blackbox-v1 \
