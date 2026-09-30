@@ -2631,6 +2631,9 @@ pub struct EvaluationReport {
     pub failure_clusters: BTreeMap<String, usize>,
     pub external: ExternalReport,
     pub per_track: Vec<TrackEvaluation>,
+    #[serde(skip)]
+    pub research_raw_observations:
+        BTreeMap<String, wotoha_core::beat_analysis::NeuralBeatObservations>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2872,6 +2875,184 @@ pub struct FractionalTempoRefinement {
     pub periodic_consistency: f32,
     pub phase_stability: f32,
     pub resolution_frames: f32,
+}
+
+/// Research-only tempo estimate derived from the decoded neural event clock.
+/// The estimate is a label; it never replaces the Classical or Neural beat
+/// timeline used by an analyzer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BeatEventIntervalRefinement {
+    pub selected_bpm: Option<f32>,
+    pub selected_period_micros: Option<f64>,
+    pub relation: String,
+    pub usable_events: usize,
+    pub usable_intervals: usize,
+    pub interval_median_micros: Option<f64>,
+    pub interval_mad_micros: Option<f64>,
+    pub relative_dispersion: Option<f64>,
+    pub fit_residual_micros: Option<f64>,
+    pub middle_period_micros: Option<f64>,
+    pub early_late_drift: Option<f64>,
+    pub available: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorMetricSummary {
+    pub scored: usize,
+    pub canonical_correct: usize,
+    pub canonical_accuracy: Option<f64>,
+    pub half_time: usize,
+    pub double_time: usize,
+    pub other_wrong: usize,
+    pub absent: usize,
+    pub absolute_bpm_mae: Option<f64>,
+    pub absolute_bpm_median: Option<f64>,
+    pub absolute_bpm_p95: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorOracleComparison {
+    pub classical: TempoAdvisorMetricSummary,
+    pub candidate: TempoAdvisorMetricSummary,
+    pub oracle: TempoAdvisorMetricSummary,
+    pub oracle_uplift_over_classical: i64,
+    pub classical_rescues_candidate_cannot_provide: Vec<String>,
+    pub candidate_rescues_classical: Vec<String>,
+    pub both_correct: Vec<String>,
+    pub both_wrong: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorFeatureDescription {
+    pub name: String,
+    pub definition: String,
+    pub source: String,
+    pub production_time_available: bool,
+    pub missing_value_behavior: String,
+    pub observed_min: Option<f64>,
+    pub observed_median: Option<f64>,
+    pub observed_max: Option<f64>,
+    pub exposure: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorFoldAudit {
+    pub fold: usize,
+    pub validation_sample_ids: Vec<String>,
+    pub training_sample_ids: Vec<String>,
+    pub validation_groups: Vec<String>,
+    pub training_groups: Vec<String>,
+    pub selected_threshold: f64,
+    pub selected_candidate: String,
+    pub exact_pcm_overlap: bool,
+    pub lineage_overlap: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorFixture {
+    pub sample_id: String,
+    pub family: String,
+    pub truth_bpm: f32,
+    pub classical_bpm: Option<f32>,
+    pub classical_relation: String,
+    pub current_neural_bpm: Option<f32>,
+    pub current_neural_relation: String,
+    pub activation_refined_bpm: Option<f32>,
+    pub activation_refined_relation: String,
+    pub event_refined_bpm: Option<f32>,
+    pub event_refined_relation: String,
+    pub consensus_bpm: Option<f32>,
+    pub consensus_relation: String,
+    pub oracle_choice: String,
+    pub oof_advisor_choice: String,
+    pub oof_advisor_selected_bpm: Option<f32>,
+    pub oof_advisor_correct: Option<bool>,
+    pub advisor_features: BTreeMap<String, f64>,
+    pub outer_fold: Option<usize>,
+    pub event_refinement: Option<BeatEventIntervalRefinement>,
+    pub neural_diagnostics: Option<NeuralDiagnostics>,
+    pub classical_tempo_hypotheses: Vec<NormalizedTempoHypothesis>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorFamilyStress {
+    pub requested_family: String,
+    pub expanded_validation_samples: Vec<String>,
+    pub other_families_pulled_into_validation: Vec<String>,
+    pub train_size: usize,
+    pub validation_size: usize,
+    pub exact_pcm_overlap: bool,
+    pub lineage_overlap: bool,
+    pub advisor_metrics: TempoAdvisorMetricSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorReport {
+    pub schema_version: u32,
+    pub evaluator: String,
+    pub source_commit: String,
+    pub starting_commit: Option<String>,
+    pub corpus_seed: u64,
+    pub fixture_count: usize,
+    pub scalar_tempo_fixture_count: usize,
+    pub native_neural_scalar_cohort: usize,
+    pub architecture: String,
+    pub baseline_classical: TempoAdvisorMetricSummary,
+    pub baseline_current_neural: TempoAdvisorMetricSummary,
+    pub activation_refined: TempoAdvisorMetricSummary,
+    pub event_refined: TempoAdvisorMetricSummary,
+    pub consensus_refined: TempoAdvisorMetricSummary,
+    pub refined_oracle: TempoAdvisorMetricSummary,
+    pub activation_oracle: TempoAdvisorOracleComparison,
+    pub event_oracle: TempoAdvisorOracleComparison,
+    pub best_refined_oracle: TempoAdvisorOracleComparison,
+    pub classical_failure_budget: Vec<TempoAdvisorFixture>,
+    pub feature_inventory: Vec<TempoAdvisorFeatureDescription>,
+    pub nested_oof: TempoAdvisorNestedOof,
+    pub component_expanded_family_stress: Vec<TempoAdvisorFamilyStress>,
+    pub per_fixture: Vec<TempoAdvisorFixture>,
+    pub variable_tempo_safety: Vec<TempoAdvisorVariableTempoSafety>,
+    pub transform_robustness: BTreeMap<String, TempoAdvisorTransformPair>,
+    pub recommendation: String,
+    pub production_changes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorNestedOof {
+    pub grouping_rule: String,
+    pub feature_set_frozen_before_oof: bool,
+    pub outer_fold_count: usize,
+    pub outer_folds: Vec<TempoAdvisorFoldAudit>,
+    pub advisor_metrics: TempoAdvisorMetricSummary,
+    pub false_accept_sample_ids: Vec<String>,
+    pub canonical_rescue_sample_ids: Vec<String>,
+    pub neural_coverage: usize,
+    pub abstention_count: usize,
+    pub full_data_refit_threshold: f64,
+    pub full_data_refit_is_not_held_out: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorVariableTempoSafety {
+    pub sample_id: String,
+    pub family: String,
+    pub fit_residual_micros: Option<f64>,
+    pub interval_dispersion: Option<f64>,
+    pub early_period_micros: Option<f64>,
+    pub middle_period_micros: Option<f64>,
+    pub late_period_micros: Option<f64>,
+    pub refinement_available: bool,
+    pub abstention_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TempoAdvisorTransformPair {
+    pub base_sample_id: String,
+    pub transformed_sample_id: String,
+    pub activation_bpm_delta: Option<f32>,
+    pub event_bpm_delta: Option<f32>,
+    pub advisor_decision_changed: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3292,6 +3473,15 @@ fn evaluate_manifest_with_context(
     }
     let analyzer_mode = options.mode;
     let source_commit = options.source_commit;
+    let research_raw_observations = experimental_results
+        .iter()
+        .filter_map(|(sample_id, result)| {
+            result
+                .raw_observations
+                .clone()
+                .map(|observations| (sample_id.clone(), observations))
+        })
+        .collect();
     let external_report = external
         .map(|document| compare_external(document, manifest, &tracks, external_identities))
         .transpose()?
@@ -3319,6 +3509,7 @@ fn evaluate_manifest_with_context(
         failure_clusters,
         external: external_report,
         per_track: tracks,
+        research_raw_observations,
     })
 }
 
@@ -3907,6 +4098,1074 @@ pub fn run_ground_truth_research(
     let markdown = research_summary_markdown_corrected(&summary, &oracle, &gate, &tempo, &meter);
     fs::write(output_dir.join("research-summary.md"), markdown)?;
     Ok(summary)
+}
+
+/// Run the research-only Classical-rhythm/Neural-tempo-advisor experiment.
+///
+/// This deliberately evaluates two independent exported-WAV runs and joins
+/// only their pre-truth diagnostics. The returned advisor can select a tempo
+/// label, but no Neural beat event, phase, meter, or downbeat is ever copied
+/// into the hypothetical architecture.
+pub fn run_tempo_advisor_research(
+    manifest_path: &Path,
+    audio_root: &Path,
+    output_dir: &Path,
+    source_commit: String,
+    starting_commit: Option<String>,
+) -> Result<TempoAdvisorReport, LabError> {
+    let blackbox = BlackboxManifest::load(manifest_path)?;
+    fs::create_dir_all(output_dir)?;
+    let hybrid = evaluate_exported_manifest(
+        manifest_path,
+        audio_root,
+        None,
+        EvaluationOptions {
+            mode: AnalyzerMode::Hybrid,
+            split: blackbox.split.clone(),
+            source_commit: Some(source_commit.clone()),
+            include_backend_comparison: true,
+        },
+    )?;
+    let classical = evaluate_exported_manifest(
+        manifest_path,
+        audio_root,
+        None,
+        EvaluationOptions {
+            mode: AnalyzerMode::Classical,
+            split: blackbox.split.clone(),
+            source_commit: Some(source_commit.clone()),
+            include_backend_comparison: true,
+        },
+    )?;
+    let mut rows = build_tempo_advisor_rows(&blackbox, &hybrid, &classical)?;
+    let mut gate_rows = rows
+        .iter()
+        .map(|row| GateFeatureRow {
+            sample_id: row.fixture.sample_id.clone(),
+            family: row.fixture.family.clone(),
+            pcm_group: row.pcm_group.clone(),
+            lineage_group: row.lineage_group.clone(),
+            leakage_group: String::new(),
+            neural_available: row.candidate_bpm.is_some(),
+            features: row.fixture.advisor_features.clone(),
+            diagnostic_score: row.diagnostic_score,
+            truth_side_label: if canonical_tempo(row.fixture.classical_bpm, row.fixture.truth_bpm)
+                && !canonical_tempo(row.candidate_bpm, row.fixture.truth_bpm)
+            {
+                "classical_dominates"
+            } else if !canonical_tempo(row.fixture.classical_bpm, row.fixture.truth_bpm)
+                && canonical_tempo(row.candidate_bpm, row.fixture.truth_bpm)
+            {
+                "neural_dominates"
+            } else {
+                "equal"
+            }
+            .into(),
+        })
+        .collect::<Vec<_>>();
+    let leakage_groups = connected_leakage_groups(&gate_rows);
+    for row in &mut gate_rows {
+        row.leakage_group = leakage_groups
+            .get(&row.sample_id)
+            .cloned()
+            .unwrap_or_else(|| row.sample_id.clone());
+    }
+    for row in &mut rows {
+        row.leakage_group = leakage_groups
+            .get(&row.fixture.sample_id)
+            .cloned()
+            .unwrap_or_else(|| row.fixture.sample_id.clone());
+    }
+    let nested_oof = run_tempo_advisor_oof(&mut rows);
+    let family_stress = build_tempo_advisor_family_stress(&rows, &gate_rows);
+    let feature_inventory = build_tempo_advisor_feature_inventory(&rows);
+    let activation_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.activation_refined_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let event_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.event_refined_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let consensus_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.consensus_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let current_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.current_neural_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let classical_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.classical_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let refined_values = rows
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                best_research_candidate(row).1,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    for row in &mut rows {
+        row.fixture.oracle_choice = tempo_oracle_choice(row);
+    }
+    let activation_oracle = tempo_advisor_oracle(&rows, |row| row.fixture.activation_refined_bpm);
+    let event_oracle = tempo_advisor_oracle(&rows, |row| row.fixture.event_refined_bpm);
+    let best_refined_oracle = tempo_advisor_oracle(&rows, |row| best_research_candidate(row).1);
+    let classical_failures = rows
+        .iter()
+        .filter(|row| !canonical_tempo(row.fixture.classical_bpm, row.fixture.truth_bpm))
+        .map(|row| row.fixture.clone())
+        .collect::<Vec<_>>();
+    let variable_tempo_safety = build_variable_tempo_safety(&rows, &hybrid);
+    let transform_robustness = build_tempo_transform_robustness(&blackbox, &rows);
+    let recommendation = if nested_oof.advisor_metrics.canonical_correct
+        > tempo_metric_summary(&classical_values).canonical_correct
+        && nested_oof.false_accept_sample_ids.is_empty()
+    {
+        "B — research advisor promising, not ready: the outer grouped result shows a rescue signal, but the synthetic corpus is too small for promotion.".into()
+    } else {
+        "A — no advisor value: Always Classical remains the rational tempo architecture; retain Neural refinements as research diagnostics only.".into()
+    };
+    let report = TempoAdvisorReport {
+        schema_version: RESEARCH_REPORT_SCHEMA_VERSION + 1,
+        evaluator: format!("wotoha-analysis-lab/{}", env!("CARGO_PKG_VERSION")),
+        source_commit: source_commit.clone(),
+        starting_commit,
+        corpus_seed: blackbox.seed,
+        fixture_count: blackbox.fixtures.len(),
+        scalar_tempo_fixture_count: rows.len(),
+        native_neural_scalar_cohort: rows
+            .iter()
+            .filter(|row| row.fixture.current_neural_bpm.is_some())
+            .count(),
+        architecture: "Classical beat timeline/grid/meter/downbeat authority plus optional tempo-only Neural advisor".into(),
+        baseline_classical: tempo_metric_summary(&classical_values),
+        baseline_current_neural: tempo_metric_summary_available(&current_values),
+        activation_refined: tempo_metric_summary_available(&activation_values),
+        event_refined: tempo_metric_summary_available(&event_values),
+        consensus_refined: tempo_metric_summary_available(&consensus_values),
+        refined_oracle: tempo_metric_summary_available(&refined_values),
+        activation_oracle,
+        event_oracle,
+        best_refined_oracle,
+        classical_failure_budget: classical_failures,
+        feature_inventory,
+        nested_oof,
+        component_expanded_family_stress: family_stress,
+        per_fixture: rows.iter().map(|row| row.fixture.clone()).collect(),
+        variable_tempo_safety,
+        transform_robustness,
+        recommendation,
+        production_changes: vec![
+            "none: production analyzers and resolvers unchanged".into(),
+            "Neural tempo candidates change labels in this report only".into(),
+            "Classical beat events, grid phase, meter, and downbeats remain authoritative".into(),
+            "Traktor and Rekordbox automatic analysis are not advisor inputs".into(),
+        ],
+    };
+    write_json(&output_dir.join("tempo-advisor-research.json"), &report)?;
+    write_json(&output_dir.join("baseline-classical.json"), &classical)?;
+    write_json(&output_dir.join("baseline-hybrid.json"), &hybrid)?;
+    write_json(
+        &output_dir.join("refinement-comparison.json"),
+        &serde_json::json!({
+            "activation": report.activation_refined,
+            "event": report.event_refined,
+            "consensus": report.consensus_refined,
+            "oracle": report.best_refined_oracle,
+        }),
+    )?;
+    write_json(&output_dir.join("advisor-oof.json"), &report.nested_oof)?;
+    write_json(
+        &output_dir.join("advisor-family-stress.json"),
+        &report.component_expanded_family_stress,
+    )?;
+    fs::write(
+        output_dir.join("tempo-advisor-research.md"),
+        tempo_advisor_markdown(&report),
+    )?;
+    fs::write(
+        output_dir.join("README.txt"),
+        "Research-only output. Classical owns beats/grid/meter/downbeats; Neural candidates may change only a tempo label. OOF decisions are grouped by connected PCM+lineage components. Full-data refit is not held-out evidence.\n",
+    )?;
+    Ok(report)
+}
+
+fn build_tempo_advisor_rows(
+    blackbox: &BlackboxManifest,
+    hybrid: &EvaluationReport,
+    classical: &EvaluationReport,
+) -> Result<Vec<TempoAdvisorRow>, LabError> {
+    let hybrid_by_id = hybrid
+        .per_track
+        .iter()
+        .map(|track| (track.sample_id.as_str(), track))
+        .collect::<BTreeMap<_, _>>();
+    let classical_by_id = classical
+        .per_track
+        .iter()
+        .map(|track| (track.sample_id.as_str(), track))
+        .collect::<BTreeMap<_, _>>();
+    let experiment_by_id = hybrid
+        .tempo_experiment
+        .per_fixture
+        .iter()
+        .map(|fixture| (fixture.sample_id.as_str(), fixture))
+        .collect::<BTreeMap<_, _>>();
+    let pcm_by_id = blackbox
+        .fixtures
+        .iter()
+        .map(|fixture| (fixture.sample_id.as_str(), fixture.pcm_sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let lineage = lineage_group_map(blackbox);
+    let mut rows = Vec::new();
+    for record in &blackbox.fixtures {
+        let Some(truth) = record.truth.tempo.as_ref() else {
+            continue;
+        };
+        if !matches!(record.spec.tempo, TempoProfile::Constant { .. }) {
+            continue;
+        }
+        let Some(hybrid_track) = hybrid_by_id.get(record.sample_id.as_str()) else {
+            continue;
+        };
+        let Some(classical_track) = classical_by_id.get(record.sample_id.as_str()) else {
+            continue;
+        };
+        let Some(experiment) = experiment_by_id.get(record.sample_id.as_str()) else {
+            continue;
+        };
+        let native = hybrid_track.analysis_backend == "native_neural";
+        let current_bpm = native
+            .then(|| primary_tempo_bpm(&hybrid_track.wotoha))
+            .flatten();
+        let current_relation = current_bpm
+            .map(|bpm| relation_to_truth(Some(bpm), truth.primary_bpm, false))
+            .unwrap_or_else(|| "absent".into());
+        let selection_relation = if native {
+            production_selection_relation(hybrid_track)
+        } else {
+            "unknown".into()
+        };
+        let activation = native
+            .then(|| {
+                experiment
+                    .raw_observations
+                    .as_ref()
+                    .and_then(|observations| {
+                        fractional_tempo_refinement(observations, current_bpm, &selection_relation)
+                    })
+            })
+            .flatten();
+        let event = native
+            .then(|| {
+                experiment.raw_observations.as_ref().map(|observations| {
+                    beat_event_interval_refinement(observations, &selection_relation)
+                })
+            })
+            .flatten();
+        let activation_bpm = activation.as_ref().and_then(|value| value.selected_bpm);
+        let event_bpm = event.as_ref().and_then(|value| value.selected_bpm);
+        let consensus_bpm = activation_bpm.zip(event_bpm).and_then(|(left, right)| {
+            ((left - right).abs() / left.max(1.0) <= 0.005).then_some((left + right) / 2.0)
+        });
+        let consensus_relation = consensus_bpm
+            .map(|bpm| relation_to_truth(Some(bpm), truth.primary_bpm, false))
+            .unwrap_or_else(|| "absent".into());
+        let classical_bpm = primary_tempo_bpm(&classical_track.wotoha);
+        let classical_relation = classical_bpm
+            .map(|bpm| relation_to_truth(Some(bpm), truth.primary_bpm, false))
+            .unwrap_or_else(|| "absent".into());
+        let (candidate_label, candidate_bpm) =
+            choose_refined_candidate(current_bpm, activation.as_ref(), event.as_ref());
+        let (features, diagnostic_score) =
+            advisor_features(hybrid_track, activation.as_ref(), event.as_ref());
+        let fixture = TempoAdvisorFixture {
+            sample_id: record.sample_id.clone(),
+            family: record.spec.family.as_str().into(),
+            truth_bpm: truth.primary_bpm,
+            classical_bpm,
+            classical_relation,
+            current_neural_bpm: current_bpm,
+            current_neural_relation: current_relation,
+            activation_refined_bpm: activation_bpm,
+            activation_refined_relation: activation_bpm
+                .map(|bpm| relation_to_truth(Some(bpm), truth.primary_bpm, false))
+                .unwrap_or_else(|| "absent".into()),
+            event_refined_bpm: event_bpm,
+            event_refined_relation: event_bpm
+                .map(|bpm| relation_to_truth(Some(bpm), truth.primary_bpm, false))
+                .unwrap_or_else(|| "absent".into()),
+            consensus_bpm,
+            consensus_relation,
+            oracle_choice: "not_computed".into(),
+            oof_advisor_choice: "Classical".into(),
+            oof_advisor_selected_bpm: classical_bpm,
+            oof_advisor_correct: None,
+            advisor_features: features,
+            outer_fold: None,
+            event_refinement: event,
+            neural_diagnostics: hybrid_track.neural_diagnostics.clone(),
+            classical_tempo_hypotheses: classical_track.wotoha.tempo_hypotheses.clone(),
+        };
+        rows.push(TempoAdvisorRow {
+            fixture,
+            pcm_group: pcm_by_id
+                .get(record.sample_id.as_str())
+                .cloned()
+                .unwrap_or_else(|| record.sample_id.clone()),
+            lineage_group: lineage
+                .get(&record.sample_id)
+                .cloned()
+                .unwrap_or_else(|| record.sample_id.clone()),
+            leakage_group: String::new(),
+            candidate_label,
+            candidate_bpm,
+            diagnostic_score,
+        });
+    }
+    rows.sort_by(|left, right| left.fixture.sample_id.cmp(&right.fixture.sample_id));
+    Ok(rows)
+}
+
+fn tempo_oracle_choice(row: &TempoAdvisorRow) -> String {
+    let classical = row.fixture.classical_bpm;
+    let (candidate_label, candidate) = best_research_candidate(row);
+    match (classical, candidate) {
+        (Some(classical), Some(candidate)) => {
+            let classical_correct = canonical_tempo(Some(classical), row.fixture.truth_bpm);
+            let candidate_correct = canonical_tempo(Some(candidate), row.fixture.truth_bpm);
+            if candidate_correct && !classical_correct {
+                candidate_label
+            } else if classical_correct && !candidate_correct {
+                "Classical".into()
+            } else if (candidate - row.fixture.truth_bpm).abs()
+                < (classical - row.fixture.truth_bpm).abs()
+            {
+                candidate_label
+            } else {
+                "Classical".into()
+            }
+        }
+        (Some(_), None) => "Classical".into(),
+        (None, Some(_)) => candidate_label,
+        (None, None) => "unavailable".into(),
+    }
+}
+
+/// Select the most accurate available research candidate for retrospective
+/// oracle analysis only. This function is never used by the advisor inference
+/// path and therefore must not be interpreted as a deployable decision rule.
+fn best_research_candidate(row: &TempoAdvisorRow) -> (String, Option<f32>) {
+    let mut candidates = vec![
+        ("current_neural".to_owned(), row.fixture.current_neural_bpm),
+        (
+            "activation_refined".to_owned(),
+            row.fixture.activation_refined_bpm,
+        ),
+        ("event_refined".to_owned(), row.fixture.event_refined_bpm),
+        ("consensus_refined".to_owned(), row.fixture.consensus_bpm),
+    ];
+    candidates.retain(|(_, bpm)| bpm.is_some());
+    candidates.sort_by(|left, right| {
+        let left_bpm = left.1.expect("retained research candidates have BPM");
+        let right_bpm = right.1.expect("retained research candidates have BPM");
+        canonical_tempo(Some(right_bpm), row.fixture.truth_bpm)
+            .cmp(&canonical_tempo(Some(left_bpm), row.fixture.truth_bpm))
+            .then_with(|| {
+                (left_bpm - row.fixture.truth_bpm)
+                    .abs()
+                    .total_cmp(&(right_bpm - row.fixture.truth_bpm).abs())
+            })
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ("unavailable".to_owned(), None))
+}
+
+fn tempo_advisor_oracle(
+    rows: &[TempoAdvisorRow],
+    candidate: impl Fn(&TempoAdvisorRow) -> Option<f32>,
+) -> TempoAdvisorOracleComparison {
+    let comparable = rows
+        .iter()
+        .filter(|row| candidate(row).is_some())
+        .collect::<Vec<_>>();
+    let classical_values = comparable
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                row.fixture.classical_bpm,
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let candidate_values = comparable
+        .iter()
+        .map(|row| {
+            (
+                row.fixture.sample_id.clone(),
+                candidate(row),
+                row.fixture.truth_bpm,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut oracle_values = Vec::new();
+    let mut classical_rescues = Vec::new();
+    let mut candidate_rescues = Vec::new();
+    let mut both_correct = Vec::new();
+    let mut both_wrong = Vec::new();
+    for row in comparable {
+        let classical = row.fixture.classical_bpm;
+        let neural = candidate(row);
+        let classical_correct = canonical_tempo(classical, row.fixture.truth_bpm);
+        let neural_correct = canonical_tempo(neural, row.fixture.truth_bpm);
+        if classical_correct && !neural_correct {
+            classical_rescues.push(row.fixture.sample_id.clone());
+        } else if !classical_correct && neural_correct {
+            candidate_rescues.push(row.fixture.sample_id.clone());
+        } else if classical_correct && neural_correct {
+            both_correct.push(row.fixture.sample_id.clone());
+        } else {
+            both_wrong.push(row.fixture.sample_id.clone());
+        }
+        let selected = match (classical, neural) {
+            (Some(_classical), Some(neural)) if neural_correct && !classical_correct => {
+                Some(neural)
+            }
+            (Some(classical), Some(_neural)) if classical_correct && !neural_correct => {
+                Some(classical)
+            }
+            (Some(classical), Some(neural)) => {
+                let classical_error = (classical - row.fixture.truth_bpm).abs();
+                let neural_error = (neural - row.fixture.truth_bpm).abs();
+                Some(if neural_error < classical_error {
+                    neural
+                } else {
+                    classical
+                })
+            }
+            (Some(classical), None) => Some(classical),
+            (None, Some(neural)) => Some(neural),
+            (None, None) => None,
+        };
+        oracle_values.push((
+            row.fixture.sample_id.clone(),
+            selected,
+            row.fixture.truth_bpm,
+        ));
+    }
+    let classical = tempo_metric_summary(&classical_values);
+    let candidate_summary = tempo_metric_summary(&candidate_values);
+    let oracle = tempo_metric_summary(&oracle_values);
+    TempoAdvisorOracleComparison {
+        oracle_uplift_over_classical: oracle.canonical_correct as i64
+            - classical.canonical_correct as i64,
+        classical,
+        candidate: candidate_summary,
+        oracle,
+        classical_rescues_candidate_cannot_provide: classical_rescues,
+        candidate_rescues_classical: candidate_rescues,
+        both_correct,
+        both_wrong,
+    }
+}
+
+fn select_tempo_advisor_threshold(rows: &[TempoAdvisorRow]) -> f64 {
+    let mut thresholds = vec![1.000001_f64];
+    thresholds.extend(
+        rows.iter()
+            .filter(|row| row.candidate_bpm.is_some())
+            .map(|row| row.diagnostic_score),
+    );
+    thresholds.sort_by(f64::total_cmp);
+    thresholds.dedup_by(|left, right| (*left - *right).abs() < f64::EPSILON);
+    let mut best = (usize::MAX, usize::MAX, usize::MAX, f64::INFINITY);
+    for threshold in thresholds {
+        let mut false_accepts = 0;
+        let mut rescues = 0;
+        let mut precision_wins = 0;
+        let mut coverage = 0;
+        for row in rows {
+            let accepts = row.candidate_bpm.is_some() && row.diagnostic_score >= threshold;
+            if !accepts {
+                continue;
+            }
+            coverage += 1;
+            let classical_correct =
+                canonical_tempo(row.fixture.classical_bpm, row.fixture.truth_bpm);
+            let candidate_correct = canonical_tempo(row.candidate_bpm, row.fixture.truth_bpm);
+            false_accepts += usize::from(classical_correct && !candidate_correct);
+            rescues += usize::from(!classical_correct && candidate_correct);
+            precision_wins += usize::from(
+                classical_correct
+                    && candidate_correct
+                    && row
+                        .candidate_bpm
+                        .zip(row.fixture.classical_bpm)
+                        .is_some_and(|(candidate, classical)| {
+                            (candidate - row.fixture.truth_bpm).abs()
+                                < (classical - row.fixture.truth_bpm).abs()
+                        }),
+            );
+        }
+        let key = (
+            false_accepts,
+            usize::MAX - rescues,
+            usize::MAX - precision_wins,
+            threshold,
+        );
+        if key < best {
+            best = key;
+            let _ = coverage;
+        }
+    }
+    best.3
+}
+
+fn nested_tempo_advisor_threshold(rows: &[TempoAdvisorRow]) -> f64 {
+    if rows.len() < 3 {
+        return select_tempo_advisor_threshold(rows);
+    }
+    let groups = rows
+        .iter()
+        .map(|row| row.leakage_group.clone())
+        .collect::<BTreeSet<_>>();
+    if groups.len() < 2 {
+        return select_tempo_advisor_threshold(rows);
+    }
+    let mut thresholds = Vec::new();
+    for validation_group in groups {
+        let inner_train = rows
+            .iter()
+            .filter(|row| row.leakage_group != validation_group)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !inner_train.is_empty() {
+            thresholds.push(select_tempo_advisor_threshold(&inner_train));
+        }
+    }
+    median_f64(&thresholds).unwrap_or_else(|| select_tempo_advisor_threshold(rows))
+}
+
+fn selected_tempo_value(row: &TempoAdvisorRow, accept: bool) -> (String, Option<f32>) {
+    if accept && row.candidate_bpm.is_some() {
+        (row.candidate_label.clone(), row.candidate_bpm)
+    } else {
+        ("Classical".into(), row.fixture.classical_bpm)
+    }
+}
+
+fn run_tempo_advisor_oof(rows: &mut [TempoAdvisorRow]) -> TempoAdvisorNestedOof {
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        groups
+            .entry(row.leakage_group.clone())
+            .or_default()
+            .push(index);
+    }
+    let all_indices = (0..rows.len()).collect::<Vec<_>>();
+    let mut decisions = BTreeMap::<String, (usize, String, Option<f32>)>::new();
+    let mut audits = Vec::new();
+    for (fold_index, (group, validation_indices)) in groups.iter().enumerate() {
+        let training_indices = all_indices
+            .iter()
+            .copied()
+            .filter(|index| !validation_indices.contains(index))
+            .collect::<Vec<_>>();
+        let training_rows = training_indices
+            .iter()
+            .map(|index| rows[*index].clone())
+            .collect::<Vec<_>>();
+        let threshold = nested_tempo_advisor_threshold(&training_rows);
+        let validation_rows = validation_indices
+            .iter()
+            .map(|index| &rows[*index])
+            .collect::<Vec<_>>();
+        for row in &validation_rows {
+            let accept = row.candidate_bpm.is_some() && row.diagnostic_score >= threshold;
+            let (choice, bpm) = selected_tempo_value(row, accept);
+            decisions.insert(row.fixture.sample_id.clone(), (fold_index, choice, bpm));
+        }
+        let train_pcm = training_indices
+            .iter()
+            .map(|index| rows[*index].pcm_group.clone())
+            .collect::<BTreeSet<_>>();
+        let validation_pcm = validation_indices
+            .iter()
+            .map(|index| rows[*index].pcm_group.clone())
+            .collect::<BTreeSet<_>>();
+        let train_lineage = training_indices
+            .iter()
+            .map(|index| rows[*index].lineage_group.clone())
+            .collect::<BTreeSet<_>>();
+        let validation_lineage = validation_indices
+            .iter()
+            .map(|index| rows[*index].lineage_group.clone())
+            .collect::<BTreeSet<_>>();
+        audits.push(TempoAdvisorFoldAudit {
+            fold: fold_index,
+            validation_sample_ids: validation_indices
+                .iter()
+                .map(|index| rows[*index].fixture.sample_id.clone())
+                .collect(),
+            training_sample_ids: training_indices
+                .iter()
+                .map(|index| rows[*index].fixture.sample_id.clone())
+                .collect(),
+            validation_groups: vec![group.clone()],
+            training_groups: training_indices
+                .iter()
+                .map(|index| rows[*index].leakage_group.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            selected_threshold: threshold,
+            selected_candidate: "frozen-small-interpretable-rule".into(),
+            exact_pcm_overlap: !train_pcm.is_disjoint(&validation_pcm),
+            lineage_overlap: !train_lineage.is_disjoint(&validation_lineage),
+        });
+    }
+    let mut values = Vec::new();
+    let mut false_accepts = Vec::new();
+    let mut rescues = Vec::new();
+    let mut coverage = 0;
+    let mut abstentions = 0;
+    for row in rows.iter_mut() {
+        let (fold, choice, bpm) = decisions.get(&row.fixture.sample_id).cloned().unwrap_or((
+            usize::MAX,
+            "Classical".into(),
+            row.fixture.classical_bpm,
+        ));
+        let accepts = choice != "Classical";
+        coverage += usize::from(accepts);
+        abstentions += usize::from(!accepts && row.candidate_bpm.is_some());
+        let candidate_correct = canonical_tempo(bpm, row.fixture.truth_bpm);
+        let classical_correct = canonical_tempo(row.fixture.classical_bpm, row.fixture.truth_bpm);
+        if accepts && classical_correct && !candidate_correct {
+            false_accepts.push(row.fixture.sample_id.clone());
+        }
+        if accepts && !classical_correct && candidate_correct {
+            rescues.push(row.fixture.sample_id.clone());
+        }
+        row.fixture.outer_fold = (fold != usize::MAX).then_some(fold);
+        row.fixture.oof_advisor_choice = choice;
+        row.fixture.oof_advisor_selected_bpm = bpm;
+        row.fixture.oof_advisor_correct = Some(candidate_correct);
+        values.push((row.fixture.sample_id.clone(), bpm, row.fixture.truth_bpm));
+    }
+    let full_data_threshold = select_tempo_advisor_threshold(rows);
+    TempoAdvisorNestedOof {
+        grouping_rule:
+            "outer leave-one-connected-PCM+lineage-component-out; inner grouped threshold selection"
+                .into(),
+        feature_set_frozen_before_oof: true,
+        outer_fold_count: audits.len(),
+        outer_folds: audits,
+        advisor_metrics: tempo_metric_summary(&values),
+        false_accept_sample_ids: false_accepts,
+        canonical_rescue_sample_ids: rescues,
+        neural_coverage: coverage,
+        abstention_count: abstentions,
+        full_data_refit_threshold: full_data_threshold,
+        full_data_refit_is_not_held_out: true,
+    }
+}
+
+fn build_tempo_advisor_family_stress(
+    rows: &[TempoAdvisorRow],
+    gate_rows: &[GateFeatureRow],
+) -> Vec<TempoAdvisorFamilyStress> {
+    let folds = component_expanded_leave_family_out_folds(gate_rows);
+    folds
+        .into_iter()
+        .map(|fold| {
+            let validation_ids = fold
+                .validation_split
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            let train_rows = rows
+                .iter()
+                .filter(|row| !validation_ids.contains(&row.fixture.sample_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let validation_rows = rows
+                .iter()
+                .filter(|row| validation_ids.contains(&row.fixture.sample_id))
+                .collect::<Vec<_>>();
+            let threshold = nested_tempo_advisor_threshold(&train_rows);
+            let values = validation_rows
+                .iter()
+                .map(|row| {
+                    let accept = row.candidate_bpm.is_some() && row.diagnostic_score >= threshold;
+                    let (_, bpm) = selected_tempo_value(row, accept);
+                    (row.fixture.sample_id.clone(), bpm, row.fixture.truth_bpm)
+                })
+                .collect::<Vec<_>>();
+            let requested = fold
+                .validation_groups
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "unknown".into());
+            let other_families = validation_rows
+                .iter()
+                .filter(|row| row.fixture.family != requested)
+                .map(|row| row.fixture.family.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            TempoAdvisorFamilyStress {
+                requested_family: requested,
+                expanded_validation_samples: fold.validation_split,
+                other_families_pulled_into_validation: other_families,
+                train_size: train_rows.len(),
+                validation_size: validation_rows.len(),
+                exact_pcm_overlap: fold.exact_pcm_overlap,
+                lineage_overlap: fold.lineage_overlap,
+                advisor_metrics: tempo_metric_summary(&values),
+            }
+        })
+        .collect()
+}
+
+fn build_tempo_advisor_feature_inventory(
+    rows: &[TempoAdvisorRow],
+) -> Vec<TempoAdvisorFeatureDescription> {
+    let definitions = [
+        (
+            "path_coverage",
+            "fraction of activation path supported by selected model frames",
+            "NeuralRhythmDiagnostics.path_coverage",
+            "0.0 when unavailable",
+            "lab diagnostic; derivable at analysis time",
+        ),
+        (
+            "support",
+            "activation support for the decoded path",
+            "NeuralRhythmDiagnostics.support",
+            "0.0 when unavailable",
+            "lab diagnostic; derivable at analysis time",
+        ),
+        (
+            "interval_residual",
+            "normalized residual of the selected Neural event path",
+            "NeuralRhythmDiagnostics.interval_residual",
+            "1.0 when unavailable",
+            "lab diagnostic; derivable at analysis time",
+        ),
+        (
+            "alias_margin",
+            "margin against the nearest tempo-family alias",
+            "NeuralRhythmDiagnostics.alias_margin",
+            "0.0 when unavailable",
+            "lab diagnostic; derivable at analysis time",
+        ),
+        (
+            "activation_refinement_quality",
+            "bounded score from fractional activation support, coverage, periodicity, and phase stability",
+            "FractionalTempoRefinement",
+            "0.0 when unavailable",
+            "research-only diagnostic",
+        ),
+        (
+            "event_refinement_quality",
+            "bounded score from robust BeatEvent interval dispersion, residual, and drift",
+            "BeatEventIntervalRefinement",
+            "0.0 when unavailable",
+            "research-only diagnostic",
+        ),
+        (
+            "activation_event_disagreement",
+            "relative BPM disagreement between independent Neural refinements",
+            "activation and event candidates",
+            "1.0 unless both are available",
+            "research-only diagnostic",
+        ),
+        (
+            "classical_tempo_margin",
+            "margin between Classical tempo hypothesis weights",
+            "Classical NormalizedAnalysis.tempo_hypotheses",
+            "0.0 when unavailable",
+            "lab diagnostic; not Ground Truth",
+        ),
+        (
+            "neural_path_marker_count",
+            "number of events in the accepted Neural path",
+            "NeuralRhythmDiagnostics.path_marker_count",
+            "0 when unavailable",
+            "lab diagnostic; derivable at analysis time",
+        ),
+    ];
+    definitions
+        .into_iter()
+        .map(|(name, definition, source, missing, exposure)| {
+            let values = rows
+                .iter()
+                .filter_map(|row| row.fixture.advisor_features.get(name).copied())
+                .collect::<Vec<_>>();
+            TempoAdvisorFeatureDescription {
+                name: name.into(),
+                definition: definition.into(),
+                source: source.into(),
+                production_time_available: true,
+                missing_value_behavior: missing.into(),
+                observed_min: values.iter().copied().reduce(f64::min),
+                observed_median: median_f64(&values),
+                observed_max: values.iter().copied().reduce(f64::max),
+                exposure: exposure.into(),
+            }
+        })
+        .collect()
+}
+
+fn build_variable_tempo_safety(
+    _rows: &[TempoAdvisorRow],
+    hybrid: &EvaluationReport,
+) -> Vec<TempoAdvisorVariableTempoSafety> {
+    hybrid
+        .per_track
+        .iter()
+        .filter(|track| track.family == FixtureFamily::TempoDrift.as_str())
+        .filter_map(|track| {
+            let raw = hybrid.research_raw_observations.get(&track.sample_id)?;
+            let refinement = beat_event_interval_refinement(raw, "primary");
+            Some(TempoAdvisorVariableTempoSafety {
+                sample_id: track.sample_id.clone(),
+                family: track.family.clone(),
+                fit_residual_micros: refinement.fit_residual_micros,
+                interval_dispersion: refinement.relative_dispersion,
+                early_period_micros: refinement
+                    .selected_period_micros
+                    .zip(refinement.early_late_drift)
+                    .map(|(period, drift)| period * (1.0 - drift)),
+                middle_period_micros: refinement.middle_period_micros,
+                late_period_micros: refinement
+                    .selected_period_micros
+                    .zip(refinement.early_late_drift)
+                    .map(|(period, drift)| period * (1.0 + drift)),
+                refinement_available: refinement.available,
+                abstention_reason: refinement.reason,
+            })
+        })
+        .collect()
+}
+
+fn build_tempo_transform_robustness(
+    blackbox: &BlackboxManifest,
+    rows: &[TempoAdvisorRow],
+) -> BTreeMap<String, TempoAdvisorTransformPair> {
+    let by_id = rows
+        .iter()
+        .map(|row| (row.fixture.sample_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let mut result = BTreeMap::new();
+    for fixture in &blackbox.fixtures {
+        let Some(base_id) = fixture.spec.base_id.as_deref() else {
+            continue;
+        };
+        let (Some(base), Some(transformed)) =
+            (by_id.get(base_id), by_id.get(fixture.sample_id.as_str()))
+        else {
+            continue;
+        };
+        let key = fixture.spec.transform.label().to_owned();
+        result
+            .entry(key)
+            .or_insert_with(|| TempoAdvisorTransformPair {
+                base_sample_id: base.fixture.sample_id.clone(),
+                transformed_sample_id: transformed.fixture.sample_id.clone(),
+                activation_bpm_delta: base
+                    .fixture
+                    .activation_refined_bpm
+                    .zip(transformed.fixture.activation_refined_bpm)
+                    .map(|(before, after)| after - before),
+                event_bpm_delta: base
+                    .fixture
+                    .event_refined_bpm
+                    .zip(transformed.fixture.event_refined_bpm)
+                    .map(|(before, after)| after - before),
+                advisor_decision_changed: base.fixture.oof_advisor_choice
+                    != transformed.fixture.oof_advisor_choice,
+            });
+    }
+    result
+}
+
+fn tempo_advisor_markdown(report: &TempoAdvisorReport) -> String {
+    let mut markdown = format!(
+        "# Classical rhythm + Neural tempo advisor research\n\nSource commit: `{}`\nStarting commit: `{}`\nCorpus: {} fixtures; {} scalar-tempo fixtures; seed `{}`\n\n## Executive summary\n\n{}\n\n",
+        report.source_commit,
+        report.starting_commit.as_deref().unwrap_or("unknown"),
+        report.fixture_count,
+        report.scalar_tempo_fixture_count,
+        report.corpus_seed,
+        report.recommendation,
+    );
+    markdown.push_str(
+        "The hypothetical architecture fixes Classical beats, grid phase, meter, and downbeats. Neural candidates can change only a research tempo label. Traktor and Rekordbox are not advisor inputs.\n\n",
+    );
+    markdown.push_str("## Baseline and refinement comparison\n\n| Candidate | canonical | half/double/other wrong | absolute BPM MAE/median/p95 |\n|---|---:|---:|---:|\n");
+    for (name, metric) in [
+        ("Always Classical", &report.baseline_classical),
+        ("Current Neural", &report.baseline_current_neural),
+        ("Activation refined", &report.activation_refined),
+        ("Event refined", &report.event_refined),
+        ("Consensus refined", &report.consensus_refined),
+        ("Best refined candidate", &report.refined_oracle),
+        ("Nested OOF advisor", &report.nested_oof.advisor_metrics),
+    ] {
+        markdown.push_str(&format!(
+            "| {} | {}/{} ({:?}) | {}/{}/{} | {:?}/{:?}/{:?} |\n",
+            name,
+            metric.canonical_correct,
+            metric.scored,
+            metric.canonical_accuracy,
+            metric.half_time,
+            metric.double_time,
+            metric.other_wrong,
+            metric.absolute_bpm_mae,
+            metric.absolute_bpm_median,
+            metric.absolute_bpm_p95,
+        ));
+    }
+    markdown.push_str("\n## Refined-tempo oracle upper bounds\n\n");
+    for (name, oracle) in [
+        ("activation", &report.activation_oracle),
+        ("event", &report.event_oracle),
+        ("best refined", &report.best_refined_oracle),
+    ] {
+        markdown.push_str(&format!(
+            "- {}: uplift={} tracks; candidate rescues={:?}; Classical rescues={:?}.\n",
+            name,
+            oracle.oracle_uplift_over_classical,
+            oracle.candidate_rescues_classical,
+            oracle.classical_rescues_candidate_cannot_provide,
+        ));
+    }
+    markdown.push_str("\nThese are Ground-Truth-selected upper bounds, not deployable advisor results.\n\n## Classical failure budget\n\n| sample | family | Classical | current Neural | activation | event | oracle |\n|---|---|---:|---:|---:|---:|---|\n");
+    for row in &report.classical_failure_budget {
+        markdown.push_str(&format!(
+            "| {} | {} | {:?} ({}) | {:?} ({}) | {:?} ({}) | {:?} ({}) | {} |\n",
+            row.sample_id,
+            row.family,
+            row.classical_bpm,
+            row.classical_relation,
+            row.current_neural_bpm,
+            row.current_neural_relation,
+            row.activation_refined_bpm,
+            row.activation_refined_relation,
+            row.event_refined_bpm,
+            row.event_refined_relation,
+            row.oracle_choice,
+        ));
+    }
+    markdown.push_str("\n## Allowed feature inventory\n\n| feature | definition | source | min/median/max | missing behavior |\n|---|---|---|---:|---|\n");
+    for feature in &report.feature_inventory {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {:?}/{:?}/{:?} | {} |\n",
+            feature.name,
+            feature.definition,
+            feature.source,
+            feature.observed_min,
+            feature.observed_median,
+            feature.observed_max,
+            feature.missing_value_behavior,
+        ));
+    }
+    markdown.push_str(&format!(
+        "\nThe feature set was frozen before final outer OOF. It excludes truth, IDs, family, hashes, lineage, transform identity, Traktor, and Rekordbox.\n\n## Nested grouped OOF advisor\n\nGrouping: `{}`\nOuter folds: {}\nExact PCM overlap: {}\nLineage overlap: {}\nNeural coverage: {}\nAbstentions: {}\nFalse accepts: {} ({:?})\nCanonical rescues: {} ({:?})\nFull-data refit threshold: {:.6}; full-data refit is not held-out evidence.\n\n",
+        report.nested_oof.grouping_rule,
+        report.nested_oof.outer_fold_count,
+        report.nested_oof.outer_folds.iter().any(|fold| fold.exact_pcm_overlap),
+        report.nested_oof.outer_folds.iter().any(|fold| fold.lineage_overlap),
+        report.nested_oof.neural_coverage,
+        report.nested_oof.abstention_count,
+        report.nested_oof.false_accept_sample_ids.len(),
+        report.nested_oof.false_accept_sample_ids,
+        report.nested_oof.canonical_rescue_sample_ids.len(),
+        report.nested_oof.canonical_rescue_sample_ids,
+        report.nested_oof.full_data_refit_threshold,
+    ));
+    markdown.push_str("## Component-expanded leave-family-out stress\n\n| requested family | validation size | other families pulled in | correct/scored | PCM overlap/lineage overlap |\n|---|---:|---|---:|---:|\n");
+    for family in &report.component_expanded_family_stress {
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {}/{} | {}/{} |\n",
+            family.requested_family,
+            family.validation_size,
+            family.other_families_pulled_into_validation.join(", "),
+            family.advisor_metrics.canonical_correct,
+            family.advisor_metrics.scored,
+            family.exact_pcm_overlap,
+            family.lineage_overlap,
+        ));
+    }
+    markdown.push_str("\n## Variable-tempo safety\n\nScalar-tempo metrics exclude ramps and step-return fixtures.\n\n| sample | early | middle | late | dispersion | available | reason |\n|---|---:|---:|---:|---:|---:|---|\n");
+    for item in &report.variable_tempo_safety {
+        markdown.push_str(&format!(
+            "| {} | {:?} | {:?} | {:?} | {:?} | {} | {:?} |\n",
+            item.sample_id,
+            item.early_period_micros,
+            item.middle_period_micros,
+            item.late_period_micros,
+            item.interval_dispersion,
+            item.refinement_available,
+            item.abstention_reason,
+        ));
+    }
+    markdown.push_str("\n## Transform robustness\n\n");
+    for (name, pair) in &report.transform_robustness {
+        markdown.push_str(&format!(
+            "- `{}`: {} → {}; activation Δ={:?}, event Δ={:?}, advisor decision changed={}.\n",
+            name,
+            pair.base_sample_id,
+            pair.transformed_sample_id,
+            pair.activation_bpm_delta,
+            pair.event_bpm_delta,
+            pair.advisor_decision_changed,
+        ));
+    }
+    markdown.push_str("\n## Recommendation\n\n");
+    markdown.push_str(&report.recommendation);
+    markdown.push_str("\n\n## Production freeze\n\nProduction source behavior, Classical/Neural analyzers, BeatEvent timestamps, tempo resolver, grid, meter, downbeat, AutoMix, runtime, Discord, yt-dlp, and deployment are unchanged. Generated artifacts remain outside Git.\n");
+    markdown
 }
 
 fn research_summary_markdown_corrected(
@@ -5391,11 +6650,53 @@ fn gate_validation_fold(
 fn gate_group(row: &GateFeatureRow, grouping_rule: &str) -> String {
     match grouping_rule {
         "joint_leakage" => row.leakage_group.clone(),
+        "component_expanded_leave_family_out" => row.leakage_group.clone(),
         "exact_pcm" => row.pcm_group.clone(),
         "lineage" => row.lineage_group.clone(),
         "family" => row.family.clone(),
         _ => row.sample_id.clone(),
     }
+}
+
+/// Hold out every connected PCM+lineage component touched by a nominal
+/// family. Family labels are not safe leakage boundaries on their own.
+fn component_expanded_leave_family_out_folds(rows: &[GateFeatureRow]) -> Vec<GateValidationFold> {
+    let families = rows
+        .iter()
+        .map(|row| row.family.clone())
+        .collect::<BTreeSet<_>>();
+    let mut components_by_family = BTreeMap::<String, BTreeSet<String>>::new();
+    for row in rows {
+        components_by_family
+            .entry(row.family.clone())
+            .or_default()
+            .insert(row.leakage_group.clone());
+    }
+    families
+        .into_iter()
+        .filter_map(|requested_family| {
+            let held_out_components = components_by_family
+                .get(&requested_family)
+                .cloned()
+                .unwrap_or_default();
+            let validation_indices = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| held_out_components.contains(&row.leakage_group))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if validation_indices.is_empty() || validation_indices.len() == rows.len() {
+                return None;
+            }
+            let mut fold = gate_validation_fold(
+                rows,
+                &validation_indices,
+                "component_expanded_leave_family_out",
+            );
+            fold.validation_groups = vec![requested_family];
+            Some(fold)
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -5534,7 +6835,7 @@ fn build_gate_research(
             .unwrap_or_else(|| row.sample_id.clone());
     }
     let primary_folds = grouped_validation_folds(&rows, "joint_leakage");
-    let family_validation = grouped_validation_folds(&rows, "family");
+    let family_validation = component_expanded_leave_family_out_folds(&rows);
     let exact_pcm_duplicate_leakage = primary_folds.iter().any(|fold| fold.exact_pcm_overlap);
     let lineage_leakage = primary_folds.iter().any(|fold| fold.lineage_overlap);
     let largest_leakage_group_size = rows
@@ -6311,6 +7612,430 @@ fn fractional_tempo_refinement(
         phase_stability: score.phase_stability,
         resolution_frames: resolution,
     })
+}
+
+fn median_f64(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    Some(sorted[sorted.len() / 2])
+}
+
+/// Estimate a tempo from the decoded Neural BeatEvent clock using a bounded,
+/// robust interval fit. The production family relation is carried through as
+/// metadata; this function never changes half/native/double selection.
+fn beat_event_interval_refinement(
+    observations: &wotoha_core::beat_analysis::NeuralBeatObservations,
+    relation: &str,
+) -> BeatEventIntervalRefinement {
+    let unavailable = |reason: &str,
+                       usable_events: usize,
+                       usable_intervals: usize,
+                       median: Option<f64>,
+                       mad: Option<f64>,
+                       dispersion: Option<f64>,
+                       residual: Option<f64>,
+                       middle: Option<f64>,
+                       drift: Option<f64>| BeatEventIntervalRefinement {
+        selected_bpm: None,
+        selected_period_micros: median,
+        relation: relation.to_owned(),
+        usable_events,
+        usable_intervals,
+        interval_median_micros: median,
+        interval_mad_micros: mad,
+        relative_dispersion: dispersion,
+        fit_residual_micros: residual,
+        middle_period_micros: middle,
+        early_late_drift: drift,
+        available: false,
+        reason: Some(reason.into()),
+    };
+    let Some(decoded) = wotoha_core::beat_analysis::decode_neural_rhythm(observations) else {
+        return unavailable(
+            "neural_event_decode_unavailable",
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    };
+    let events = decoded.beat_events;
+    if events.len() < 6 {
+        return unavailable(
+            "insufficient_events",
+            events.len(),
+            events.len().saturating_sub(1),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+    let interval_records = events
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| {
+            let left = duration_micros(window[0].time);
+            let right = duration_micros(window[1].time);
+            right
+                .checked_sub(left)
+                .filter(|value| *value > 0)
+                .map(|value| (index, value as f64))
+        })
+        .collect::<Vec<_>>();
+    let intervals = interval_records
+        .iter()
+        .map(|(_, interval)| *interval)
+        .collect::<Vec<_>>();
+    let Some(median) = median_f64(&intervals) else {
+        return unavailable(
+            "no_positive_intervals",
+            events.len(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+    };
+    let absolute_deviations = intervals
+        .iter()
+        .map(|interval| (interval - median).abs())
+        .collect::<Vec<_>>();
+    let mad = median_f64(&absolute_deviations).unwrap_or_default();
+    let dispersion = mad / median.max(1.0);
+    let trim_limit = (median * 0.08).max(mad * 3.0).max(1.0);
+    let retained = interval_records
+        .iter()
+        .filter(|(_, interval)| (*interval - median).abs() <= trim_limit)
+        .map(|(_, interval)| *interval)
+        .collect::<Vec<_>>();
+    let Some(_) = median_f64(&retained) else {
+        return unavailable(
+            "all_intervals_rejected",
+            events.len(),
+            0,
+            Some(median),
+            Some(mad),
+            Some(dispersion),
+            None,
+            None,
+            None,
+        );
+    };
+    if retained.len() < 5 {
+        return unavailable(
+            "insufficient_robust_intervals",
+            events.len(),
+            retained.len(),
+            Some(median),
+            Some(mad),
+            Some(dispersion),
+            None,
+            None,
+            None,
+        );
+    }
+    // Use bounded multi-event spans in addition to adjacent intervals. This
+    // recovers a fractional average period from frame-quantized events such
+    // as 24/25/24/25 frames, while rejecting isolated large gaps and double
+    // hits through the same median/MAD band.
+    let maximum_span = events.len().saturating_sub(1).min(8);
+    let mut span_estimates = Vec::new();
+    for span in 1..=maximum_span {
+        for start in 0..events.len().saturating_sub(span) {
+            let left = duration_micros(events[start].time) as f64;
+            let right = duration_micros(events[start + span].time) as f64;
+            let estimate = (right - left) / span as f64;
+            if estimate.is_finite() && estimate > 0.0 {
+                let distance = (estimate - median).abs();
+                if distance <= trim_limit {
+                    span_estimates.push(estimate);
+                }
+            }
+        }
+    }
+    if span_estimates.len() < 5 {
+        return unavailable(
+            "insufficient_robust_spans",
+            events.len(),
+            retained.len(),
+            Some(median),
+            Some(mad),
+            Some(dispersion),
+            None,
+            None,
+            None,
+        );
+    }
+    let fitted_period = median_f64(&span_estimates).expect("non-empty robust spans");
+    let fit_residual = span_estimates
+        .iter()
+        .map(|interval| (interval - fitted_period).abs())
+        .sum::<f64>()
+        / span_estimates.len() as f64;
+    let split = intervals.len() / 2;
+    let early_period = median_f64(&intervals[..split.max(1)]);
+    let middle_start = intervals.len() / 3;
+    let middle_end = (intervals.len() * 2 / 3).max(middle_start + 1);
+    let middle_period = median_f64(&intervals[middle_start..middle_end.min(intervals.len())]);
+    let late_period = median_f64(&intervals[split.max(1)..]);
+    let drift = early_period
+        .zip(late_period)
+        .map(|(early, late)| (late - early).abs() / fitted_period.max(1.0));
+    if drift.is_some_and(|value| value > 0.05) {
+        return unavailable(
+            "interval_drift_exceeds_global_fit",
+            events.len(),
+            retained.len(),
+            Some(fitted_period),
+            Some(mad),
+            Some(dispersion),
+            Some(fit_residual),
+            middle_period,
+            drift,
+        );
+    }
+    let bpm = 60_000_000.0 / fitted_period;
+    if !(f64::from(wotoha_core::beat_analysis::MIN_BPM)
+        ..=f64::from(wotoha_core::beat_analysis::MAX_BPM))
+        .contains(&bpm)
+    {
+        return unavailable(
+            "event_tempo_out_of_range",
+            events.len(),
+            retained.len(),
+            Some(fitted_period),
+            Some(mad),
+            Some(dispersion),
+            Some(fit_residual),
+            middle_period,
+            drift,
+        );
+    }
+    BeatEventIntervalRefinement {
+        selected_bpm: Some(bpm as f32),
+        selected_period_micros: Some(fitted_period),
+        relation: relation.to_owned(),
+        usable_events: events.len(),
+        usable_intervals: retained.len(),
+        interval_median_micros: Some(fitted_period),
+        interval_mad_micros: Some(mad),
+        relative_dispersion: Some(dispersion),
+        fit_residual_micros: Some(fit_residual),
+        middle_period_micros: middle_period,
+        early_late_drift: drift,
+        available: true,
+        reason: None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TempoAdvisorRow {
+    fixture: TempoAdvisorFixture,
+    pcm_group: String,
+    lineage_group: String,
+    leakage_group: String,
+    candidate_label: String,
+    candidate_bpm: Option<f32>,
+    diagnostic_score: f64,
+}
+
+fn canonical_tempo(bpm: Option<f32>, truth: f32) -> bool {
+    bpm.is_some_and(|value| relation_to_truth(Some(value), truth, false) == "primary")
+}
+
+fn tempo_metric_summary(values: &[(String, Option<f32>, f32)]) -> TempoAdvisorMetricSummary {
+    let mut errors = Vec::new();
+    let mut correct = 0;
+    let mut half = 0;
+    let mut double = 0;
+    let mut other = 0;
+    let mut absent = 0;
+    for (_, bpm, truth) in values {
+        if let Some(bpm) = bpm {
+            errors.push(f64::from((*bpm - *truth).abs()));
+            match relation_to_truth(Some(*bpm), *truth, false).as_str() {
+                "primary" => correct += 1,
+                "half_time" => half += 1,
+                "double_time" => double += 1,
+                _ => other += 1,
+            }
+        } else {
+            absent += 1;
+        }
+    }
+    let scored = values.len();
+    TempoAdvisorMetricSummary {
+        scored,
+        canonical_correct: correct,
+        canonical_accuracy: (scored > 0).then_some(correct as f64 / scored as f64),
+        half_time: half,
+        double_time: double,
+        other_wrong: other,
+        absent,
+        absolute_bpm_mae: mean(&errors),
+        absolute_bpm_median: percentile(&errors, 0.50),
+        absolute_bpm_p95: percentile(&errors, 0.95),
+    }
+}
+
+fn tempo_metric_summary_available(
+    values: &[(String, Option<f32>, f32)],
+) -> TempoAdvisorMetricSummary {
+    let available = values
+        .iter()
+        .filter(|(_, bpm, _)| bpm.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    tempo_metric_summary(&available)
+}
+
+fn classical_tempo_margin(analysis: &NormalizedAnalysis) -> f64 {
+    let mut weights = analysis
+        .tempo_hypotheses
+        .iter()
+        .map(|hypothesis| f64::from(hypothesis.relative_weight))
+        .collect::<Vec<_>>();
+    weights.sort_by(f64::total_cmp);
+    match (weights.last(), weights.iter().rev().nth(1)) {
+        (Some(best), Some(second)) => (best - second).max(0.0),
+        (Some(_), None) => 1.0,
+        _ => 0.0,
+    }
+}
+
+fn event_refinement_quality(refinement: Option<&BeatEventIntervalRefinement>) -> f64 {
+    refinement
+        .filter(|refinement| refinement.available)
+        .map(|refinement| {
+            let dispersion = refinement.relative_dispersion.unwrap_or(1.0);
+            let residual = refinement
+                .fit_residual_micros
+                .zip(refinement.selected_period_micros)
+                .map(|(residual, period)| residual / period.max(1.0))
+                .unwrap_or(1.0);
+            let drift = refinement.early_late_drift.unwrap_or(1.0);
+            (1.0 - 3.0 * dispersion - 3.0 * residual - drift).clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0)
+}
+
+fn activation_refinement_quality(refinement: Option<&FractionalTempoRefinement>) -> f64 {
+    refinement
+        .map(|refinement| {
+            f64::from(
+                (0.45 * refinement.score
+                    + 0.25 * refinement.coverage
+                    + 0.20 * refinement.periodic_consistency
+                    + 0.10 * refinement.phase_stability)
+                    .clamp(0.0, 1.0),
+            )
+        })
+        .unwrap_or(0.0)
+}
+
+fn choose_refined_candidate(
+    current_bpm: Option<f32>,
+    activation: Option<&FractionalTempoRefinement>,
+    event: Option<&BeatEventIntervalRefinement>,
+) -> (String, Option<f32>) {
+    let activation_bpm = activation.and_then(|value| value.selected_bpm);
+    let event_bpm = event.and_then(|value| value.selected_bpm);
+    if let (Some(activation_bpm), Some(event_bpm)) = (activation_bpm, event_bpm) {
+        let disagreement = (activation_bpm - event_bpm).abs() / activation_bpm.max(1.0);
+        if disagreement <= 0.005 {
+            return (
+                "consensus_refined".into(),
+                Some((activation_bpm + event_bpm) / 2.0),
+            );
+        }
+        if event_refinement_quality(event) > activation_refinement_quality(activation) {
+            return ("event_refined".into(), Some(event_bpm));
+        }
+        return ("activation_refined".into(), Some(activation_bpm));
+    }
+    if let Some(event_bpm) = event_bpm {
+        return ("event_refined".into(), Some(event_bpm));
+    }
+    if let Some(activation_bpm) = activation_bpm {
+        return ("activation_refined".into(), Some(activation_bpm));
+    }
+    ("current_neural".into(), current_bpm)
+}
+
+fn advisor_features(
+    track: &TrackEvaluation,
+    activation: Option<&FractionalTempoRefinement>,
+    event: Option<&BeatEventIntervalRefinement>,
+) -> (BTreeMap<String, f64>, f64) {
+    let diagnostics = track.neural_diagnostics.as_ref();
+    let activation_score = activation_refinement_quality(activation);
+    let event_score = event_refinement_quality(event);
+    let activation_bpm = activation.and_then(|value| value.selected_bpm);
+    let event_bpm = event.and_then(|value| value.selected_bpm);
+    let disagreement = activation_bpm
+        .zip(event_bpm)
+        .map(|(left, right)| f64::from((left - right).abs() / left.max(1.0)))
+        .unwrap_or(1.0);
+    let path_coverage = diagnostics
+        .and_then(|value| value.path_coverage)
+        .unwrap_or_default();
+    let support = diagnostics
+        .and_then(|value| value.support)
+        .unwrap_or_default();
+    let interval_residual = diagnostics
+        .and_then(|value| value.interval_residual)
+        .unwrap_or(1.0);
+    let values = [
+        ("path_coverage", f64::from(path_coverage)),
+        ("support", f64::from(support)),
+        ("interval_residual", f64::from(interval_residual)),
+        (
+            "alias_margin",
+            f64::from(
+                diagnostics
+                    .and_then(|value| value.alias_margin)
+                    .unwrap_or_default(),
+            ),
+        ),
+        ("activation_refinement_quality", activation_score),
+        ("event_refinement_quality", event_score),
+        ("activation_event_disagreement", disagreement.min(1.0)),
+        (
+            "classical_tempo_margin",
+            classical_tempo_margin(&track.wotoha),
+        ),
+        (
+            "neural_path_marker_count",
+            diagnostics.map_or(0.0, |value| value.path_marker_count as f64),
+        ),
+    ];
+    let mut features = BTreeMap::new();
+    for (name, value) in values {
+        features.insert(name.into(), value);
+    }
+    let score = (0.24 * activation_score
+        + 0.24 * event_score
+        + 0.16 * features["path_coverage"].clamp(0.0, 1.0)
+        + 0.14 * features["support"].clamp(0.0, 1.0)
+        + 0.10 * features["alias_margin"].clamp(0.0, 1.0)
+        + 0.08 * features["classical_tempo_margin"].clamp(0.0, 1.0)
+        - 0.12 * disagreement
+        - 0.10 * features["interval_residual"].clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+    (features, score)
 }
 
 fn canonical_relation_name(relation: &str) -> &str {
@@ -9183,6 +10908,127 @@ mod tests {
         )
         .unwrap();
         assert!(fractional_tempo_refinement(&observations, Some(5_000.0), "primary").is_none());
+    }
+
+    #[test]
+    fn beat_event_refinement_is_deterministic_and_preserves_relation() {
+        let mut beat_logits = vec![-7.0; 700];
+        for frame in (25..650).step_by(24) {
+            beat_logits[frame] = 7.0;
+        }
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            beat_logits,
+            vec![-7.0; 700],
+        )
+        .unwrap();
+        let first = beat_event_interval_refinement(&observations, "half_time");
+        let second = beat_event_interval_refinement(&observations, "half_time");
+        assert_eq!(first.selected_bpm, second.selected_bpm);
+        assert_eq!(first.relation, "half_time");
+        assert_eq!(first.middle_period_micros, second.middle_period_micros);
+        assert_eq!(observations.beat_logits.len(), 700);
+    }
+
+    #[test]
+    fn beat_event_refinement_uses_multi_event_spans_for_fractional_periods() {
+        let mut beat_logits = vec![-7.0; 900];
+        let mut frame = 25usize;
+        for index in 0..30 {
+            beat_logits[frame] = 7.0;
+            frame = frame.saturating_add(if index % 2 == 0 { 24 } else { 25 });
+        }
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            beat_logits,
+            vec![-7.0; 900],
+        )
+        .unwrap();
+        let refinement = beat_event_interval_refinement(&observations, "primary");
+        assert!(refinement.available);
+        assert!((refinement.selected_period_micros.unwrap() - 490_000.0).abs() < 20_000.0);
+        assert_eq!(refinement.relation, "primary");
+    }
+
+    #[test]
+    fn beat_event_refinement_rejects_strong_global_drift() {
+        let mut beat_logits = vec![-7.0; 1_100];
+        let mut frame = 25usize;
+        for index in 0..30 {
+            beat_logits[frame] = 7.0;
+            frame = frame.saturating_add(if index < 15 { 24 } else { 30 });
+        }
+        let observations = wotoha_core::beat_analysis::NeuralBeatObservations::with_frame_rate(
+            50.0,
+            beat_logits,
+            vec![-7.0; 1_100],
+        )
+        .unwrap();
+        let refinement = beat_event_interval_refinement(&observations, "primary");
+        assert!(!refinement.available);
+        assert!(refinement.reason.is_some());
+    }
+
+    #[test]
+    fn component_expanded_family_holdout_excludes_transitive_leakage() {
+        let mut rows = vec![
+            GateFeatureRow {
+                sample_id: "a".into(),
+                family: "constant_tempo".into(),
+                pcm_group: "pcm-a".into(),
+                lineage_group: "lineage-a".into(),
+                leakage_group: String::new(),
+                neural_available: true,
+                features: BTreeMap::new(),
+                diagnostic_score: 0.1,
+                truth_side_label: "classical_dominates".into(),
+            },
+            GateFeatureRow {
+                sample_id: "b".into(),
+                family: "transform".into(),
+                pcm_group: "pcm-a".into(),
+                lineage_group: "lineage-b".into(),
+                leakage_group: String::new(),
+                neural_available: true,
+                features: BTreeMap::new(),
+                diagnostic_score: 0.2,
+                truth_side_label: "equal".into(),
+            },
+            GateFeatureRow {
+                sample_id: "c".into(),
+                family: "percussion".into(),
+                pcm_group: "pcm-c".into(),
+                lineage_group: "lineage-b".into(),
+                leakage_group: String::new(),
+                neural_available: true,
+                features: BTreeMap::new(),
+                diagnostic_score: 0.3,
+                truth_side_label: "equal".into(),
+            },
+            GateFeatureRow {
+                sample_id: "d".into(),
+                family: "meter".into(),
+                pcm_group: "pcm-d".into(),
+                lineage_group: "lineage-d".into(),
+                leakage_group: String::new(),
+                neural_available: true,
+                features: BTreeMap::new(),
+                diagnostic_score: 0.4,
+                truth_side_label: "equal".into(),
+            },
+        ];
+        let groups = connected_leakage_groups(&rows);
+        for row in &mut rows {
+            row.leakage_group = groups[&row.sample_id].clone();
+        }
+        let folds = component_expanded_leave_family_out_folds(&rows);
+        let fold = folds
+            .iter()
+            .find(|fold| fold.validation_groups == vec!["constant_tempo"])
+            .unwrap();
+        assert_eq!(fold.validation_split, vec!["a", "b", "c"]);
+        assert!(!fold.exact_pcm_overlap);
+        assert!(!fold.lineage_overlap);
     }
 
     #[test]

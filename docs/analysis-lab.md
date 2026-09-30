@@ -190,6 +190,39 @@ tempo is excluded from global BPM accuracy. The existing PCM-envelope and
 activation-domain experiments remain diagnostic and are not combined or
 promoted.
 
+### Classical rhythm + Neural tempo advisor
+
+The dedicated research command keeps Classical authoritative for the beat
+timeline, grid phase, meter, and downbeats while comparing three label-only
+Neural tempo candidates: the production Neural tempo, fractional activation
+refinement, and robust BeatEvent interval refinement. It writes all output
+outside Git:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+cargo run --release --locked -p wotoha-analysis-lab -- research-tempo-advisor \
+  --manifest /tmp/wotoha-blackbox-v1/manifest.json \
+  --audio-root /tmp/wotoha-blackbox-v1 \
+  --output /tmp/wotoha-tempo-advisor
+```
+
+The event estimator uses decoded Neural event intervals, a median/MAD bounded
+trim, fit residual, and an early/late drift check. It requires at least five
+robust intervals and abstains on excessive global drift. It preserves the
+production half/native/double family relation and never changes event
+timestamps. `tempo-advisor-research.json` reports candidate metrics, the
+Ground-Truth oracle upper bound, the Classical failure budget, frozen
+pre-truth feature inventory, nested grouped OOF advisor decisions, and
+component-expanded leave-family-out stress. Full-data refit is explicitly not
+held-out evidence. The command is research-only and cannot select a production
+backend.
+
+The family stress folds are expanded by connected PCM+lineage components. A
+nominal family fold is invalid as generalization evidence if either exact PCM
+or lineage overlap is present; the expanded validation sample list is retained
+in the report.
+
 Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
 downbeat evidence, off-phase leakage, periodic consistency, bar-cycle
 consistency, and beat-event confidence. Its primary set is only the `Meter`
