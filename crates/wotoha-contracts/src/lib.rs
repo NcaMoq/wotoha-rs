@@ -385,6 +385,13 @@ pub trait VoiceRuntime: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Async cache lookup for playback paths. Filesystem-backed runtimes
+    /// override this so synchronous decoding never blocks the voice executor.
+    /// The default preserves compatibility for in-memory implementations.
+    async fn cached_track_analysis_async(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        self.cached_track_analysis(request)
+    }
+
     /// Returns a cached V2 record without starting decode or inference work.
     /// Playback uses this optional hook only for non-authoritative shadow
     /// comparisons; a miss never changes the V1 plan.

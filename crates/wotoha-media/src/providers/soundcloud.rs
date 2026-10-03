@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{Mutex, RwLock};
 use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
-use crate::{ResolveError, provider::MediaProvider};
+use crate::{ResolveError, bounded_text, provider::MediaProvider};
 
 const SOUNDCLOUD_HOME_URL: &str = "https://soundcloud.com";
 const SOUNDCLOUD_RESOLVE_URL: &str = "https://api-v2.soundcloud.com/resolve";
@@ -119,7 +119,7 @@ impl MediaProvider for SoundCloudProvider {
                         .error_for_status()
                         .map_err(ResolveError::Request)?;
                     let final_url = response.url().to_string();
-                    let page = response.text().await.map_err(ResolveError::Request)?;
+                    let page = bounded_text(response).await?;
                     let track = parse_sound_hydration(&page)?;
                     self.track_request_from_track(raw_url, &final_url, &track, probe_client)
                         .await
@@ -348,17 +348,15 @@ fn extract_hydration_json(page: &str) -> Option<&str> {
 }
 
 async fn fetch_client_id(probe_client: &Client) -> Result<String, ResolveError> {
-    let home = probe_client
+    let response = probe_client
         .get(SOUNDCLOUD_HOME_URL)
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .text()
-        .await
         .map_err(ResolveError::Request)?;
+    let home = bounded_text(response).await?;
 
     for script_url in extract_script_urls(&home) {
         let Ok(response) = probe_client
@@ -372,7 +370,7 @@ async fn fetch_client_id(probe_client: &Client) -> Result<String, ResolveError> 
         let Ok(response) = response.error_for_status() else {
             continue;
         };
-        let Ok(js) = response.text().await else {
+        let Ok(js) = bounded_text(response).await else {
             continue;
         };
 

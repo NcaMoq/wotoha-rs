@@ -90,6 +90,7 @@ const STREAM_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const STREAM_REDIRECT_LIMIT: usize = 5;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_V2_SHADOW_CACHE_ENTRIES: usize = 32;
+const MAX_CLASSICAL_FALLBACKS: usize = 4_096;
 // A classical fallback is deliberately process-local and short-lived. This
 // bounds retries after a transient model failure while allowing a newly
 // available embedded model to upgrade the same source on the next attempt.
@@ -823,13 +824,43 @@ impl VoiceRuntime for SongbirdRuntime {
         }
         let key = AnalysisCacheKey::from_request(request).ok()?;
         if self.v2_shadow_enabled {
-            if let Ok(Some(analysis)) = self.analysis_cache.load_v2(&key) {
-                self.remember_v2(&key, analysis);
-            } else if let Ok(Some(analysis)) = self.classical_cache.load_v2(&key) {
-                self.remember_v2(&key, analysis);
+            match self.analysis_cache.load_v2(&key) {
+                Ok(Some(analysis)) => self.remember_v2(&key, analysis),
+                Ok(None) => match self.classical_cache.load_v2(&key) {
+                    Ok(Some(analysis)) => self.remember_v2(&key, analysis),
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(error = %error, "failed to read classical V2 analysis cache")
+                    }
+                },
+                Err(error) => warn!(error = %error, "failed to read neural V2 analysis cache"),
             }
         }
-        let analysis = self.analysis_cache.load(&key).ok().flatten()?;
+        let analysis = match self.analysis_cache.load(&key) {
+            Ok(analysis) => analysis?,
+            Err(error) => {
+                warn!(error = %error, "failed to read analysis cache");
+                return None;
+            }
+        };
+        if self.v2_shadow_enabled {
+            self.remember_cached_v2(&key, &analysis);
+        }
+        Some(analysis)
+    }
+
+    async fn cached_track_analysis_async(&self, request: &TrackRequest) -> Option<TrackAnalysis> {
+        if !analysis_source_supported(request) {
+            return None;
+        }
+        let key = AnalysisCacheKey::from_request(request).ok()?;
+        let analysis = match self.analysis_cache.load_async(&key).await {
+            Ok(analysis) => analysis?,
+            Err(error) => {
+                warn!(error = %error, "failed to read analysis cache");
+                return None;
+            }
+        };
         if self.v2_shadow_enabled {
             self.remember_cached_v2(&key, &analysis);
         }
@@ -930,25 +961,36 @@ impl SongbirdRuntime {
         // Prefer the compact V2 namespace when available.  This preserves
         // model scores, timing support, hypotheses and provenance that a V1
         // cache cannot represent, while leaving the V1 cache untouched.
-        if let Ok(Some(analysis)) = self.analysis_cache.load_v2(&key) {
-            self.remember_v2(&key, analysis.clone());
-            return Some(analysis);
+        match self.analysis_cache.load_v2_async(&key).await {
+            Ok(Some(analysis)) => {
+                self.remember_v2(&key, analysis.clone());
+                return Some(analysis);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(error = %error, "failed to read neural V2 analysis cache"),
         }
-        if let Ok(Some(analysis)) = self.classical_cache.load_v2(&key) {
-            self.remember_v2(&key, analysis.clone());
-            return Some(analysis);
+        match self.classical_cache.load_v2_async(&key).await {
+            Ok(Some(analysis)) => {
+                self.remember_v2(&key, analysis.clone());
+                return Some(analysis);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(error = %error, "failed to read classical V2 analysis cache"),
         }
         let outcome = self.analyze_track_with_backend(request).await?;
         let backend = outcome.backend;
         let (analysis, neural_rhythm) = analysis_outcome_to_v2(&outcome)?;
         if neural_rhythm {
-            let _ = self.analysis_cache.store_v2(&key, &analysis);
+            if let Err(error) = self.analysis_cache.store_v2_async(&key, &analysis).await {
+                warn!(error = %error, "failed to write neural V2 analysis cache");
+            }
         } else if matches!(
             backend,
             AnalysisBackend::ClassicalPermanentIneligible
                 | AnalysisBackend::CachedClassicalPermanentIneligible
-        ) {
-            let _ = self.classical_cache.store_v2(&key, &analysis);
+        ) && let Err(error) = self.classical_cache.store_v2_async(&key, &analysis).await
+        {
+            warn!(error = %error, "failed to write classical V2 analysis cache");
         }
         Some(analysis)
     }
@@ -990,7 +1032,9 @@ impl SongbirdRuntime {
         }
         let key = AnalysisCacheKey::from_request(request).ok()?;
         if !bypass_cache {
-            if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+            if let Some(analysis) =
+                load_cached_analysis(&self.analysis_cache, &key, "neural analysis cache").await
+            {
                 return Some(AnalysisOutcome {
                     analysis,
                     backend: AnalysisBackend::CachedNeural,
@@ -1000,7 +1044,9 @@ impl SongbirdRuntime {
             // This directory has a distinct analyzer identity and is written only
             // for permanent neural ineligibility. A transient model failure never
             // reaches disk, so a later model retry can upgrade the same source.
-            if let Ok(Some(analysis)) = self.classical_cache.load(&key) {
+            if let Some(analysis) =
+                load_cached_analysis(&self.classical_cache, &key, "classical analysis cache").await
+            {
                 return Some(AnalysisOutcome {
                     analysis,
                     backend: AnalysisBackend::CachedClassicalPermanentIneligible,
@@ -1021,17 +1067,22 @@ impl SongbirdRuntime {
             cancelled: cancelled.clone(),
             cancellation: cancellation.clone(),
         };
+        let analysis_started = Instant::now();
         let outcome = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
-            let _permit = self.analysis_limit.acquire().await.ok()?;
             if !bypass_cache {
-                if let Ok(Some(analysis)) = self.analysis_cache.load(&key) {
+                if let Some(analysis) =
+                    load_cached_analysis(&self.analysis_cache, &key, "neural analysis cache").await
+                {
                     return Some(AnalysisOutcome {
                         analysis,
                         backend: AnalysisBackend::CachedNeural,
                         v2_rhythm: None,
                     });
                 }
-                if let Ok(Some(analysis)) = self.classical_cache.load(&key) {
+                if let Some(analysis) =
+                    load_cached_analysis(&self.classical_cache, &key, "classical analysis cache")
+                        .await
+                {
                     return Some(AnalysisOutcome {
                         analysis,
                         backend: AnalysisBackend::CachedClassicalPermanentIneligible,
@@ -1055,36 +1106,84 @@ impl SongbirdRuntime {
             .make_playable_async(get_codec_registry(), get_probe())
             .await
             .ok()?;
+            // Acquire an owned permit immediately before spawning the blocking
+            // worker. The permit moves into that worker, so a timeout that
+            // drops this async future cannot make another worker start while
+            // the timed-out decoder is still running.
+            let permit = self.analysis_limit.clone().acquire_owned().await.ok()?;
             let worker_cancelled = cancelled.clone();
             tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 analyze_input_with_cancel_outcome(input, &worker_cancelled)
             })
             .await
             .ok()?
         })
-        .await
-        .ok()??;
+        .await;
+        let outcome = match outcome {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) => {
+                warn!(
+                    provider_id = request.provider_id.as_ref(),
+                    elapsed_ms = analysis_started.elapsed().as_millis() as u64,
+                    "analysis did not produce a result"
+                );
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    provider_id = request.provider_id.as_ref(),
+                    timeout_seconds = ANALYSIS_TIMEOUT.as_secs(),
+                    "analysis timed out"
+                );
+                return None;
+            }
+        };
+        info!(
+            provider_id = request.provider_id.as_ref(),
+            backend = ?outcome.backend,
+            elapsed_ms = analysis_started.elapsed().as_millis() as u64,
+            "analysis completed"
+        );
         drop(cancel_on_drop);
-        self.store_analysis_outcome(&key, &outcome);
+        self.store_analysis_outcome(&key, &outcome).await;
         Some(outcome)
     }
 
-    fn store_analysis_outcome(&self, key: &AnalysisCacheKey, outcome: &AnalysisOutcome) {
+    async fn store_analysis_outcome(&self, key: &AnalysisCacheKey, outcome: &AnalysisOutcome) {
         match outcome.backend {
             AnalysisBackend::Neural => {
                 if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
                     fallbacks.remove(key);
                 }
-                let _ = self.analysis_cache.store(key, &outcome.analysis);
+                if let Err(error) = self
+                    .analysis_cache
+                    .store_async(key, &outcome.analysis)
+                    .await
+                {
+                    warn!(error = %error, "failed to write neural analysis cache");
+                }
             }
             AnalysisBackend::ClassicalPermanentIneligible => {
                 if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
                     fallbacks.remove(key);
                 }
-                let _ = self.classical_cache.store(key, &outcome.analysis);
+                if let Err(error) = self
+                    .classical_cache
+                    .store_async(key, &outcome.analysis)
+                    .await
+                {
+                    warn!(error = %error, "failed to write classical analysis cache");
+                }
             }
             AnalysisBackend::ClassicalTransientFailure => {
                 if let Ok(mut fallbacks) = self.classical_fallbacks.lock() {
+                    fallbacks.retain(|_, fallback| fallback.is_fresh_at(Instant::now()));
+                    if fallbacks.len() >= MAX_CLASSICAL_FALLBACKS
+                        && let Some(evicted_key) = fallbacks.keys().next().cloned()
+                    {
+                        fallbacks.remove(&evicted_key);
+                    }
                     fallbacks.insert(
                         key.clone(),
                         ClassicalFallback {
@@ -1114,6 +1213,20 @@ impl SongbirdRuntime {
         let mut tracks = self.tracks.lock().ok()?;
         tracks.retain(|_, handle| handle.strong_count() != 0);
         tracks.get(&identity).and_then(Weak::upgrade)
+    }
+}
+
+async fn load_cached_analysis(
+    cache: &AnalysisCache,
+    key: &AnalysisCacheKey,
+    label: &'static str,
+) -> Option<TrackAnalysis> {
+    match cache.load_async(key).await {
+        Ok(analysis) => analysis,
+        Err(error) => {
+            warn!(error = %error, cache = label, "failed to read analysis cache");
+            None
+        }
     }
 }
 
@@ -2224,7 +2337,7 @@ mod tests {
             v2_rhythm: None,
         };
         assert_eq!(fresh.backend, AnalysisBackend::ClassicalTransientFailure);
-        runtime.store_analysis_outcome(&key, &fresh);
+        runtime.store_analysis_outcome(&key, &fresh).await;
 
         let outcome = runtime
             .analyze_track_with_backend(&request)

@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::hls_security::{filtered_headers, validate_provider_url};
 
 const NICONICO_HLS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const NICONICO_HLS_MAX_PLAYLIST_BYTES: usize = 8 * 1024 * 1024;
 const NICONICO_HLS_MAX_KEY_BYTES: usize = 1024;
 const NICONICO_HLS_MAX_MEDIA_PART_BYTES: usize = 64 * 1024 * 1024;
 
@@ -53,11 +54,12 @@ impl NiconicoHlsRequest {
     }
 
     async fn fetch_text(&self, url: &str) -> Result<String, AudioStreamError> {
-        self.fetch_response(url)
-            .await?
-            .text()
-            .await
-            .map_err(reqwest_error)
+        let bytes = collect_response_bytes_limited(
+            self.fetch_response(url).await?,
+            NICONICO_HLS_MAX_PLAYLIST_BYTES,
+        )
+        .await?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>, AudioStreamError> {

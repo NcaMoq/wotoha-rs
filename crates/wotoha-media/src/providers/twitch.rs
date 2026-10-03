@@ -8,7 +8,7 @@ use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
-use crate::{ResolveError, provider::MediaProvider};
+use crate::{ResolveError, bounded_json, bounded_text, provider::MediaProvider};
 
 const TWITCH_GQL_URL: &str = "https://gql.twitch.tv/gql";
 const TWITCH_WEB_CLIENT_ID: &str = "kimne78kx3ncx6brgo4mv6wki5h1ko";
@@ -428,7 +428,7 @@ async fn refreshed_request_from_token(
 }
 
 async fn twitch_graphql(probe_client: &Client, body: Value) -> Result<Value, ResolveError> {
-    probe_client
+    let response = probe_client
         .post(TWITCH_GQL_URL)
         .header("Client-ID", TWITCH_WEB_CLIENT_ID)
         .header("Accept", "*/*")
@@ -438,10 +438,8 @@ async fn twitch_graphql(probe_client: &Client, body: Value) -> Result<Value, Res
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json()
-        .await
-        .map_err(ResolveError::Request)
+        .map_err(ResolveError::Request)?;
+    bounded_json(response).await
 }
 
 fn parse_twitch_target(raw_url: &str) -> Option<TwitchTarget> {
@@ -538,7 +536,7 @@ async fn fetch_audio_only_playlist(
     master_url: &str,
     referer: &str,
 ) -> Result<Option<String>, ResolveError> {
-    let manifest = probe_client
+    let response = probe_client
         .get(master_url)
         .header("Referer", referer)
         .header("User-Agent", "Mozilla/5.0")
@@ -546,10 +544,8 @@ async fn fetch_audio_only_playlist(
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .text()
-        .await
         .map_err(ResolveError::Request)?;
+    let manifest = bounded_text(response).await?;
 
     Ok(extract_audio_only_playlist(master_url, &manifest))
 }

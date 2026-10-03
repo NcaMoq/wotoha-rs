@@ -292,8 +292,8 @@ fn track_request_from_info(
         None
     } else {
         info.duration
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(Duration::from_secs_f64)
+            .filter(|v| v.is_finite() && *v > 0.0 && *v <= 24.0 * 60.0 * 60.0)
+            .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
     };
     Ok(TrackRequest::new(
         "youtube",
@@ -346,8 +346,8 @@ fn sanitize_headers(
 pub fn resolve_ytdlp_path() -> Result<PathBuf, YtDlpError> {
     resolve_ytdlp_path_with_candidates(
         env::var_os("WOTOHA_YTDLP_PATH").map(PathBuf::from),
-        Path::new("/data/tools/yt-dlp"),
-        Path::new("/data/tools/yt-dlp.sha256"),
+        Path::new("/wotoha/tools/yt-dlp"),
+        Path::new("/wotoha/tools/yt-dlp.sha256"),
         Path::new("/app/tools/yt-dlp-fallback"),
         Path::new("/opt/wotoha/bin/yt-dlp"),
     )

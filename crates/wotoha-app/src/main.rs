@@ -43,12 +43,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if std::env::args().any(|argument| argument == "--version") {
+        println!(
+            "wotoha {} (commit {})",
+            option_env!("WOTOHA_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+            option_env!("WOTOHA_SOURCE_COMMIT").unwrap_or("unknown")
+        );
+        return Ok(());
+    }
     if std::env::args().any(|argument| argument == "--self-check") {
         return self_check().await;
     }
     let config = BotConfig::load()?;
     std::fs::create_dir_all(&config.logging.directory)?;
     let log_path = config.logging.file_path();
+    rotate_runtime_log(&log_path)?;
     let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(file) => file,
         Err(error) => {
@@ -77,6 +86,15 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .init();
     append_debug_log("main: boot starting");
     append_debug_log("main: config loaded");
+    info!(
+        build_version = option_env!("WOTOHA_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        source_commit = option_env!("WOTOHA_SOURCE_COMMIT").unwrap_or("unknown"),
+        image_version = std::env::var("WOTOHA_IMAGE_VERSION")
+            .ok()
+            .as_deref()
+            .unwrap_or("unknown"),
+        "build identity"
+    );
     info!(
         log_dir = %config.logging.directory.display(),
         log_file = %config.logging.file_name,
@@ -135,20 +153,69 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         result = client.start() => result?,
         result = shutdown_signal() => {
             result?;
-            append_debug_log("main: shutdown signal received; notifying active sessions");
-            shutdown_handler.notify_restart(&http).await;
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            shutdown_handler.persist_restart_state().await;
-            shard_manager.shutdown_all().await;
+            append_debug_log("main: shutdown signal received; persisting active sessions");
+            if tokio::time::timeout(
+                RESTART_STATE_TIMEOUT,
+                shutdown_handler.persist_restart_state(),
+            )
+            .await
+            .is_err()
+            {
+                append_debug_log("main: reconnect state persistence timed out");
+            }
+            append_debug_log("main: reconnect state persisted; notifying active sessions");
+            if tokio::time::timeout(
+                RESTART_NOTIFICATION_TIMEOUT,
+                shutdown_handler.notify_restart(&http),
+            )
+            .await
+            .is_err()
+            {
+                append_debug_log("main: restart notifications timed out");
+            }
+            if tokio::time::timeout(SHARD_SHUTDOWN_TIMEOUT, shard_manager.shutdown_all())
+                .await
+                .is_err()
+            {
+                append_debug_log("main: shard shutdown timed out");
+            }
         }
     }
     append_debug_log("main: client exited");
     Ok(())
 }
 
+const MAX_RUNTIME_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const RESTART_STATE_TIMEOUT: Duration = Duration::from_secs(18);
+const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(4);
+const SHARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn rotate_runtime_log(path: &std::path::Path) -> io::Result<()> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.len() <= MAX_RUNTIME_LOG_BYTES {
+        return Ok(());
+    }
+    let rotated = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&rotated);
+    std::fs::rename(path, rotated)
+}
+
 async fn self_check() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let data_dir =
-        PathBuf::from(std::env::var_os("WOTOHA_DATA_DIR").unwrap_or_else(|| "/data".into()));
+    let data_dir = PathBuf::from(
+        std::env::var_os("WOTOHA_DATA_DIR")
+            .or_else(|| {
+                std::env::var_os("WOTOHA_RECONNECT_STATE_FILE").and_then(|path| {
+                    PathBuf::from(path)
+                        .parent()
+                        .map(|parent| parent.as_os_str().to_owned())
+                })
+            })
+            .unwrap_or_else(|| "/wotoha".into()),
+    );
     for relative in ["cache/analysis", "logs", "tools"] {
         std::fs::create_dir_all(data_dir.join(relative))?;
     }
@@ -368,6 +435,13 @@ where
         request: &TrackRequest,
     ) -> Option<wotoha_core::automix::TrackAnalysis> {
         self.inner.cached_track_analysis(request)
+    }
+
+    async fn cached_track_analysis_async(
+        &self,
+        request: &TrackRequest,
+    ) -> Option<wotoha_core::automix::TrackAnalysis> {
+        self.inner.cached_track_analysis_async(request).await
     }
 
     fn cached_track_analysis_v2(

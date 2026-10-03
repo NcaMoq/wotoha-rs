@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use wotoha_contracts::{ChannelKey, GuildKey, PlaybackRestartSnapshot};
 
 const SCHEMA_VERSION: u32 = 2;
-const DEFAULT_STATE_FILE: &str = ".wotoha-reconnect.json";
+const DEFAULT_STATE_FILE: &str = "/wotoha/reconnect.json";
 
 #[derive(Clone)]
 pub(crate) struct ReconnectStore {

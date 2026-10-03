@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
-use crate::{ResolveError, provider::MediaProvider};
+use crate::{ResolveError, bounded_json, bounded_text, provider::MediaProvider};
 
 const X_GUEST_ACTIVATE_URL: &str = "https://api.twitter.com/1.1/guest/activate.json";
 const X_WEB_CONTEXT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -277,28 +277,24 @@ impl XProvider {
         probe_client: &Client,
         raw_url: &str,
     ) -> Result<XWebContext, ResolveError> {
-        let page = probe_client
+        let response = probe_client
             .get(raw_url)
             .send()
             .await
             .map_err(ResolveError::Request)?
             .error_for_status()
-            .map_err(ResolveError::Request)?
-            .text()
-            .await
             .map_err(ResolveError::Request)?;
+        let page = bounded_text(response).await?;
         let main_js_url = extract_main_js_url(&page)
             .ok_or_else(|| ResolveError::Parse("missing X main.js URL".to_owned()))?;
-        let main_js = probe_client
+        let response = probe_client
             .get(&main_js_url)
             .send()
             .await
             .map_err(ResolveError::Request)?
             .error_for_status()
-            .map_err(ResolveError::Request)?
-            .text()
-            .await
             .map_err(ResolveError::Request)?;
+        let main_js = bounded_text(response).await?;
 
         let context = XWebContext {
             bearer_token: extract_bearer_token(&main_js)
@@ -450,17 +446,15 @@ async fn activate_guest_token(
     probe_client: &Client,
     bearer_token: &str,
 ) -> Result<String, ResolveError> {
-    let payload: Value = probe_client
+    let response = probe_client
         .post(X_GUEST_ACTIVATE_URL)
         .headers(token_headers(bearer_token, None)?)
         .send()
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json()
-        .await
         .map_err(ResolveError::Request)?;
+    let payload: Value = bounded_json(response).await?;
 
     payload
         .get("guest_token")
@@ -510,17 +504,15 @@ async fn fetch_tweet_payload(
         urlencoding(&features.to_string()),
     );
 
-    probe_client
+    let response = probe_client
         .get(url)
         .headers(token_headers(bearer_token, Some(guest_token))?)
         .send()
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .json()
-        .await
-        .map_err(ResolveError::Request)
+        .map_err(ResolveError::Request)?;
+    bounded_json(response).await
 }
 
 fn token_headers(bearer_token: &str, guest_token: Option<&str>) -> Result<HeaderMap, ResolveError> {
@@ -665,7 +657,7 @@ fn extract_title(result: &Value, canonical_url: &str) -> String {
 fn sanitize_title(raw: &str) -> Option<String> {
     static URL_RE: OnceLock<Regex> = OnceLock::new();
     let without_urls = URL_RE
-        .get_or_init(|| Regex::new(r"https?://\S+").expect("X URL regex should compile"))
+        .get_or_init(|| Regex::new(r"(?i)https?://\S+").expect("X URL regex should compile"))
         .replace_all(raw, "");
     let title = without_urls
         .lines()

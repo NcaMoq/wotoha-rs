@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

@@ -6,7 +6,7 @@ use serde_json::Value;
 use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
 use crate::{
-    ResolveError,
+    ResolveError, bounded_text,
     html::{decode_html_attribute, extract_attribute, extract_meta_content, extract_script_tag},
     provider::MediaProvider,
 };
@@ -37,16 +37,14 @@ impl MediaProvider for BandcampProvider {
         raw_url: &str,
         probe_client: &Client,
     ) -> Result<TrackRequest, ResolveError> {
-        let page = probe_client
+        let response = probe_client
             .get(raw_url)
             .send()
             .await
             .map_err(ResolveError::Request)?
             .error_for_status()
-            .map_err(ResolveError::Request)?
-            .text()
-            .await
             .map_err(ResolveError::Request)?;
+        let page = bounded_text(response).await?;
 
         parse_bandcamp_track(raw_url, &page)
     }
@@ -102,7 +100,7 @@ fn parse_bandcamp_track(raw_url: &str, page: &str) -> Result<TrackRequest, Resol
     let duration = track
         .get("duration")
         .and_then(Value::as_f64)
-        .map(Duration::from_secs_f64);
+        .and_then(bounded_duration);
 
     Ok(TrackRequest::new(
         "bandcamp",
@@ -124,6 +122,14 @@ fn parse_bandcamp_track(raw_url: &str, page: &str) -> Result<TrackRequest, Resol
             duration,
         ),
     ))
+}
+
+fn bounded_duration(seconds: f64) -> Option<Duration> {
+    seconds
+        .is_finite()
+        .then_some(seconds)
+        .filter(|seconds| *seconds > 0.0 && *seconds <= 24.0 * 60.0 * 60.0)
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
 }
 
 fn parse_json(raw: &str) -> Result<Value, ResolveError> {
@@ -190,5 +196,13 @@ mod tests {
             }
             other => panic!("expected prepared http source, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn ignores_invalid_external_duration_without_panicking() {
+        assert_eq!(bounded_duration(f64::NAN), None);
+        assert_eq!(bounded_duration(-1.0), None);
+        assert_eq!(bounded_duration(24.0 * 60.0 * 60.0 + 1.0), None);
+        assert!(bounded_duration(341.387).is_some());
     }
 }

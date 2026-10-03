@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::automix::AutoMixConfig;
 
-const DEFAULT_LOG_DIR: &str = "target";
+const DEFAULT_LOG_DIR: &str = "/wotoha/logs";
 const DEFAULT_LOG_FILE: &str = "wotoha-app.runtime.log";
 const DEFAULT_RUST_LOG: &str = "info,wotoha_debug=info";
 const DEFAULT_LOG_ANSI: bool = false;
@@ -465,7 +465,10 @@ mod tests {
         let config = load_from(&[("DISCORD_TOKEN", "token")]).unwrap();
 
         assert_eq!(config.discord_token, "token");
-        assert_eq!(config.logging.directory, std::path::PathBuf::from("target"));
+        assert_eq!(
+            config.logging.directory,
+            std::path::PathBuf::from("/wotoha/logs")
+        );
         assert_eq!(config.logging.file_name, "wotoha-app.runtime.log");
         assert_eq!(config.logging.rust_log, "info,wotoha_debug=info");
         assert!(!config.logging.ansi);

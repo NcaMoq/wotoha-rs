@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use wotoha_core::{PreparedHeader, PreparedSource, TrackMetadata, TrackRequest};
 
 use crate::{
-    ResolveError,
+    ResolveError, bounded_json, bounded_text,
     html::{decode_html_attribute, extract_meta_content},
     provider::MediaProvider,
 };
@@ -55,7 +55,7 @@ impl MediaProvider for NiconicoProvider {
             .map_err(ResolveError::Request)?;
         let mut playback_cookies = HashMap::new();
         collect_response_cookies(&response, &mut playback_cookies);
-        let page = response.text().await.map_err(ResolveError::Request)?;
+        let page = bounded_text(response).await?;
 
         let payload = parse_server_response(&page)?;
         let response = payload
@@ -256,7 +256,7 @@ async fn request_domand_playlist(
         .error_for_status()
         .map_err(ResolveError::Request)?;
     collect_response_cookies(&response, playback_cookies);
-    let payload: Value = response.json().await.map_err(ResolveError::Request)?;
+    let payload: Value = bounded_json(response).await?;
 
     let content_url = payload
         .get("data")
@@ -320,15 +320,13 @@ async fn resolve_audio_playlist_url(
         request = request.header(COOKIE, cookie);
     }
 
-    let playlist = request
+    let response = request
         .send()
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .text()
-        .await
         .map_err(ResolveError::Request)?;
+    let playlist = bounded_text(response).await?;
 
     Ok(select_best_audio_playlist(master_playlist_url, &playlist)
         .unwrap_or_else(|| master_playlist_url.to_owned()))

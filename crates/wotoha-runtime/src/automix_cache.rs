@@ -42,6 +42,9 @@ pub(crate) const ANALYSIS_CACHE_ANALYZER_VERSION: &str = "pcm-onset-chroma-level
 pub(crate) const ANALYSIS_CACHE_CLASSICAL_ANALYZER_VERSION: &str = "pcm-onset-chroma-level-loudness-classical-permanent-neural-eligibility-beat-this-1.0.0-rten-0.24.0-a5f8d39d989f31859454ba27afe61c5317ca95e4d9373e6853e5361b8937172f-fdd59e65c515331308e4c8841edf99972deca646bdf6197744c2a5b7755e3de9-v12";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024;
 const SOURCE_DURATION_TOLERANCE_MICROS: u64 = 1_000_000;
+const MAX_CACHE_ENTRIES: usize = 4_096;
+const MAX_CACHE_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const CACHE_ENTRY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -161,6 +164,19 @@ impl AnalysisCache {
         record.analysis.try_into().map(Some)
     }
 
+    /// Run the synchronous decoder away from the async executor. Filesystem
+    /// latency must not hold up a voice or event worker.
+    pub async fn load_async(
+        &self,
+        key: &AnalysisCacheKey,
+    ) -> Result<Option<TrackAnalysis>, AnalysisCacheError> {
+        let cache = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || cache.load(&key))
+            .await
+            .map_err(|error| AnalysisCacheError::Blocking(error.to_string()))?
+    }
+
     pub fn store(
         &self,
         key: &AnalysisCacheKey,
@@ -189,13 +205,28 @@ impl AnalysisCache {
                 io_error("sync temporary cache file", temp_path.clone(), source)
             })?;
             drop(writer);
-            replace_file(&temp_path, &path)
+            replace_file(&temp_path, &path)?;
+            self.prune()?;
+            Ok(())
         })();
 
         if write_result.is_err() {
             let _ = fs::remove_file(&temp_path);
         }
         write_result
+    }
+
+    pub async fn store_async(
+        &self,
+        key: &AnalysisCacheKey,
+        analysis: &TrackAnalysis,
+    ) -> Result<(), AnalysisCacheError> {
+        let cache = self.clone();
+        let key = key.clone();
+        let analysis = analysis.clone();
+        tokio::task::spawn_blocking(move || cache.store(&key, &analysis))
+            .await
+            .map_err(|error| AnalysisCacheError::Blocking(error.to_string()))?
     }
 
     /// Loads an analysis-schema V2 record from its separate binary cache
@@ -256,6 +287,17 @@ impl AnalysisCache {
         Ok(Some(record.analysis))
     }
 
+    pub async fn load_v2_async(
+        &self,
+        key: &AnalysisCacheKey,
+    ) -> Result<Option<TrackAnalysisV2>, AnalysisCacheError> {
+        let cache = self.clone();
+        let key = key.clone();
+        tokio::task::spawn_blocking(move || cache.load_v2(&key))
+            .await
+            .map_err(|error| AnalysisCacheError::Blocking(error.to_string()))?
+    }
+
     /// Stores an analysis-schema V2 record using a bounded compact binary
     /// codec and the same fsync + atomic-rename protocol as the V1 cache.
     pub fn store_v2(
@@ -296,7 +338,9 @@ impl AnalysisCache {
                 io_error("sync temporary cache file", temp_path.clone(), source)
             })?;
             drop(writer);
-            replace_file(&temp_path, &path)
+            replace_file(&temp_path, &path)?;
+            self.prune()?;
+            Ok(())
         })();
 
         if write_result.is_err() {
@@ -305,8 +349,66 @@ impl AnalysisCache {
         write_result
     }
 
+    pub async fn store_v2_async(
+        &self,
+        key: &AnalysisCacheKey,
+        analysis: &TrackAnalysisV2,
+    ) -> Result<(), AnalysisCacheError> {
+        let cache = self.clone();
+        let key = key.clone();
+        let analysis = analysis.clone();
+        tokio::task::spawn_blocking(move || cache.store_v2(&key, &analysis))
+            .await
+            .map_err(|error| AnalysisCacheError::Blocking(error.to_string()))?
+    }
+
     fn path_for(&self, key: &AnalysisCacheKey) -> PathBuf {
         self.root.join(format!("{}.json", key.digest()))
+    }
+
+    fn prune(&self) -> Result<(), AnalysisCacheError> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_error("scan cache directory", self.root.clone(), error)),
+        };
+        let now = std::time::SystemTime::now();
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| io_error("read cache directory", self.root.clone(), error))?;
+            let path = entry.path();
+            let extension = path.extension().and_then(|extension| extension.to_str());
+            let metadata = entry
+                .metadata()
+                .map_err(|error| io_error("inspect cache entry", path.clone(), error))?;
+            let modified = metadata.modified().unwrap_or(now);
+            if extension == Some("tmp") {
+                if now.duration_since(modified).unwrap_or_default() > CACHE_ENTRY_TTL {
+                    let _ = fs::remove_file(&path);
+                }
+                continue;
+            }
+            if !matches!(extension, Some("json") | Some("bin")) {
+                continue;
+            }
+            if now.duration_since(modified).unwrap_or_default() > CACHE_ENTRY_TTL {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            files.push((path, metadata.len(), modified));
+        }
+        files.sort_unstable_by_key(|(_, _, modified)| *modified);
+        let mut total = files.iter().map(|(_, size, _)| *size).sum::<u64>();
+        while files.len() > MAX_CACHE_ENTRIES || total > MAX_CACHE_TOTAL_BYTES {
+            let Some((path, size, _)) = files.first().cloned() else {
+                break;
+            };
+            files.remove(0);
+            let _ = fs::remove_file(path);
+            total = total.saturating_sub(size);
+        }
+        Ok(())
     }
 
     fn path_for_v2(&self, key: &AnalysisCacheKey) -> PathBuf {
@@ -340,6 +442,8 @@ pub enum AnalysisCacheError {
     InvalidKey,
     #[error("analysis cache analyzer version must not be empty")]
     InvalidAnalyzerVersion,
+    #[error("analysis cache blocking task failed: {0}")]
+    Blocking(String),
     #[error("invalid track analysis: {0}")]
     InvalidAnalysis(&'static str),
     #[error("failed to {operation} at {path}: {source}")]

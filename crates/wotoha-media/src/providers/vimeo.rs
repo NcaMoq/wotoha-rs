@@ -5,7 +5,7 @@ use reqwest::{Client, Url};
 use serde_json::Value;
 use wotoha_core::{PreparedSource, TrackMetadata, TrackRequest};
 
-use crate::{ResolveError, provider::MediaProvider};
+use crate::{ResolveError, bounded_json, bounded_text, provider::MediaProvider};
 
 #[derive(Clone, Debug, Default)]
 pub struct VimeoProvider;
@@ -46,16 +46,14 @@ impl MediaProvider for VimeoProvider {
         let reference = extract_vimeo_reference(raw_url)
             .ok_or_else(|| ResolveError::UnsupportedSource(raw_url.to_owned()))?;
         let config_url = reference.config_url();
-        let payload: Value = probe_client
+        let response = probe_client
             .get(config_url)
             .send()
             .await
             .map_err(ResolveError::Request)?
             .error_for_status()
-            .map_err(ResolveError::Request)?
-            .json()
-            .await
             .map_err(ResolveError::Request)?;
+        let payload: Value = bounded_json(response).await?;
 
         track_request_from_config(raw_url, &payload, probe_client).await
     }
@@ -247,16 +245,14 @@ async fn fetch_audio_only_playlist(
     probe_client: &Client,
     master_url: &str,
 ) -> Result<Option<String>, ResolveError> {
-    let manifest = probe_client
+    let response = probe_client
         .get(master_url)
         .send()
         .await
         .map_err(ResolveError::Request)?
         .error_for_status()
-        .map_err(ResolveError::Request)?
-        .text()
-        .await
         .map_err(ResolveError::Request)?;
+    let manifest = bounded_text(response).await?;
 
     Ok(extract_audio_only_playlist(master_url, &manifest))
 }

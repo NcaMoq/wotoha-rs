@@ -11,8 +11,8 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{
-    Mutex as AsyncMutex,
-    mpsc::{UnboundedReceiver, unbounded_channel},
+    Mutex as AsyncMutex, Semaphore,
+    mpsc::{self, UnboundedReceiver, error::TrySendError, unbounded_channel},
     oneshot,
 };
 use tracing::{info, warn};
@@ -52,6 +52,8 @@ const AUTOMIX_ANALYSIS_LOOKAHEAD: usize = 4;
 const LOUDNESS_GAIN_RAMP_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 const LOUDNESS_GAIN_RAMP_STEP: std::time::Duration = std::time::Duration::from_millis(50);
 const MAX_V2_SHADOW_DIAGNOSTICS: u64 = 128;
+const PER_GUILD_EVENT_QUEUE: usize = 64;
+const GLOBAL_EVENT_CONCURRENCY: usize = 16;
 
 #[derive(Default)]
 pub struct V2RuntimeMetrics {
@@ -130,6 +132,41 @@ struct PlaybackCoordinatorInner<M: MediaBackend, R: VoiceRuntime> {
     automix_beatmatch: BeatmatchBlendConfig,
     v2_metrics: Arc<V2RuntimeMetrics>,
     v2_shadow_diagnostic_count: AtomicU64,
+    event_workers: DashMap<GuildKey, EventWorker>,
+    next_event_worker_id: AtomicU64,
+    event_concurrency: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct EventWorker {
+    id: u64,
+    sender: mpsc::Sender<PlaybackRuntimeEvent>,
+}
+
+fn runtime_event_guild(event: &PlaybackRuntimeEvent) -> GuildKey {
+    match event {
+        PlaybackRuntimeEvent::TrackStarted { guild_id, .. }
+        | PlaybackRuntimeEvent::TrackEnded { guild_id, .. }
+        | PlaybackRuntimeEvent::TransitionDue { guild_id, .. }
+        | PlaybackRuntimeEvent::TransitionPrefetchDue { guild_id, .. }
+        | PlaybackRuntimeEvent::TransitionStarted { guild_id, .. }
+        | PlaybackRuntimeEvent::TransitionArmFailed { guild_id, .. }
+        | PlaybackRuntimeEvent::TrackErrored { guild_id, .. }
+        | PlaybackRuntimeEvent::VoiceDisconnected { guild_id, .. } => *guild_id,
+    }
+}
+
+fn runtime_event_name(event: &PlaybackRuntimeEvent) -> &'static str {
+    match event {
+        PlaybackRuntimeEvent::TrackStarted { .. } => "track_started",
+        PlaybackRuntimeEvent::TrackEnded { .. } => "track_ended",
+        PlaybackRuntimeEvent::TransitionDue { .. } => "transition_due",
+        PlaybackRuntimeEvent::TransitionPrefetchDue { .. } => "transition_prefetch_due",
+        PlaybackRuntimeEvent::TransitionStarted { .. } => "transition_started",
+        PlaybackRuntimeEvent::TransitionArmFailed { .. } => "transition_arm_failed",
+        PlaybackRuntimeEvent::TrackErrored { .. } => "track_errored",
+        PlaybackRuntimeEvent::VoiceDisconnected { .. } => "voice_disconnected",
+    }
 }
 
 struct GuildSession<ME, RE>
@@ -176,6 +213,7 @@ where
     next_enqueue_seq: u64,
     next_commit_seq: u64,
     pending_enqueues: BTreeMap<u64, PendingEnqueue<ME, RE>>,
+    cancelled_enqueues: HashSet<u64>,
 }
 
 struct PendingEnqueue<ME, RE>
@@ -185,6 +223,34 @@ where
 {
     outcome: Option<Result<TrackRequest, PlaybackError<ME, RE>>>,
     completion: Option<CompletionSender<ME, RE>>,
+}
+
+struct EnqueueReservation<ME, RE>
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    session: SessionHandle<ME, RE>,
+    sequence: u64,
+}
+
+impl<ME, RE> Drop for EnqueueReservation<ME, RE>
+where
+    ME: std::error::Error + Send + Sync + 'static,
+    RE: std::error::Error + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        let mut playback = self.session.playback.lock();
+        if playback.pending_enqueues.remove(&self.sequence).is_some() {
+            playback.cancelled_enqueues.insert(self.sequence);
+            while {
+                let next = playback.next_commit_seq;
+                playback.cancelled_enqueues.remove(&next)
+            } {
+                playback.next_commit_seq += 1;
+            }
+        }
+    }
 }
 
 struct PreparedTransition {
@@ -295,6 +361,7 @@ where
             next_enqueue_seq: 0,
             next_commit_seq: 0,
             pending_enqueues: BTreeMap::new(),
+            cancelled_enqueues: HashSet::new(),
         }
     }
 }
@@ -397,6 +464,9 @@ where
                 automix_beatmatch,
                 v2_metrics: Arc::new(V2RuntimeMetrics::default()),
                 v2_shadow_diagnostic_count: AtomicU64::new(0),
+                event_workers: DashMap::new(),
+                next_event_worker_id: AtomicU64::new(1),
+                event_concurrency: Arc::new(Semaphore::new(GLOBAL_EVENT_CONCURRENCY)),
             }),
         };
         playback.spawn_runtime_event_loop(receiver);
@@ -411,109 +481,159 @@ where
         let playback = self.clone();
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                match event {
-                    PlaybackRuntimeEvent::TrackStarted { .. } => {}
-                    PlaybackRuntimeEvent::TransitionDue {
-                        guild_id,
-                        session_id,
-                        playback_id,
-                    } => {
-                        let playback = playback.clone();
-                        tokio::spawn(async move {
-                            playback.transition(guild_id, session_id, playback_id).await
-                        });
-                    }
-                    PlaybackRuntimeEvent::TransitionPrefetchDue {
-                        guild_id,
-                        session_id,
-                        playback_id,
-                    } => {
-                        let playback = playback.clone();
-                        tokio::spawn(async move {
-                            playback
-                                .prefetch_transition(guild_id, session_id, playback_id)
-                                .await
-                        });
-                    }
-                    PlaybackRuntimeEvent::TransitionStarted {
-                        guild_id,
-                        session_id,
-                        outgoing_playback_id,
-                        generation,
-                        ..
-                    } => {
-                        let playback = playback.clone();
-                        tokio::spawn(async move {
-                            playback
-                                .transition_started(
-                                    guild_id,
-                                    session_id,
-                                    outgoing_playback_id,
-                                    generation,
-                                )
-                                .await
-                        });
-                    }
-                    PlaybackRuntimeEvent::TransitionArmFailed {
-                        guild_id,
-                        session_id,
-                        outgoing_playback_id,
-                        incoming_playback_id,
-                        generation,
-                        actual_frame,
-                        underflow,
-                        failure_kind,
-                        reason,
-                        ..
-                    } => {
-                        let playback = playback.clone();
-                        tokio::spawn(async move {
-                            playback
-                                .degrade_armed_transition(
-                                    guild_id,
-                                    session_id,
-                                    outgoing_playback_id,
-                                    incoming_playback_id,
-                                    generation,
-                                    actual_frame,
-                                    underflow,
-                                    failure_kind,
-                                    reason,
-                                )
-                                .await;
-                        });
-                    }
-                    PlaybackRuntimeEvent::TrackEnded {
-                        guild_id,
-                        session_id,
-                        playback_id,
-                        reason,
-                    } => {
-                        playback
-                            .advance(guild_id, session_id, playback_id, reason)
-                            .await
-                    }
-                    PlaybackRuntimeEvent::TrackErrored {
-                        guild_id,
-                        session_id,
-                        playback_id,
-                        message,
-                    } => {
-                        playback
-                            .handle_track_error(guild_id, session_id, playback_id, message.as_ref())
-                            .await
-                    }
-                    PlaybackRuntimeEvent::VoiceDisconnected { guild_id, reason } => {
-                        warn!(
-                            guild_id = guild_id.get(),
-                            reason = reason.as_ref(),
-                            "runtime reported voice disconnect"
-                        );
-                        playback.disconnect_guild(guild_id).await;
-                    }
+                playback.route_runtime_event(event);
+            }
+        });
+    }
+
+    fn route_runtime_event(&self, event: PlaybackRuntimeEvent) {
+        let guild_id = runtime_event_guild(&event);
+        let worker = if let Some(worker) = self.inner.event_workers.get(&guild_id) {
+            worker.clone()
+        } else {
+            let (sender, receiver) = mpsc::channel(PER_GUILD_EVENT_QUEUE);
+            let candidate = EventWorker {
+                id: self
+                    .inner
+                    .next_event_worker_id
+                    .fetch_add(1, Ordering::Relaxed),
+                sender,
+            };
+            match self.inner.event_workers.entry(guild_id) {
+                dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    let worker = candidate.clone();
+                    entry.insert(candidate);
+                    self.spawn_guild_event_worker(guild_id, worker.id, receiver);
+                    worker
+                }
+            }
+        };
+
+        if let Err(error) = worker.sender.try_send(event) {
+            match error {
+                TrySendError::Full(event) => warn!(
+                    guild_id = guild_id.get(),
+                    event = runtime_event_name(&event),
+                    queue_limit = PER_GUILD_EVENT_QUEUE,
+                    "dropping runtime event because the guild queue is full"
+                ),
+                TrySendError::Closed(_) => {
+                    self.inner
+                        .event_workers
+                        .remove_if(&guild_id, |_, value| value.id == worker.id);
+                }
+            }
+        }
+    }
+
+    fn spawn_guild_event_worker(
+        &self,
+        guild_id: GuildKey,
+        worker_id: u64,
+        mut receiver: mpsc::Receiver<PlaybackRuntimeEvent>,
+    ) {
+        let playback = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                let disconnected = matches!(event, PlaybackRuntimeEvent::VoiceDisconnected { .. });
+                let permit = playback
+                    .inner
+                    .event_concurrency
+                    .clone()
+                    .acquire_owned()
+                    .await;
+                let Ok(_permit) = permit else { break };
+                playback.handle_runtime_event(event).await;
+                if disconnected {
+                    playback
+                        .inner
+                        .event_workers
+                        .remove_if(&guild_id, |_, value| value.id == worker_id);
+                    break;
                 }
             }
         });
+    }
+
+    async fn handle_runtime_event(&self, event: PlaybackRuntimeEvent) {
+        match event {
+            PlaybackRuntimeEvent::TrackStarted { .. } => {}
+            PlaybackRuntimeEvent::TransitionDue {
+                guild_id,
+                session_id,
+                playback_id,
+            } => self.transition(guild_id, session_id, playback_id).await,
+            PlaybackRuntimeEvent::TransitionPrefetchDue {
+                guild_id,
+                session_id,
+                playback_id,
+            } => {
+                self.prefetch_transition(guild_id, session_id, playback_id)
+                    .await
+            }
+            PlaybackRuntimeEvent::TransitionStarted {
+                guild_id,
+                session_id,
+                outgoing_playback_id,
+                generation,
+                ..
+            } => {
+                self.transition_started(guild_id, session_id, outgoing_playback_id, generation)
+                    .await
+            }
+            PlaybackRuntimeEvent::TransitionArmFailed {
+                guild_id,
+                session_id,
+                outgoing_playback_id,
+                incoming_playback_id,
+                generation,
+                actual_frame,
+                underflow,
+                failure_kind,
+                reason,
+                ..
+            } => {
+                self.degrade_armed_transition(
+                    guild_id,
+                    session_id,
+                    outgoing_playback_id,
+                    incoming_playback_id,
+                    generation,
+                    actual_frame,
+                    underflow,
+                    failure_kind,
+                    reason,
+                )
+                .await;
+            }
+            PlaybackRuntimeEvent::TrackEnded {
+                guild_id,
+                session_id,
+                playback_id,
+                reason,
+            } => {
+                self.advance(guild_id, session_id, playback_id, reason)
+                    .await
+            }
+            PlaybackRuntimeEvent::TrackErrored {
+                guild_id,
+                session_id,
+                playback_id,
+                message,
+            } => {
+                self.handle_track_error(guild_id, session_id, playback_id, message.as_ref())
+                    .await
+            }
+            PlaybackRuntimeEvent::VoiceDisconnected { guild_id, reason } => {
+                warn!(
+                    guild_id = guild_id.get(),
+                    reason = reason.as_ref(),
+                    "runtime reported voice disconnect"
+                );
+                self.disconnect_guild(guild_id).await;
+            }
+        }
     }
 
     fn next_playback_id(&self) -> PlaybackId {
@@ -725,6 +845,10 @@ where
             );
             (sequence, rx)
         };
+        let reservation = EnqueueReservation {
+            session: session.clone(),
+            sequence,
+        };
 
         let resolved = self
             .inner
@@ -748,9 +872,11 @@ where
         self.finish_enqueue(guild_id, session.clone(), session_id, sequence, resolved)
             .await?;
 
-        completion
+        let result = completion
             .await
-            .unwrap_or(Err(PlaybackError::SessionExpired))
+            .unwrap_or(Err(PlaybackError::SessionExpired));
+        drop(reservation);
+        result
     }
 
     pub fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview> {
@@ -2898,21 +3024,30 @@ where
             .is_some_and(|session| {
                 session.playback.lock().automix_enabled || self.inner.loudness.enabled
             });
-        let cached_analysis = analysis_enabled
-            .then(|| {
-                self.get_session(guild_id)
-                    .filter(|session| session.id == session_id)
-                    .and_then(|session| {
-                        session
-                            .playback
-                            .lock()
-                            .analysis_by_key
-                            .get(&analysis_key)
-                            .cloned()
-                    })
-                    .or_else(|| self.inner.runtime.cached_track_analysis(&prepared))
-            })
-            .flatten();
+        let cached_analysis = if analysis_enabled {
+            let in_memory = self
+                .get_session(guild_id)
+                .filter(|session| session.id == session_id)
+                .and_then(|session| {
+                    session
+                        .playback
+                        .lock()
+                        .analysis_by_key
+                        .get(&analysis_key)
+                        .cloned()
+                });
+            match in_memory {
+                Some(analysis) => Some(analysis),
+                None => {
+                    self.inner
+                        .runtime
+                        .cached_track_analysis_async(&prepared)
+                        .await
+                }
+            }
+        } else {
+            None
+        };
         let normalization_gain =
             loudness_normalization_gain(&self.inner.loudness, cached_analysis.as_ref());
         let effective_initial_gain = initial_gain * normalization_gain;
@@ -3340,6 +3475,12 @@ where
     ME: std::error::Error + Send + Sync + 'static,
     RE: std::error::Error + Send + Sync + 'static,
 {
+    while {
+        let next = playback.next_commit_seq;
+        playback.cancelled_enqueues.remove(&next)
+    } {
+        playback.next_commit_seq += 1;
+    }
     let sequence = playback.next_commit_seq;
     let Some(pending) = playback.pending_enqueues.get_mut(&sequence) else {
         return FlushAction::WaitForEarlier;
@@ -3471,6 +3612,7 @@ where
     ME: std::error::Error + Send + Sync + 'static,
     RE: std::error::Error + Send + Sync + 'static,
 {
+    playback.cancelled_enqueues.clear();
     std::mem::take(&mut playback.pending_enqueues)
         .into_values()
         .filter_map(|mut pending| pending.completion.take())
@@ -5305,6 +5447,30 @@ mod tests {
             "pending-0"
         );
         assert_eq!(preview.total_queued(), MAX_PENDING_ENQUEUES - 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_enqueue_releases_ordered_reservation() {
+        let guild_id = GuildKey::new(111);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new(media.clone(), runtime);
+        let _release = media.block_resolve("cancelled");
+
+        let cancelled = spawn_enqueue(playback.clone(), guild_id, "cancelled".to_owned());
+        media.wait_for_resolve_count(1).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+
+        assert_eq!(pending_len(&playback, guild_id), 0);
+        let next = timeout(
+            Duration::from_secs(1),
+            playback.enqueue_impl(guild_id, "next"),
+        )
+        .await
+        .expect("the cancelled reservation stalled the guild queue")
+        .expect("the next enqueue should succeed");
+        assert_eq!(next.request.canonical_key.as_ref(), "next");
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
+const MAX_TRACK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrackMetadata {
     pub title: Arc<str>,
@@ -17,6 +19,8 @@ impl TrackMetadata {
         thumbnail_url: Option<Arc<str>>,
         duration: Option<Duration>,
     ) -> Self {
+        let duration =
+            duration.filter(|duration| !duration.is_zero() && *duration <= MAX_TRACK_DURATION);
         Self {
             title: title.into(),
             author: author.into(),
@@ -165,5 +169,48 @@ impl TrackRequest {
             prepared,
             metadata,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackMetadata;
+    use std::time::Duration;
+
+    #[test]
+    fn rejects_unbounded_external_duration_metadata() {
+        assert_eq!(
+            TrackMetadata::new(
+                "title",
+                "author",
+                "https://example.com",
+                None,
+                Some(Duration::ZERO)
+            )
+            .duration,
+            None
+        );
+        assert_eq!(
+            TrackMetadata::new(
+                "title",
+                "author",
+                "https://example.com",
+                None,
+                Some(Duration::from_secs(24 * 60 * 60 + 1)),
+            )
+            .duration,
+            None
+        );
+        assert_eq!(
+            TrackMetadata::new(
+                "title",
+                "author",
+                "https://example.com",
+                None,
+                Some(Duration::from_secs(60)),
+            )
+            .duration,
+            Some(Duration::from_secs(60))
+        );
     }
 }

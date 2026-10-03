@@ -14,8 +14,8 @@ use serenity::{
         CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateButton,
         CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
-        CreateInteractionResponseMessage, EmojiId, Guild, Interaction, MessageFlags, ReactionType,
-        Ready, UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
+        CreateInteractionResponseMessage, Guild, Interaction, MessageFlags, ReactionType, Ready,
+        UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
     },
     async_trait,
     builder::CreateMessage,
@@ -33,16 +33,15 @@ use wotoha_contracts::{
 use wotoha_control::{ComponentAction, ComponentOutcome, ControlService};
 use wotoha_core::{
     QueuePreview, TrackMetadata,
-    debug::append_debug_log,
+    debug::{append_debug_log, sanitize_log_message},
     ui::{
-        self, AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, AUTOMIX_NICKNAME, BUTTON_AUTOMIX,
-        BUTTON_AUTOMIX_LABEL, BUTTON_LOOP, BUTTON_LOOP_LABEL, BUTTON_QUEUE, BUTTON_QUEUE_LABEL,
-        BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, BUTTON_SKIP, BUTTON_SKIP_LABEL, COLOR_ERROR,
-        COLOR_INFO, LOOP_EMOJI_ID, LOOP_EMOJI_NAME, LOOPING_NICKNAME, MSG_ALLOWED_URL_ONLY,
-        MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE,
-        MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION,
-        PLAY_COMMAND_NAME, PLAY_COMMAND_URL_OPTION, QUEUE_EMOJI_ID, QUEUE_EMOJI_NAME,
-        SHUFFLE_EMOJI_ID, SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
+        self, AUTOMIX_NICKNAME, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP,
+        BUTTON_LOOP_LABEL, BUTTON_QUEUE, BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL,
+        BUTTON_SKIP, BUTTON_SKIP_LABEL, COLOR_ERROR, COLOR_INFO, LOOPING_NICKNAME,
+        MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING,
+        MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED,
+        PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME, PLAY_COMMAND_URL_OPTION, QUEUE_EMOJI_ID,
+        QUEUE_EMOJI_NAME,
     },
     url::summarize_url_for_logs,
 };
@@ -51,6 +50,9 @@ use crate::{SongbirdRuntime, reconnect::ReconnectStore};
 
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const QUEUE_PREVIEW_LIMIT: usize = 10;
+const MAX_RESTART_NOTIFICATIONS: usize = 64;
+const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
+const MAX_RESTART_SNAPSHOTS: usize = 128;
 const EMBED_FIELD_LIMIT: usize = 1024;
 const EMBED_TITLE_LIMIT: usize = 180;
 const UPDATE_NOTICE_TITLE: &str = "アップデートのお知らせ";
@@ -111,14 +113,23 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             .iter()
             .filter(|entry| self.control.has_current_track(*entry.key()))
             .map(|entry| *entry.value())
+            .take(MAX_RESTART_NOTIFICATIONS)
             .collect::<Vec<_>>();
-        let notifications = targets.into_iter().map(|channel_id| {
-            channel_id.send_message(http, CreateMessage::new().embed(update_restart_embed()))
+        let notifications = targets.into_iter().map(|channel_id| async move {
+            tokio::time::timeout(
+                RESTART_NOTIFICATION_TIMEOUT,
+                channel_id.send_message(http, CreateMessage::new().embed(update_restart_embed())),
+            )
+            .await
         });
 
         for result in join_all(notifications).await {
-            if let Err(error) = result {
-                error!(error = %error, "failed to send update restart notification");
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    error!(error = %error, "failed to send update restart notification")
+                }
+                Err(_) => error!("restart notification timed out"),
             }
         }
     }
@@ -130,6 +141,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             .map(|entry| (*entry.key(), *entry.value()))
             .collect::<Vec<_>>();
         voice_connections.sort_unstable_by_key(|(guild_id, _)| guild_id.get());
+        voice_connections.truncate(MAX_RESTART_SNAPSHOTS);
         let connections = join_all(voice_connections.into_iter().map(|(guild_id, channel_id)| {
             let control = self.control.clone();
             async move {
@@ -223,7 +235,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             .to_owned();
         let source_url_log = summarize_url_for_logs(&source_url);
         append_debug_log(format!(
-            "discord: /play received guild_id={} user_id={} url={source_url}",
+            "discord: /play received guild_id={} user_id={} url={source_url_log}",
             guild_id.get(),
             command.user.id.get()
         ));
@@ -300,22 +312,24 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             }
         }
 
-        let (defer_result, join_result) = tokio::join!(
-            command.defer(&ctx.http),
-            self.runtime.ensure_joined(guild_key, user_channel_key),
-        );
-        defer_result?;
-
-        let joined_now = match join_result {
+        command.defer(&ctx.http).await?;
+        let joined_now = match self
+            .runtime
+            .ensure_joined(guild_key, user_channel_key)
+            .await
+        {
             Ok(joined) => joined,
             Err(error) => {
-                append_debug_log(format!("discord: ensure_joined failed: {error}"));
+                let safe_error = sanitize_log_message(&error.to_string());
+                append_debug_log(format!("discord: ensure_joined failed: {safe_error}"));
                 command
                     .create_followup(
                         &ctx.http,
                         CreateInteractionResponseFollowup::new()
                             .flags(MessageFlags::EPHEMERAL)
-                            .embed(error_embed(&format!("接続エラー: {error}"))),
+                            .embed(error_embed(
+                                "接続に失敗しました。しばらくしてから再試行してください。",
+                            )),
                     )
                     .await?;
                 return Ok(());
@@ -335,18 +349,21 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             Ok(outcome) => {
                 self.notification_channels
                     .insert(guild_key, command.channel_id);
+                let safe_canonical_key =
+                    sanitize_log_message(outcome.request.canonical_key.as_ref());
+                let safe_title = sanitize_log_message(outcome.request.metadata.title.as_ref());
                 append_debug_log(format!(
                     "discord: control.play ok provider={} key={} title={} now_playing={}",
                     outcome.request.provider_id.as_ref(),
-                    outcome.request.canonical_key.as_ref(),
-                    outcome.request.metadata.title.as_ref(),
+                    safe_canonical_key,
+                    safe_title,
                     outcome.now_playing
                 ));
                 info!(
                     guild_id = guild_id.get(),
                     provider_id = outcome.request.provider_id.as_ref(),
-                    canonical_key = outcome.request.canonical_key.as_ref(),
-                    title = outcome.request.metadata.title.as_ref(),
+                    canonical_key = safe_canonical_key.as_str(),
+                    title = safe_title.as_str(),
                     now_playing = outcome.now_playing,
                     "play command resolved successfully"
                 );
@@ -365,12 +382,13 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 command.create_followup(&ctx.http, response).await?;
             }
             Err(error) => {
-                append_debug_log(format!("discord: control.play failed: {error}"));
+                let safe_error = sanitize_log_message(&error.to_string());
+                append_debug_log(format!("discord: control.play failed: {safe_error}"));
                 error!(
                     guild_id = guild_id.get(),
                     user_id = command.user.id.get(),
                     source = source_url_log.as_str(),
-                    error = %error,
+                    error = safe_error.as_str(),
                     "play command failed"
                 );
                 if joined_now && !self.control.has_current_track(guild_key) {
@@ -382,7 +400,9 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                         &ctx.http,
                         CreateInteractionResponseFollowup::new()
                             .flags(MessageFlags::EPHEMERAL)
-                            .embed(error_embed(&format!("読み込みエラー: {error}"))),
+                            .embed(error_embed(
+                                "読み込みに失敗しました。しばらくしてから再試行してください。",
+                            )),
                     )
                     .await?;
             }
@@ -415,6 +435,11 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             .user_voice_channel(ctx, guild_id, component.user.id)
             .map(|channel_id| ChannelKey::new(channel_id.get()));
 
+        // A component interaction has a short acknowledgement deadline.  The
+        // control operation may wait on per-guild playback state, so acknowledge
+        // before taking that lock or performing any follow-up HTTP work.
+        component.defer(&ctx.http).await?;
+
         match self
             .control
             .handle_component(guild_key, actor_channel, action)
@@ -424,87 +449,72 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 if was_looping {
                     let _ = guild_id.edit_nickname(&ctx.http, None).await;
                 }
-                component.defer(&ctx.http).await?;
             }
             ComponentOutcome::Loop { enabled } => {
                 let nickname = enabled.then_some(LOOPING_NICKNAME);
                 let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
-                component.defer(&ctx.http).await?;
             }
             ComponentOutcome::Shuffle => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(info_embed(MSG_SHUFFLED)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(info_embed(MSG_SHUFFLED)),
                     )
                     .await?;
             }
             ComponentOutcome::NothingToShuffle => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(error_embed(MSG_NOTHING_TO_SHUFFLE)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(error_embed(MSG_NOTHING_TO_SHUFFLE)),
                     )
                     .await?;
             }
             ComponentOutcome::AutoMix { enabled } => {
                 let nickname = enabled.then_some(AUTOMIX_NICKNAME);
                 let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
-                component.defer(&ctx.http).await?;
             }
             ComponentOutcome::QueuePreview(preview) => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(queue_embed(&preview)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(queue_embed(&preview)),
                     )
                     .await?;
             }
             ComponentOutcome::QueueEmpty => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(error_embed(MSG_QUEUE_EMPTY)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(error_embed(MSG_QUEUE_EMPTY)),
                     )
                     .await?;
             }
             ComponentOutcome::NoTrackPlaying => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(error_embed(MSG_NO_TRACK_PLAYING)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(error_embed(MSG_NO_TRACK_PLAYING)),
                     )
                     .await?;
             }
             ComponentOutcome::VoiceChannelRequired => {
                 component
-                    .create_response(
+                    .create_followup(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .ephemeral(true)
-                                .embed(error_embed(MSG_JOIN_ACTIVE_VOICE)),
-                        ),
+                        CreateInteractionResponseFollowup::new()
+                            .flags(MessageFlags::EPHEMERAL)
+                            .embed(error_embed(MSG_JOIN_ACTIVE_VOICE)),
                     )
                     .await?;
             }
@@ -777,11 +787,13 @@ fn track_embed(
     requested_by: &str,
     avatar_url: Option<&str>,
 ) -> CreateEmbed {
+    let title = truncate_embed_text(&sanitize_display_text(metadata.title.as_ref()), 256);
+    let author = truncate_embed_text(&sanitize_display_text(metadata.author.as_ref()), 256);
+    let uri = safe_display_url(metadata.uri.as_ref());
     let mut embed = CreateEmbed::new()
         .color(Colour::new(COLOR_INFO))
-        .author(CreateEmbedAuthor::new(metadata.author.as_ref()))
-        .title(metadata.title.as_ref())
-        .url(metadata.uri.as_ref())
+        .author(CreateEmbedAuthor::new(author))
+        .title(title)
         .field("Time", ui::format_duration(metadata.duration), true)
         .footer(match avatar_url {
             Some(icon_url) => CreateEmbedFooter::new(format!("Requested by {requested_by}"))
@@ -789,8 +801,13 @@ fn track_embed(
             None => CreateEmbedFooter::new(format!("Requested by {requested_by}")),
         });
 
-    if let Some(thumbnail_url) = &metadata.thumbnail_url {
-        embed = embed.thumbnail(thumbnail_url.as_ref());
+    if let Some(uri) = uri {
+        embed = embed.url(uri);
+    }
+    if let Some(thumbnail_url) = &metadata.thumbnail_url
+        && let Some(uri) = safe_display_url(thumbnail_url.as_ref())
+    {
+        embed = embed.thumbnail(uri);
     }
 
     embed
@@ -851,8 +868,9 @@ fn queue_lines(preview: &QueuePreview) -> String {
 }
 
 fn truncate_embed_text(text: &str, max_len: usize) -> String {
+    let text = sanitize_display_text(text);
     if text.chars().count() <= max_len {
-        return text.to_owned();
+        return text;
     }
 
     let keep = max_len.saturating_sub(3);
@@ -867,61 +885,61 @@ fn truncate_embed_text(text: &str, max_len: usize) -> String {
     out
 }
 
+fn sanitize_display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() && ch != '\n' && ch != '\t' {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+fn safe_display_url(raw_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(raw_url).ok()?;
+    if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty() {
+        return None;
+    }
+    if url.password().is_some() {
+        return None;
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
 fn player_action_row() -> CreateActionRow {
     CreateActionRow::Buttons(vec![
-        player_button(
-            BUTTON_SKIP,
-            BUTTON_SKIP_LABEL,
-            ButtonStyle::Secondary,
-            SKIP_EMOJI_NAME,
-            SKIP_EMOJI_ID,
-        ),
-        player_button(
-            BUTTON_LOOP,
-            BUTTON_LOOP_LABEL,
-            ButtonStyle::Secondary,
-            LOOP_EMOJI_NAME,
-            LOOP_EMOJI_ID,
-        ),
-        player_button(
-            BUTTON_SHUFFLE,
-            BUTTON_SHUFFLE_LABEL,
-            ButtonStyle::Secondary,
-            SHUFFLE_EMOJI_NAME,
-            SHUFFLE_EMOJI_ID,
-        ),
-        player_button(
-            BUTTON_AUTOMIX,
-            BUTTON_AUTOMIX_LABEL,
-            ButtonStyle::Secondary,
-            AUTOMIX_EMOJI_NAME,
-            AUTOMIX_EMOJI_ID,
-        ),
-        player_button(
-            BUTTON_QUEUE,
-            BUTTON_QUEUE_LABEL,
-            ButtonStyle::Primary,
-            QUEUE_EMOJI_NAME,
-            QUEUE_EMOJI_ID,
-        ),
+        player_button(BUTTON_SKIP, BUTTON_SKIP_LABEL, ButtonStyle::Secondary),
+        player_button(BUTTON_LOOP, BUTTON_LOOP_LABEL, ButtonStyle::Secondary),
+        player_button(BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, ButtonStyle::Secondary),
+        player_button(BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, ButtonStyle::Secondary),
+        player_button(BUTTON_QUEUE, BUTTON_QUEUE_LABEL, ButtonStyle::Primary),
     ])
 }
 
-fn player_button(
-    custom_id: &str,
-    label: &str,
-    style: ButtonStyle,
-    emoji_name: &str,
-    emoji_id: u64,
-) -> CreateButton {
+fn player_button(custom_id: &str, label: &str, style: ButtonStyle) -> CreateButton {
     CreateButton::new(custom_id)
         .label(label)
         .style(style)
-        .emoji(ReactionType::Custom {
-            animated: false,
-            id: EmojiId::new(emoji_id),
-            name: Some(emoji_name.to_owned()),
-        })
+        .emoji(ReactionType::Unicode(
+            button_fallback_emoji(custom_id).to_owned(),
+        ))
+}
+
+fn button_fallback_emoji(custom_id: &str) -> &'static str {
+    match custom_id {
+        BUTTON_SKIP => "⏭️",
+        BUTTON_LOOP => "🔁",
+        BUTTON_SHUFFLE => "🔀",
+        BUTTON_AUTOMIX => "🎚️",
+        BUTTON_QUEUE => "📜",
+        _ => "🎵",
+    }
 }
 
 #[cfg(test)]

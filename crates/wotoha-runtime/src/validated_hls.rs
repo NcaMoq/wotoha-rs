@@ -29,6 +29,7 @@ const HLS_MAX_PLAYLIST_RELOAD: Duration = Duration::from_secs(15);
 const SEGMENT_QUEUE_CAPACITY: usize = 16;
 const SEGMENT_LINK_CAPACITY: usize = 512;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_PLAYLIST_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ValidatedHlsRequest {
@@ -434,13 +435,42 @@ impl HlsWatcher {
         .error_for_status()
         .map_err(|error| error.to_string())?;
 
-        let text = tokio::select! {
-            text = response.text() => text.map_err(|error| error.to_string())?,
-            () = wait_for_stop(stop_rx) => return Ok(None),
-        };
+        let text = tokio::time::timeout(self.timeout, read_playlist_body(response, stop_rx))
+            .await
+            .map_err(|_| "HLS playlist body timed out".to_owned())??;
 
         Ok(Some(text))
     }
+}
+
+async fn read_playlist_body(
+    response: reqwest::Response,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> Result<String, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PLAYLIST_BODY_BYTES as u64)
+    {
+        return Err("HLS playlist body exceeded its size limit".to_owned());
+    }
+    let mut bytes = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_PLAYLIST_BODY_BYTES as u64) as usize,
+    );
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = tokio::select! {
+        chunk = stream.next() => chunk,
+        () = wait_for_stop(stop_rx) => return Err("HLS playlist fetch stopped".to_owned()),
+    } {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PLAYLIST_BODY_BYTES {
+            return Err("HLS playlist body exceeded its size limit".to_owned());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn parse_media_playlist(raw: &str) -> Result<MediaPlaylist<'_>, String> {

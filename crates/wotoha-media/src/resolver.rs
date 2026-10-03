@@ -32,6 +32,8 @@ use crate::{
 
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const PROBE_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 const PREPARED_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -168,14 +170,9 @@ impl MediaResolver {
             return Ok(request);
         }
 
-        let _permit = self
-            .inner
-            .probe_slots
-            .acquire()
-            .await
-            .expect("media probe semaphore should stay open");
+        let _permit = self.acquire_probe_slot().await?;
 
-        let resolved = self.probe_with_fallback(source_url).await;
+        let resolved = self.probe_with_deadline(source_url).await;
 
         let result = match resolved {
             Ok(request) => match validate_prepared_request(&request) {
@@ -210,14 +207,9 @@ impl MediaResolver {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let _guard = gate.lock().await;
-        let _permit = self
-            .inner
-            .probe_slots
-            .acquire()
-            .await
-            .expect("media probe semaphore should stay open");
+        let _permit = self.acquire_probe_slot().await?;
 
-        let result = match self.probe_with_fallback(source_url).await {
+        let result = match self.probe_with_deadline(source_url).await {
             Ok(request) => match validate_prepared_request(&request) {
                 Ok(()) => {
                     self.store_request(source_url, &request);
@@ -259,14 +251,9 @@ impl MediaResolver {
                 return Ok(prepared);
             }
 
-            let _permit = self
-                .inner
-                .probe_slots
-                .acquire()
-                .await
-                .expect("media probe semaphore should stay open");
+            let _permit = self.acquire_probe_slot().await?;
 
-            let result = match self.refresh_request(request).await {
+            let result = match self.refresh_with_deadline(request).await {
                 Ok(refreshed) => match validate_prepared_request(&refreshed) {
                     Ok(()) => {
                         self.store_request(request.requested_url.as_ref(), &refreshed);
@@ -300,14 +287,9 @@ impl MediaResolver {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let _guard = gate.lock().await;
-        let _permit = self
-            .inner
-            .probe_slots
-            .acquire()
-            .await
-            .expect("media probe semaphore should stay open");
+        let _permit = self.acquire_probe_slot().await?;
 
-        let result = match self.refresh_request(request).await {
+        let result = match self.refresh_with_deadline(request).await {
             Ok(refreshed) => match validate_prepared_request(&refreshed) {
                 Ok(()) => {
                     self.store_request(request.requested_url.as_ref(), &refreshed);
@@ -322,6 +304,13 @@ impl MediaResolver {
             .prepare_inflight
             .remove(request.canonical_key.as_ref());
         result
+    }
+
+    async fn acquire_probe_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ResolveError> {
+        tokio::time::timeout(PROBE_QUEUE_TIMEOUT, self.inner.probe_slots.acquire())
+            .await
+            .map_err(|_| ResolveError::ProbeQueueTimeout(PROBE_QUEUE_TIMEOUT))?
+            .map_err(|_| ResolveError::ProbeQueueClosed)
     }
 
     fn lookup_cached_request(&self, source_url: &str) -> Option<TrackRequest> {
@@ -429,6 +418,21 @@ impl MediaResolver {
         });
     }
 
+    async fn probe_with_deadline(&self, raw_url: &str) -> Result<TrackRequest, ResolveError> {
+        tokio::time::timeout(PROBE_TOTAL_TIMEOUT, self.probe_with_fallback(raw_url))
+            .await
+            .map_err(|_| ResolveError::ProbeTotalTimeout(PROBE_TOTAL_TIMEOUT))?
+    }
+
+    async fn refresh_with_deadline(
+        &self,
+        request: &TrackRequest,
+    ) -> Result<TrackRequest, ResolveError> {
+        tokio::time::timeout(PROBE_TOTAL_TIMEOUT, self.refresh_request(request))
+            .await
+            .map_err(|_| ResolveError::ProbeTotalTimeout(PROBE_TOTAL_TIMEOUT))?
+    }
+
     async fn probe_with_fallback(&self, raw_url: &str) -> Result<TrackRequest, ResolveError> {
         let mut last_error = None;
 
@@ -516,6 +520,16 @@ pub enum ResolveError {
     HttpClient(reqwest::Error),
     #[error("failed to send HTTP request: {0}")]
     Request(reqwest::Error),
+    #[error("provider response exceeded the {limit}-byte limit")]
+    BodyTooLarge { limit: usize },
+    #[error("provider response exceeded the body deadline of {0:?}")]
+    BodyTimeout(Duration),
+    #[error("media provider queue was busy for {0:?}")]
+    ProbeQueueTimeout(Duration),
+    #[error("media provider queue is unavailable")]
+    ProbeQueueClosed,
+    #[error("media provider resolution exceeded the total deadline of {0:?}")]
+    ProbeTotalTimeout(Duration),
     #[error("failed to parse provider payload: {0}")]
     Parse(String),
     #[error("invalid HTTP header name: {0}")]
