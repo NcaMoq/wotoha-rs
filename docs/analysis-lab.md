@@ -390,13 +390,16 @@ WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
 ```
 
 The report includes the baseline, robust median/MAD tempo estimates derived
-only from final Classical markers, confidence-abstention thresholds, explicit
-lower-bound sweeps, full/low-band top-five autocorrelation diagnostics,
-harmonic relations, marker-clock consistency, duration sensitivity, variable-
-tempo safety, transform metadata, and three-run determinism checks. Variable
-tempo fixtures are retained as diagnostics and excluded from scalar-tempo
-accuracy. The command never changes beat markers, phase, downbeats, meter,
-backend selection, or production tempo behavior.
+only from final Classical markers, residual classifications, full/low-band
+top-eight autocorrelation diagnostics with adjacent-lag clustering, harmonic
+families, lower-bound search counterfactuals, confidence distributions,
+research-only two-dimensional abstention selectors, marker-clock consistency,
+same-master-prefix duration sensitivity, variable-tempo safety, transform
+metadata, and three-run determinism checks. Selector thresholds are frozen
+research parameters and are evaluated on every scalar-tempo fixture; they are
+not production logic. Variable-tempo fixtures are retained as diagnostics and
+excluded from scalar-tempo accuracy. The command never changes beat markers,
+phase, downbeats, meter, backend selection, or production tempo behavior.
 
 ## Final clean-room handoff
 
