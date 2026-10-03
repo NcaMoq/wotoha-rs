@@ -78,8 +78,10 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          sbom: true
-          provenance: mode=max
+          # The docker exporter used by `load: true` cannot carry attestations.
+          # Publication below uses the registry exporter and keeps both enabled.
+          sbom: false
+          provenance: false
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
