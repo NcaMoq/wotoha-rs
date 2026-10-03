@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: container-${{ github.ref }}
@@ -21,7 +20,29 @@ env:
   IMAGE_NAME: ghcr.io/ncamoq/wotoha-rs
 
 jobs:
-  build-smoke-publish:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: "1.95.0"
+          components: rustfmt,clippy
+
+      - name: Quality gate before image publication
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets --locked
+          cargo test --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
+          bash -n deploy/*.sh deploy/tests/*.sh
+          bash deploy/tests/run.sh
+
+  container-smoke:
+    needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -57,6 +78,8 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
@@ -73,10 +96,11 @@ jobs:
           docker run --rm \
             --read-only \
             --tmpfs /tmp:rw,exec,mode=1777 \
-            --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+            --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
             --cap-drop=ALL \
             --security-opt=no-new-privileges:true \
             "$image" --self-check
+          docker run --rm "$image" --version | grep -F "commit $GITHUB_SHA"
           docker run --rm --entrypoint /bin/sh "$image" -c '
             set -eu
             test ! -e /usr/local/cargo
@@ -85,6 +109,11 @@ jobs:
             test -x /app/wotoha-app
             test -x /app/tools/yt-dlp-fallback
             test -x /app/tools/deno
+            test -s /app/licenses/license-inventory.json
+            test -s /app/licenses/Cargo.lock
+            test -s /app/licenses/models/NOTICE.txt
+            test -s /app/licenses/third-party-versions.env
+            test ! -e /wotoha/reconnect.json
           '
 
       - name: Test verified managed yt-dlp override and invalid fallback
@@ -96,43 +125,95 @@ jobs:
           managed_output="$(docker run --rm \
             --read-only \
             --tmpfs /tmp:rw,exec,mode=1777 \
-            --tmpfs /data:rw,exec,mode=0777 \
+            --tmpfs /wotoha:rw,exec,mode=0777 \
             --cap-drop=ALL \
             --security-opt=no-new-privileges:true \
             --entrypoint /bin/sh "$image" -c '
               set -eu
-              mkdir -p /data/tools
-              cp /app/tools/yt-dlp-fallback /data/tools/yt-dlp
-              sha256sum /data/tools/yt-dlp > /data/tools/yt-dlp.sha256
+              mkdir -p /wotoha/tools
+              cp /app/tools/yt-dlp-fallback /wotoha/tools/yt-dlp
+              sha256sum /wotoha/tools/yt-dlp > /wotoha/tools/yt-dlp.sha256
               exec /app/wotoha-app --self-check
             ' 2>&1)"
           printf '%s\n' "$managed_output"
-          grep -F 'wotoha self-check: yt-dlp path=/data/tools/yt-dlp' <<< "$managed_output"
+          grep -F 'wotoha self-check: yt-dlp path=/wotoha/tools/yt-dlp' <<< "$managed_output"
 
           invalid_output="$(docker run --rm \
             --read-only \
             --tmpfs /tmp:rw,exec,mode=1777 \
-            --tmpfs /data:rw,exec,mode=0777 \
+            --tmpfs /wotoha:rw,exec,mode=0777 \
             --cap-drop=ALL \
             --security-opt=no-new-privileges:true \
             --entrypoint /bin/sh "$image" -c '
               set -eu
-              mkdir -p /data/tools
-              cp /app/tools/yt-dlp-fallback /data/tools/yt-dlp
-              printf "%064d  %s\\n" 0 /data/tools/yt-dlp > /data/tools/yt-dlp.sha256
+              mkdir -p /wotoha/tools
+              cp /app/tools/yt-dlp-fallback /wotoha/tools/yt-dlp
+              printf "%064d  %s\\n" 0 /wotoha/tools/yt-dlp > /wotoha/tools/yt-dlp.sha256
               exec /app/wotoha-app --self-check
             ' 2>&1)"
           printf '%s\n' "$invalid_output"
           grep -F 'ignoring invalid managed yt-dlp override' <<< "$invalid_output"
           grep -F 'wotoha self-check: yt-dlp path=/app/tools/yt-dlp-fallback' <<< "$invalid_output"
 
-      - name: Push immutable image tags
-        if: github.event_name == 'push'
+  publish:
+    if: github.event_name == 'push'
+    needs:
+      - quality
+      - container-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Compute image metadata
+        id: metadata
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=sha-${{ github.sha }}
+            type=ref,event=tag
+
+      - name: Log in to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push immutable image tags
+        id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            IMAGE_VERSION=${{ github.ref_name }}
+
+      - name: Record published image digest
         env:
           IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
         run: |
           set -euo pipefail
           while IFS= read -r image; do
             [ -n "$image" ] || continue
-            docker push "$image"
+            digest="${{ steps.build.outputs.digest }}"
+            printf 'published image: %s\nresolved digest: %s\n\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY"
           done <<< "$IMAGE_TAGS"

@@ -1,6 +1,7 @@
 /target
 /dist
 .env
+/runtime.env
 .wotoha-analysis/
 /analysis-lab-runs/
 /analysis-lab-report.json

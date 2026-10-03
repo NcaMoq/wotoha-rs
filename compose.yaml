@@ -2,16 +2,16 @@ services:
   wotoha:
     image: ghcr.io/ncamoq/wotoha-rs:${WOTOHA_IMAGE_TAG:?set WOTOHA_IMAGE_TAG to an immutable sha-<commit> or version tag}
     restart: unless-stopped
+    env_file:
+      - path: ./runtime.env
+        required: false
     environment:
-      - DISCORD_TOKEN=${DISCORD_TOKEN-}
-      - WOTOHA_AUTOMIX_PLANNER_MODE=${WOTOHA_AUTOMIX_PLANNER_MODE:-legacy}
-      - WOTOHA_AUTOMIX_V2_SHADOW_ENABLED=${WOTOHA_AUTOMIX_V2_SHADOW_ENABLED:-false}
-      - WOTOHA_ANALYSIS_CACHE_DIR=/data/cache/analysis
-      - WOTOHA_LOG_DIR=/data/logs
-      - WOTOHA_DENO_PATH=/app/tools/deno
-      - WOTOHA_YTDLP_PATH
+      WOTOHA_RECONNECT_STATE_FILE: /wotoha/reconnect.json
+      WOTOHA_ANALYSIS_CACHE_DIR: /wotoha/cache/analysis
+      WOTOHA_LOG_DIR: /wotoha/logs
+      WOTOHA_DENO_PATH: /app/tools/deno
     volumes:
-      - wotoha-data:/data
+      - ${WOTOHA_DATA_DIR:-./data}:/wotoha
     read_only: true
     tmpfs:
       - /tmp:rw,exec,mode=1777
@@ -20,6 +20,8 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 30s
-
-volumes:
-  wotoha-data:
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
