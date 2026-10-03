@@ -15,6 +15,9 @@ const MARKER_MAX_BPM: f32 = 240.0;
 const VARIABLE_TEMPO_RELATIVE_SPREAD_LIMIT: f64 = 0.08;
 const HARMONIC_RELATION_TOLERANCE: f32 = 0.02;
 const RESEARCH_CONFIDENCE_THRESHOLD: f32 = 0.0001;
+const FULL_LOW_AGREEMENT_TOLERANCE: f32 = 0.03;
+const SCORE_MARGIN_THRESHOLD: f32 = 0.05;
+const HARMONIC_AMBIGUITY_MARGIN_THRESHOLD: f32 = 0.05;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ClassicalTempoResearchReport {
@@ -22,6 +25,7 @@ pub struct ClassicalTempoResearchReport {
     pub evaluator: String,
     pub source_commit: String,
     pub corpus: CorpusIdentity,
+    pub research_parameters: ResearchParameters,
     pub baseline: ScalarMetrics,
     pub confidence_distribution: ConfidenceDistribution,
     pub residual_inventory: ResidualInventory,
@@ -37,6 +41,17 @@ pub struct ClassicalTempoResearchReport {
     pub transform_audit: Vec<TransformAudit>,
     pub repeatability: RepeatabilityReport,
     pub promotion_candidates: Vec<PromotionCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResearchParameters {
+    pub peak_extraction_k: usize,
+    pub adjacent_lag_cluster_radius_blocks: usize,
+    pub harmonic_relation_tolerance: f32,
+    pub confidence_abstention_threshold: f32,
+    pub full_low_agreement_tolerance: f32,
+    pub score_margin_threshold: f32,
+    pub harmonic_ambiguity_margin_threshold: f32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -589,6 +604,15 @@ pub fn run_classical_tempo_research(
             seed: blackbox.seed,
             fixture_count: blackbox.fixtures.len(),
             exported_wav_identity_verified: true,
+        },
+        research_parameters: ResearchParameters {
+            peak_extraction_k: 32,
+            adjacent_lag_cluster_radius_blocks: 1,
+            harmonic_relation_tolerance: HARMONIC_RELATION_TOLERANCE,
+            confidence_abstention_threshold: RESEARCH_CONFIDENCE_THRESHOLD,
+            full_low_agreement_tolerance: FULL_LOW_AGREEMENT_TOLERANCE,
+            score_margin_threshold: SCORE_MARGIN_THRESHOLD,
+            harmonic_ambiguity_margin_threshold: HARMONIC_AMBIGUITY_MARGIN_THRESHOLD,
         },
         baseline,
         confidence_distribution,
@@ -1223,23 +1247,23 @@ fn selector_accepts(run: &FixtureRun, candidate: &str) -> bool {
         "A1_confidence" => true,
         "A2_confidence_plus_score_margin" => features
             .top1_top2_score_margin
-            .is_some_and(|margin| margin >= 0.05),
+            .is_some_and(|margin| margin >= SCORE_MARGIN_THRESHOLD),
         "A3_confidence_plus_harmonic_margin" => features
             .harmonic_ambiguity_margin
-            .is_some_and(|margin| margin >= 0.05),
+            .is_some_and(|margin| margin >= HARMONIC_AMBIGUITY_MARGIN_THRESHOLD),
         "A4_confidence_plus_band_agreement" => features
             .full_low_disagreement
-            .is_none_or(|disagreement| disagreement <= 0.03),
+            .is_none_or(|disagreement| disagreement <= FULL_LOW_AGREEMENT_TOLERANCE),
         "A5_conservative_combination" => {
             features
                 .top1_top2_score_margin
-                .is_some_and(|margin| margin >= 0.05)
+                .is_some_and(|margin| margin >= SCORE_MARGIN_THRESHOLD)
                 && features
                     .harmonic_ambiguity_margin
-                    .is_some_and(|margin| margin >= 0.05)
+                    .is_some_and(|margin| margin >= HARMONIC_AMBIGUITY_MARGIN_THRESHOLD)
                 && features
                     .full_low_disagreement
-                    .is_none_or(|disagreement| disagreement <= 0.03)
+                    .is_none_or(|disagreement| disagreement <= FULL_LOW_AGREEMENT_TOLERANCE)
         }
         _ => false,
     }
@@ -1893,14 +1917,22 @@ fn markdown_report(report: &ClassicalTempoResearchReport) -> String {
         report.corpus.fixture_count,
         report.corpus.exported_wav_identity_verified
     ));
+    markdown.push_str(&format!(
+        "Research parameters: peak extraction K={}, adjacent-lag cluster radius={} block, harmonic tolerance={:.3}%, confidence threshold={:.4}, full/low agreement tolerance={:.1}%, score-margin threshold={:.2}, harmonic-margin threshold={:.2}.\n\n",
+        report.research_parameters.peak_extraction_k,
+        report.research_parameters.adjacent_lag_cluster_radius_blocks,
+        report.research_parameters.harmonic_relation_tolerance * 100.0,
+        report.research_parameters.confidence_abstention_threshold,
+        report.research_parameters.full_low_agreement_tolerance * 100.0,
+        report.research_parameters.score_margin_threshold,
+        report.research_parameters.harmonic_ambiguity_margin_threshold,
+    ));
     markdown.push_str("## Scalar tempo matrix\n\n| Candidate | Correct | Scored | Accuracy | Returned | False returns | MAE BPM |\n|---|---:|---:|---:|---:|---:|---:|\n");
-    let mut rows = vec![
-        ("A0 baseline", &report.baseline),
-        ("A1 marker refinement", &report.marker_refinement),
-    ];
-    for candidate in &report.candidate_matrix {
-        rows.push((&candidate.candidate, &candidate.metrics));
-    }
+    let rows = report
+        .candidate_matrix
+        .iter()
+        .map(|candidate| (candidate.candidate.as_str(), &candidate.metrics))
+        .collect::<Vec<_>>();
     for (name, metrics) in rows {
         markdown.push_str(&format!(
             "| {} | {} | {} | {:.3?} | {} | {} | {:.3?} |\n",
@@ -1924,15 +1956,15 @@ fn markdown_report(report: &ClassicalTempoResearchReport) -> String {
             result.metrics.false_returns
         ));
     }
-    markdown.push_str("\n## Confidence distribution\n\n| Class | Count | Min | Median | Max |\n|---|---:|---:|---:|---:|\n");
+    markdown.push_str("\n## Confidence distribution\n\n| Class | Count | Min | P10 | Median | P90 | Max |\n|---|---:|---:|---:|---:|---:|---:|\n");
     for (name, stats) in [
         ("correct", &report.confidence_distribution.correct),
         ("incorrect", &report.confidence_distribution.incorrect),
         ("absent", &report.confidence_distribution.absent),
     ] {
         markdown.push_str(&format!(
-            "| {} | {} | {:.6?} | {:.6?} | {:.6?} |\n",
-            name, stats.count, stats.minimum, stats.median, stats.maximum
+            "| {} | {} | {:.6?} | {:.6?} | {:.6?} | {:.6?} | {:.6?} |\n",
+            name, stats.count, stats.minimum, stats.p10, stats.median, stats.p90, stats.maximum
         ));
     }
     markdown.push_str(&format!(
@@ -1972,6 +2004,24 @@ fn markdown_report(report: &ClassicalTempoResearchReport) -> String {
             selector.metrics.false_returns,
             selector.incorrectly_abstained_sample_ids.len(),
         ));
+    }
+    markdown.push_str("\nFixed-rule family holdout (thresholds frozen before slicing):\n\n| Held-out family | Fixtures | A1 correct | A1 coverage | A1 false returns |\n|---|---:|---:|---:|---:|\n");
+    for holdout in &report.selector_family_holdout {
+        if let Some(selector) = holdout
+            .selectors
+            .iter()
+            .find(|selector| selector.candidate == "A1_confidence")
+        {
+            markdown.push_str(&format!(
+                "| {} | {} | {}/{} | {:.3?} | {} |\n",
+                holdout.held_out_family,
+                holdout.validation_fixture_count,
+                selector.metrics.correct,
+                selector.metrics.scored,
+                selector.metrics.coverage,
+                selector.metrics.false_returns,
+            ));
+        }
     }
     markdown.push_str("\n## Residual mechanism evidence\n\n| Fixture | Truth | Selected | Runner-up | Full/low | Confidence | Mechanism |\n|---|---:|---:|---:|---|---:|---|\n");
     for fixture in &report.per_fixture {
@@ -2109,6 +2159,13 @@ mod tests {
         assert_eq!(stats.count, 5);
         assert_eq!(stats.minimum, Some(0.0));
         assert_eq!(stats.maximum, Some(0.9));
-        assert_eq!(stats.histogram.iter().map(|bucket| bucket.count).sum::<usize>(), 5);
+        assert_eq!(
+            stats
+                .histogram
+                .iter()
+                .map(|bucket| bucket.count)
+                .sum::<usize>(),
+            5
+        );
     }
 }
