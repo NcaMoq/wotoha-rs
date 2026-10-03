@@ -3,8 +3,8 @@ use std::time::Duration;
 use crate::automix::TrackAnalysis;
 use crate::vocal_analysis::{analyze_vocal_activity, apply_vocal_activity};
 
-const MIN_BPM: usize = 70;
-const MAX_BPM: usize = 180;
+pub const CLASSICAL_MIN_BPM: f32 = 70.0;
+pub const CLASSICAL_MAX_BPM: f32 = 180.0;
 const ONSET_BLOCKS_PER_SECOND: usize = 200;
 const MIN_KICK_TRACK_CONFIDENCE: f32 = 0.35;
 const MIN_KICK_ENERGY_RATIO: f32 = 0.015;
@@ -23,6 +23,40 @@ struct EnergyStructure {
     intro_confidence: f32,
     outro_start: Option<Duration>,
     outro_confidence: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClassicalTempoSource {
+    FullBand,
+    LowBand,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClassicalTempoPeak {
+    pub lag_blocks: usize,
+    pub bpm: f32,
+    pub raw_score: f32,
+    pub normalized_confidence: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClassicalTempoBandDiagnostics {
+    pub bpm: Option<f32>,
+    pub confidence: Option<f32>,
+    pub beat_lag_blocks: Option<f32>,
+    pub peaks: Vec<ClassicalTempoPeak>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClassicalTempoDiagnostics {
+    pub full_band: ClassicalTempoBandDiagnostics,
+    pub low_band: ClassicalTempoBandDiagnostics,
+    pub low_energy_ratio: f32,
+    pub kick_reliable: bool,
+    pub selected_source: Option<ClassicalTempoSource>,
+    pub selected_bpm: Option<f32>,
+    pub selected_confidence: Option<f32>,
+    pub selected_beat_lag_blocks: Option<f32>,
 }
 
 /// Lightweight 40-180 Hz filter used before analysis-rate downsampling.
@@ -88,6 +122,27 @@ pub fn analyze_mono_pcm_with_low_band(
     low_band: &[f32],
     sample_rate: u32,
 ) -> Option<TrackAnalysis> {
+    analyze_mono_pcm_with_low_band_and_tempo_bounds(
+        samples,
+        low_band,
+        sample_rate,
+        CLASSICAL_MIN_BPM,
+        CLASSICAL_MAX_BPM,
+    )
+}
+
+/// Research-only variant with explicit tempo search bounds. The default
+/// production entry point keeps the historical bounds and behavior.
+pub fn analyze_mono_pcm_with_low_band_and_tempo_bounds(
+    samples: &[f32],
+    low_band: &[f32],
+    sample_rate: u32,
+    min_bpm: f32,
+    max_bpm: f32,
+) -> Option<TrackAnalysis> {
+    if !valid_tempo_bounds(min_bpm, max_bpm) {
+        return None;
+    }
     if samples.is_empty() || samples.len() != low_band.len() || sample_rate == 0 {
         return None;
     }
@@ -139,8 +194,8 @@ pub fn analyze_mono_pcm_with_low_band(
     );
     kick_onset.resize(onset.len(), 0.0);
 
-    let full_tempo = estimate_tempo(&onset, onset_rate);
-    let low_tempo = estimate_tempo(&kick_onset, onset_rate);
+    let full_tempo = estimate_tempo_with_bounds(&onset, onset_rate, min_bpm, max_bpm);
+    let low_tempo = estimate_tempo_with_bounds(&kick_onset, onset_rate, min_bpm, max_bpm);
     let full_energy_sum = energy.iter().sum::<f32>();
     let low_energy_ratio = low_energy.iter().sum::<f32>() / full_energy_sum.max(f32::EPSILON);
     let kick_reliable = low_tempo.is_some_and(|(_, confidence, _)| {
@@ -271,6 +326,84 @@ pub fn analyze_mono_pcm_with_low_band(
         sample_peak_dbfs: None,
         integrated_lufs: None,
         true_peak_dbtp: None,
+    })
+}
+
+/// Returns independent full-band and low-band tempo evidence used by the
+/// classical analyser. This is intended for bounded analysis-lab research;
+/// it does not alter production selection or beat markers.
+pub fn diagnose_classical_tempo(
+    samples: &[f32],
+    low_band: &[f32],
+    sample_rate: u32,
+    min_bpm: f32,
+    max_bpm: f32,
+    top_k: usize,
+) -> Option<ClassicalTempoDiagnostics> {
+    if !valid_tempo_bounds(min_bpm, max_bpm)
+        || samples.is_empty()
+        || samples.len() != low_band.len()
+        || sample_rate == 0
+    {
+        return None;
+    }
+    let block = (sample_rate as usize / ONSET_BLOCKS_PER_SECOND).max(1);
+    let onset_rate = sample_rate as f32 / block as f32;
+    let energy = block_energy(samples, block);
+    let onset = energy
+        .windows(2)
+        .map(|pair| (pair[1].sqrt() - pair[0].sqrt()).max(0.0))
+        .collect::<Vec<_>>();
+    let low_energy = block_energy(low_band, block);
+    let low_smoothed = low_energy
+        .windows(4)
+        .map(|window| window.iter().sum::<f32>() / window.len() as f32)
+        .collect::<Vec<_>>();
+    let mut kick_onset = vec![0.0; 3];
+    kick_onset.extend(
+        low_smoothed
+            .windows(2)
+            .map(|pair| (pair[1].sqrt() - pair[0].sqrt()).max(0.0)),
+    );
+    kick_onset.resize(onset.len(), 0.0);
+
+    let full_band =
+        estimate_tempo_diagnostics(&onset, onset_rate, min_bpm, max_bpm, top_k).unwrap_or_default();
+    let low_band = estimate_tempo_diagnostics(&kick_onset, onset_rate, min_bpm, max_bpm, top_k)
+        .unwrap_or_default();
+    let full_energy_sum = energy.iter().sum::<f32>();
+    let low_energy_ratio = low_energy.iter().sum::<f32>() / full_energy_sum.max(f32::EPSILON);
+    let kick_reliable = low_band.confidence.is_some_and(|confidence| {
+        confidence >= MIN_KICK_TRACK_CONFIDENCE && low_energy_ratio >= MIN_KICK_ENERGY_RATIO
+    });
+    let (selected_source, selected) = if kick_reliable {
+        match (tempo_tuple(&low_band), tempo_tuple(&full_band)) {
+            (Some(low), Some(full)) if (low.0 / full.0 - 1.0).abs() <= 0.03 => {
+                if full.1 > low.1 {
+                    (Some(ClassicalTempoSource::FullBand), Some(full))
+                } else {
+                    (Some(ClassicalTempoSource::LowBand), Some(low))
+                }
+            }
+            (Some(low), _) => (Some(ClassicalTempoSource::LowBand), Some(low)),
+            (None, Some(full)) => (Some(ClassicalTempoSource::FullBand), Some(full)),
+            (None, None) => (None, None),
+        }
+    } else {
+        (
+            tempo_tuple(&full_band).map(|_| ClassicalTempoSource::FullBand),
+            tempo_tuple(&full_band),
+        )
+    };
+    Some(ClassicalTempoDiagnostics {
+        full_band,
+        low_band,
+        low_energy_ratio,
+        kick_reliable,
+        selected_source,
+        selected_bpm: selected.map(|value| value.0),
+        selected_confidence: selected.map(|value| value.1),
+        selected_beat_lag_blocks: selected.map(|value| value.2),
     })
 }
 
@@ -499,16 +632,35 @@ fn estimate_downbeat_phase(onset: &[f32], first_beat: usize, beat_lag: usize) ->
     }
 }
 
-fn estimate_tempo(onset: &[f32], onset_rate: f32) -> Option<(f32, f32, f32)> {
-    if onset.len() < onset_rate as usize || onset_rate <= 0.0 {
+fn estimate_tempo_with_bounds(
+    onset: &[f32],
+    onset_rate: f32,
+    min_bpm: f32,
+    max_bpm: f32,
+) -> Option<(f32, f32, f32)> {
+    let diagnostics = estimate_tempo_diagnostics(onset, onset_rate, min_bpm, max_bpm, 0)?;
+    tempo_tuple(&diagnostics)
+}
+
+fn estimate_tempo_diagnostics(
+    onset: &[f32],
+    onset_rate: f32,
+    min_bpm: f32,
+    max_bpm: f32,
+    top_k: usize,
+) -> Option<ClassicalTempoBandDiagnostics> {
+    if !valid_tempo_bounds(min_bpm, max_bpm)
+        || onset.len() < onset_rate as usize
+        || onset_rate <= 0.0
+    {
         return None;
     }
     let energy = onset.iter().map(|value| value * value).sum::<f32>();
     if energy <= f32::EPSILON {
         return None;
     }
-    let minimum_lag = (onset_rate * 60.0 / MAX_BPM as f32).floor() as usize;
-    let maximum_lag = (onset_rate * 60.0 / MIN_BPM as f32).ceil() as usize;
+    let minimum_lag = (onset_rate * 60.0 / max_bpm).floor() as usize;
+    let maximum_lag = (onset_rate * 60.0 / min_bpm).ceil() as usize;
     let scores = (minimum_lag.max(1)..=maximum_lag.min(onset.len() - 1))
         .map(|lag| (lag, autocorrelation(onset, lag)))
         .collect::<Vec<_>>();
@@ -528,13 +680,49 @@ fn estimate_tempo(onset: &[f32], onset_rate: f32) -> Option<(f32, f32, f32)> {
         0.0
     };
     let refined_lag = best_lag as f32 + fractional_offset;
-    (refined_lag > 0.0).then(|| {
-        (
-            onset_rate * 60.0 / refined_lag,
-            (best_score / energy).clamp(0.0, 1.0),
-            refined_lag,
-        )
+    if !refined_lag.is_finite() || refined_lag <= 0.0 {
+        return None;
+    }
+    let bpm = onset_rate * 60.0 / refined_lag;
+    let confidence = (best_score / energy).clamp(0.0, 1.0);
+    let peaks = if top_k == 0 {
+        Vec::new()
+    } else {
+        let mut peaks = scores
+            .iter()
+            .map(|(lag, score)| ClassicalTempoPeak {
+                lag_blocks: *lag,
+                bpm: onset_rate * 60.0 / *lag as f32,
+                raw_score: *score,
+                normalized_confidence: (*score / energy).clamp(0.0, 1.0),
+            })
+            .collect::<Vec<_>>();
+        peaks.sort_by(|left, right| right.raw_score.total_cmp(&left.raw_score));
+        peaks.truncate(top_k);
+        peaks
+    };
+    Some(ClassicalTempoBandDiagnostics {
+        bpm: Some(bpm),
+        confidence: Some(confidence),
+        beat_lag_blocks: Some(refined_lag),
+        peaks,
     })
+}
+
+fn tempo_tuple(diagnostics: &ClassicalTempoBandDiagnostics) -> Option<(f32, f32, f32)> {
+    diagnostics
+        .bpm
+        .zip(diagnostics.confidence)
+        .zip(diagnostics.beat_lag_blocks)
+        .map(|((bpm, confidence), lag)| (bpm, confidence, lag))
+}
+
+fn valid_tempo_bounds(min_bpm: f32, max_bpm: f32) -> bool {
+    min_bpm.is_finite()
+        && max_bpm.is_finite()
+        && min_bpm > 0.0
+        && max_bpm > min_bpm
+        && max_bpm <= 1_000.0
 }
 
 fn autocorrelation(onset: &[f32], lag: usize) -> f32 {
@@ -787,6 +975,63 @@ mod tests {
         assert_eq!(analysis.bpm, None);
         assert_eq!(analysis.beat_confidence, 0.0);
         assert_eq!(analysis.first_downbeat, None);
+    }
+
+    #[test]
+    fn explicit_default_tempo_bounds_preserve_the_production_result() {
+        let sample_rate = 1_000;
+        let mut samples = vec![0.0; 12_000];
+        for beat in (1_000..11_000).step_by(500) {
+            samples[beat..beat + 20].fill(1.0);
+        }
+        let mut filter = LowBandFilter::new(sample_rate).unwrap();
+        let low_band = samples
+            .iter()
+            .map(|sample| filter.process(*sample))
+            .collect::<Vec<_>>();
+        let production = analyze_mono_pcm_with_low_band(&samples, &low_band, sample_rate).unwrap();
+        let explicit = analyze_mono_pcm_with_low_band_and_tempo_bounds(
+            &samples,
+            &low_band,
+            sample_rate,
+            CLASSICAL_MIN_BPM,
+            CLASSICAL_MAX_BPM,
+        )
+        .unwrap();
+        assert_eq!(production.bpm, explicit.bpm);
+        assert_eq!(production.beat_markers, explicit.beat_markers);
+        assert_eq!(
+            production.beat_marker_confidences,
+            explicit.beat_marker_confidences
+        );
+    }
+
+    #[test]
+    fn tempo_diagnostics_are_bounded_and_reject_invalid_bounds() {
+        let sample_rate = 1_000;
+        let mut samples = vec![0.0; 12_000];
+        for beat in (1_000..11_000).step_by(500) {
+            samples[beat..beat + 20].fill(1.0);
+        }
+        let mut filter = LowBandFilter::new(sample_rate).unwrap();
+        let low_band = samples
+            .iter()
+            .map(|sample| filter.process(*sample))
+            .collect::<Vec<_>>();
+        let diagnostics = diagnose_classical_tempo(
+            &samples,
+            &low_band,
+            sample_rate,
+            CLASSICAL_MIN_BPM,
+            CLASSICAL_MAX_BPM,
+            5,
+        )
+        .unwrap();
+        assert!(diagnostics.full_band.peaks.len() <= 5);
+        assert!(diagnostics.selected_bpm.is_some());
+        assert!(
+            diagnose_classical_tempo(&samples, &low_band, sample_rate, 180.0, 70.0, 5,).is_none()
+        );
     }
 
     #[test]

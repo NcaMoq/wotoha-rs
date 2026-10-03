@@ -373,6 +373,31 @@ Research artifacts use research schema version 2 because their gate, oracle,
 meter, and tempo semantics changed in this audit. Old manifests, observations,
 and reports must not be compared silently with new schemas.
 
+## Classical tempo research
+
+`research-classical-tempo` is a bounded, research-only command for studying
+the existing Classical analyzer on the exported-WAV corpus. It verifies each
+WAV, decoded PCM identity, and Ground Truth hash before analysis, then writes
+JSON and Markdown outside Git:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+  cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-classical-tempo \
+  --manifest /tmp/wotoha-blackbox-v1/manifest.json \
+  --audio-root /tmp/wotoha-blackbox-v1 \
+  --output /tmp/wotoha-classical-tempo-research
+```
+
+The report includes the baseline, robust median/MAD tempo estimates derived
+only from final Classical markers, confidence-abstention thresholds, explicit
+lower-bound sweeps, full/low-band top-five autocorrelation diagnostics,
+harmonic relations, marker-clock consistency, duration sensitivity, variable-
+tempo safety, transform metadata, and three-run determinism checks. Variable
+tempo fixtures are retained as diagnostics and excluded from scalar-tempo
+accuracy. The command never changes beat markers, phase, downbeats, meter,
+backend selection, or production tempo behavior.
+
 ## Final clean-room handoff
 
 The lab keeps three tempo interpretations separate: the current production

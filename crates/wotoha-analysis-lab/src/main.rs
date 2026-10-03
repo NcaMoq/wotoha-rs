@@ -3,8 +3,8 @@ use std::{env, error::Error, path::PathBuf};
 use wotoha_analysis_lab::{
     AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
-    generate_default_manifest, load_manifest, package_blackbox, run_ground_truth_research,
-    run_tempo_advisor_research, verify_blackbox_package, write_json,
+    generate_default_manifest, load_manifest, package_blackbox, run_classical_tempo_research,
+    run_ground_truth_research, run_tempo_advisor_research, verify_blackbox_package, write_json,
 };
 
 fn main() {
@@ -184,6 +184,23 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 evaluate.output.display()
             );
         }
+        "research-classical-tempo" => {
+            let evaluate = parse_exported_args(&mut args)?;
+            reject_unknown(args)?;
+            let source_commit = env::var("WOTOHA_SOURCE_COMMIT")
+                .map_err(|_| "research-classical-tempo requires WOTOHA_SOURCE_COMMIT")?;
+            let report = run_classical_tempo_research(
+                &evaluate.manifest,
+                &evaluate.audio_root,
+                &evaluate.output,
+                source_commit,
+            )?;
+            println!(
+                "classical tempo research complete: {} fixtures, output={}",
+                report.corpus.fixture_count,
+                evaluate.output.display()
+            );
+        }
         "--help" | "-h" => println!("{}", usage()),
         _ => return Err(usage().into()),
     }
@@ -351,5 +368,5 @@ fn reject_unknown(
 }
 
 fn usage() -> &'static str {
-    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab package-blackbox --input DIRECTORY --output ZIP\n       analysis_lab verify-blackbox ZIP\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--audio-root PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-pass --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-tempo-advisor --manifest PATH --audio-root DIRECTORY --output DIRECTORY"
+    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab package-blackbox --input DIRECTORY --output ZIP\n       analysis_lab verify-blackbox ZIP\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--audio-root PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-pass --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-tempo-advisor --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-classical-tempo --manifest PATH --audio-root DIRECTORY --output DIRECTORY"
 }

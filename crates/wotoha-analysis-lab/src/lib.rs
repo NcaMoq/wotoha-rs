@@ -16,6 +16,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+
+mod classical_tempo_research;
+pub use classical_tempo_research::{ClassicalTempoResearchReport, run_classical_tempo_research};
 use sha2::{Digest, Sha256};
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},
