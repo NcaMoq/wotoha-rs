@@ -2,6 +2,11 @@ name: YouTube compatibility
 
 on:
   workflow_dispatch:
+    inputs:
+      candidate_version:
+        description: "Optional verified release version to probe separately; never promoted automatically"
+        required: false
+        type: string
   schedule:
     - cron: "17 3 * * *"
 
@@ -26,37 +31,125 @@ jobs:
       - name: Verify managed yt-dlp and probe playback through production path
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           source deploy/third-party-versions.env
           curl_retry=(--retry 4 --retry-all-errors --retry-delay 2 --retry-max-time 45 --connect-timeout 10)
-          case "$YTDLP_REPOSITORY" in yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;; *) exit 1 ;; esac
           tmp="$(mktemp -d)"
           trap 'rm -rf "$tmp"' EXIT
-          base="https://github.com/$YTDLP_REPOSITORY/releases/download/$YTDLP_VERSION"
-          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "$base/yt-dlp_linux" -o "$tmp/yt-dlp"
-          curl -fsSL "${curl_retry[@]}" --max-filesize $((256 * 1024)) --remove-on-error "$base/SHA2-256SUMS" -o "$tmp/SHA2-256SUMS"
-          curl -fsSL "${curl_retry[@]}" --max-filesize $((64 * 1024)) --remove-on-error "$base/SHA2-256SUMS.sig" -o "$tmp/SHA2-256SUMS.sig"
-          install -d -m 0700 "$tmp/gnupg"
-          gpg --batch --homedir "$tmp/gnupg" --import deploy/yt-dlp-public.key
-          test "$(gpg --batch --homedir "$tmp/gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')" = AC0CBBE6848D6A873464AF4E57CF65933B5A7581
-          gpg --batch --homedir "$tmp/gnupg" --verify "$tmp/SHA2-256SUMS.sig" "$tmp/SHA2-256SUMS"
-          expected_ytdlp_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$tmp/SHA2-256SUMS")"
-          test "$expected_ytdlp_digest" = "$(sha256sum "$tmp/yt-dlp" | awk '{print $1}')"
-          chmod 0755 "$tmp/yt-dlp"
-          curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" -o "$tmp/deno.zip"
-          printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$tmp/deno.zip" | sha256sum --check --status
-          unzip -q "$tmp/deno.zip" -d "$tmp"
+          case "$YTDLP_REPOSITORY" in
+            yt-dlp/yt-dlp|yt-dlp/yt-dlp-nightly-builds) ;;
+            *)
+              echo "classification=SUPPLY_CHAIN_FAILURE status=REAL_FAILURE reason=repository-policy" | tee "$GITHUB_STEP_SUMMARY"
+              exit 1
+              ;;
+          esac
 
-          # Do not extract a URL and curl it here. The production resolver owns yt-dlp's
-          # headers, HLS selection, and Googlevideo range-query semantics; track_probe
-          # continues through prepare_playback and SongbirdRuntime::verify_track.
-          probe_log="$tmp/track-probe.log"
-          if ! WOTOHA_YTDLP_PATH="$tmp/yt-dlp" WOTOHA_DENO_PATH="$tmp/deno" \
-            cargo run --locked -p wotoha-app --bin track_probe -- \
-            --strict https://www.youtube.com/watch?v=H7HmzwI67ec \
-            2>&1 | tee "$probe_log"; then
-            echo "YouTube production-path probe failed; provider diagnostics:" >&2
-            grep -E 'PROVIDER_ERROR|yt-dlp failed|RESOLVED.*error|PLAYABLE.*error' \
-              "$probe_log" >&2 || cat "$probe_log" >&2
+          candidate_version="${{ inputs.candidate_version || '' }}"
+          if [[ -n "$candidate_version" && ! "$candidate_version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{6}$ ]]; then
+            echo "classification=SUPPLY_CHAIN_FAILURE status=REAL_FAILURE reason=invalid-candidate-version" | tee "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          prepare_deno() {
+            local destination="$1"
+            if ! curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error \
+              "https://github.com/denoland/deno/releases/download/v$DENO_VERSION/deno-x86_64-unknown-linux-gnu.zip" \
+              -o "$destination/deno.zip"; then
+              return 1
+            fi
+            if ! printf '%s  %s\n' "$DENO_X86_64_LINUX_GNU_SHA256" "$destination/deno.zip" | sha256sum --check --status; then
+              return 1
+            fi
+            unzip -q "$destination/deno.zip" -d "$destination" || return 1
+          }
+
+          verify_extractor() {
+            local version="$1"
+            local destination="$2"
+            local base="https://github.com/$YTDLP_REPOSITORY/releases/download/$version"
+            [[ "$version" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]{6}$ ]] || return 1
+            curl -fsSL "${curl_retry[@]}" --max-filesize $((128 * 1024 * 1024)) --remove-on-error "$base/yt-dlp_linux" -o "$destination/yt-dlp" || return 1
+            curl -fsSL "${curl_retry[@]}" --max-filesize $((256 * 1024)) --remove-on-error "$base/SHA2-256SUMS" -o "$destination/SHA2-256SUMS" || return 1
+            curl -fsSL "${curl_retry[@]}" --max-filesize $((64 * 1024)) --remove-on-error "$base/SHA2-256SUMS.sig" -o "$destination/SHA2-256SUMS.sig" || return 1
+            install -d -m 0700 "$destination/gnupg"
+            gpg --batch --homedir "$destination/gnupg" --import deploy/yt-dlp-public.key >/dev/null 2>&1 || return 1
+            test "$(gpg --batch --homedir "$destination/gnupg" --with-colons --fingerprint | awk -F: '$1 == "fpr" {print $10; exit}')" = AC0CBBE6848D6A873464AF4E57CF65933B5A7581 || return 1
+            gpg --batch --homedir "$destination/gnupg" --verify "$destination/SHA2-256SUMS.sig" "$destination/SHA2-256SUMS" >/dev/null 2>&1 || return 1
+            expected_ytdlp_digest="$(awk '$2 == "yt-dlp_linux" && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$destination/SHA2-256SUMS")"
+            test -n "$expected_ytdlp_digest" || return 1
+            test "$expected_ytdlp_digest" = "$(sha256sum "$destination/yt-dlp" | awk '{print $1}')" || return 1
+            chmod 0755 "$destination/yt-dlp"
+            test "$("$destination/yt-dlp" --ignore-config --version)" = "$version" || return 1
+          }
+
+          pinned_result="SUPPLY_CHAIN_FAILURE"
+          pinned_status="REAL_FAILURE"
+          candidate_result="NOT_REQUESTED"
+          candidate_status="NOT_REQUESTED"
+          LAST_CLASSIFICATION="SUPPLY_CHAIN_FAILURE"
+
+          run_probe() {
+            local label="$1"
+            local version="$2"
+            local destination="$tmp/$label"
+            local log_file="$destination/track-probe.log"
+            mkdir -p "$destination"
+            if ! verify_extractor "$version" "$destination"; then
+              LAST_CLASSIFICATION="SUPPLY_CHAIN_FAILURE"
+              printf '%s: classification=SUPPLY_CHAIN_FAILURE status=REAL_FAILURE\n' "$label"
+              return 2
+            fi
+            # The production resolver owns headers, HLS selection, and media range semantics.
+            if WOTOHA_YTDLP_PATH="$destination/yt-dlp" WOTOHA_DENO_PATH="$tmp/deno" \
+              cargo run --locked -p wotoha-app --bin track_probe -- \
+              --strict https://www.youtube.com/watch?v=H7HmzwI67ec 2>&1 | tee "$log_file"; then
+              LAST_CLASSIFICATION="SUCCESS"
+              printf '%s: classification=SUCCESS status=SUCCESS\n' "$label"
+              return 0
+            fi
+            classification="$(bash deploy/classify-youtube-probe.sh "$log_file")"
+            LAST_CLASSIFICATION="$classification"
+            if [[ "$classification" == AUTH_OR_BOT_CHALLENGE ]]; then
+              printf '%s: classification=%s status=DEGRADED/RUNNER_BLOCKED\n' "$label" "$classification"
+              return 10
+            fi
+            printf '%s: classification=%s status=REAL_FAILURE\n' "$label" "$classification"
+            return 1
+          }
+
+          if ! prepare_deno "$tmp"; then
+            pinned_result="SUPPLY_CHAIN_FAILURE"
+            pinned_status="REAL_FAILURE"
+          else
+            set +e
+            run_probe pinned "$YTDLP_VERSION"
+            pinned_exit=$?
+            set -e
+            case "$pinned_exit" in
+              0) pinned_result="$LAST_CLASSIFICATION"; pinned_status=SUCCESS ;;
+              10) pinned_result="$LAST_CLASSIFICATION"; pinned_status=DEGRADED/RUNNER_BLOCKED ;;
+              *) pinned_result="$LAST_CLASSIFICATION"; pinned_status=REAL_FAILURE ;;
+            esac
+          fi
+
+          if [[ -n "$candidate_version" ]]; then
+            set +e
+            run_probe candidate "$candidate_version"
+            candidate_exit=$?
+            set -e
+            case "$candidate_exit" in
+              0) candidate_result="$LAST_CLASSIFICATION"; candidate_status=SUCCESS ;;
+              10) candidate_result="$LAST_CLASSIFICATION"; candidate_status=DEGRADED/RUNNER_BLOCKED ;;
+              *) candidate_result="$LAST_CLASSIFICATION"; candidate_status=REAL_FAILURE ;;
+            esac
+          fi
+
+          jq -n \
+            --arg pinned_version "$YTDLP_VERSION" --arg pinned_result "$pinned_result" --arg pinned_status "$pinned_status" \
+            --arg candidate_version "$candidate_version" --arg candidate_result "$candidate_result" --arg candidate_status "$candidate_status" \
+            '{pinned_version:$pinned_version,pinned_result:$pinned_result,pinned_status:$pinned_status,candidate_version:$candidate_version,candidate_result:$candidate_result,candidate_status:$candidate_status}' \
+            | tee "$RUNNER_TEMP/youtube-compatibility.json" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$pinned_status" == REAL_FAILURE || "$candidate_status" == REAL_FAILURE ]]; then
             exit 1
           fi

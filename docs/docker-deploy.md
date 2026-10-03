@@ -20,6 +20,11 @@ cp runtime.env.example runtime.env
 # Set DISCORD_TOKEN in runtime.env and keep that file mode 0600.
 chmod 0600 runtime.env
 export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>
+sudo bash deploy/prepare-docker-data.sh "${WOTOHA_DATA_DIR:-./data}" ./runtime.env
+docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
+  --mount "type=bind,source=${WOTOHA_DATA_DIR:-./data},destination=/wotoha" \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  "${WOTOHA_IMAGE_REF}" --self-check
 docker compose pull
 docker compose up -d
 ~~~
@@ -34,7 +39,10 @@ Loudness normalization remains enabled by default and targets `-16.0` LUFS with
 a `-2.0` dBTP ceiling. The default maximum positive gain is now `0.0` dB:
 tracks louder than the target are attenuated, while quieter tracks are not
 automatically amplified. Set `WOTOHA_LOUDNESS_MAX_BOOST_DB` above `0.0` in
-`runtime.env` to opt in to positive gain; the true-peak ceiling still applies.
+`runtime.env` to opt in to positive gain; the true-peak ceiling applies at
+the track-normalization stage. It is not a final-output limiter after the
+separately configured master volume, so deployments that raise the master
+volume above `1.0` must validate the resulting output chain separately.
 
 This default changed from `6.0` dB to `0.0` dB only when the variable is
 omitted. Existing deployments with an explicit value, including `6.0`, retain

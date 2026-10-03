@@ -23,10 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if options.urls.is_empty() {
         eprintln!(
-            "usage: cargo run -p wotoha-app --bin track_probe -- [--strict] [--warmup] [--automix-plan] [--automix-preview <file.wav>] <url>..."
+            "usage: cargo run -p wotoha-app --bin track_probe -- [--strict] [--warmup] [--automix-plan] [--automix-preview <file.wav>] [--loudness-max-boost-db <db>] <url>..."
         );
         std::process::exit(2);
     }
+    let loudness_max_boost_db = options.loudness_max_boost_db;
     let automix_requested = options.automix_plan || options.automix_preview.is_some();
     if automix_requested && options.urls.len() < 2 {
         eprintln!("AutoMix probing requires at least two URLs");
@@ -111,10 +112,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     if automix_requested {
-        print_automix_plans(&prepared_tracks);
+        print_automix_plans(&prepared_tracks, loudness_max_boost_db);
     }
     if let Some(path) = options.automix_preview.as_ref() {
-        render_preview(&runtime, &prepared_tracks, path).await?;
+        render_preview(&runtime, &prepared_tracks, path, loudness_max_boost_db).await?;
     }
 
     if options.strict && probe_failed {
@@ -135,6 +136,7 @@ struct ProbeOptions {
     warmup: bool,
     automix_plan: bool,
     automix_preview: Option<PathBuf>,
+    loudness_max_boost_db: f32,
     urls: Vec<String>,
 }
 
@@ -144,6 +146,7 @@ impl ProbeOptions {
         let mut warmup = false;
         let mut automix_plan = false;
         let mut automix_preview = None;
+        let mut loudness_max_boost_db = 0.0;
         let mut urls = Vec::new();
         let mut args = args.into_iter();
 
@@ -158,6 +161,21 @@ impl ProbeOptions {
                     };
                     automix_preview = Some(PathBuf::from(path));
                 }
+                "--loudness-max-boost-db" => {
+                    let Some(value) = args.next() else {
+                        return Err("--loudness-max-boost-db requires a value".to_owned());
+                    };
+                    loudness_max_boost_db = value
+                        .parse::<f32>()
+                        .map_err(|_| "--loudness-max-boost-db must be finite".to_owned())?;
+                    if !loudness_max_boost_db.is_finite()
+                        || !(0.0..=12.0).contains(&loudness_max_boost_db)
+                    {
+                        return Err(
+                            "--loudness-max-boost-db must be between 0 and 12 dB".to_owned()
+                        );
+                    }
+                }
                 value if value.starts_with("--") => {
                     return Err(format!("unknown option: {value}"));
                 }
@@ -170,6 +188,7 @@ impl ProbeOptions {
             warmup,
             automix_plan,
             automix_preview,
+            loudness_max_boost_db,
             urls,
         })
     }
@@ -197,9 +216,17 @@ fn print_analysis(index: usize, analysis: Option<&TrackAnalysis>) {
     );
 }
 
-fn print_automix_plans(tracks: &[PreparedProbe]) {
+fn print_automix_plans(tracks: &[PreparedProbe], loudness_max_boost_db: f32) {
     let config = automix_probe_config();
-    let loudness = loudness_probe_config();
+    let loudness = loudness_probe_config(loudness_max_boost_db);
+    println!(
+        "AUTOMIX_CONFIG\tloudness_enabled={}\ttarget_lufs={}\tmax_boost_db={}\ttrue_peak_ceiling_dbtp={}\tmaster_volume_assumption=1.0\ttrue_peak_scope=normalization-stage\tsource_commit={}",
+        loudness.enabled,
+        loudness.target_lufs,
+        loudness.max_boost_db,
+        loudness.true_peak_ceiling_dbtp,
+        option_env!("WOTOHA_SOURCE_COMMIT").unwrap_or("unknown"),
+    );
     for pair in tracks.windows(2) {
         let [outgoing, incoming] = pair else {
             continue;
@@ -311,6 +338,7 @@ async fn render_preview(
     runtime: &SongbirdRuntime,
     tracks: &[PreparedProbe],
     path: &PathBuf,
+    loudness_max_boost_db: f32,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let [outgoing, incoming] = tracks else {
         return Err(probe_error("preview requires exactly two prepared tracks"));
@@ -338,7 +366,7 @@ async fn render_preview(
             outgoing_analysis,
             incoming_analysis,
             &automix_probe_config(),
-            &loudness_probe_config(),
+            &loudness_probe_config(loudness_max_boost_db),
         )
         .await?;
     let bytes = preview.wav.len();
@@ -384,12 +412,10 @@ fn automix_probe_config() -> AutoMixConfig {
     }
 }
 
-fn loudness_probe_config() -> LoudnessConfig {
+fn loudness_probe_config(max_boost_db: f32) -> LoudnessConfig {
     LoudnessConfig {
-        enabled: true,
-        target_lufs: -16.0,
-        max_boost_db: 6.0,
-        true_peak_ceiling_dbtp: -2.0,
+        max_boost_db,
+        ..LoudnessConfig::production_default()
     }
 }
 
@@ -430,6 +456,7 @@ mod tests {
         assert!(options.warmup);
         assert!(!options.strict);
         assert!(options.automix_plan);
+        assert_eq!(options.loudness_max_boost_db, 0.0);
         assert_eq!(options.automix_preview, None);
         assert_eq!(options.urls, ["one", "two"]);
     }
@@ -462,5 +489,21 @@ mod tests {
         assert!(!options.automix_plan);
         assert_eq!(options.automix_preview, Some(PathBuf::from("preview.wav")));
         assert_eq!(options.urls, ["one", "two"]);
+    }
+
+    #[test]
+    fn explicit_loudness_boost_is_opt_in() {
+        let options = ProbeOptions::parse([
+            "--loudness-max-boost-db".to_owned(),
+            "6".to_owned(),
+            "one".to_owned(),
+        ])
+        .unwrap();
+
+        assert_eq!(options.loudness_max_boost_db, 6.0);
+        assert_eq!(
+            loudness_probe_config(options.loudness_max_boost_db).max_boost_db,
+            6.0
+        );
     }
 }

@@ -76,7 +76,14 @@ WORKDIR /src
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes build-essential cmake jq pkg-config \
     && rm -rf /var/lib/apt/lists/*
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml LICENSE THIRD_PARTY_NOTICES.md ./
+COPY crates ./crates
+COPY vendor ./vendor
+COPY deploy/third-party-versions.env \
+     deploy/yt-dlp-public.key \
+     deploy/release-about.toml \
+     deploy/third-party-licenses.hbs \
+     deploy/generate-cargo-attributions.sh ./deploy/
 
 ARG SOURCE_COMMIT=unknown
 ARG IMAGE_VERSION=development
@@ -151,5 +158,4 @@ LABEL org.opencontainers.image.title="wotoha-rs" \
 
 WORKDIR /app
 USER 10001:10001
-VOLUME ["/wotoha"]
 ENTRYPOINT ["/app/wotoha-app"]

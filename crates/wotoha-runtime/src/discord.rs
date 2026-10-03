@@ -36,13 +36,12 @@ use wotoha_core::{
     debug::{append_debug_log, sanitize_log_message},
     operational_metrics,
     ui::{
-        self, AUTOMIX_NICKNAME, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP,
-        BUTTON_LOOP_LABEL, BUTTON_QUEUE, BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL,
-        BUTTON_SKIP, BUTTON_SKIP_LABEL, COLOR_ERROR, COLOR_INFO, LOOPING_NICKNAME,
-        MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING,
-        MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED,
-        PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME, PLAY_COMMAND_URL_OPTION, QUEUE_EMOJI_ID,
-        QUEUE_EMOJI_NAME,
+        self, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP, BUTTON_LOOP_LABEL, BUTTON_QUEUE,
+        BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, BUTTON_SKIP, BUTTON_SKIP_LABEL,
+        COLOR_ERROR, COLOR_INFO, MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST,
+        MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE,
+        MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME,
+        PLAY_COMMAND_URL_MAX_LENGTH, PLAY_COMMAND_URL_OPTION,
     },
     url::summarize_url_for_logs,
 };
@@ -199,11 +198,6 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                                 "failed to restore playback after restart"
                             );
                         }
-                    }
-                    if self.control.automix_enabled(guild_id) {
-                        let _ = serenity_guild_id
-                            .edit_nickname(&ctx.http, Some(AUTOMIX_NICKNAME))
-                            .await;
                     }
                     info!(
                         guild_id = guild_id.get(),
@@ -377,11 +371,6 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     now_playing = outcome.now_playing,
                     "play command resolved successfully"
                 );
-                if self.control.automix_enabled(guild_key) {
-                    let _ = guild_id
-                        .edit_nickname(&ctx.http, Some(AUTOMIX_NICKNAME))
-                        .await;
-                }
                 let response = CreateInteractionResponseFollowup::new()
                     .embed(track_embed(
                         &outcome.request.metadata,
@@ -458,15 +447,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             .handle_component(guild_key, actor_channel, action)
             .await
         {
-            ComponentOutcome::Skip { was_looping } => {
-                if was_looping {
-                    let _ = guild_id.edit_nickname(&ctx.http, None).await;
-                }
-            }
-            ComponentOutcome::Loop { enabled } => {
-                let nickname = enabled.then_some(LOOPING_NICKNAME);
-                let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
-            }
+            ComponentOutcome::Skip { .. } => {}
+            ComponentOutcome::Loop { .. } => {}
             ComponentOutcome::Shuffle => {
                 component
                     .create_followup(
@@ -487,10 +469,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     )
                     .await?;
             }
-            ComponentOutcome::AutoMix { enabled } => {
-                let nickname = enabled.then_some(AUTOMIX_NICKNAME);
-                let _ = guild_id.edit_nickname(&ctx.http, nickname).await;
-            }
+            ComponentOutcome::AutoMix { .. } => {}
             ComponentOutcome::QueuePreview(preview) => {
                 component
                     .create_followup(
@@ -696,7 +675,6 @@ where
                     self.active_voice_channels.remove(&guild_key);
                     self.record_active_voice_counts();
                     self.notification_channels.remove(&guild_key);
-                    let _ = guild_id.edit_nickname(&ctx.http, None).await;
                 }
             }
             return;
@@ -716,7 +694,6 @@ where
         self.active_voice_channels.remove(&guild_key);
         self.record_active_voice_counts();
         self.control.disconnect_guild(guild_key).await;
-        let _ = guild_id.edit_nickname(&ctx.http, None).await;
     }
 
     async fn voice_server_update(&self, _ctx: Context, event: VoiceServerUpdateEvent) {
@@ -768,9 +745,25 @@ async fn ensure_global_commands(ctx: &Context) -> serenity::Result<()> {
 fn matches_play_command(command: &Command) -> bool {
     command.name == PLAY_COMMAND_NAME
         && command.description == PLAY_COMMAND_DESCRIPTION
+        && command.kind == serenity::all::CommandType::ChatInput
+        && !command.nsfw
         && command.options.len() == 1
-        && command.options[0].name == PLAY_COMMAND_URL_OPTION
-        && command.options[0].kind == CommandOptionType::String
+        && matches_play_option(&command.options[0])
+}
+
+fn matches_play_option(option: &serenity::all::CommandOption) -> bool {
+    option.name == PLAY_COMMAND_URL_OPTION
+        && option.description == "URL"
+        && option.kind == CommandOptionType::String
+        && option.required
+        && option.choices.is_empty()
+        && option.options.is_empty()
+        && option.channel_types.is_empty()
+        && option.min_value.is_none()
+        && option.max_value.is_none()
+        && option.min_length == Some(1)
+        && option.max_length == Some(PLAY_COMMAND_URL_MAX_LENGTH)
+        && !option.autocomplete
 }
 
 fn play_command() -> CreateCommand {
@@ -778,7 +771,9 @@ fn play_command() -> CreateCommand {
         .description(PLAY_COMMAND_DESCRIPTION)
         .add_option(
             CreateCommandOption::new(CommandOptionType::String, PLAY_COMMAND_URL_OPTION, "URL")
-                .required(true),
+                .required(true)
+                .min_length(1)
+                .max_length(PLAY_COMMAND_URL_MAX_LENGTH),
         )
 }
 
@@ -808,7 +803,7 @@ fn track_embed(
 ) -> CreateEmbed {
     let title = truncate_embed_text(&sanitize_display_text(metadata.title.as_ref()), 256);
     let author = truncate_embed_text(&sanitize_display_text(metadata.author.as_ref()), 256);
-    let uri = safe_display_url(metadata.uri.as_ref());
+    let uri = public_display_url(metadata.uri.as_ref());
     let mut embed = CreateEmbed::new()
         .color(Colour::new(COLOR_INFO))
         .author(CreateEmbedAuthor::new(author))
@@ -824,7 +819,7 @@ fn track_embed(
         embed = embed.url(uri);
     }
     if let Some(thumbnail_url) = &metadata.thumbnail_url
-        && let Some(uri) = safe_display_url(thumbnail_url.as_ref())
+        && let Some(uri) = safe_thumbnail_url(thumbnail_url.as_ref())
     {
         embed = embed.thumbnail(uri);
     }
@@ -834,10 +829,7 @@ fn track_embed(
 
 fn queue_embed(preview: &QueuePreview) -> CreateEmbed {
     let mut embed = CreateEmbed::new()
-        .title(format!(
-            "<:{}:{}> Playlist",
-            QUEUE_EMOJI_NAME, QUEUE_EMOJI_ID
-        ))
+        .title("📜 Playlist")
         .color(Colour::new(COLOR_INFO));
 
     if let Some(current) = preview.current() {
@@ -918,17 +910,46 @@ fn sanitize_display_text(text: &str) -> String {
         .to_owned()
 }
 
-fn safe_display_url(raw_url: &str) -> Option<String> {
+fn public_display_url(raw_url: &str) -> Option<String> {
+    if !wotoha_core::url::is_allowed_track_url(raw_url) {
+        return None;
+    }
     let mut url = url::Url::parse(raw_url).ok()?;
-    if url.scheme() != "https" || url.host_str().is_none() || !url.username().is_empty() {
-        return None;
-    }
-    if url.password().is_some() {
-        return None;
-    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    let is_youtube = matches!(
+        host.as_str(),
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be"
+    );
+    let query = url
+        .query_pairs()
+        .filter(|(key, _)| {
+            (is_youtube && key == "v") || (!is_youtube && !is_tracking_query_key(key))
+        })
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
     url.set_query(None);
+    if !query.is_empty() {
+        let mut pairs = url.query_pairs_mut();
+        for (key, value) in query {
+            pairs.append_pair(&key, &value);
+        }
+    }
     url.set_fragment(None);
     Some(url.to_string())
+}
+
+fn safe_thumbnail_url(raw_url: &str) -> Option<String> {
+    if !wotoha_core::url::is_safe_https_url(raw_url) {
+        return None;
+    }
+    let mut url = url::Url::parse(raw_url).ok()?;
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn is_tracking_query_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "fbclid" || key == "gclid" || key == "si" || key == "feature" || key.starts_with("utm_")
 }
 
 fn player_action_row() -> CreateActionRow {
@@ -964,7 +985,8 @@ fn button_fallback_emoji(custom_id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_VERSION, EMBED_FIELD_LIMIT, queue_lines, truncate_embed_text, version_activity,
+        BUILD_VERSION, EMBED_FIELD_LIMIT, matches_play_option, play_command, public_display_url,
+        queue_lines, safe_thumbnail_url, truncate_embed_text, version_activity,
     };
     use serenity::all::ActivityType;
     use wotoha_core::{GuildPlayerState, PreparedSource, TrackMetadata, TrackRequest};
@@ -998,6 +1020,66 @@ mod tests {
             Some(format!("v{version} | in 42 servers").as_str())
         );
         assert_eq!(activity.kind, ActivityType::Custom);
+    }
+
+    #[test]
+    fn public_youtube_url_preserves_video_identity_and_removes_tracking() {
+        assert_eq!(
+            public_display_url("https://www.youtube.com/watch?v=abc&utm_source=test&feature=share"),
+            Some("https://www.youtube.com/watch?v=abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn public_and_thumbnail_url_policies_are_distinct() {
+        assert_eq!(
+            public_display_url("https://user:pass@www.youtube.com/watch?v=abc"),
+            None
+        );
+        assert_eq!(
+            safe_thumbnail_url("https://cdn.example.test/thumb.jpg?signature=keep"),
+            Some("https://cdn.example.test/thumb.jpg?signature=keep".to_owned())
+        );
+        assert_eq!(
+            public_display_url("https://rr1---sn.example.googlevideo.com/videoplayback?id=abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn play_command_declares_bounded_url_option() {
+        let value = serde_json::to_value(play_command()).expect("command serializes");
+        let option = &value["options"][0];
+        assert_eq!(option["required"], true);
+        assert_eq!(option["min_length"], 1);
+        assert_eq!(option["max_length"], 2048);
+    }
+
+    #[test]
+    fn command_matcher_rejects_schema_drift() {
+        let option = |max_length| {
+            serde_json::from_value(serde_json::json!({
+                "type": 3,
+                "name": "url",
+                "name_localizations": null,
+                "description": "URL",
+                "description_localizations": null,
+                "required": true,
+                "choices": [],
+                "options": [],
+                "channel_types": [],
+                "min_value": null,
+                "max_value": null,
+                "min_length": 1,
+                "max_length": max_length,
+                "autocomplete": false
+            }))
+            .expect("command option deserializes")
+        };
+
+        assert!(matches_play_option(&option(serde_json::json!(2048))));
+        assert!(!matches_play_option(&option(serde_json::json!(2047))));
+        assert!(!matches_play_option(&option(serde_json::Value::Null)));
     }
 
     fn track(title: String, index: usize) -> TrackRequest {

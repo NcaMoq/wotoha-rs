@@ -110,6 +110,19 @@ pub struct LoudnessConfig {
     pub true_peak_ceiling_dbtp: f32,
 }
 
+impl LoudnessConfig {
+    /// Returns the production-equivalent loudness policy before explicit
+    /// research-only overrides are applied.
+    pub fn production_default() -> Self {
+        Self {
+            enabled: DEFAULT_LOUDNESS_NORMALIZATION_ENABLED,
+            target_lufs: DEFAULT_LOUDNESS_TARGET_LUFS,
+            max_boost_db: DEFAULT_LOUDNESS_MAX_BOOST_DB,
+            true_peak_ceiling_dbtp: DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP,
+        }
+    }
+}
+
 impl BotConfig {
     pub fn load() -> Result<Self, ConfigError> {
         let _ = dotenvy::from_filename(".env");

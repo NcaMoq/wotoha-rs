@@ -164,6 +164,8 @@ const PROVIDER_URL_POLICIES: &[ProviderUrlPolicy] = &[
     },
 ];
 
+const MAX_SAFE_URL_BYTES: usize = 16 * 1024;
+
 pub fn is_allowed_track_url(raw_url: &str) -> bool {
     is_allowed_by_any(raw_url, |policy| policy.track)
 }
@@ -180,7 +182,17 @@ pub fn is_allowed_runtime_redirect_url(raw_url: &str) -> bool {
     is_allowed_by_any(raw_url, |policy| policy.playback)
 }
 
-pub fn same_url_host(left: &str, right: &str) -> bool {
+/// Returns whether a URL has the safe shape accepted at an external boundary.
+/// Host allowlisting is deliberately a separate decision made by the caller.
+pub fn is_safe_https_url(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    is_safe_url_shape(&url)
+}
+
+/// Compares scheme, normalized host, and effective port.
+pub fn same_url_origin(left: &str, right: &str) -> bool {
     let Ok(left) = Url::parse(left) else {
         return false;
     };
@@ -188,8 +200,16 @@ pub fn same_url_host(left: &str, right: &str) -> bool {
         return false;
     };
 
+    if !is_safe_url_shape(&left) || !is_safe_url_shape(&right) {
+        return false;
+    }
+
     match (normalize_host(&left), normalize_host(&right)) {
-        (Some(left_host), Some(right_host)) => left_host == right_host,
+        (Some(left_host), Some(right_host)) => {
+            left.scheme() == right.scheme()
+                && left_host == right_host
+                && left.port_or_known_default() == right.port_or_known_default()
+        }
         _ => false,
     }
 }
@@ -231,7 +251,7 @@ where
     let Ok(url) = Url::parse(raw_url) else {
         return false;
     };
-    if url.scheme() != "https" {
+    if !is_safe_url_shape(&url) {
         return false;
     }
     let Some(host) = normalize_host(&url) else {
@@ -248,7 +268,7 @@ fn is_allowed_url(raw_url: &str, policy: HostPolicy) -> bool {
     let Ok(url) = Url::parse(raw_url) else {
         return false;
     };
-    if url.scheme() != "https" {
+    if !is_safe_url_shape(&url) {
         return false;
     }
 
@@ -261,6 +281,15 @@ fn is_allowed_url(raw_url: &str, policy: HostPolicy) -> bool {
 
 fn policy_matches_host(policy: HostPolicy, host: &str) -> bool {
     policy.exact.contains(&host) || policy.suffixes.iter().any(|suffix| host.ends_with(suffix))
+}
+
+fn is_safe_url_shape(url: &Url) -> bool {
+    url.as_str().len() <= MAX_SAFE_URL_BYTES
+        && url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port_or_known_default() == Some(443)
+        && normalize_host(url).is_some()
 }
 
 fn normalize_host(url: &Url) -> Option<String> {
@@ -278,7 +307,7 @@ fn normalize_host(url: &Url) -> Option<String> {
 mod tests {
     use super::{
         is_allowed_prepared_url, is_allowed_runtime_redirect_url, is_allowed_track_url,
-        same_url_host, summarize_url_for_logs,
+        is_safe_https_url, same_url_origin, summarize_url_for_logs,
     };
 
     #[test]
@@ -332,13 +361,42 @@ mod tests {
 
     #[test]
     fn compares_hosts_after_normalization() {
-        assert!(same_url_host(
+        assert!(same_url_origin(
             "https://www.nicovideo.jp/watch/sm9",
             "https://www.nicovideo.jp/api/watch/v3/sm9",
         ));
-        assert!(!same_url_host(
+        assert!(!same_url_origin(
             "https://www.nicovideo.jp/watch/sm9",
             "https://asset.domand.nicovideo.jp/media/segment.ts",
+        ));
+    }
+
+    #[test]
+    fn rejects_credentials_non_default_ports_and_oversized_urls() {
+        assert!(!is_safe_https_url(
+            "https://user:pass@www.youtube.com/watch?v=id"
+        ));
+        assert!(!is_safe_https_url(
+            "https://www.youtube.com:8443/watch?v=id"
+        ));
+        assert!(!is_allowed_track_url(
+            "https://www.youtube.com:8443/watch?v=id"
+        ));
+        assert!(!is_safe_https_url(&format!(
+            "https://www.youtube.com/{}",
+            "x".repeat(16 * 1024)
+        )));
+    }
+
+    #[test]
+    fn origin_comparison_includes_effective_port() {
+        assert!(same_url_origin(
+            "https://www.youtube.com/watch?v=id",
+            "https://www.youtube.com:443/segment.ts",
+        ));
+        assert!(!same_url_origin(
+            "https://www.youtube.com/watch?v=id",
+            "https://www.youtube.com:8443/segment.ts",
         ));
     }
 }

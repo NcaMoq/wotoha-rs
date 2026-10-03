@@ -2,6 +2,10 @@
 /dist
 .env
 /runtime.env
+/data/
+.cleanroom-private/
+/external-observations-private/
+/research-private/
 .wotoha-analysis/
 /analysis-lab-runs/
 /analysis-lab-report.json

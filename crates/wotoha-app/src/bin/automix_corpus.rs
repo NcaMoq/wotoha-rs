@@ -126,7 +126,7 @@ async fn run() -> Result<bool, AnyError> {
     let runtime = SongbirdRuntime::new(Songbird::serenity())?;
     let http = corpus_http_client()?;
     let automix = automix_config();
-    let loudness = loudness_config();
+    let loudness = loudness_config(options.loudness_max_boost_db);
     let mut prepared = HashMap::new();
     let mut track_reports = Vec::with_capacity(manifest.tracks.len());
 
@@ -182,6 +182,7 @@ struct Options {
     manifest: PathBuf,
     report: Option<PathBuf>,
     keep_artifacts: bool,
+    loudness_max_boost_db: f32,
 }
 
 impl Options {
@@ -192,6 +193,7 @@ impl Options {
             .join("automix-corpus.json");
         let mut report = None;
         let mut keep_artifacts = false;
+        let mut loudness_max_boost_db = 0.0;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -210,9 +212,22 @@ impl Options {
                     );
                 }
                 "--keep-artifacts" => keep_artifacts = true,
+                "--loudness-max-boost-db" => {
+                    let Some(value) = args.next() else {
+                        return Err("--loudness-max-boost-db requires a value".into());
+                    };
+                    loudness_max_boost_db = value.parse::<f32>().map_err(|_| {
+                        "--loudness-max-boost-db must be a finite number".to_owned()
+                    })?;
+                    if !loudness_max_boost_db.is_finite()
+                        || !(0.0..=12.0).contains(&loudness_max_boost_db)
+                    {
+                        return Err("--loudness-max-boost-db must be between 0 and 12 dB".into());
+                    }
+                }
                 "--help" | "-h" => {
                     return Err(
-                        "usage: automix_corpus --allow-network [--manifest PATH] [--report PATH] [--keep-artifacts]"
+                        "usage: automix_corpus --allow-network [--manifest PATH] [--report PATH] [--keep-artifacts] [--loudness-max-boost-db DB]"
                             .into(),
                     );
                 }
@@ -224,6 +239,7 @@ impl Options {
             manifest: absolute_path(cwd, manifest),
             report: report.map(|path| absolute_path(cwd, path)),
             keep_artifacts,
+            loudness_max_boost_db,
         })
     }
 }
@@ -1622,12 +1638,10 @@ fn automix_config() -> AutoMixConfig {
     }
 }
 
-fn loudness_config() -> LoudnessConfig {
+fn loudness_config(max_boost_db: f32) -> LoudnessConfig {
     LoudnessConfig {
-        enabled: true,
-        target_lufs: -16.0,
-        max_boost_db: 6.0,
-        true_peak_ceiling_dbtp: -2.0,
+        max_boost_db,
+        ..LoudnessConfig::production_default()
     }
 }
 
@@ -1648,8 +1662,13 @@ struct ConfigReport {
     crossfade_ms: u128,
     max_tempo_adjustment: f32,
     min_beat_confidence: f32,
+    loudness_enabled: bool,
     target_lufs: f32,
+    max_boost_db: f32,
     true_peak_ceiling_dbtp: f32,
+    master_volume_assumption: f32,
+    true_peak_scope: &'static str,
+    source_commit: &'static str,
 }
 
 impl ConfigReport {
@@ -1658,8 +1677,13 @@ impl ConfigReport {
             crossfade_ms: automix.crossfade.as_millis(),
             max_tempo_adjustment: automix.max_tempo_adjustment,
             min_beat_confidence: automix.min_beat_confidence,
+            loudness_enabled: loudness.enabled,
             target_lufs: loudness.target_lufs,
+            max_boost_db: loudness.max_boost_db,
             true_peak_ceiling_dbtp: loudness.true_peak_ceiling_dbtp,
+            master_volume_assumption: 1.0,
+            true_peak_scope: "normalization-stage",
+            source_commit: option_env!("WOTOHA_SOURCE_COMMIT").unwrap_or("unknown"),
         }
     }
 }
@@ -2509,6 +2533,21 @@ mod tests {
         maximum_sample_peak_dbfs: -1.0,
         maximum_true_peak_dbtp: -1.0,
     };
+
+    #[test]
+    fn research_loudness_defaults_match_production_attenuation_only_policy() {
+        let config = loudness_config(0.0);
+        assert!(config.enabled);
+        assert_eq!(config.target_lufs, -16.0);
+        assert_eq!(config.max_boost_db, 0.0);
+        assert_eq!(config.true_peak_ceiling_dbtp, -2.0);
+    }
+
+    #[test]
+    fn explicit_research_boost_remains_opt_in() {
+        let config = loudness_config(6.0);
+        assert_eq!(config.max_boost_db, 6.0);
+    }
 
     #[tokio::test]
     async fn stage_timeout_is_finite_and_allows_continuation() {

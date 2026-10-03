@@ -1,6 +1,6 @@
 use reqwest::header::HeaderMap;
 use songbird::input::AudioStreamError;
-use wotoha_core::url::{is_allowed_prepared_url, same_url_host, summarize_url_for_logs};
+use wotoha_core::url::{is_allowed_prepared_url, same_url_origin, summarize_url_for_logs};
 
 pub fn validate_provider_url(provider_id: &str, raw_url: &str) -> Result<(), AudioStreamError> {
     if is_allowed_prepared_url(provider_id, raw_url) {
@@ -17,7 +17,7 @@ pub fn validate_provider_url(provider_id: &str, raw_url: &str) -> Result<(), Aud
 }
 
 pub fn filtered_headers(origin_url: &str, target_url: &str, headers: &HeaderMap) -> HeaderMap {
-    if same_url_host(origin_url, target_url) {
+    if same_url_origin(origin_url, target_url) {
         return headers.clone();
     }
 
@@ -72,5 +72,40 @@ mod tests {
             filtered.get(ORIGIN).and_then(|value| value.to_str().ok()),
             Some("https://www.youtube.com")
         );
+    }
+
+    #[test]
+    fn strips_sensitive_headers_when_only_the_port_changes() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("user_session=secret"));
+        headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0"));
+
+        let filtered = filtered_headers(
+            "https://www.youtube.com/watch?v=id",
+            "https://www.youtube.com:8443/segment.ts",
+            &headers,
+        );
+
+        assert!(!filtered.contains_key(COOKIE));
+        assert_eq!(
+            filtered
+                .get(USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("Mozilla/5.0")
+        );
+    }
+
+    #[test]
+    fn retains_headers_for_the_same_origin_including_explicit_default_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, HeaderValue::from_static("user_session=secret"));
+
+        let filtered = filtered_headers(
+            "https://www.youtube.com/watch?v=id",
+            "https://www.youtube.com:443/segment.ts",
+            &headers,
+        );
+
+        assert!(filtered.contains_key(COOKIE));
     }
 }

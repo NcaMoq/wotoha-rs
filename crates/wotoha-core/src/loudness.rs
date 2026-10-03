@@ -5,6 +5,11 @@ use crate::{automix::TrackAnalysis, config::LoudnessConfig};
 /// Boosting requires both integrated loudness and true-peak measurements so
 /// the configured ceiling can be enforced. Attenuation remains safe when a
 /// true-peak measurement is unavailable.
+///
+/// The ceiling is a track-normalization-stage contract. The separately
+/// configured master volume is applied after this gain and is intentionally
+/// outside this helper's guarantee; callers that raise the master above unity
+/// must validate the final output chain separately.
 pub fn loudness_normalization_gain(
     config: &LoudnessConfig,
     analysis: Option<&TrackAnalysis>,
