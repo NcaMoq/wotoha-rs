@@ -11,7 +11,7 @@ const DEFAULT_LOG_ANSI: bool = false;
 const DEFAULT_PLAYBACK_VOLUME: f32 = 0.10;
 const DEFAULT_LOUDNESS_NORMALIZATION_ENABLED: bool = true;
 const DEFAULT_LOUDNESS_TARGET_LUFS: f32 = -16.0;
-const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 6.0;
+const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 0.0;
 const DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP: f32 = -2.0;
 const DEFAULT_MAX_QUEUE_LEN: usize = 512;
 const DEFAULT_MAX_PENDING_ENQUEUES: usize = 64;
@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(config.playback.default_volume, 0.10);
         assert!(config.playback.loudness.enabled);
         assert_eq!(config.playback.loudness.target_lufs, -16.0);
-        assert_eq!(config.playback.loudness.max_boost_db, 6.0);
+        assert_eq!(config.playback.loudness.max_boost_db, 0.0);
         assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -2.0);
         assert_eq!(config.playback.max_queue_len, 512);
         assert_eq!(config.playback.max_pending_enqueues, 64);

@@ -69,9 +69,13 @@ The following work still needs to happen:
 - `WOTOHA_DEFAULT_VOLUME`: playback volume value, accepted range `0.0..=2.0`.
 - `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED`: enables per-track loudness normalization; defaults to `true`.
 - `WOTOHA_LOUDNESS_TARGET_LUFS`: integrated loudness target, accepted range `-24.0..=-8.0` LUFS; defaults to `-16.0`.
-- `WOTOHA_LOUDNESS_MAX_BOOST_DB`: maximum normalization boost, accepted range `0.0..=12.0` dB; defaults to `6.0`.
+- `WOTOHA_LOUDNESS_MAX_BOOST_DB`: maximum normalization boost, accepted range `0.0..=12.0` dB; defaults to `0.0`. By default, loudness normalization attenuates tracks above the target but does not amplify quieter tracks. Set this above `0.0` to opt in to positive gain.
 - `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP`: true-peak ceiling, accepted range `-6.0..=0.0` dBTP; defaults to `-2.0`.
 - `WOTOHA_MAX_QUEUE_LEN`: guild queue limit value, accepted range `1..=512`.
 - `WOTOHA_MAX_PENDING_ENQUEUES`: pending enqueue limit value, accepted range `1..=64`. It cannot exceed `WOTOHA_MAX_QUEUE_LEN`.
+
+The default maximum normalization boost changed from `6.0` dB to `0.0` dB.
+This affects only deployments that omit `WOTOHA_LOUDNESS_MAX_BOOST_DB`.
+Deployments that explicitly set `6.0` or another value retain that setting.
 
 Startup applies these values before the Discord client is built. Logging settings configure both stdout and the runtime log file. Playback volume is applied through the runtime track handle. Queue and pending enqueue limits are checked before enqueue work enters the playback coordinator.

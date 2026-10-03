@@ -27,6 +27,18 @@ docker compose up -d
 optional host data directory. `runtime.env` is loaded into the container and
 contains the application settings and secret; it is never committed.
 
+## Loudness normalization policy
+
+Loudness normalization remains enabled by default and targets `-16.0` LUFS with
+a `-2.0` dBTP ceiling. The default maximum positive gain is now `0.0` dB:
+tracks louder than the target are attenuated, while quieter tracks are not
+automatically amplified. Set `WOTOHA_LOUDNESS_MAX_BOOST_DB` above `0.0` in
+`runtime.env` to opt in to positive gain; the true-peak ceiling still applies.
+
+This default changed from `6.0` dB to `0.0` dB only when the variable is
+omitted. Existing deployments with an explicit value, including `6.0`, retain
+their configured behavior.
+
 The Compose file intentionally has no published ports or fake healthcheck.
 Discord voice and gateway traffic are outbound connections. The service runs
 as UID/GID 10001, drops all Linux capabilities, enables no-new-privileges,

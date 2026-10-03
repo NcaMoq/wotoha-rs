@@ -28,7 +28,7 @@ Most users can start with the hosted bot:
 
 - **Adaptive AutoMix** — analyzes BPM, beat confidence, musical structure, energy, vocals, and harmonic compatibility before selecting a transition.
 - **Safe transition fallback** — chooses beat-matched mixing when it is safe, falls back to an adaptive crossfade, and uses a gapless handoff when an overlap would sound worse.
-- **Consistent loudness** — normalizes each track toward `-16 LUFS` by default, with a `-2 dBTP` true-peak ceiling and configurable boost limit.
+- **Consistent loudness** — normalizes each track toward `-16 LUFS` by default, with a `-2 dBTP` true-peak ceiling and attenuation-only defaults. Positive gain is an explicit opt-in.
 - **Multi-source playback** — supports YouTube, SoundCloud, Bandcamp, NicoNico, Vimeo, Twitch streams/VODs, and X media URLs.
 - **Simple Discord controls** — queue tracks with `/play <url>`, then use Skip, Loop, Shuffle, AutoMix, and List buttons.
 - **No server setup** — invite Wotoha to Discord and start playing music without managing a host.
@@ -98,12 +98,18 @@ Compose environment variables and a persistent `/wotoha` volume.
 | `WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE` | `0.70` | Minimum beat confidence for beat matching |
 | `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED` | `true` | Enable per-track loudness normalization |
 | `WOTOHA_LOUDNESS_TARGET_LUFS` | `-16.0` | Integrated loudness target |
-| `WOTOHA_LOUDNESS_MAX_BOOST_DB` | `6.0` | Maximum normalization boost |
+| `WOTOHA_LOUDNESS_MAX_BOOST_DB` | `0.0` | Maximum normalization boost; values above `0` opt in to positive gain |
 | `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP` | `-2.0` | True-peak ceiling |
 | `WOTOHA_MAX_QUEUE_LEN` | `512` | Maximum queued tracks per Discord server |
 
 See [`compose.yaml`](compose.yaml) and [`.env.example`](.env.example) for
 the container configuration template.
+
+By default, loudness normalization attenuates tracks that are louder than the
+target but does not amplify quieter tracks. Set
+`WOTOHA_LOUDNESS_MAX_BOOST_DB` above `0` to opt in to positive gain. Existing
+deployments that explicitly set `6.0` continue to use that value; only the
+value used when the variable is omitted changed from `6.0` dB to `0.0` dB.
 
 ## Build from Source
 

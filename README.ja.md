@@ -96,12 +96,17 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 | `WOTOHA_AUTOMIX_MIN_BEAT_CONFIDENCE` | `0.70` | Beat Matchに必要な最低ビート信頼度 |
 | `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED` | `true` | 曲ごとのラウドネス正規化を有効化 |
 | `WOTOHA_LOUDNESS_TARGET_LUFS` | `-16.0` | Integrated Loudnessの目標値 |
-| `WOTOHA_LOUDNESS_MAX_BOOST_DB` | `6.0` | 正規化で許可する最大ブースト量 |
+| `WOTOHA_LOUDNESS_MAX_BOOST_DB` | `0.0` | 正規化で許可する最大ブースト量。`0` より大きい値で増幅を明示的に許可 |
 | `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP` | `-2.0` | True Peakの上限 |
 | `WOTOHA_MAX_QUEUE_LEN` | `512` | Discordサーバーごとの最大キュー長 |
 
 コンテナ設定は [`compose.yaml`](compose.yaml) と
 [`.env.example`](.env.example) を参照してください。
+
+既定では目標より大きい曲を減衰させますが、静かな曲を元音源より増幅しません。
+静かな曲も持ち上げたい場合のみ `WOTOHA_LOUDNESS_MAX_BOOST_DB` に `0` より大きい値を設定してください。
+既存環境でこの変数を明示的に `6.0` にしている場合は、その設定が引き続き尊重されます。
+変わったのは、変数を省略した場合の既定値だけです。
 
 ## ソースからビルド
 

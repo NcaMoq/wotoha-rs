@@ -90,6 +90,13 @@ mod tests {
         }
     }
 
+    fn attenuation_only_config() -> LoudnessConfig {
+        LoudnessConfig {
+            max_boost_db: 0.0,
+            ..config()
+        }
+    }
+
     fn analysis(integrated_lufs: Option<f32>, true_peak_dbtp: Option<f32>) -> TrackAnalysis {
         let mut analysis = TrackAnalysis::unanalyzed(Duration::from_secs(180));
         analysis.integrated_lufs = integrated_lufs;
@@ -123,10 +130,42 @@ mod tests {
     }
 
     #[test]
+    fn attenuation_only_policy_does_not_boost_quiet_tracks() {
+        let gain = loudness_normalization_gain(
+            &attenuation_only_config(),
+            Some(&analysis(Some(-20.0), Some(-8.0))),
+        );
+        assert_eq!(gain, 1.0);
+    }
+
+    #[test]
+    fn attenuation_only_policy_still_reduces_loud_tracks() {
+        let gain = loudness_normalization_gain(
+            &attenuation_only_config(),
+            Some(&analysis(Some(-10.0), Some(-8.0))),
+        );
+        assert!((gain_db(gain) + 6.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn boost_is_limited_by_configured_maximum() {
         let gain =
             loudness_normalization_gain(&config(), Some(&analysis(Some(-30.0), Some(-20.0))));
         assert!((gain_db(gain) - 6.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn explicit_boost_reaches_target_when_true_peak_allows_it() {
+        let gain = loudness_normalization_gain(&config(), Some(&analysis(Some(-20.0), Some(-8.0))));
+        assert!((gain_db(gain) - 4.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn explicit_three_decibel_boost_remains_supported() {
+        let mut config = attenuation_only_config();
+        config.max_boost_db = 3.0;
+        let gain = loudness_normalization_gain(&config, Some(&analysis(Some(-20.0), Some(-8.0))));
+        assert!((gain_db(gain) - 3.0).abs() < 0.0001);
     }
 
     #[test]
