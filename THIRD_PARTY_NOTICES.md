@@ -12,7 +12,7 @@ The supported production artifact is the lower-case GHCR image
 `ghcr.io/ncamoq/wotoha-rs`, built for `linux/amd64`. The final image contains
 the Wotoha executable, embedded Beat This!/RTen model assets, and pinned
 yt-dlp and Deno runtime executables. The image keeps this notice and the
-project license under `/app/licenses/`; `/data` is the only persistent
+project license under `/app/licenses/`; `/wotoha` is the only persistent
 writable application area.
 
 The bundled yt-dlp executable is distributed under the GNU General Public
@@ -58,6 +58,16 @@ canary. The independently downloaded programs remain subject to their upstream
 licenses and are not part of the Wotoha release archive.
 
 ## Rust application dependencies
+
+The gateway library is vendored at the locked upstream package version shown
+in `vendor/serenity/Cargo.toml` because the workspace applies a local Cargo
+patch and must build deterministically without resolving that package from a
+moving registry checkout. The vendored tree is reviewed as source, its
+`LICENSE.md` is retained, and updates must record the upstream release version,
+the complete local diff, and the reason each local patch is still needed.
+To update it, compare the new upstream release against the current vendored
+tree, rerun the full workspace and container gates, and remove the local patch
+when the upstream release makes it unnecessary.
 
 Both Linux archives include:
 

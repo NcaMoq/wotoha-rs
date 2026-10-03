@@ -2,7 +2,7 @@
 
 This document describes the reproducible local development environment for
 the Wotoha workspace. It is based on the repository requirements at the
-current `main` baseline (`dd3dba627d8f778352b1ee6abd40839e7131713e`) and does
+current `main` baseline and does
 not change production behavior.
 
 ## Required toolchain
@@ -91,14 +91,14 @@ docker run --rm --entrypoint id wotoha-local:dev -u
 docker run --rm \
   --read-only \
   --tmpfs /tmp:rw,exec,mode=1777 \
-  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
   wotoha-local:dev --self-check
 ```
 
 The expected container user is UID `10001`. The image must not require a
-writable root filesystem and must keep application data under `/data`.
+writable root filesystem and must keep application data under `/wotoha`.
 
 ## Namespace and bubblewrap note
 

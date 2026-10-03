@@ -9,15 +9,16 @@ native Wotoha application updater.
 
 1. Record the current immutable Wotoha image tag and Discord configuration.
 2. Install Docker Engine and Compose on the Linux host.
-3. Copy compose.yaml and .env.example to the host.
-4. Set DISCORD_TOKEN and an immutable WOTOHA_IMAGE_TAG in .env.
+3. Copy compose.yaml, `.env.example`, and `runtime.env.example` to the host.
+4. Set `DISCORD_TOKEN` in `runtime.env` and an immutable `WOTOHA_IMAGE_TAG` in `.env`.
 5. Run the offline self-check before connecting the bot.
 6. Start the service with docker compose up -d.
 7. After observing healthy logs, stop and disable the old native service.
 
-The named wotoha-data volume is the persistent boundary for the container.
-Move any analysis cache or operational logs that must be retained into that
-volume; the application binary and its container filesystem are immutable.
+The host `./data` directory, mounted at `/wotoha`, is the persistent boundary
+for the container. Move any analysis cache, reconnect state, or operational
+logs that must be retained into that directory; the application binary and its
+container filesystem are immutable.
 
 ## Legacy updater boundary
 

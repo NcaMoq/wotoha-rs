@@ -11,15 +11,21 @@ The canonical image is ghcr.io/ncamoq/wotoha-rs. Use a full SHA tag
 sha-<40-hex-characters> or a release version tag. Do not use latest for an
 operational deployment.
 
-Create a local environment file and set the Discord token:
+Create the Compose interpolation file and a private runtime file:
 
 ~~~bash
 cp .env.example .env
-# Set DISCORD_TOKEN in .env before continuing.
+cp runtime.env.example runtime.env
+# Set DISCORD_TOKEN in runtime.env and keep that file mode 0600.
+chmod 0600 runtime.env
 export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
 docker compose pull
 docker compose up -d
 ~~~
+
+`.env` supplies Compose interpolation such as the immutable image tag and
+optional host data directory. `runtime.env` is loaded into the container and
+contains the application settings and secret; it is never committed.
 
 The Compose file intentionally has no published ports or fake healthcheck.
 Discord voice and gateway traffic are outbound connections. The service runs
@@ -28,18 +34,18 @@ uses a read-only root filesystem, and provides only /tmp as a tmpfs.
 
 ## Persistent data and logs
 
-Only /data is writable and persistent:
+Only /wotoha is writable and persistent:
 
-- /data/cache/analysis contains the bounded analysis cache.
-- /data/logs contains the optional secondary runtime log.
-- /data/tools is reserved for a separately managed, SHA-256-verified yt-dlp
+- /wotoha/cache/analysis contains the bounded analysis cache.
+- /wotoha/logs contains the optional secondary runtime log.
+- /wotoha/tools is reserved for a separately managed, SHA-256-verified yt-dlp
   override named yt-dlp with a matching yt-dlp.sha256 sidecar.
 
 The production yt-dlp resolver has one explicit, deterministic order:
 
 1. `WOTOHA_YTDLP_PATH`, when an administrator explicitly provides an absolute
    path.
-2. `/data/tools/yt-dlp`, only when `/data/tools/yt-dlp.sha256` verifies its
+2. `/wotoha/tools/yt-dlp`, only when `/wotoha/tools/yt-dlp.sha256` verifies its
    contents.
 3. The immutable image-pinned `/app/tools/yt-dlp-fallback`.
 4. The legacy native `/opt/wotoha/bin/yt-dlp` path, only when present for
@@ -54,17 +60,17 @@ that variable.
 stdout and stderr are the primary logs. The application handles SIGTERM
 directly as PID 1 and has a 30-second Compose stop grace period. The image
 does not self-update its application binary. A separate yt-dlp updater may
-maintain the optional /data/tools override without restarting Wotoha.
+maintain the optional /wotoha/tools override without restarting Wotoha.
 
 ## Offline preflight
 
 The image provides a self-check that does not load Discord credentials or make
-network requests. It verifies that /data is writable, initializes the embedded
+network requests. It verifies that /wotoha is writable, initializes the embedded
 Beat This!/rten models, and runs the pinned yt-dlp and Deno version commands.
 
 ~~~bash
 docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
-  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
   --cap-drop=ALL --security-opt=no-new-privileges:true \
   ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
 ~~~
@@ -85,7 +91,31 @@ docker compose logs --since=5m wotoha
 ~~~
 
 To roll back, set the old immutable tag and repeat the same commands. The
-named wotoha-data volume is retained across image changes.
+host `./data` directory is retained across image changes.
+
+### Migrating the former named volume
+
+Older Compose deployments used a Docker-managed volume for the persistent
+data. Before the first container recreation, copy that volume into the host
+directory that will be mounted at `/wotoha`; do not mount both stores at the
+same time:
+
+~~~bash
+mkdir -p /home/ncamoq/wotoha/data
+docker run --rm \
+  --mount source=wotoha-data,destination=/from,readonly \
+  --mount type=bind,source=/home/ncamoq/wotoha/data,destination=/to \
+  debian:bookworm-slim \
+  sh -c 'cp -a /from/. /to/'
+~~~
+
+If the old volume has a different name, replace only `source=` after checking
+`docker volume ls`. Inspect the copy, set `WOTOHA_DATA_DIR=/home/ncamoq/wotoha/data`
+in `.env`, and start the new Compose service. Keep the old volume untouched
+until the new container has passed `--self-check` and has operated normally
+through one restart; after that, remove it only under the host's normal change
+procedure. The application writes to one `/wotoha` mount and does not perform
+dual writes during migration.
 
 ## Building locally
 
@@ -102,7 +132,7 @@ docker buildx build --platform linux/amd64 --load \
   --build-arg IMAGE_VERSION=local \
   --tag wotoha-rs:local .
 docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
-  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
   wotoha-rs:local --self-check
 ~~~
 

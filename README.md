@@ -81,7 +81,7 @@ The now-playing message provides these controls:
 ## Configuration
 
 Wotoha RS reads `.env` during local development. Supported production uses
-Compose environment variables and a persistent `/data` volume.
+Compose environment variables and a persistent `/wotoha` volume.
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
@@ -216,10 +216,15 @@ TensorRT, NVML, or a GPU. Native Cargo execution remains supported for Linux
 development and CI; the production image is the supported deployment unit.
 
 Choose an immutable image tag such as sha-<full-git-sha> or a release version.
-Do not use an unqualified moving latest tag:
+Do not use an unqualified moving latest tag. Keep Compose interpolation in
+`.env` and application settings, including the Discord token, in the
+untracked `runtime.env` file:
 
 ~~~bash
 cp .env.example .env
+cp runtime.env.example runtime.env
+# Set DISCORD_TOKEN in runtime.env, then keep it private.
+chmod 0600 runtime.env
 export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
 docker compose pull
 docker compose up -d
@@ -227,13 +232,13 @@ docker compose logs -f wotoha
 ~~~
 
 The Compose service is outbound-only, runs as a dedicated non-root user, uses
-a read-only root filesystem, drops Linux capabilities, and persists only /data.
+a read-only root filesystem, drops Linux capabilities, and persists only /wotoha.
 stdout/stderr are the primary logs. Before a rollout, run the offline
 self-check without Discord credentials:
 
 ~~~bash
 docker run --rm --read-only --tmpfs /tmp \
-  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
+  --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
   ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
 ~~~
 

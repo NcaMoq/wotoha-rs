@@ -3,15 +3,15 @@
 Production containers use the immutable image-pinned fallback at
 `/app/tools/yt-dlp-fallback` and `/app/tools/deno`. The application image is
 immutable and does not self-update. A separately managed optional yt-dlp
-override may be placed at `/data/tools/yt-dlp` only when its
-`/data/tools/yt-dlp.sha256` sidecar matches the executable. The independent
+override may be placed at `/wotoha/tools/yt-dlp` only when its
+`/wotoha/tools/yt-dlp.sha256` sidecar matches the executable. The independent
 yt-dlp updater remains a migration-only concern for legacy native hosts.
 
 The yt-dlp resolution order is:
 
 1. `WOTOHA_YTDLP_PATH`: an explicit administrator override, which must be an
    absolute path.
-2. The verified managed override `/data/tools/yt-dlp`.
+2. The verified managed override `/wotoha/tools/yt-dlp`.
 3. The immutable image fallback `/app/tools/yt-dlp-fallback`.
 4. The legacy `/opt/wotoha/bin/yt-dlp` path, only when retained for migration.
 
