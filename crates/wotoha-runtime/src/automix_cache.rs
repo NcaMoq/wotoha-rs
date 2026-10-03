@@ -1847,21 +1847,21 @@ fn decode_cue_provenance(
 
 fn encode_human_cue_source(source: HumanCueSource) -> u8 {
     match source {
-        HumanCueSource::RekordboxMemory => 0,
-        // Keep the legacy HotCue wire value stable. The explicit Rekordbox
-        // spelling gets a new value so old records remain distinguishable.
+        // Keep all historical source IDs stable. The imported and legacy
+        // generic hot-cue values remain distinct in existing records.
+        HumanCueSource::ImportedMemoryCue => 0,
         HumanCueSource::HotCue => 1,
         HumanCueSource::ManualWotoha => 2,
-        HumanCueSource::RekordboxHotCue => 3,
+        HumanCueSource::ImportedHotCue => 3,
     }
 }
 
 fn decode_human_cue_source(value: u8) -> Result<HumanCueSource, String> {
     match value {
-        0 => Ok(HumanCueSource::RekordboxMemory),
+        0 => Ok(HumanCueSource::ImportedMemoryCue),
         1 => Ok(HumanCueSource::HotCue),
         2 => Ok(HumanCueSource::ManualWotoha),
-        3 => Ok(HumanCueSource::RekordboxHotCue),
+        3 => Ok(HumanCueSource::ImportedHotCue),
         _ => Err("invalid human cue source".to_owned()),
     }
 }
@@ -2249,18 +2249,40 @@ mod tests {
     }
 
     #[test]
-    fn v2_cache_roundtrip_preserves_rekordbox_hot_cue_provenance() {
+    fn v2_cache_roundtrip_preserves_imported_hot_cue_provenance() {
         let directory = TestDirectory::new();
         let cache = AnalysisCache::new(directory.path(), "automix-v2-test").unwrap();
         let key = AnalysisCacheKey::new("youtube", "v2-hot-cue", None, None).unwrap();
         let mut expected = analysis_v2();
         let mut hot_cue = DjCue::new(2, UnitInterval::ONE);
-        hot_cue.provenance = CueProvenance::Imported(HumanCueSource::RekordboxHotCue);
+        hot_cue.provenance = CueProvenance::Imported(HumanCueSource::ImportedHotCue);
         expected.cues.push(hot_cue);
 
         cache.store_v2(&key, &expected).unwrap();
         let restored = cache.load_v2(&key).unwrap().expect("V2 cache hit");
         assert_eq!(restored.cues[1].provenance, hot_cue.provenance);
+    }
+
+    #[test]
+    fn human_cue_source_wire_ids_remain_legacy_compatible() {
+        assert_eq!(
+            encode_human_cue_source(HumanCueSource::ImportedMemoryCue),
+            0
+        );
+        assert_eq!(encode_human_cue_source(HumanCueSource::HotCue), 1);
+        assert_eq!(encode_human_cue_source(HumanCueSource::ManualWotoha), 2);
+        assert_eq!(encode_human_cue_source(HumanCueSource::ImportedHotCue), 3);
+
+        assert_eq!(
+            decode_human_cue_source(0),
+            Ok(HumanCueSource::ImportedMemoryCue)
+        );
+        assert_eq!(decode_human_cue_source(1), Ok(HumanCueSource::HotCue));
+        assert_eq!(decode_human_cue_source(2), Ok(HumanCueSource::ManualWotoha));
+        assert_eq!(
+            decode_human_cue_source(3),
+            Ok(HumanCueSource::ImportedHotCue)
+        );
     }
 
     #[test]

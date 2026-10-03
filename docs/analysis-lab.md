@@ -16,8 +16,8 @@ external application. External DJ software is an observation reference, not
 ground truth.
 
 The observation schema is vendor-neutral. It records `sample_id`, the exact
-transferred WAV file SHA-256 and optional decoded PCM SHA-256, observer
-product/version/platform, public analysis settings,
+transferred WAV file SHA-256 and optional decoded PCM SHA-256, generic observer
+identity/version/environment, public analysis settings,
 optional reported BPM, optional beatgrid/downbeat/key/meter results, completion
 state, timing, and notes. Optional fields are `Option` values where absence
 must remain distinguishable from an observed empty result. For example,
@@ -34,14 +34,24 @@ When importing an observation against a `BlackboxManifest`, the evaluator
 checks sample ID, `wav_file_sha256`, supplied `pcm_sha256`, and supplied
 `ground_truth_sha256` before scoring.
 
-The current clean-room target can be represented by an observer identity such
-as `Traktor Pro 4`, version `4.1.1 (23)`, macOS. No binary is needed by this
-crate. A future Team A packet can be passed to `--external-observations` after
-its hashes and schema have been validated.
+External clean-room references are represented through generic observer
+identities. Vendor-specific acquisition details and raw observations are
+intentionally kept outside this repository. A future neutral observation
+packet can be passed to `--external-observations` after its hashes and schema
+have been validated.
 
-The lab does not contain a Traktor implementation or a vendor-specific
-adapter. External records are generic observations, grouped by observer
-product/version/settings and matched by cryptographic audio identity.
+The lab contains no vendor-specific implementation or adapter. External
+records are generic observations, grouped by observer identity/version/settings
+and matched by cryptographic audio identity.
+
+Repository clean-room policy:
+
+- External observers are represented only by generic identities.
+- Vendor-specific acquisition details stay outside the repository.
+- Raw external observations stay outside the repository.
+- Research consumes only neutral observation packets.
+- External observations never directly determine production implementation.
+- Production changes require independent Wotoha evidence and regression tests.
 
 ## Synthetic corpus
 
@@ -385,9 +395,9 @@ cargo run --release --locked -p wotoha-analysis-lab -- \
   export-blackbox --output /tmp/wotoha-blackbox-v1 --seed 246813579
 cargo run --release --locked -p wotoha-analysis-lab -- \
   package-blackbox --input /tmp/wotoha-blackbox-v1 \
-  --output /tmp/wotoha-traktor-blackbox-v1.zip
+  --output /tmp/wotoha-blackbox-v1.zip
 cargo run --release --locked -p wotoha-analysis-lab -- \
-  verify-blackbox /tmp/wotoha-traktor-blackbox-v1.zip
+  verify-blackbox /tmp/wotoha-blackbox-v1.zip
 ```
 
 Packaging uses stable ordering, normalized timestamps, stored entries, bounded

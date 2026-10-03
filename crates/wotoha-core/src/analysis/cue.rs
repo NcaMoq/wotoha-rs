@@ -2,7 +2,7 @@
 //!
 //! Cue generation here is intentionally heuristic and bounded.  It consumes
 //! beat indexes and already-computed structure evidence; it does not parse
-//! Rekordbox XML, load a model, or perform DSP.
+//! vendor-specific cue files, load a model, or perform DSP.
 
 use std::{borrow::Borrow, cmp::Ordering, collections::BTreeMap, time::Duration};
 
@@ -259,11 +259,12 @@ impl DjCue {
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanCueSource {
-    RekordboxMemory,
-    /// Primary source name for Rekordbox hot cues.
-    RekordboxHotCue,
-    /// Legacy spelling retained for callers and cache records that used the
-    /// shorter source name.
+    /// A memory cue imported through the neutral external-cue boundary.
+    ImportedMemoryCue,
+    /// A hot cue imported through the neutral external-cue boundary.
+    ImportedHotCue,
+    /// Legacy generic spelling retained for callers and cache records that
+    /// used the shorter source name.
     HotCue,
     #[default]
     ManualWotoha,
@@ -272,8 +273,8 @@ pub enum HumanCueSource {
 impl HumanCueSource {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::RekordboxMemory => "rekordbox_memory",
-            Self::RekordboxHotCue => "rekordbox_hot_cue",
+            Self::ImportedMemoryCue => "imported_memory_cue",
+            Self::ImportedHotCue => "imported_hot_cue",
             Self::HotCue => "hot_cue",
             Self::ManualWotoha => "manual_wotoha",
         }
@@ -761,7 +762,7 @@ mod tests {
         let beat_times = [Duration::from_secs(1), Duration::from_secs(2)];
         let human = HumanCue::new(
             Duration::from_millis(1_950),
-            HumanCueSource::RekordboxHotCue,
+            HumanCueSource::ImportedHotCue,
             HumanCueKind::MixIn,
         );
         let dj = human.to_dj_cue(&beat_times).expect("beat grid");
@@ -771,20 +772,18 @@ mod tests {
             roundtrip,
             HumanCue::new(
                 Duration::from_secs(2),
-                HumanCueSource::RekordboxHotCue,
+                HumanCueSource::ImportedHotCue,
                 HumanCueKind::MixIn,
             )
         );
     }
 
     #[test]
-    fn human_cue_sources_keep_primary_and_legacy_names_distinct() {
-        assert_eq!(
-            HumanCueSource::RekordboxHotCue.as_str(),
-            "rekordbox_hot_cue"
-        );
+    fn human_cue_sources_keep_imported_and_legacy_names_distinct() {
+        assert_eq!(HumanCueSource::ImportedHotCue.as_str(), "imported_hot_cue");
         assert_eq!(HumanCueSource::HotCue.as_str(), "hot_cue");
-        assert!(HumanCueSource::RekordboxHotCue.is_imported());
+        assert!(HumanCueSource::ImportedMemoryCue.is_imported());
+        assert!(HumanCueSource::ImportedHotCue.is_imported());
         assert!(HumanCueSource::HotCue.is_imported());
         assert!(!HumanCueSource::ManualWotoha.is_imported());
     }

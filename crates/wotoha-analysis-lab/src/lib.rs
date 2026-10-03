@@ -4089,8 +4089,8 @@ pub fn run_ground_truth_research(
             "production BeatEvent timing unchanged".into(),
             "production tempo and meter resolvers unchanged".into(),
             "research algorithms are not production-callable".into(),
-            "Traktor binary and proprietary resources were not inspected".into(),
-            "Rekordbox automatic analysis was not used".into(),
+            "vendor-specific binaries and proprietary resources were not inspected".into(),
+            "automatic analysis from external products was not used".into(),
             "reports and WAVs remain outside Git and Docker".into(),
         ],
     };
@@ -4294,7 +4294,7 @@ pub fn run_tempo_advisor_research(
             "none: production analyzers and resolvers unchanged".into(),
             "Neural tempo candidates change labels in this report only".into(),
             "Classical beat events, grid phase, meter, and downbeats remain authoritative".into(),
-            "Traktor and Rekordbox automatic analysis are not advisor inputs".into(),
+            "external product analysis is not an advisor input".into(),
         ],
     };
     write_json(&output_dir.join("tempo-advisor-research.json"), &report)?;
@@ -5040,7 +5040,7 @@ fn tempo_advisor_markdown(report: &TempoAdvisorReport) -> String {
         report.recommendation,
     );
     markdown.push_str(
-        "The hypothetical architecture fixes Classical beats, grid phase, meter, and downbeats. Neural candidates can change only a research tempo label. Traktor and Rekordbox are not advisor inputs.\n\n",
+        "The hypothetical architecture fixes Classical beats, grid phase, meter, and downbeats. Neural candidates can change only a research tempo label. External product analysis is not an advisor input.\n\n",
     );
     markdown.push_str("## Baseline and refinement comparison\n\n| Candidate | canonical | half/double/other wrong | absolute BPM MAE/median/p95 |\n|---|---:|---:|---:|\n");
     for (name, metric) in [
@@ -5111,7 +5111,7 @@ fn tempo_advisor_markdown(report: &TempoAdvisorReport) -> String {
         ));
     }
     markdown.push_str(&format!(
-        "\nThe feature set was frozen before final outer OOF. It excludes truth, IDs, family, hashes, lineage, transform identity, Traktor, and Rekordbox.\n\n## Nested grouped OOF advisor\n\nGrouping: `{}`\nOuter folds: {}\nExact PCM overlap: {}\nLineage overlap: {}\nNeural coverage: {}\nAbstentions: {}\nFalse accepts: {} ({:?})\nCanonical rescues: {} ({:?})\nFull-data refit threshold: {:.6}; full-data refit is not held-out evidence.\n\n",
+        "\nThe feature set was frozen before final outer OOF. It excludes truth, IDs, family, hashes, lineage, transform identity, and vendor-specific external analysis.\n\n## Nested grouped OOF advisor\n\nGrouping: `{}`\nOuter folds: {}\nExact PCM overlap: {}\nLineage overlap: {}\nNeural coverage: {}\nAbstentions: {}\nFalse accepts: {} ({:?})\nCanonical rescues: {} ({:?})\nFull-data refit threshold: {:.6}; full-data refit is not held-out evidence.\n\n",
         report.nested_oof.grouping_rule,
         report.nested_oof.outer_fold_count,
         report.nested_oof.outer_folds.iter().any(|fold| fold.exact_pcm_overlap),
