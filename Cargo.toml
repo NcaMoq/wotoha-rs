@@ -46,7 +46,10 @@ url = "2.5.7"
 [profile.release]
 codegen-units = 1
 lto = "fat"
-panic = "abort"
+# Production recovery boundaries use catch_unwind around model/planner calls.
+# Keep release behavior aligned with that contract; a panic is recovered where
+# the boundary is explicit, and an unrecovered panic still terminates normally.
+panic = "unwind"
 strip = "symbols"
 
 [patch.crates-io]

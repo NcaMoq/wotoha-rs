@@ -32,7 +32,7 @@ maintenance of existing Ubuntu installations.
 - Slash commands and button actions now enforce same-room control rules instead of letting another voice channel steal or manipulate the active session.
 - Prepared playback now has its own short-lived cache, canonical-key dedupe, and bounded refresh path instead of forcing a provider re-fetch on every handoff to runtime.
 - Runtime diagnostics now flow through tracing only, and signed media URLs are redacted before they are written to disk.
-- Release builds now use `lto=fat`, `codegen-units=1`, `panic=abort`, and symbol stripping.
+- Release builds now use `lto=fat`, `codegen-units=1`, `panic=unwind`, and symbol stripping. Model and planner recovery boundaries use `catch_unwind`; unrecovered panics still terminate the process for supervisor restart.
 
 ## What is still a real compromise
 
@@ -65,6 +65,7 @@ The following work still needs to happen:
 - `RUST_LOG`: tracing filter used by stdout and `/var/log/wotoha/wotoha-app.runtime.log`.
 - `WOTOHA_LOG_DIR`: directory for the runtime log file.
 - `WOTOHA_LOG_FILE`: file name created under `WOTOHA_LOG_DIR`. Directory separators are rejected.
+- `WOTOHA_LOG_FILE_ENABLED`: enables the optional secondary file writer; Docker defaults this to `false` so stdout/stderr remain the primary bounded log stream.
 - `WOTOHA_LOG_ANSI`: `true` enables ANSI color sequences in stdout and the file writer; keep `false` for systemd logs.
 - `WOTOHA_DEFAULT_VOLUME`: playback volume value, accepted range `0.0..=2.0`.
 - `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED`: enables per-track loudness normalization; defaults to `true`.
@@ -78,4 +79,9 @@ The default maximum normalization boost changed from `6.0` dB to `0.0` dB.
 This affects only deployments that omit `WOTOHA_LOUDNESS_MAX_BOOST_DB`.
 Deployments that explicitly set `6.0` or another value retain that setting.
 
-Startup applies these values before the Discord client is built. Logging settings configure both stdout and the runtime log file. Playback volume is applied through the runtime track handle. Queue and pending enqueue limits are checked before enqueue work enters the playback coordinator.
+Startup applies these values before the Discord client is built. File logging is
+optional and is not described as a runtime size bound; Docker disables it by
+default and relies on the container engine's configured stdout/stderr log
+rotation. Playback volume
+is applied through the runtime track handle. Queue and pending enqueue limits
+are checked before enqueue work enters the playback coordinator.

@@ -38,6 +38,7 @@ pub struct BotConfig {
 pub struct LogConfig {
     pub directory: PathBuf,
     pub file_name: String,
+    pub file_enabled: bool,
     pub rust_log: String,
     pub ansi: bool,
 }
@@ -124,6 +125,7 @@ impl BotConfig {
             "WOTOHA_LOG_FILE",
             DEFAULT_LOG_FILE,
         )?)?;
+        let log_file_enabled = read_optional_bool(&get, "WOTOHA_LOG_FILE_ENABLED", true)?;
         let rust_log = read_optional_string(&get, "RUST_LOG", DEFAULT_RUST_LOG)?;
         let log_ansi = read_optional_bool(&get, "WOTOHA_LOG_ANSI", DEFAULT_LOG_ANSI)?;
         let max_queue_len = read_optional_usize(
@@ -259,6 +261,7 @@ impl BotConfig {
             logging: LogConfig {
                 directory: PathBuf::from(log_dir),
                 file_name: log_file,
+                file_enabled: log_file_enabled,
                 rust_log,
                 ansi: log_ansi,
             },
@@ -470,6 +473,7 @@ mod tests {
             std::path::PathBuf::from("/wotoha/logs")
         );
         assert_eq!(config.logging.file_name, "wotoha-app.runtime.log");
+        assert!(config.logging.file_enabled);
         assert_eq!(config.logging.rust_log, "info,wotoha_debug=info");
         assert!(!config.logging.ansi);
         assert_eq!(config.playback.default_volume, 0.10);
@@ -498,6 +502,7 @@ mod tests {
             ("DISCORD_TOKEN", " token "),
             ("WOTOHA_LOG_DIR", "/var/log/wotoha"),
             ("WOTOHA_LOG_FILE", "runtime.log"),
+            ("WOTOHA_LOG_FILE_ENABLED", "false"),
             ("RUST_LOG", "warn,wotoha=debug"),
             ("WOTOHA_LOG_ANSI", "true"),
             ("WOTOHA_DEFAULT_VOLUME", "0.25"),
@@ -525,6 +530,7 @@ mod tests {
             std::path::PathBuf::from("/var/log/wotoha")
         );
         assert_eq!(config.logging.file_name, "runtime.log");
+        assert!(!config.logging.file_enabled);
         assert_eq!(config.logging.rust_log, "warn,wotoha=debug");
         assert!(config.logging.ansi);
         assert_eq!(config.playback.default_volume, 0.25);

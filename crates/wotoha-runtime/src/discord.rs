@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
@@ -34,6 +34,7 @@ use wotoha_control::{ComponentAction, ComponentOutcome, ControlService};
 use wotoha_core::{
     QueuePreview, TrackMetadata,
     debug::{append_debug_log, sanitize_log_message},
+    operational_metrics,
     ui::{
         self, AUTOMIX_NICKNAME, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP,
         BUTTON_LOOP_LABEL, BUTTON_QUEUE, BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL,
@@ -107,6 +108,12 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         }
     }
 
+    fn record_active_voice_counts(&self) {
+        let count = self.active_voice_channels.len();
+        operational_metrics().set_active_guilds(count);
+        operational_metrics().set_active_voice_sessions(count);
+    }
+
     pub async fn notify_restart(&self, http: &Http) {
         let targets = self
             .notification_channels
@@ -173,6 +180,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             match self.runtime.ensure_joined(guild_id, channel_id).await {
                 Ok(_) => {
                     self.active_voice_channels.insert(guild_id, channel_id);
+                    self.record_active_voice_counts();
                     let serenity_guild_id = serenity::all::GuildId::new(guild_id.get());
                     let bot_user_id = UserKey::new(ctx.cache.current_user().id.get());
                     self.control.bootstrap_voice_state(
@@ -220,6 +228,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> serenity::Result<()> {
+        let interaction_started = Instant::now();
         let Some(guild_id) = command.guild_id else {
             return Ok(());
         };
@@ -313,6 +322,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         }
 
         command.defer(&ctx.http).await?;
+        operational_metrics().observe_interaction_ack(interaction_started.elapsed());
         let joined_now = match self
             .runtime
             .ensure_joined(guild_key, user_channel_key)
@@ -393,6 +403,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 );
                 if joined_now && !self.control.has_current_track(guild_key) {
                     self.active_voice_channels.remove(&guild_key);
+                    self.record_active_voice_counts();
                     self.control.disconnect_guild(guild_key).await;
                 }
                 command
@@ -416,6 +427,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         ctx: &Context,
         component: &ComponentInteraction,
     ) -> serenity::Result<()> {
+        let interaction_started = Instant::now();
         let Some(guild_id) = component.guild_id else {
             return Ok(());
         };
@@ -439,6 +451,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         // control operation may wait on per-guild playback state, so acknowledge
         // before taking that lock or performing any follow-up HTTP work.
         component.defer(&ctx.http).await?;
+        operational_metrics().observe_interaction_ack(interaction_started.elapsed());
 
         match self
             .control
@@ -593,6 +606,9 @@ where
 {
     async fn ready(&self, ctx: Context, ready: Ready) {
         append_debug_log("discord: ready event received");
+        operational_metrics().record_gateway_ready();
+        operational_metrics().set_active_guilds(self.active_voice_channels.len());
+        operational_metrics().set_active_voice_sessions(self.active_voice_channels.len());
         update_version_activity(&ctx);
         if self.startup.boot_tasks_done.swap(true, Ordering::AcqRel) {
             info!("Gateway ready received again; skipping boot-only tasks");
@@ -674,9 +690,11 @@ where
             match new_channel {
                 Some(channel_id) => {
                     self.active_voice_channels.insert(guild_key, channel_id);
+                    self.record_active_voice_counts();
                 }
                 None => {
                     self.active_voice_channels.remove(&guild_key);
+                    self.record_active_voice_counts();
                     self.notification_channels.remove(&guild_key);
                     let _ = guild_id.edit_nickname(&ctx.http, None).await;
                 }
@@ -696,6 +714,7 @@ where
         }
 
         self.active_voice_channels.remove(&guild_key);
+        self.record_active_voice_counts();
         self.control.disconnect_guild(guild_key).await;
         let _ = guild_id.edit_nickname(&ctx.http, None).await;
     }

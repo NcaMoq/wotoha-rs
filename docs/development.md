@@ -62,7 +62,9 @@ cargo check --workspace --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
 
-bash -n deploy/*.sh deploy/tests/*.sh
+for script in deploy/*.sh deploy/tests/*.sh; do
+    bash -n "$script"
+done
 bash deploy/tests/run.sh
 cargo run --locked -p wotoha-analysis-lab -- --help
 ```
@@ -70,6 +72,17 @@ cargo run --locked -p wotoha-analysis-lab -- --help
 The analysis lab provides research commands including `research-pass` and
 `research-tempo-advisor`. Research outputs and corpus data belong outside the
 repository; do not commit them or `.wotoha-analysis/`.
+
+Runtime observability is aggregate-only: the application keeps atomic counters
+and bounded `count/sum/max` latency accumulators for lifecycle, media, analysis,
+playback, cache, and shutdown events. It does not use URLs, user IDs, or guild
+IDs as metric labels. A snapshot is emitted at application shutdown.
+
+Runtime lifecycle delivery uses a bounded ingress and bounded per-guild
+mailboxes. Replaceable telemetry may be rejected under pressure; completion,
+transition, error, and disconnect events use reserved bounded overflow slots
+with duplicate identity coalescing. Guild routing remains isolated and stale
+session/generation checks remain in the playback state machine.
 
 ## Container parity
 

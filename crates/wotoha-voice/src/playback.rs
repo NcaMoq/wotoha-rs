@@ -1,9 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -11,17 +12,17 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use thiserror::Error;
 use tokio::sync::{
-    Mutex as AsyncMutex, Semaphore,
-    mpsc::{self, UnboundedReceiver, error::TrySendError, unbounded_channel},
+    Mutex as AsyncMutex, Notify, Semaphore,
+    mpsc::{self, error::TrySendError},
     oneshot,
 };
 use tracing::{debug, info, warn};
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
-    PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent, PlaybackService, RuntimeEventSink,
-    RuntimeTrackHandle, TrackEndReason, TrackStartOptions, TransitionArmFailureKind,
-    TransitionArmResult, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime,
-    VoiceUpdateDecision,
+    PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent, PlaybackService,
+    RuntimeEventReceiver, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
+    TransitionArmFailureKind, TransitionArmResult, UserKey, VoiceActionAccess, VoicePeerSnapshot,
+    VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
@@ -37,6 +38,11 @@ use wotoha_core::{
     config::{AutoMixPlannerMode, BeatmatchBlendConfig, LoudnessConfig},
     debug::append_debug_log,
     loudness::loudness_normalization_gain,
+    operational_metrics,
+};
+
+use crate::playback_events::{
+    MAX_CRITICAL_EVENT_OVERFLOW, is_critical_runtime_event, queue_critical_overflow,
 };
 
 type CompletionSender<ME, RE> = oneshot::Sender<Result<EnqueueOutcome, PlaybackError<ME, RE>>>;
@@ -139,6 +145,8 @@ struct PlaybackCoordinatorInner<M: MediaBackend, R: VoiceRuntime> {
 struct EventWorker {
     id: u64,
     sender: mpsc::Sender<PlaybackRuntimeEvent>,
+    critical_overflow: Arc<Mutex<VecDeque<PlaybackRuntimeEvent>>>,
+    critical_notify: Arc<Notify>,
 }
 
 fn runtime_event_guild(event: &PlaybackRuntimeEvent) -> GuildKey {
@@ -448,7 +456,7 @@ where
         planner_mode: AutoMixPlannerMode,
         automix_beatmatch: BeatmatchBlendConfig,
     ) -> Self {
-        let (events, receiver) = unbounded_channel();
+        let (events, receiver) = RuntimeEventSink::channel();
         let playback = Self {
             inner: Arc::new(PlaybackCoordinatorInner {
                 media,
@@ -476,7 +484,7 @@ where
         self.inner.v2_metrics.snapshot()
     }
 
-    fn spawn_runtime_event_loop(&self, mut receiver: UnboundedReceiver<PlaybackRuntimeEvent>) {
+    fn spawn_runtime_event_loop(&self, mut receiver: RuntimeEventReceiver) {
         let playback = self.clone();
         tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
@@ -497,13 +505,21 @@ where
                     .next_event_worker_id
                     .fetch_add(1, Ordering::Relaxed),
                 sender,
+                critical_overflow: Arc::new(Mutex::new(VecDeque::new())),
+                critical_notify: Arc::new(Notify::new()),
             };
             match self.inner.event_workers.entry(guild_id) {
                 dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
                 dashmap::mapref::entry::Entry::Vacant(entry) => {
                     let worker = candidate.clone();
                     entry.insert(candidate);
-                    self.spawn_guild_event_worker(guild_id, worker.id, receiver);
+                    self.spawn_guild_event_worker(
+                        guild_id,
+                        worker.id,
+                        receiver,
+                        worker.critical_overflow.clone(),
+                        worker.critical_notify.clone(),
+                    );
                     worker
                 }
             }
@@ -511,11 +527,23 @@ where
 
         if let Err(error) = worker.sender.try_send(event) {
             match error {
+                TrySendError::Full(event) if is_critical_runtime_event(&event) => {
+                    let queued =
+                        queue_critical_overflow(&mut worker.critical_overflow.lock(), event);
+                    worker.critical_notify.notify_one();
+                    if !queued {
+                        warn!(
+                            guild_id = guild_id.get(),
+                            queue_limit = MAX_CRITICAL_EVENT_OVERFLOW,
+                            "critical runtime event overflow is saturated; event identity was not duplicated"
+                        );
+                    }
+                }
                 TrySendError::Full(event) => warn!(
                     guild_id = guild_id.get(),
                     event = runtime_event_name(&event),
                     queue_limit = PER_GUILD_EVENT_QUEUE,
-                    "dropping runtime event because the guild queue is full"
+                    "dropping replaceable runtime event because the guild queue is full"
                 ),
                 TrySendError::Closed(_) => {
                     self.inner
@@ -531,10 +559,24 @@ where
         guild_id: GuildKey,
         worker_id: u64,
         mut receiver: mpsc::Receiver<PlaybackRuntimeEvent>,
+        critical_overflow: Arc<Mutex<VecDeque<PlaybackRuntimeEvent>>>,
+        critical_notify: Arc<Notify>,
     ) {
         let playback = self.clone();
         tokio::spawn(async move {
-            while let Some(event) = receiver.recv().await {
+            loop {
+                let notified = critical_notify.notified();
+                let event = if let Ok(event) = receiver.try_recv() {
+                    Some(event)
+                } else if let Some(event) = critical_overflow.lock().pop_front() {
+                    Some(event)
+                } else {
+                    tokio::select! {
+                        event = receiver.recv() => event,
+                        _ = notified => continue,
+                    }
+                };
+                let Some(event) = event else { break };
                 let disconnected = matches!(event, PlaybackRuntimeEvent::VoiceDisconnected { .. });
                 let permit = playback
                     .inner
@@ -669,6 +711,7 @@ where
             if !playback.analysis_in_flight.insert(analysis_key.clone()) {
                 return;
             }
+            operational_metrics().record_analysis_queued();
         }
 
         let coordinator = self.clone();
@@ -710,6 +753,7 @@ where
                 }
                 drop(playback);
                 if late_analysis_for_current {
+                    operational_metrics().record_late_analysis_for_future();
                     debug!(
                         guild_id = guild_id.get(),
                         session_id,
@@ -822,6 +866,7 @@ where
         guild_id: GuildKey,
         source_url: &str,
     ) -> Result<EnqueueOutcome, PlaybackError<M::Error, R::Error>> {
+        let started = Instant::now();
         let session = self.get_or_create_session(guild_id);
         let session_id = session.id;
 
@@ -876,6 +921,7 @@ where
             .await
             .unwrap_or(Err(PlaybackError::SessionExpired));
         drop(reservation);
+        operational_metrics().observe_enqueue(started.elapsed());
         result
     }
 
@@ -2915,13 +2961,16 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
+        let playback_started = Instant::now();
         let playback_id = self.next_playback_id();
+        let media_started = Instant::now();
         let prepared = self
             .inner
             .media
             .prepare_playback(request)
             .await
             .map_err(PlaybackError::Resolve)?;
+        operational_metrics().observe_media_resolve(media_started.elapsed());
         append_debug_log(format!(
             "voice: prepare_playback ok guild_id={} session_id={} provider={} key={} title={}",
             guild_id.get(),
@@ -2966,9 +3015,17 @@ where
             None
         };
         let analysis_available_at_start = cached_analysis.is_some();
+        if self.inner.loudness.enabled && analysis_available_at_start {
+            operational_metrics().record_loudness_cache_hit();
+        } else if self.inner.loudness.enabled {
+            operational_metrics().record_loudness_cache_miss();
+        }
         let normalization_gain =
             loudness_normalization_gain(&self.inner.loudness, cached_analysis.as_ref());
         let effective_initial_gain = initial_gain * normalization_gain;
+        if self.inner.loudness.enabled && analysis_available_at_start {
+            operational_metrics().record_normalized_at_start();
+        }
 
         info!(
             guild_id = guild_id.get(),
@@ -2996,7 +3053,11 @@ where
                 ),
             )
             .await
-            .map_err(PlaybackError::Runtime)?;
+            .map_err(|error| {
+                operational_metrics().record_playback_failure();
+                PlaybackError::Runtime(error)
+            })?;
+        operational_metrics().observe_playback_start(playback_started.elapsed());
         append_debug_log(format!(
             "voice: runtime.play_track ok guild_id={} session_id={} playback_id={} provider={} key={} title={}",
             guild_id.get(),
@@ -3543,13 +3604,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        GuildVoiceIndex, MAX_PENDING_ENQUEUES, PlaybackCoordinator, PlaybackError,
-        compensate_trimmed_source_events, run_automix_fade, track_start_options,
+        GuildVoiceIndex, MAX_CRITICAL_EVENT_OVERFLOW, MAX_PENDING_ENQUEUES, PlaybackCoordinator,
+        PlaybackError, compensate_trimmed_source_events, queue_critical_overflow, run_automix_fade,
+        track_start_options,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::{
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         fmt,
         sync::{
             Arc,
@@ -3592,6 +3654,38 @@ mod tests {
         let (outgoing, incoming) = automix_mix_gains(TransitionKind::Crossfade, 1.0);
         assert!(outgoing.abs() < 0.0001);
         assert_eq!(incoming, 1.0);
+    }
+
+    #[test]
+    fn critical_overflow_is_bounded_and_coalesces_duplicate_lifecycle_events() {
+        let mut overflow = VecDeque::new();
+        let event = PlaybackRuntimeEvent::TrackEnded {
+            guild_id: GuildKey::new(1),
+            session_id: 2,
+            playback_id: PlaybackId::new(3),
+            reason: TrackEndReason::Completed,
+        };
+        assert!(queue_critical_overflow(&mut overflow, event.clone()));
+        assert!(queue_critical_overflow(&mut overflow, event));
+        assert_eq!(overflow.len(), 1);
+
+        for index in 0..MAX_CRITICAL_EVENT_OVERFLOW.saturating_sub(1) {
+            assert!(queue_critical_overflow(
+                &mut overflow,
+                PlaybackRuntimeEvent::VoiceDisconnected {
+                    guild_id: GuildKey::new(index as u64 + 10),
+                    reason: "test".into(),
+                },
+            ));
+        }
+        assert_eq!(overflow.len(), MAX_CRITICAL_EVENT_OVERFLOW);
+        assert!(!queue_critical_overflow(
+            &mut overflow,
+            PlaybackRuntimeEvent::VoiceDisconnected {
+                guild_id: GuildKey::new(99_999),
+                reason: "bounded".into(),
+            },
+        ));
     }
 
     #[test]

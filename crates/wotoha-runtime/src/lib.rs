@@ -34,5 +34,6 @@ pub use beat_this_analysis::{
     track_analysis_v2_from_legacy_with_neural_rhythm,
 };
 pub use discord::{DiscordGateway, recommended_cache_settings};
+pub use reconnect::{reconnect_self_check_read, reconnect_self_check_write};
 pub use songbird::{SongbirdRuntime, SongbirdRuntimeError};
 pub use wotoha_core::analysis::TrackAnalysisV2;

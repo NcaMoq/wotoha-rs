@@ -83,7 +83,7 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 ## 設定
 
 ローカル開発時は `.env` から設定を読み込みます。本番はComposeの
-環境変数と永続 `/data` ボリュームを使用します。
+環境変数と、コンテナ内 `/wotoha`（ホスト側の既定は `./data`）の永続領域を使用します。
 
 | 環境変数 | 既定値 | 用途 |
 | --- | ---: | --- |
@@ -107,6 +107,23 @@ Wotoha RSは曲の切り替え前に、再生中の曲と次の曲を解析し�
 静かな曲も持ち上げたい場合のみ `WOTOHA_LOUDNESS_MAX_BOOST_DB` に `0` より大きい値を設定してください。
 既存環境でこの変数を明示的に `6.0` にしている場合は、その設定が引き続き尊重されます。
 変わったのは、変数を省略した場合の既定値だけです。
+
+## Dockerでの本番起動
+
+本番では、まず設定ファイルを作成し、`runtime.env` の
+`DISCORD_TOKEN` を設定します。
+
+```bash
+cp .env.example .env
+cp runtime.env.example runtime.env
+chmod 0600 runtime.env
+export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>
+docker compose pull
+docker compose up -d
+```
+
+`WOTOHA_IMAGE_REF` は公開済みの digest reference を使ってください。
+`runtime.env` はGitへ追加しません。
 
 ## ソースからビルド
 
@@ -215,29 +232,33 @@ yt-dlp/Denoが含まれます。NVIDIA、CUDA、cuDNN、TensorRT、NVML、GPUは
 必要ありません。LinuxでのCargo実行は開発・CI向けにサポートしますが、
 本番の運用単位はDockerイメージです。
 
-sha-<完全なGit SHA> またはリリースバージョンの不変タグを使用し、動く
-latest は使わないでください。
+本番では `ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>` のような
+content-addressed referenceを優先してください。`sha-<完全なGit SHA>` は
+source-correlatedな便利なタグですが技術的には変更可能で、digestだけが
+不変のイメージ識別子です。動くlatestは使わないでください。
 
 ~~~bash
 cp .env.example .env
-export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
+export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>
 docker compose pull
 docker compose up -d
 docker compose logs -f wotoha
 ~~~
 
 Composeサービスは外向き通信のみ、専用の非rootユーザー、read-only root
-filesystem、Linux capability全削除で動作し、永続化するのは /data だけです。
+filesystem、Linux capability全削除で動作し、コンテナ内の永続領域は
+`/wotoha`（ホスト側の既定は `./data`）だけです。
 stdout/stderrを主ログとし、Discord認証情報なしでオフラインself-checkを
 実行できます。
 
 ~~~bash
-docker run --rm --read-only --tmpfs /tmp \
-  --mount type=tmpfs,destination=/data,tmpfs-mode=0777 \
-  ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
+docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
+  --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
+  --cap-drop=ALL --security-opt=no-new-privileges:true \
+  ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest> --self-check
 ~~~
 
-ロールバックは WOTOHA_IMAGE_TAG を以前の不変タグに変更して
+ロールバックは WOTOHA_IMAGE_REF を以前のdigest referenceに変更して
 docker compose up -d を実行します。詳細はDockerデプロイ手順を参照してください。
 
 ## ドキュメント

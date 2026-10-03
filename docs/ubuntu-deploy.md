@@ -7,10 +7,10 @@ native Wotoha application updater.
 
 ## Migration
 
-1. Record the current immutable Wotoha image tag and Discord configuration.
+1. Record the current source commit, image tag, resolved digest, and Discord configuration.
 2. Install Docker Engine and Compose on the Linux host.
 3. Copy compose.yaml, `.env.example`, and `runtime.env.example` to the host.
-4. Set `DISCORD_TOKEN` in `runtime.env` and an immutable `WOTOHA_IMAGE_TAG` in `.env`.
+4. Set `DISCORD_TOKEN` in `runtime.env` and prefer a digest-pinned `WOTOHA_IMAGE_REF` in `.env`.
 5. Run the offline self-check before connecting the bot.
 6. Start the service with docker compose up -d.
 7. After observing healthy logs, stop and disable the old native service.

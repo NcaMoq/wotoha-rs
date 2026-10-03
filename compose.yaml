@@ -1,6 +1,6 @@
 services:
   wotoha:
-    image: ghcr.io/ncamoq/wotoha-rs:${WOTOHA_IMAGE_TAG:?set WOTOHA_IMAGE_TAG to an immutable sha-<commit> or version tag}
+    image: ${WOTOHA_IMAGE_REF:-ghcr.io/ncamoq/wotoha-rs:${WOTOHA_IMAGE_TAG:?set WOTOHA_IMAGE_REF or WOTOHA_IMAGE_TAG}}
     restart: unless-stopped
     env_file:
       - path: ./runtime.env
@@ -9,6 +9,7 @@ services:
       WOTOHA_RECONNECT_STATE_FILE: /wotoha/reconnect.json
       WOTOHA_ANALYSIS_CACHE_DIR: /wotoha/cache/analysis
       WOTOHA_LOG_DIR: /wotoha/logs
+      WOTOHA_LOG_FILE_ENABLED: ${WOTOHA_LOG_FILE_ENABLED:-false}
       WOTOHA_DENO_PATH: /app/tools/deno
     volumes:
       - ${WOTOHA_DATA_DIR:-./data}:/wotoha

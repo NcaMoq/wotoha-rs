@@ -46,7 +46,9 @@ jobs:
           '
       - name: Test deployment updater safety
         run: |
-          bash -n deploy/*.sh deploy/tests/*.sh
+          for script in deploy/*.sh deploy/tests/*.sh; do
+            bash -n "$script"
+          done
           bash deploy/tests/run.sh
       - name: Check the workspace
         run: cargo check --workspace --locked
@@ -54,3 +56,8 @@ jobs:
         run: cargo test --workspace --locked
       - name: Lint the workspace
         run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
+      - name: Offline deterministic quality regression
+        run: |
+          cargo test --locked -p wotoha-analysis-lab --lib
+          cargo test --locked -p wotoha-app --bin automix_corpus
+          cargo test --locked -p wotoha-voice --lib

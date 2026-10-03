@@ -145,6 +145,49 @@ impl ReconnectStore {
     }
 }
 
+/// Writes a deterministic, network-free handoff used by the container smoke test.
+/// It exercises the same atomic persistence path as production restart handling.
+pub fn reconnect_self_check_write() -> io::Result<()> {
+    let store = ReconnectStore::from_env();
+    store.save(&[(
+        GuildKey::new(7_001),
+        ChannelKey::new(8_001),
+        Some(PlaybackRestartSnapshot {
+            current_source_url: "https://example.invalid/current".to_owned(),
+            queued_source_urls: vec!["https://example.invalid/next".to_owned()],
+            position: std::time::Duration::from_millis(12_345),
+            looping: true,
+            automix_enabled: true,
+        }),
+    )])
+}
+
+/// Reads and validates the deterministic handoff used by the container smoke test.
+/// The normal one-shot consumption semantics are retained: successful reads remove the file.
+pub fn reconnect_self_check_read() -> io::Result<()> {
+    let store = ReconnectStore::from_env();
+    let connections = store.take()?;
+    let expected = vec![(
+        GuildKey::new(7_001),
+        ChannelKey::new(8_001),
+        Some(PlaybackRestartSnapshot {
+            current_source_url: "https://example.invalid/current".to_owned(),
+            queued_source_urls: vec!["https://example.invalid/next".to_owned()],
+            position: std::time::Duration::from_millis(12_345),
+            looping: true,
+            automix_enabled: true,
+        }),
+    )];
+    if connections == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "reconnect self-check state did not survive container recreation",
+        ))
+    }
+}
+
 fn temporary_path(path: &Path) -> PathBuf {
     let name = path
         .file_name()

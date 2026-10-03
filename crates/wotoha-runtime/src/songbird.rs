@@ -45,6 +45,7 @@ use wotoha_core::{
     },
     config::LoudnessConfig,
     debug::append_debug_log,
+    operational_metrics,
     url::{is_allowed_prepared_url, summarize_url_for_logs},
 };
 
@@ -1068,6 +1069,7 @@ impl SongbirdRuntime {
             cancellation: cancellation.clone(),
         };
         let analysis_started = Instant::now();
+        operational_metrics().record_analysis_started();
         let outcome = tokio::time::timeout(ANALYSIS_TIMEOUT, async {
             if !bypass_cache {
                 if let Some(analysis) =
@@ -1123,6 +1125,7 @@ impl SongbirdRuntime {
         let outcome = match outcome {
             Ok(Some(outcome)) => outcome,
             Ok(None) => {
+                operational_metrics().record_analysis_completed(analysis_started.elapsed());
                 warn!(
                     provider_id = request.provider_id.as_ref(),
                     elapsed_ms = analysis_started.elapsed().as_millis() as u64,
@@ -1131,6 +1134,8 @@ impl SongbirdRuntime {
                 return None;
             }
             Err(_) => {
+                operational_metrics().record_analysis_timeout();
+                operational_metrics().record_analysis_completed(analysis_started.elapsed());
                 warn!(
                     provider_id = request.provider_id.as_ref(),
                     timeout_seconds = ANALYSIS_TIMEOUT.as_secs(),
@@ -1139,6 +1144,7 @@ impl SongbirdRuntime {
                 return None;
             }
         };
+        operational_metrics().record_analysis_completed(analysis_started.elapsed());
         info!(
             provider_id = request.provider_id.as_ref(),
             backend = ?outcome.backend,
@@ -1162,6 +1168,7 @@ impl SongbirdRuntime {
                     .await
                 {
                     warn!(error = %error, "failed to write neural analysis cache");
+                    operational_metrics().record_cache_write_failure();
                 }
             }
             AnalysisBackend::ClassicalPermanentIneligible => {
@@ -1174,6 +1181,7 @@ impl SongbirdRuntime {
                     .await
                 {
                     warn!(error = %error, "failed to write classical analysis cache");
+                    operational_metrics().record_cache_write_failure();
                 }
             }
             AnalysisBackend::ClassicalTransientFailure => {
@@ -1224,6 +1232,7 @@ async fn load_cached_analysis(
     match cache.load_async(key).await {
         Ok(analysis) => analysis,
         Err(error) => {
+            operational_metrics().record_cache_read_failure();
             warn!(error = %error, cache = label, "failed to read analysis cache");
             None
         }

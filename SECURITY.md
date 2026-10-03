@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-The `main` branch and the latest immutable production image are the supported
-security targets. Operators should use a full immutable image tag and keep
+The `main` branch and the latest digest-pinned production image are the
+supported security targets. Operators should use a full digest image reference and keep
 the host, Docker Engine, and host credentials updated.
 
 ## Reporting a vulnerability

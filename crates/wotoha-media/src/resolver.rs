@@ -9,7 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use reqwest::{Client, redirect::Policy};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
@@ -58,8 +58,8 @@ struct MediaResolverInner {
     metadata_cache: DashMap<String, CachedMetadata>,
     prepared_cache: DashMap<String, CachedPrepared>,
     url_aliases: DashMap<String, CachedAlias>,
-    inflight: DashMap<String, Arc<Mutex<()>>>,
-    prepare_inflight: DashMap<String, Arc<Mutex<()>>>,
+    inflight: DashMap<String, Arc<InflightGate>>,
+    prepare_inflight: DashMap<String, Arc<InflightGate>>,
     maintenance_tick: AtomicU64,
     probe_slots: Semaphore,
 }
@@ -80,6 +80,36 @@ struct CachedPrepared {
 struct CachedAlias {
     canonical_key: Arc<str>,
     cached_at: Instant,
+}
+
+struct InflightGate {
+    lock: Arc<Mutex<()>>,
+    users: AtomicU64,
+}
+
+impl InflightGate {
+    fn new() -> Self {
+        Self {
+            lock: Arc::new(Mutex::new(())),
+            users: AtomicU64::new(0),
+        }
+    }
+}
+
+struct InflightLease<'a> {
+    map: &'a DashMap<String, Arc<InflightGate>>,
+    key: String,
+    gate: Arc<InflightGate>,
+}
+
+impl Drop for InflightLease<'_> {
+    fn drop(&mut self) {
+        if self.gate.users.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let gate = self.gate.clone();
+            self.map
+                .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &gate));
+        }
+    }
 }
 
 impl MediaResolver {
@@ -158,13 +188,8 @@ impl MediaResolver {
             return Ok(request);
         }
 
-        let gate = self
-            .inner
-            .inflight
-            .entry(source_url.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = gate.lock().await;
+        let lease = self.acquire_inflight(&self.inner.inflight, source_url.to_owned());
+        let _guard = lease.gate.lock.clone().lock_owned().await;
 
         if let Some(request) = self.lookup_cached_request(source_url) {
             return Ok(request);
@@ -174,7 +199,7 @@ impl MediaResolver {
 
         let resolved = self.probe_with_deadline(source_url).await;
 
-        let result = match resolved {
+        match resolved {
             Ok(request) => match validate_prepared_request(&request) {
                 Ok(()) => {
                     self.store_request(source_url, &request);
@@ -184,9 +209,7 @@ impl MediaResolver {
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
-        };
-        self.inner.inflight.remove(source_url);
-        result
+        }
     }
 
     /// Resolve the source again, bypassing metadata and prepared-playback caches.
@@ -200,16 +223,11 @@ impl MediaResolver {
             return Err(ResolveError::UnsupportedSource(source_url.to_owned()));
         }
 
-        let gate = self
-            .inner
-            .inflight
-            .entry(source_url.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = gate.lock().await;
+        let lease = self.acquire_inflight(&self.inner.inflight, source_url.to_owned());
+        let _guard = lease.gate.lock.clone().lock_owned().await;
         let _permit = self.acquire_probe_slot().await?;
 
-        let result = match self.probe_with_deadline(source_url).await {
+        match self.probe_with_deadline(source_url).await {
             Ok(request) => match validate_prepared_request(&request) {
                 Ok(()) => {
                     self.store_request(source_url, &request);
@@ -219,9 +237,7 @@ impl MediaResolver {
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
-        };
-        self.inner.inflight.remove(source_url);
-        result
+        }
     }
 
     pub async fn prepare_playback(
@@ -236,24 +252,19 @@ impl MediaResolver {
             self.store_prepared_request(request);
             Ok(request.clone())
         } else {
-            let gate = self
-                .inner
-                .prepare_inflight
-                .entry(request.canonical_key.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone();
-            let _guard = gate.lock().await;
+            let lease = self.acquire_inflight(
+                &self.inner.prepare_inflight,
+                request.canonical_key.to_string(),
+            );
+            let _guard = lease.gate.lock.clone().lock_owned().await;
 
             if let Some(prepared) = self.lookup_prepared_request(request) {
-                self.inner
-                    .prepare_inflight
-                    .remove(request.canonical_key.as_ref());
                 return Ok(prepared);
             }
 
             let _permit = self.acquire_probe_slot().await?;
 
-            let result = match self.refresh_with_deadline(request).await {
+            match self.refresh_with_deadline(request).await {
                 Ok(refreshed) => match validate_prepared_request(&refreshed) {
                     Ok(()) => {
                         self.store_request(request.requested_url.as_ref(), &refreshed);
@@ -263,11 +274,7 @@ impl MediaResolver {
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
-            };
-            self.inner
-                .prepare_inflight
-                .remove(request.canonical_key.as_ref());
-            result
+            }
         }
     }
 
@@ -280,16 +287,14 @@ impl MediaResolver {
         &self,
         request: &TrackRequest,
     ) -> Result<TrackRequest, ResolveError> {
-        let gate = self
-            .inner
-            .prepare_inflight
-            .entry(request.canonical_key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let _guard = gate.lock().await;
+        let lease = self.acquire_inflight(
+            &self.inner.prepare_inflight,
+            request.canonical_key.to_string(),
+        );
+        let _guard = lease.gate.lock.clone().lock_owned().await;
         let _permit = self.acquire_probe_slot().await?;
 
-        let result = match self.refresh_with_deadline(request).await {
+        match self.refresh_with_deadline(request).await {
             Ok(refreshed) => match validate_prepared_request(&refreshed) {
                 Ok(()) => {
                     self.store_request(request.requested_url.as_ref(), &refreshed);
@@ -299,11 +304,28 @@ impl MediaResolver {
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
+        }
+    }
+
+    fn acquire_inflight<'a>(
+        &self,
+        map: &'a DashMap<String, Arc<InflightGate>>,
+        key: String,
+    ) -> InflightLease<'a> {
+        let gate = match map.entry(key.clone()) {
+            Entry::Occupied(entry) => {
+                let gate = entry.get().clone();
+                gate.users.fetch_add(1, Ordering::AcqRel);
+                gate
+            }
+            Entry::Vacant(entry) => {
+                let gate = Arc::new(InflightGate::new());
+                gate.users.store(1, Ordering::Release);
+                entry.insert(gate.clone());
+                gate
+            }
         };
-        self.inner
-            .prepare_inflight
-            .remove(request.canonical_key.as_ref());
-        result
+        InflightLease { map, key, gate }
     }
 
     async fn acquire_probe_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, ResolveError> {
@@ -698,5 +720,35 @@ mod tests {
 
         request.provider_id = "youtube".into();
         assert!(!should_refresh_on_prepare(&request));
+    }
+
+    #[tokio::test]
+    async fn inflight_leases_remove_only_after_the_last_waiter_drops() {
+        let resolver = MediaResolver::new().expect("resolver");
+        let first = resolver.acquire_inflight(&resolver.inner.inflight, "same-key".to_owned());
+        let second = resolver.acquire_inflight(&resolver.inner.inflight, "same-key".to_owned());
+        assert_eq!(resolver.inner.inflight.len(), 1);
+
+        drop(first);
+        assert_eq!(resolver.inner.inflight.len(), 1);
+
+        drop(second);
+        assert_eq!(resolver.inner.inflight.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn canceled_like_lease_cannot_remove_a_replacement_gate() {
+        let resolver = MediaResolver::new().expect("resolver");
+        let first = resolver.acquire_inflight(&resolver.inner.inflight, "same-key".to_owned());
+        let second = resolver.acquire_inflight(&resolver.inner.inflight, "same-key".to_owned());
+        drop(first);
+
+        let third = resolver.acquire_inflight(&resolver.inner.inflight, "same-key".to_owned());
+        assert_eq!(resolver.inner.inflight.len(), 1);
+
+        drop(second);
+        assert_eq!(resolver.inner.inflight.len(), 1);
+        drop(third);
+        assert_eq!(resolver.inner.inflight.len(), 0);
     }
 }

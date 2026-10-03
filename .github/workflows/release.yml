@@ -1,5 +1,5 @@
 # Deprecated migration-only workflow. Supported production releases are built
-# and published by container.yml to the immutable GHCR image.
+# and published by container.yml to the digest-pinned GHCR image.
 name: legacy native archive release (migration-only)
 
 on:
@@ -33,7 +33,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bash -n deploy/*.sh deploy/tests/*.sh
+          for script in deploy/*.sh deploy/tests/*.sh; do
+            bash -n "$script"
+          done
           bash deploy/tests/run.sh
       - name: Test PowerShell release packager contract
         shell: pwsh

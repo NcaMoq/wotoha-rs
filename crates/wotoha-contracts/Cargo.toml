@@ -8,4 +8,5 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 wotoha-core = { path = "../wotoha-core" }

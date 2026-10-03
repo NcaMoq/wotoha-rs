@@ -5,11 +5,12 @@ on linux/amd64. Native Cargo execution remains supported for Linux development
 and CI. NVIDIA, CUDA, cuDNN, TensorRT, NVML, and GPU access are not required
 or supported by the production image.
 
-## Pull an immutable image
+## Pull a digest-pinned image
 
-The canonical image is ghcr.io/ncamoq/wotoha-rs. Use a full SHA tag
-sha-<40-hex-characters> or a release version tag. Do not use latest for an
-operational deployment.
+The canonical image is ghcr.io/ncamoq/wotoha-rs. Prefer a full
+content-addressed digest reference (`@sha256:...`) for production. A
+`sha-<40-hex-characters>` tag is source-correlated and convenient, but OCI
+tags are technically mutable; the digest is the immutable identity.
 
 Create the Compose interpolation file and a private runtime file:
 
@@ -18,12 +19,12 @@ cp .env.example .env
 cp runtime.env.example runtime.env
 # Set DISCORD_TOKEN in runtime.env and keep that file mode 0600.
 chmod 0600 runtime.env
-export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
+export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>
 docker compose pull
 docker compose up -d
 ~~~
 
-`.env` supplies Compose interpolation such as the immutable image tag and
+`.env` supplies Compose interpolation such as the digest-pinned image reference and
 optional host data directory. `runtime.env` is loaded into the container and
 contains the application settings and secret; it is never committed.
 
@@ -69,8 +70,10 @@ Compose file passes through `WOTOHA_YTDLP_PATH` only when it is set in the
 administrator's environment; it does not force the image fallback through
 that variable.
 
-stdout and stderr are the primary logs. The application handles SIGTERM
-directly as PID 1 and has a 30-second Compose stop grace period. The image
+stdout and stderr are the primary logs. Container file logging is disabled by
+default; `WOTOHA_LOG_FILE_ENABLED=true` is an explicit optional secondary log
+for hosts that need it. The application handles SIGTERM directly as PID 1 and
+has a 30-second Compose stop grace period. The image
 does not self-update its application binary. A separate yt-dlp updater may
 maintain the optional /wotoha/tools override without restarting Wotoha.
 
@@ -84,7 +87,7 @@ Beat This!/rten models, and runs the pinned yt-dlp and Deno version commands.
 docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
   --mount type=tmpfs,destination=/wotoha,tmpfs-mode=0777 \
   --cap-drop=ALL --security-opt=no-new-privileges:true \
-  ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
+  ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest> --self-check
 ~~~
 
 The container workflow performs the same check on a linux/amd64 image and
@@ -93,16 +96,17 @@ stage.
 
 ## Upgrade and rollback
 
-Set WOTOHA_IMAGE_TAG to the new immutable tag, then pull and recreate:
+Record the source commit, source-correlated tag, and resolved image digest.
+Set WOTOHA_IMAGE_REF to the new digest reference, then pull and recreate:
 
 ~~~bash
-export WOTOHA_IMAGE_TAG=sha-<new-full-git-sha>
+export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<new-image-digest>
 docker compose pull
 docker compose up -d
 docker compose logs --since=5m wotoha
 ~~~
 
-To roll back, set the old immutable tag and repeat the same commands. The
+To roll back, set the old digest reference and repeat the same commands. The
 host `./data` directory is retained across image changes.
 
 ### Migrating the former named volume
@@ -149,5 +153,6 @@ docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
 ~~~
 
 The GitHub workflow builds and smoke-tests pull-request images without
-pushing. Pushes to main publish the immutable SHA tag. Version tags publish
-both the version tag and the immutable SHA tag to the canonical GHCR image.
+pushing. Pushes to main publish a source-correlated SHA tag and its content
+digest. Version tags publish both the version tag and the source-correlated SHA
+tag; production should still use the recorded digest reference.

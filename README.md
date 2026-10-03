@@ -221,8 +221,11 @@ pinned yt-dlp/Deno runtime tools. It does not require NVIDIA, CUDA, cuDNN,
 TensorRT, NVML, or a GPU. Native Cargo execution remains supported for Linux
 development and CI; the production image is the supported deployment unit.
 
-Choose an immutable image tag such as sha-<full-git-sha> or a release version.
-Do not use an unqualified moving latest tag. Keep Compose interpolation in
+Prefer a content-addressed image reference such as
+`ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>` for production. A
+`sha-<full-git-sha>` tag is source-correlated but technically mutable; the
+digest is the immutable identity. Do not use an unqualified moving latest tag.
+Keep Compose interpolation in
 `.env` and application settings, including the Discord token, in the
 untracked `runtime.env` file:
 
@@ -231,7 +234,7 @@ cp .env.example .env
 cp runtime.env.example runtime.env
 # Set DISCORD_TOKEN in runtime.env, then keep it private.
 chmod 0600 runtime.env
-export WOTOHA_IMAGE_TAG=sha-<full-git-sha>
+export WOTOHA_IMAGE_REF=ghcr.io/ncamoq/wotoha-rs@sha256:<image-digest>
 docker compose pull
 docker compose up -d
 docker compose logs -f wotoha
@@ -248,7 +251,7 @@ docker run --rm --read-only --tmpfs /tmp \
   ghcr.io/ncamoq/wotoha-rs:sha-<full-git-sha> --self-check
 ~~~
 
-For rollback, set WOTOHA_IMAGE_TAG to the previous immutable tag and run
+For rollback, set WOTOHA_IMAGE_REF to the previous digest reference and run
 docker compose up -d. See the Docker deployment guide for the complete
 release, persistence, and upgrade contract.
 

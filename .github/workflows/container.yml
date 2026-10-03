@@ -38,13 +38,23 @@ jobs:
           cargo check --workspace --all-targets --locked
           cargo test --workspace --all-targets --locked
           cargo clippy --workspace --all-targets --all-features --locked --no-deps -- -D warnings
-          bash -n deploy/*.sh deploy/tests/*.sh
+          for script in deploy/*.sh deploy/tests/*.sh; do
+            bash -n "$script"
+          done
           bash deploy/tests/run.sh
+          cargo test --locked -p wotoha-analysis-lab --lib
+          cargo test --locked -p wotoha-app --bin automix_corpus
+          cargo test --locked -p wotoha-voice --lib
 
-  container-smoke:
+  publish:
     needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -70,18 +80,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build linux/amd64 image
+      - name: Build and publish linux/amd64 image
+        id: build
         uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64
-          load: true
-          push: false
-          # The docker exporter used by `load: true` cannot carry attestations.
-          # Publication below uses the registry exporter and keeps both enabled.
-          sbom: false
-          provenance: false
+          load: ${{ github.event_name != 'push' }}
+          push: ${{ github.event_name == 'push' }}
+          sbom: ${{ github.event_name == 'push' }}
+          provenance: ${{ github.event_name == 'push' && 'mode=max' || 'false' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
@@ -91,9 +100,14 @@ jobs:
       - name: Smoke test offline self-check
         env:
           IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          if [ -n "${PUBLISHED_DIGEST:-}" ]; then
+            image="${{ env.IMAGE_NAME }}@${PUBLISHED_DIGEST}"
+            docker pull "$image"
+          fi
           test "$(docker run --rm --entrypoint id "$image" -u)" = 10001
           docker run --rm \
             --read-only \
@@ -112,6 +126,12 @@ jobs:
             test -x /app/tools/yt-dlp-fallback
             test -x /app/tools/deno
             test -s /app/licenses/license-inventory.json
+            test -s /app/licenses/rust/THIRD_PARTY_LICENSES.html
+            test -s /app/licenses/rust/THIRD_PARTY_ATTRIBUTIONS.txt
+            test -s /app/licenses/yt-dlp/LICENSE
+            test -s /app/licenses/yt-dlp/PROVENANCE.txt
+            test -s /app/licenses/deno/LICENSE.md
+            test -s /app/licenses/deno/PROVENANCE.txt
             test -s /app/licenses/Cargo.lock
             test -s /app/licenses/models/NOTICE.txt
             test -s /app/licenses/third-party-versions.env
@@ -121,9 +141,13 @@ jobs:
       - name: Test verified managed yt-dlp override and invalid fallback
         env:
           IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
           image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          if [ -n "${PUBLISHED_DIGEST:-}" ]; then
+            image="${{ env.IMAGE_NAME }}@${PUBLISHED_DIGEST}"
+          fi
           managed_output="$(docker run --rm \
             --read-only \
             --tmpfs /tmp:rw,exec,mode=1777 \
@@ -157,65 +181,60 @@ jobs:
           grep -F 'ignoring invalid managed yt-dlp override' <<< "$invalid_output"
           grep -F 'wotoha self-check: yt-dlp path=/app/tools/yt-dlp-fallback' <<< "$invalid_output"
 
-  publish:
-    if: github.event_name == 'push'
-    needs:
-      - quality
-      - container-smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-      packages: write
-      attestations: write
-      id-token: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-
-      - name: Compute image metadata
-        id: metadata
-        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=sha-${{ github.sha }}
-            type=ref,event=tag
-
-      - name: Log in to GHCR
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push immutable image tags
-        id: build
-        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64
-          push: true
-          sbom: true
-          provenance: mode=max
-          tags: ${{ steps.metadata.outputs.tags }}
-          labels: ${{ steps.metadata.outputs.labels }}
-          build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
-            IMAGE_VERSION=${{ github.ref_name }}
-
-      - name: Record published image digest
+      - name: Reconnect state survives container recreation
+        if: github.event_name == 'push'
         env:
           IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          while IFS= read -r image; do
-            [ -n "$image" ] || continue
-            digest="${{ steps.build.outputs.digest }}"
-            printf 'published image: %s\nresolved digest: %s\n\n' "$image" "$digest" >> "$GITHUB_STEP_SUMMARY"
-          done <<< "$IMAGE_TAGS"
+          image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          image="${{ env.IMAGE_NAME }}@${PUBLISHED_DIGEST:-$(docker image inspect "$image" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)}"
+          state_dir="$RUNNER_TEMP/wotoha-persistent-state"
+          mkdir -p "$state_dir"
+          docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
+            --mount "type=bind,source=$state_dir,destination=/wotoha" \
+            --cap-drop=ALL --security-opt=no-new-privileges:true \
+            -e WOTOHA_SELF_CHECK_RECONNECT=write \
+            "$image" --self-check
+          test -s "$state_dir/reconnect.json"
+          docker run --rm --read-only --tmpfs /tmp:rw,exec,mode=1777 \
+            --mount "type=bind,source=$state_dir,destination=/wotoha" \
+            --cap-drop=ALL --security-opt=no-new-privileges:true \
+            -e WOTOHA_SELF_CHECK_RECONNECT=read \
+            "$image" --self-check
+          test ! -e "$state_dir/reconnect.json"
+
+      - name: Record deployment metadata
+        if: github.event_name == 'push'
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+          PUBLISHED_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          tag="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1 | sed 's#^.*/##')"
+          ytdlp_version="$(awk -F= '$1 == "YTDLP_VERSION" {print $2}' deploy/third-party-versions.env)"
+          deno_version="$(awk -F= '$1 == "DENO_VERSION" {print $2}' deploy/third-party-versions.env)"
+          jq -n \
+            --arg source_commit "$GITHUB_SHA" \
+            --arg image "${{ env.IMAGE_NAME }}" \
+            --arg tag "$tag" \
+            --arg digest "$PUBLISHED_DIGEST" \
+            --arg version "$GITHUB_REF_NAME" \
+            --arg yt_dlp_version "$ytdlp_version" \
+            --arg deno_version "$deno_version" \
+            '{schema_version: 1, source_commit: $source_commit, image: $image,
+              tag: $tag, digest: $digest, version: $version,
+              yt_dlp_version: $yt_dlp_version, deno_version: $deno_version}' \
+            > deployment-metadata.json
+          jq -e '.source_commit == $ENV.GITHUB_SHA and (.digest | startswith("sha256:"))' deployment-metadata.json >/dev/null
+          cat deployment-metadata.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload deployment metadata
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deployment-metadata-${{ github.sha }}
+          path: deployment-metadata.json
+          if-no-files-found: error
+          retention-days: 14

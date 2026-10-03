@@ -1,7 +1,13 @@
-use std::{error::Error, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    error::Error,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
+use tracing::warn;
 use wotoha_core::{
     QueuePreview, TrackRequest,
     analysis::TrackAnalysisV2,
@@ -136,7 +142,242 @@ pub enum PlaybackRuntimeEvent {
     },
 }
 
-pub type RuntimeEventSink = mpsc::UnboundedSender<PlaybackRuntimeEvent>;
+const RUNTIME_EVENT_INGRESS_CAPACITY: usize = 1024;
+const RUNTIME_CRITICAL_OVERFLOW_CAPACITY: usize = 128;
+
+/// Bounded runtime-event ingress shared by runtimes and the playback router.
+///
+/// Replaceable telemetry is rejected when the bounded channel is full. Critical
+/// lifecycle events have a separate, fixed-size overflow queue so a busy
+/// runtime cannot make track completion or disconnect state disappear. The
+/// queue coalesces repeated identities and therefore remains bounded even when
+/// an upstream runtime repeats the same callback.
+#[derive(Clone)]
+pub struct RuntimeEventSink {
+    sender: mpsc::Sender<PlaybackRuntimeEvent>,
+    critical_overflow: Arc<Mutex<VecDeque<PlaybackRuntimeEvent>>>,
+    critical_notify: Arc<tokio::sync::Notify>,
+}
+
+pub struct RuntimeEventReceiver {
+    receiver: mpsc::Receiver<PlaybackRuntimeEvent>,
+    critical_overflow: Arc<Mutex<VecDeque<PlaybackRuntimeEvent>>>,
+    critical_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeEventSendError;
+
+impl RuntimeEventSink {
+    pub fn channel() -> (Self, RuntimeEventReceiver) {
+        let (sender, receiver) = mpsc::channel(RUNTIME_EVENT_INGRESS_CAPACITY);
+        let critical_overflow = Arc::new(Mutex::new(VecDeque::new()));
+        let critical_notify = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                sender,
+                critical_overflow: critical_overflow.clone(),
+                critical_notify: critical_notify.clone(),
+            },
+            RuntimeEventReceiver {
+                receiver,
+                critical_overflow,
+                critical_notify,
+            },
+        )
+    }
+
+    /// Try to enqueue one runtime event without awaiting from a runtime
+    /// callback. Critical lifecycle events use the bounded overflow path when
+    /// the normal ingress queue is full.
+    pub fn send(&self, event: PlaybackRuntimeEvent) -> Result<(), RuntimeEventSendError> {
+        match self.sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(event)) if is_critical_runtime_event(&event) => {
+                let queued = {
+                    let mut overflow = self
+                        .critical_overflow
+                        .lock()
+                        .expect("runtime event overflow mutex poisoned");
+                    queue_critical_event(&mut overflow, event)
+                };
+                self.critical_notify.notify_one();
+                if !queued {
+                    warn!(
+                        queue_limit = RUNTIME_CRITICAL_OVERFLOW_CAPACITY,
+                        "critical runtime event overflow is saturated"
+                    );
+                    Err(RuntimeEventSendError)
+                } else {
+                    Ok(())
+                }
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    queue_limit = RUNTIME_EVENT_INGRESS_CAPACITY,
+                    "dropping replaceable runtime event because ingress is full"
+                );
+                Err(RuntimeEventSendError)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(RuntimeEventSendError),
+        }
+    }
+}
+
+impl RuntimeEventReceiver {
+    pub async fn recv(&mut self) -> Option<PlaybackRuntimeEvent> {
+        loop {
+            if let Ok(event) = self.receiver.try_recv() {
+                return Some(event);
+            }
+            if let Some(event) = self
+                .critical_overflow
+                .lock()
+                .expect("runtime event overflow mutex poisoned")
+                .pop_front()
+            {
+                return Some(event);
+            }
+            tokio::select! {
+                event = self.receiver.recv() => return event,
+                _ = self.critical_notify.notified() => {}
+            }
+        }
+    }
+}
+
+fn is_critical_runtime_event(event: &PlaybackRuntimeEvent) -> bool {
+    matches!(
+        event,
+        PlaybackRuntimeEvent::TrackEnded { .. }
+            | PlaybackRuntimeEvent::TransitionDue { .. }
+            | PlaybackRuntimeEvent::TransitionStarted { .. }
+            | PlaybackRuntimeEvent::TransitionArmFailed { .. }
+            | PlaybackRuntimeEvent::TrackErrored { .. }
+            | PlaybackRuntimeEvent::VoiceDisconnected { .. }
+    )
+}
+
+fn queue_critical_event(
+    overflow: &mut VecDeque<PlaybackRuntimeEvent>,
+    event: PlaybackRuntimeEvent,
+) -> bool {
+    if overflow
+        .iter()
+        .any(|queued| same_critical_identity(queued, &event))
+    {
+        return true;
+    }
+    if overflow.len() >= RUNTIME_CRITICAL_OVERFLOW_CAPACITY {
+        return false;
+    }
+    overflow.push_back(event);
+    true
+}
+
+fn same_critical_identity(left: &PlaybackRuntimeEvent, right: &PlaybackRuntimeEvent) -> bool {
+    match (left, right) {
+        (
+            PlaybackRuntimeEvent::TrackEnded {
+                guild_id: left_guild,
+                session_id: left_session,
+                playback_id: left_playback,
+                ..
+            },
+            PlaybackRuntimeEvent::TrackEnded {
+                guild_id: right_guild,
+                session_id: right_session,
+                playback_id: right_playback,
+                ..
+            },
+        )
+        | (
+            PlaybackRuntimeEvent::TrackErrored {
+                guild_id: left_guild,
+                session_id: left_session,
+                playback_id: left_playback,
+                ..
+            },
+            PlaybackRuntimeEvent::TrackErrored {
+                guild_id: right_guild,
+                session_id: right_session,
+                playback_id: right_playback,
+                ..
+            },
+        ) => {
+            left_guild == right_guild
+                && left_session == right_session
+                && left_playback == right_playback
+        }
+        (
+            PlaybackRuntimeEvent::TransitionDue {
+                guild_id: left_guild,
+                session_id: left_session,
+                playback_id: left_playback,
+            },
+            PlaybackRuntimeEvent::TransitionDue {
+                guild_id: right_guild,
+                session_id: right_session,
+                playback_id: right_playback,
+            },
+        ) => {
+            left_guild == right_guild
+                && left_session == right_session
+                && left_playback == right_playback
+        }
+        (
+            PlaybackRuntimeEvent::TransitionStarted {
+                guild_id: left_guild,
+                session_id: left_session,
+                outgoing_playback_id: left_outgoing,
+                incoming_playback_id: left_incoming,
+                generation: left_generation,
+                ..
+            }
+            | PlaybackRuntimeEvent::TransitionArmFailed {
+                guild_id: left_guild,
+                session_id: left_session,
+                outgoing_playback_id: left_outgoing,
+                incoming_playback_id: left_incoming,
+                generation: left_generation,
+                ..
+            },
+            PlaybackRuntimeEvent::TransitionStarted {
+                guild_id: right_guild,
+                session_id: right_session,
+                outgoing_playback_id: right_outgoing,
+                incoming_playback_id: right_incoming,
+                generation: right_generation,
+                ..
+            }
+            | PlaybackRuntimeEvent::TransitionArmFailed {
+                guild_id: right_guild,
+                session_id: right_session,
+                outgoing_playback_id: right_outgoing,
+                incoming_playback_id: right_incoming,
+                generation: right_generation,
+                ..
+            },
+        ) => {
+            left_guild == right_guild
+                && left_session == right_session
+                && left_outgoing == right_outgoing
+                && left_incoming == right_incoming
+                && left_generation == right_generation
+        }
+        (
+            PlaybackRuntimeEvent::VoiceDisconnected {
+                guild_id: left_guild,
+                ..
+            },
+            PlaybackRuntimeEvent::VoiceDisconnected {
+                guild_id: right_guild,
+                ..
+            },
+        ) => left_guild == right_guild,
+        _ => false,
+    }
+}
 
 /// Describes the clock that a runtime can use for a prepared two-deck
 /// transition.
@@ -500,5 +741,34 @@ mod tests {
         };
         assert!(!handle.schedule_equalizer_transition(transition));
         handle.cancel_equalizer_transition(transition.id);
+    }
+
+    #[tokio::test]
+    async fn runtime_event_ingress_is_bounded_but_preserves_critical_overflow() {
+        let (sink, mut receiver) = RuntimeEventSink::channel();
+        let replaceable = PlaybackRuntimeEvent::TrackStarted {
+            guild_id: GuildKey::new(1),
+            session_id: 1,
+            playback_id: PlaybackId::new(1),
+        };
+        for _ in 0..RUNTIME_EVENT_INGRESS_CAPACITY {
+            assert!(sink.send(replaceable.clone()).is_ok());
+        }
+        assert_eq!(sink.send(replaceable).map_err(|_| ()), Err(()));
+
+        let critical = PlaybackRuntimeEvent::TrackEnded {
+            guild_id: GuildKey::new(1),
+            session_id: 1,
+            playback_id: PlaybackId::new(1),
+            reason: TrackEndReason::Completed,
+        };
+        assert!(sink.send(critical.clone()).is_ok());
+        for _ in 0..RUNTIME_EVENT_INGRESS_CAPACITY {
+            assert!(matches!(
+                receiver.recv().await,
+                Some(PlaybackRuntimeEvent::TrackStarted { .. })
+            ));
+        }
+        assert_eq!(receiver.recv().await, Some(critical));
     }
 }

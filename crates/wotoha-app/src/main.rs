@@ -13,9 +13,10 @@ use std::{
 use serenity::{all::GatewayIntents, async_trait, client::Client};
 use songbird::SerenityInit;
 use tracing::{info, level_filters::LevelFilter};
-use tracing_appender::non_blocking;
+use tracing_appender::{non_blocking, non_blocking::WorkerGuard};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, PlaybackId,
     PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink, RuntimeTrackHandle,
@@ -28,10 +29,12 @@ use wotoha_core::{
     automix::EqTransition,
     config::{AutoMixPlannerMode, PlaybackConfig},
     debug::{append_debug_log, sanitize_log_message},
+    operational_metrics,
 };
 use wotoha_media::{MediaResolver, resolve_ytdlp_path};
 use wotoha_runtime::{
-    DiscordGateway, SongbirdRuntime, recommended_cache_settings, self_check_embedded_models,
+    DiscordGateway, SongbirdRuntime, recommended_cache_settings, reconnect_self_check_read,
+    reconnect_self_check_write, self_check_embedded_models,
 };
 use wotoha_voice::PlaybackCoordinator;
 
@@ -55,23 +58,37 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return self_check().await;
     }
     let config = BotConfig::load()?;
-    std::fs::create_dir_all(&config.logging.directory)?;
-    let log_path = config.logging.file_path();
-    rotate_runtime_log(&log_path)?;
-    let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
-        Ok(file) => file,
-        Err(error) => {
-            eprintln!(
-                "wotoha: optional file logging unavailable at {}: {error}; continuing on stdout",
-                log_path.display()
-            );
-            OpenOptions::new()
-                .write(true)
-                .open(if cfg!(unix) { "/dev/null" } else { "NUL" })?
-        }
+    let (writer, _log_guard): (BoxMakeWriter, Option<WorkerGuard>) = if config.logging.file_enabled
+    {
+        std::fs::create_dir_all(&config.logging.directory)?;
+        let log_path = config.logging.file_path();
+        rotate_runtime_log(&log_path)?;
+        let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "wotoha: optional file logging unavailable at {}: {error}; continuing on stdout",
+                    log_path.display()
+                );
+                OpenOptions::new()
+                    .write(true)
+                    .open(if cfg!(unix) { "/dev/null" } else { "NUL" })?
+            }
+        };
+        let (file_writer, guard) = non_blocking(log_file);
+        (
+            BoxMakeWriter::new(SanitizingMakeWriter::new(DualMakeWriter::new(
+                file_writer,
+                std::io::stdout,
+            ))),
+            Some(guard),
+        )
+    } else {
+        (
+            BoxMakeWriter::new(SanitizingMakeWriter::new(std::io::stdout)),
+            None,
+        )
     };
-    let (file_writer, guard) = non_blocking(log_file);
-    let _guard = Box::leak(Box::new(guard));
     let env_filter = EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())
         .parse(&config.logging.rust_log)?
@@ -79,10 +96,7 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_ansi(config.logging.ansi)
-        .with_writer(SanitizingMakeWriter::new(DualMakeWriter::new(
-            file_writer,
-            std::io::stdout,
-        )))
+        .with_writer(writer)
         .init();
     append_debug_log("main: boot starting");
     append_debug_log("main: config loaded");
@@ -98,6 +112,7 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(
         log_dir = %config.logging.directory.display(),
         log_file = %config.logging.file_name,
+        log_file_enabled = config.logging.file_enabled,
         log_ansi = config.logging.ansi,
         default_volume = config.playback.default_volume,
         loudness_normalization_enabled = config.playback.loudness.enabled,
@@ -154,9 +169,13 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     append_debug_log("main: starting client");
     tokio::select! {
-        result = client.start() => result?,
+        result = client.start() => {
+            operational_metrics().record_gateway_disconnected();
+            result?;
+        },
         result = shutdown_signal() => {
             result?;
+            operational_metrics().record_shutdown_signal();
             append_debug_log("main: shutdown signal received; persisting active sessions");
             if tokio::time::timeout(
                 RESTART_STATE_TIMEOUT,
@@ -185,13 +204,16 @@ async fn app_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+    info!(snapshot = ?operational_metrics().snapshot(), "operational metrics snapshot");
+    drop(_log_guard);
     append_debug_log("main: client exited");
     Ok(())
 }
 
 const MAX_RUNTIME_LOG_BYTES: u64 = 10 * 1024 * 1024;
-const RESTART_STATE_TIMEOUT: Duration = Duration::from_secs(18);
-const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(4);
+// Keep the total shutdown path comfortably below Compose's 30 second grace period.
+const RESTART_STATE_TIMEOUT: Duration = Duration::from_secs(8);
+const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(2);
 const SHARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn rotate_runtime_log(path: &std::path::Path) -> io::Result<()> {
@@ -222,6 +244,19 @@ async fn self_check() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     for relative in ["cache/analysis", "logs", "tools"] {
         std::fs::create_dir_all(data_dir.join(relative))?;
+    }
+    if let Some(mode) = std::env::var_os("WOTOHA_SELF_CHECK_RECONNECT") {
+        match mode.to_string_lossy().as_ref() {
+            "write" => reconnect_self_check_write().map_err(io::Error::other)?,
+            "read" => reconnect_self_check_read().map_err(io::Error::other)?,
+            value => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("WOTOHA_SELF_CHECK_RECONNECT must be write or read, got {value}"),
+                )
+                .into());
+            }
+        }
     }
     let probe = data_dir.join(".wotoha-self-check");
     std::fs::write(&probe, b"wotoha self-check\n")?;
@@ -1183,7 +1218,7 @@ mod tests {
     async fn configured_voice_runtime_composes_master_and_track_gain_once() {
         let inner = MockVoiceRuntime::default();
         let runtime = ConfiguredVoiceRuntime::new(inner.clone(), 0.25);
-        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _receiver) = RuntimeEventSink::channel();
         let handle = runtime
             .play_track_with_options(
                 GuildKey::new(1),

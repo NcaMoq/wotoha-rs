@@ -49,6 +49,23 @@ RUN set -eux; \
     test -x /tmp/deno/deno; \
     install -m 0755 /tmp/yt-dlp /out/yt-dlp-fallback; \
     install -m 0755 /tmp/deno/deno /out/deno; \
+    mkdir -p /out/licenses/yt-dlp /out/licenses/deno; \
+    curl --fail --silent --show-error --location --retry 4 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/LICENSE" \
+        --output /out/licenses/yt-dlp/LICENSE; \
+    curl --fail --silent --show-error --location --retry 4 --retry-all-errors --retry-delay 2 \
+        --connect-timeout 10 --max-time 60 \
+        "https://raw.githubusercontent.com/denoland/deno/v$DENO_VERSION/LICENSE.md" \
+        --output /out/licenses/deno/LICENSE.md; \
+    test -s /out/licenses/yt-dlp/LICENSE; \
+    test -s /out/licenses/deno/LICENSE.md; \
+    printf 'repository=%s\nversion=%s\nrelease_artifact=https://github.com/%s/releases/download/%s/yt-dlp_linux\nlicense_source=https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/LICENSE\n' \
+        "$YTDLP_REPOSITORY" "$YTDLP_VERSION" "$YTDLP_REPOSITORY" "$YTDLP_VERSION" \
+        > /out/licenses/yt-dlp/PROVENANCE.txt; \
+    printf 'repository=denoland/deno\nversion=%s\nrelease_artifact=https://github.com/denoland/deno/releases/download/v%s/deno-x86_64-unknown-linux-gnu.zip\nlicense_source=https://raw.githubusercontent.com/denoland/deno/v%s/LICENSE.md\nsha256=%s\n' \
+        "$DENO_VERSION" "$DENO_VERSION" "$DENO_VERSION" "$DENO_SHA256" \
+        > /out/licenses/deno/PROVENANCE.txt; \
     /out/yt-dlp-fallback --ignore-config --version | grep -Fx "$YTDLP_VERSION"; \
     /out/deno --version | awk -v expected="$DENO_VERSION" '$1 == "deno" && $2 == expected {found=1} END {exit !found}'; \
     rm -rf /tmp/gnupg /tmp/deno /tmp/yt-dlp /tmp/deno.zip /tmp/SHA2-256SUMS /tmp/SHA2-256SUMS.sig /tmp/verify-status
@@ -67,9 +84,17 @@ ENV WOTOHA_SOURCE_COMMIT=$SOURCE_COMMIT \
     WOTOHA_BUILD_VERSION=$IMAGE_VERSION
 
 RUN cargo build --locked --release --package wotoha-app --bin wotoha-app \
+    && cargo install cargo-about --version 0.9.1 --locked --features cli \
     && cargo metadata --locked --format-version 1 \
         | jq '{schema_version: 1, packages: [.packages[] | {name, version, source, license, license_file, repository}] | sort_by(.name, .version, (.source // ""))}' \
-        > /tmp/rust-license-inventory.json
+        > /tmp/rust-license-inventory.json \
+    && cargo metadata --locked --format-version 1 > /tmp/cargo-metadata.json \
+    && cargo about generate --frozen --fail --workspace \
+        --config deploy/release-about.toml \
+        --output-file /tmp/THIRD_PARTY_LICENSES.html \
+        deploy/third-party-licenses.hbs \
+    && bash deploy/generate-cargo-attributions.sh \
+        /tmp/cargo-metadata.json /tmp/THIRD_PARTY_ATTRIBUTIONS.txt
 
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
@@ -82,7 +107,7 @@ RUN apt-get update \
 
 RUN groupadd --system --gid 10001 wotoha \
     && useradd --system --uid 10001 --gid 10001 --home-dir /wotoha --shell /usr/sbin/nologin wotoha \
-    && install -d -o 10001 -g 10001 -m 0755 /app /app/tools /app/licenses /wotoha /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp
+    && install -d -o 10001 -g 10001 -m 0755 /app /app/tools /app/licenses /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno /wotoha /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp
 
 COPY --from=builder /src/target/release/wotoha-app /app/wotoha-app
 COPY --from=tools /out/yt-dlp-fallback /app/tools/yt-dlp-fallback
@@ -93,9 +118,17 @@ COPY crates/wotoha-runtime/models/LICENSE.beat-this-original.txt \
      crates/wotoha-runtime/models/NOTICE.txt /app/licenses/models/
 COPY deploy/third-party-versions.env /app/licenses/
 COPY --from=builder /tmp/rust-license-inventory.json /app/licenses/license-inventory.json
+COPY --from=builder /tmp/rust-license-inventory.json /app/licenses/rust/license-inventory.json
+COPY --from=builder /tmp/THIRD_PARTY_LICENSES.html /app/licenses/rust/THIRD_PARTY_LICENSES.html
+COPY --from=builder /tmp/THIRD_PARTY_ATTRIBUTIONS.txt /app/licenses/rust/THIRD_PARTY_ATTRIBUTIONS.txt
+COPY --from=tools /out/licenses/yt-dlp/LICENSE /app/licenses/yt-dlp/LICENSE
+COPY --from=tools /out/licenses/yt-dlp/PROVENANCE.txt /app/licenses/yt-dlp/PROVENANCE.txt
+COPY --from=tools /out/licenses/deno/LICENSE.md /app/licenses/deno/LICENSE.md
+COPY --from=tools /out/licenses/deno/PROVENANCE.txt /app/licenses/deno/PROVENANCE.txt
 
 RUN chmod 0555 /app /app/wotoha-app /app/tools /app/tools/yt-dlp-fallback /app/tools/deno /app/licenses \
     && chmod 0555 /app/licenses/models \
+    && chmod 0555 /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno \
     && chmod 0755 /wotoha /wotoha/cache /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp \
     && chown -R 10001:10001 /wotoha
 
@@ -105,6 +138,7 @@ ENV WOTOHA_SOURCE_COMMIT=$SOURCE_COMMIT \
     WOTOHA_RECONNECT_STATE_FILE=/wotoha/reconnect.json \
     WOTOHA_ANALYSIS_CACHE_DIR=/wotoha/cache/analysis \
     WOTOHA_LOG_DIR=/wotoha/logs \
+    WOTOHA_LOG_FILE_ENABLED=false \
     WOTOHA_DENO_PATH=/app/tools/deno \
     RUST_LOG=info,wotoha_debug=info
 
