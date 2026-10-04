@@ -38,8 +38,8 @@ const MAX_CANDIDATES: usize = 4;
 const ACCEPT_SCORE: f32 = 0.68;
 const ACCEPT_MARGIN: f32 = 0.08;
 const ACCEPT_EVENT_AGREEMENT: f32 = 0.80;
-const STATIONARY_DRIFT: f64 = 0.005;
-const STATIONARY_DISPERSION: f64 = 0.005;
+const STATIONARY_DRIFT: f64 = 0.003;
+const STATIONARY_DISPERSION: f64 = 0.003;
 const CLASSICAL_ANCHOR_BONUS: f32 = 0.15;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -694,9 +694,14 @@ fn classical_anchor_available(candidates: &[EvidenceCandidate]) -> bool {
 }
 
 fn classical_anchor_allows(first: &EvidenceCandidate, candidates: &[EvidenceCandidate]) -> bool {
-    !classical_anchor_available(candidates)
-        || (first.has_full && first.has_low)
-        || (first.has_neural && first.has_event && first.source_count >= 3)
+    if classical_anchor_available(candidates) {
+        (first.has_full && first.has_low)
+            || (first.has_neural && first.has_event && first.source_count >= 3)
+    } else if (first.has_full ^ first.has_low) && !first.has_neural {
+        false
+    } else {
+        true
+    }
 }
 
 fn rank_candidates(
@@ -2248,5 +2253,12 @@ mod tests {
             rank_value(&anchored, RankMode::ClassicalAnchor, 0.0)
                 > rank_value(&base, RankMode::ClassicalAnchor, 0.0)
         );
+        assert!(!classical_anchor_allows(
+            &base,
+            &[base.clone(), anchored.clone()]
+        ));
+        let mut full_only = base;
+        full_only.has_full = true;
+        assert!(!classical_anchor_allows(&full_only, &[full_only.clone()]));
     }
 }
