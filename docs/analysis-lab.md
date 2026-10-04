@@ -233,6 +233,32 @@ nominal family fold is invalid as generalization evidence if either exact PCM
 or lineage overlap is present; the expanded validation sample list is retained
 in the report.
 
+### Conservative tempo shadow
+
+`research-tempo-conservative-shadow` is a follow-up research command. It
+reuses the long-duration candidate-flow audit, then evaluates bounded Classical
+candidate propagation, source-aware ranking, explicit `Select` /
+`RetainMultiple` / `Abstain` decisions, variable-tempo stationarity, and a
+separate metrical-consistency guard. The guard compares a candidate hypothesis
+with the observed BeatEvent clock through primary/half/double relations; it is
+not a replacement for the production quality guard.
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-tempo-conservative-shadow \
+  --output /tmp/wotoha-tempo-conservative-shadow
+```
+
+The command writes candidate provenance, ranking and abstention operating
+points, evidence attribution, stationarity results, adversarial metrical
+consistency cases, candidate-count pressure, pruning summaries, and
+component-aware family stress reports outside Git. All thresholds are fixed
+research rules; no Ground Truth, fixture identity, external observation, or
+production output is used as an inference feature. Classical remains the
+production beat/grid/tempo authority and all AutoMix results are shadow-only.
+
 Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
 downbeat evidence, off-phase leakage, periodic consistency, bar-cycle
 consistency, and beat-event confidence. Its primary set is only the `Meter`

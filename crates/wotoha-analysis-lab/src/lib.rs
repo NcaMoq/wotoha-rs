@@ -24,6 +24,10 @@ use sha2::{Digest, Sha256};
 pub use tempo_ambiguity_research::{TempoAmbiguityResearchReport, run_tempo_ambiguity_research};
 mod tempo_shadow_followup;
 pub use tempo_shadow_followup::{TempoShadowFollowupReport, run_tempo_shadow_followup};
+mod tempo_conservative_shadow;
+pub use tempo_conservative_shadow::{
+    TempoConservativeShadowReport, run_tempo_conservative_shadow_research,
+};
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},
     audio_analysis::LowBandFilter,
