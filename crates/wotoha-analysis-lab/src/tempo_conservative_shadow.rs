@@ -494,6 +494,7 @@ pub struct RealisticPositiveCorpusReport {
     pub construction: String,
     pub fixture_count: usize,
     pub pair_count: usize,
+    pub candidate_caps: Vec<RealisticCandidateCapSummary>,
     pub fixtures: Vec<RealisticFixtureObservation>,
     pub transition_cases: Vec<RealisticPositiveTransitionCase>,
     pub summary: RealisticPositiveSummary,
@@ -3566,6 +3567,7 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
         .iter()
         .map(|(item, _)| &item.flow)
         .collect::<Vec<_>>();
+    let candidate_caps = realistic_candidate_caps(&flow_refs);
     let decisions = build_abstention_rows(&flow_refs);
     let fixtures = generated
         .iter()
@@ -3724,6 +3726,7 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
         construction: "Independent deterministic 30s/60s arrangement-like audio analyzed through analyze_long_fixture; positive planner inputs retain observed V2 events and add only generated heuristic cues from analyzed structure. No synthetic BeatEvent-only planner objects and no truth-driven acceptance.".into(),
         fixture_count: fixtures.len(),
         pair_count: transition_cases.len(),
+        candidate_caps,
         fixtures,
         transition_cases,
         summary,
