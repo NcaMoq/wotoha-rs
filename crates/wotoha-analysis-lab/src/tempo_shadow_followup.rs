@@ -294,6 +294,8 @@ pub struct RenderQualityObservation {
     pub tempo_adjustment: Option<f32>,
     pub quietest_to_edge_rms_ratio: Option<f32>,
     pub mid_to_edge_rms_ratio: Option<f32>,
+    pub finite_samples: bool,
+    pub no_discontinuous_gap: bool,
     pub acceptable: bool,
     pub issues: Vec<String>,
 }
@@ -2209,7 +2211,7 @@ fn incoming_bpm(truth: &AnalysisGroundTruth) -> f32 {
     outgoing_bpm(truth)
 }
 
-fn render_preview(
+pub(crate) fn render_preview(
     outgoing: &SyntheticFixture,
     incoming: &SyntheticFixture,
     plan: &wotoha_core::automix::TransitionPlan,
@@ -2223,6 +2225,7 @@ fn render_preview(
     let mut edge_energy = Vec::new();
     let mut middle_energy = Vec::new();
     let mut previous_gains: Option<(f32, f32)> = None;
+    let mut finite_samples = true;
     for index in 0..=steps {
         let progress = index as f32 / steps as f32;
         let elapsed = duration.mul_f32(progress);
@@ -2243,6 +2246,11 @@ fn render_preview(
         }
         previous_gains = Some(gains);
         let mixed = gains.0 * outgoing_sample + gains.1 * incoming_sample;
+        finite_samples &= outgoing_sample.is_finite()
+            && incoming_sample.is_finite()
+            && gains.0.is_finite()
+            && gains.1.is_finite()
+            && mixed.is_finite();
         peak = peak.max(mixed.abs());
         let energy = mixed * mixed;
         if index < steps / 4 || index > steps * 3 / 4 {
@@ -2258,7 +2266,15 @@ fn render_preview(
         .zip(edge_rms)
         .map(|(middle, edge)| middle / edge.max(1.0e-6));
     let phase_alignment_ms = phase_error.map(|error| error.as_secs_f32() * 1_000.0);
+    let no_discontinuous_gap = plan.duration > Duration::ZERO
+        && (plan.kind != TransitionKind::BeatMatched || plan.duration.as_micros() > 0);
     let mut issues = Vec::new();
+    if !finite_samples {
+        issues.push("non_finite_samples".into());
+    }
+    if !no_discontinuous_gap {
+        issues.push("discontinuous_gap".into());
+    }
     if peak > 1.0 {
         issues.push("peak_above_unity".into());
     }
@@ -2281,6 +2297,8 @@ fn render_preview(
         tempo_adjustment: Some((plan.incoming_tempo_ratio - 1.0).abs()),
         quietest_to_edge_rms_ratio: quietest_to_edge,
         mid_to_edge_rms_ratio: middle_to_edge,
+        finite_samples,
+        no_discontinuous_gap,
         acceptable: issues.is_empty(),
         issues,
     }

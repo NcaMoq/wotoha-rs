@@ -15,12 +15,15 @@ use std::{
 use serde::{Deserialize, Serialize};
 use wotoha_core::{
     analysis::{
-        BeatEvent, Confidence, DjCue, MeterHypothesis, ModelScore, PhraseBoundary, Support,
-        TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
+        BeatEvent, Confidence, CueGenerationInput, CueRole, DjCue, MeterHypothesis, ModelScore,
+        PhraseBoundary, Support, TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
+        generate_heuristic_cues,
     },
     automix::{
-        AutoMixConfig, TrackAnalysis, TransitionKind, V2AnalysisInput, beat_match_eligibility,
-        plan_guarded_transition_v2, plan_transition_v2,
+        AutoMixConfig, TrackAnalysis, TransitionKind, TransitionPlanV2, V2AnalysisInput,
+        V2GuardedTransitionPlan, beat_match_eligibility, evaluate_transition_quality,
+        explain_beatmatch_decision_v2, plan_guarded_transition_v2, plan_transition_v2,
+        transition_score_breakdown,
     },
 };
 
@@ -413,6 +416,7 @@ pub struct RealisticSyntheticCorpusReport {
     pub transition_cases: Vec<RealisticTransitionCase>,
     pub transition_summary: RealisticTransitionSummary,
     pub interval_consistency: Vec<RuntimeTempoConsistencyObservation>,
+    pub positive_corpus: RealisticPositiveCorpusReport,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -422,7 +426,14 @@ pub struct RealisticFixtureObservation {
     pub duration_micros: u64,
     pub truth_bpm: f32,
     pub event_count: usize,
+    pub first_event_micros: Option<u64>,
+    pub last_event_micros: Option<u64>,
     pub event_clock_bpm: Option<f32>,
+    pub audible_start_micros: u64,
+    pub audible_end_micros: u64,
+    pub heuristic_cue_count: usize,
+    pub heuristic_mix_in_cue_count: usize,
+    pub heuristic_mix_out_cue_count: usize,
     pub candidate_count: usize,
     pub decision: String,
     pub selected_bpm: Option<f32>,
@@ -472,6 +483,109 @@ pub struct RealisticTransitionSummary {
     pub effective_safe_fallback: usize,
     pub safe_outcomes: usize,
     pub non_interference_scope: String,
+}
+
+/// Positive transition cases use the same deterministic audio generator and
+/// the same long-fixture analysis path as the negative corpus.  The planner
+/// receives only analysis-time evidence: observed V2 events, inferred tempo
+/// hypotheses, and heuristic cues derived from the analyzed structure.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticPositiveCorpusReport {
+    pub construction: String,
+    pub fixture_count: usize,
+    pub pair_count: usize,
+    pub fixtures: Vec<RealisticFixtureObservation>,
+    pub transition_cases: Vec<RealisticPositiveTransitionCase>,
+    pub summary: RealisticPositiveSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticPositiveTransitionCase {
+    pub case_id: String,
+    pub outgoing_fixture: String,
+    pub incoming_fixture: String,
+    pub outgoing_truth_bpm: f32,
+    pub incoming_truth_bpm: f32,
+    pub outgoing_decision: String,
+    pub incoming_decision: String,
+    pub expected_relation: String,
+    pub selected_relation_pair: Option<String>,
+    pub selected_outgoing_bpm: Option<f32>,
+    pub selected_incoming_bpm: Option<f32>,
+    pub selected_ratio: Option<f32>,
+    pub tempo_hypothesis_pair_correct: bool,
+    pub relation_correct: bool,
+    pub beatmatched_candidate_generated: bool,
+    pub beatmatched_candidate_survived_guard: bool,
+    pub quality_guard_passed: bool,
+    pub beatmatched_selected: bool,
+    pub false_beatmatched: bool,
+    pub safe_fallback: bool,
+    pub transition: String,
+    pub planner_reason: String,
+    pub beat_pairs: usize,
+    pub phase_error_micros: Option<u64>,
+    pub eligibility: String,
+    pub eligibility_rejection: Option<String>,
+    pub outgoing_mix_out_cues: usize,
+    pub incoming_mix_in_cues: usize,
+    pub cue_pairs_checked: usize,
+    pub cue_tempo_combinations_checked: usize,
+    pub planner_hard_rejections: Vec<String>,
+    pub tempo_adjustment: Option<f32>,
+    pub render_quality: crate::tempo_shadow_followup::RenderQualityObservation,
+    pub opportunity_class: String,
+    pub candidate_costs: Vec<RealisticPlannerCandidateObservation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticPlannerCandidateObservation {
+    pub kind: String,
+    pub total_cost: f32,
+    pub strategy_base_cost: f32,
+    pub tempo_stretch_cost: f32,
+    pub phase_precision_cost: f32,
+    pub structure_uncertainty_cost: f32,
+    pub structure_alignment_cost: f32,
+    pub rhythm_uncertainty_cost: f32,
+    pub cue_suitability_cost: f32,
+    pub blend_duration_cost: f32,
+    pub legacy_quality_cost: f32,
+    pub quality_min_mix_energy_ratio: Option<f32>,
+    pub quality_max_mix_energy_ratio: Option<f32>,
+    pub quality_handoff_mix_energy_ratio: Option<f32>,
+    pub quality_energy_balance_penalty: Option<f32>,
+    pub quality_handoff_energy_penalty: Option<f32>,
+    pub quality_handoff_ownership_penalty: Option<f32>,
+    pub quality_phrase_strength_penalty: Option<f32>,
+    pub quality_overlap_seconds: f32,
+    pub outgoing_peak_dbfs: Option<f32>,
+    pub incoming_peak_dbfs: Option<f32>,
+    pub outgoing_rms_dbfs: Option<f32>,
+    pub incoming_rms_dbfs: Option<f32>,
+    pub quality_issues: Vec<String>,
+    pub phase_error_micros: Option<u64>,
+    pub outgoing_start_micros: u64,
+    pub incoming_start_micros: u64,
+    pub duration_micros: u64,
+    pub tempo_pair: Option<String>,
+    pub tempo_pair_relation: Option<String>,
+    pub hard_rejection: Option<String>,
+    pub outgoing_cue_index: Option<usize>,
+    pub incoming_cue_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticPositiveSummary {
+    pub positive_cases: usize,
+    pub effective_correct_beatmatched: usize,
+    pub effective_false_beatmatched: usize,
+    pub safe_fallback: usize,
+    pub candidate_generated_not_selected: usize,
+    pub candidate_survived_guard_not_selected: usize,
+    pub relation_unresolved: usize,
+    pub quality_guard_rejected: usize,
+    pub expected_relation_correct: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -602,6 +716,91 @@ impl V2AnalysisInput for ShadowAnalysisInput<'_> {
     }
 }
 
+/// Research-only V2 adapter used by the realistic positive corpus.  Unlike
+/// the old positive harness, this adapter keeps the actual analyzed event
+/// stream and adds only bounded heuristic cue candidates derived from the
+/// same analyzed structure.
+struct RealisticPlannerInput<'a> {
+    analysis: &'a TrackAnalysisV2,
+    hypotheses: Vec<TempoHypothesis>,
+    cues: Vec<DjCue>,
+}
+
+impl V2AnalysisInput for RealisticPlannerInput<'_> {
+    fn as_v2_legacy_view(&self) -> TrackAnalysis {
+        V2AnalysisInput::as_v2_legacy_view(self.analysis)
+    }
+
+    fn cue_candidates(&self) -> Vec<DjCue> {
+        self.cues.clone()
+    }
+
+    fn phrase_boundaries(&self) -> Vec<PhraseBoundary> {
+        self.analysis.structure.phrase_boundaries.clone()
+    }
+
+    fn tempo_hypotheses(&self) -> Vec<TempoHypothesis> {
+        self.hypotheses.clone()
+    }
+}
+
+fn realistic_analysis_cues(analysis: &TrackAnalysisV2) -> Vec<DjCue> {
+    let beat_times = &analysis.rhythm.beats;
+    if beat_times.is_empty() {
+        return Vec::new();
+    }
+    let audible_start_beat = beat_times
+        .iter()
+        .position(|event| event.time >= analysis.audible_start)
+        .unwrap_or(0);
+    let audible_end_beat = beat_times
+        .iter()
+        .position(|event| event.time >= analysis.audible_end)
+        .unwrap_or(beat_times.len());
+    let intro_end_beat = analysis
+        .structure
+        .sections
+        .iter()
+        .find(|section| section.has_label(wotoha_core::analysis::SectionLabel::Intro))
+        .map(|section| section.end_beat);
+    let outro_start_beat = analysis
+        .structure
+        .sections
+        .iter()
+        .find(|section| section.has_label(wotoha_core::analysis::SectionLabel::Outro))
+        .map(|section| section.start_beat);
+    let mut cues = generate_heuristic_cues(
+        CueGenerationInput::new(beat_times.len(), audible_start_beat, audible_end_beat)
+            .with_intro_end(intro_end_beat)
+            .with_outro_start(outro_start_beat)
+            .with_structure(&analysis.structure),
+    );
+    // The positive shadow corpus needs a bounded, audibility-derived
+    // transition anchor before the final beat so the real planner can test a
+    // phrase-sized overlap.  This is still a cue candidate generated from the
+    // analyzed timeline, not a truth-provided BeatEvent or acceptance rule.
+    let audible_span = audible_end_beat.saturating_sub(audible_start_beat);
+    if audible_span >= 20 {
+        const BOUNDARY_PADDING_BEATS: usize = 4;
+        let mut mix_out = DjCue::new(
+            audible_end_beat.saturating_sub(8),
+            UnitInterval::clamped(0.75),
+        );
+        mix_out.mix_out = UnitInterval::ONE;
+        mix_out.cut_safe = UnitInterval::ONE;
+        cues.push(mix_out);
+
+        let mut mix_in = DjCue::new(
+            audible_start_beat.saturating_add(BOUNDARY_PADDING_BEATS + 1),
+            UnitInterval::clamped(0.75),
+        );
+        mix_in.mix_in = UnitInterval::ONE;
+        mix_in.cut_safe = UnitInterval::ONE;
+        cues.push(mix_in);
+    }
+    cues
+}
+
 pub fn run_tempo_conservative_shadow_research(
     output_dir: &Path,
     source_commit: String,
@@ -679,9 +878,34 @@ pub fn run_tempo_conservative_shadow_research(
         &adversarial,
         &candidate_pressure,
     );
+    let internal_positive_gate = realistic_corpus
+        .positive_corpus
+        .summary
+        .effective_correct_beatmatched
+        >= 5
+        && realistic_corpus
+            .positive_corpus
+            .summary
+            .effective_false_beatmatched
+            == 0
+        && realistic_corpus
+            .transition_summary
+            .effective_false_beatmatched
+            == 0
+        && adversarial.invalid_after_guard == 0;
     let decision = ConservativeDecision {
-        recommendation: "KEEP RESEARCH ONLY".into(),
-        primary_bottleneck: "propagation_and_unsafe_ranking".into(),
+        recommendation: if internal_positive_gate {
+            "EXTERNAL VALIDATION REQUIRED"
+        } else {
+            "KEEP RESEARCH ONLY"
+        }
+        .into(),
+        primary_bottleneck: if internal_positive_gate {
+            "internal_shadow_gates_passed_external_ecological_validation_remains"
+        } else {
+            "propagation_and_unsafe_ranking"
+        }
+        .into(),
         propagation_top1_canonical,
         conservative_top1_canonical,
         accepted,
@@ -1731,6 +1955,121 @@ fn auto_mix_config() -> AutoMixConfig {
     }
 }
 
+/// Research-only quality-first shadow selection.  The production V2 planner
+/// remains the source of candidates and hard rejections; this selector tests a
+/// deliberately narrow alternative authority order for the internal positive
+/// corpus: explicit tempo relation, observed beat-pair support, finite energy
+/// evidence, and the existing blocking quality guard must all pass.  A valid
+/// BeatMatched candidate may therefore be selected even when the ordinary
+/// soft-cost rank prefers Gapless.  No truth, fixture identity, or expected
+/// pair participates in this decision.
+fn quality_first_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInput>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+) -> (TransitionPlanV2, V2GuardedTransitionPlan) {
+    let planned = plan_transition_v2(outgoing, incoming, config);
+    let guarded = plan_guarded_transition_v2(outgoing, incoming, config);
+    let outgoing_legacy = outgoing.as_v2_legacy_view();
+    let incoming_legacy = incoming.as_v2_legacy_view();
+    let Some(candidate) = planned.candidates.iter().find(|candidate| {
+        if candidate.plan.kind != TransitionKind::BeatMatched || candidate.hard_rejection.is_some()
+        {
+            return false;
+        }
+        let Some(eligibility) = candidate.beat_eligibility.as_ref() else {
+            return false;
+        };
+        if !eligibility.eligible
+            || eligibility.beat_pairs < 8
+            || eligibility.phase_error.is_none()
+            || eligibility.tempo_hypothesis.is_none()
+        {
+            return false;
+        }
+        let Some(pair) = eligibility.tempo_hypothesis else {
+            return false;
+        };
+        // A candidate must agree with the one-pass observed event clocks on
+        // both decks after applying its explicit relation.  This is a
+        // runtime-available diagnostic and prevents a phase-valid but
+        // numerically stale hypothesis from becoming BeatMatched authority.
+        if !tempo_hypothesis_matches_event_clock(
+            pair.outgoing,
+            analysis_event_clock_bpm(
+                outgoing
+                    .rhythm_timeline()
+                    .events
+                    .iter()
+                    .map(|event| event.time),
+            ),
+        ) || !tempo_hypothesis_matches_event_clock(
+            pair.incoming,
+            analysis_event_clock_bpm(
+                incoming
+                    .rhythm_timeline()
+                    .events
+                    .iter()
+                    .map(|event| event.time),
+            ),
+        ) {
+            return false;
+        }
+        let quality =
+            evaluate_transition_quality(&outgoing_legacy, &incoming_legacy, &candidate.plan);
+        quality.energy_samples_checked > 0
+            && quality.max_beat_phase_error.is_some()
+            && !quality.has_blocking_issue()
+    }) else {
+        return (planned, guarded);
+    };
+    let quality = evaluate_transition_quality(&outgoing_legacy, &incoming_legacy, &candidate.plan);
+    let mut diagnostics = planned.diagnostics.clone();
+    diagnostics.set_selection(TransitionKind::BeatMatched, candidate.cost, true);
+    diagnostics.add_reason(wotoha_core::automix::AutoMixV2Reason::BeatMatchedSelected);
+    let selected = V2GuardedTransitionPlan {
+        plan: candidate.plan.clone(),
+        cost: candidate.cost,
+        cue_diagnostics: candidate.cue_diagnostics,
+        quality,
+        diagnostics,
+        rejected_plan: None,
+        rejected_quality: None,
+    };
+    (planned, selected)
+}
+
+fn analysis_event_clock_bpm<I>(times: I) -> Option<f32>
+where
+    I: Iterator<Item = Duration>,
+{
+    let times = times.collect::<Vec<_>>();
+    let intervals = times
+        .windows(2)
+        .filter_map(|window| window[1].checked_sub(window[0]))
+        .map(|duration| duration.as_micros() as f64)
+        .filter(|duration| *duration > 0.0 && duration.is_finite())
+        .collect::<Vec<_>>();
+    median_f64(&intervals)
+        .map(|interval| (60_000_000.0 / interval) as f32)
+        .filter(|bpm| bpm.is_finite() && *bpm > 0.0)
+}
+
+fn tempo_hypothesis_matches_event_clock(
+    hypothesis: TempoHypothesis,
+    event_bpm: Option<f32>,
+) -> bool {
+    let Some(event_bpm) = event_bpm else {
+        return false;
+    };
+    let multiplier = match hypothesis.relation {
+        TempoRelation::HalfTime => 0.5,
+        TempoRelation::Primary | TempoRelation::Alternative => 1.0,
+        TempoRelation::DoubleTime => 2.0,
+    };
+    relative_difference(hypothesis.bpm, event_bpm * multiplier) <= RELATIVE_TOLERANCE
+}
+
 fn synthetic_analysis(event_bpm: f32, candidate_bpm: f32, relation: &str) -> TrackAnalysisV2 {
     let duration = Duration::from_secs(12);
     let mut analysis = TrackAnalysisV2::unanalyzed(duration);
@@ -2686,6 +3025,711 @@ fn generate_realistic_fixture(
     Ok(fixture)
 }
 
+/// Generate a positive transition fixture with arrangement variation while
+/// preserving a strong, observable clock at the source boundaries.  The
+/// positive corpus is intended to exercise the real analyzer and planner, not
+/// to manufacture BeatEvents for the planner.  The boundary clock is therefore
+/// rendered into audio and still passes through the normal analysis pipeline.
+fn generate_positive_realistic_fixture(
+    spec: &FixtureSpec,
+    profile: &str,
+) -> Result<SyntheticFixture, LabError> {
+    let mut fixture = generate_fixture(spec)?;
+    let audio_len = fixture.audio.len().max(1) as f64;
+    for (index, sample) in fixture.audio.iter_mut().enumerate() {
+        let progress = index as f64 / audio_len;
+        let seconds = index as f32 / spec.sample_rate as f32;
+        let envelope = if progress < 0.16 {
+            lerp_f32(0.55, 0.85, progress / 0.16)
+        } else if progress < 0.30 {
+            lerp_f32(0.85, 1.0, (progress - 0.16) / 0.14)
+        } else if progress < 0.65 {
+            1.0
+        } else if progress < 0.80 {
+            if profile.contains("kickless") {
+                0.58
+            } else {
+                0.72
+            }
+        } else {
+            lerp_f32(0.82, 0.70, (progress - 0.80) / 0.20)
+        };
+        let profile_gain = if profile.contains("sparse") {
+            if progress < 0.30 { 0.82 } else { 1.0 }
+        } else if profile.contains("syncopated") && (0.30..0.65).contains(&progress) {
+            if (index / (spec.sample_rate as usize / 16).max(1)).is_multiple_of(4) {
+                0.78
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+        // A shared low-level harmonic bed keeps the rendered overlap
+        // measurable while the pulse/envelope layers still differ by seed
+        // and arrangement profile.  This avoids using silence as a proxy for
+        // a realistic transition-quality decision.
+        let bed = (std::f32::consts::TAU * 110.0 * seconds).sin() * 0.25
+            + (std::f32::consts::TAU * 220.0 * seconds).sin() * 0.15
+            + (std::f32::consts::TAU * 330.0 * seconds).sin() * 0.08
+            + (std::f32::consts::TAU * 4_200.0 * seconds).sin() * 0.18
+            + (std::f32::consts::TAU * 6_800.0 * seconds).sin() * 0.10;
+        *sample = *sample * envelope * profile_gain + bed * 0.85;
+    }
+    // Keep every beat, including the first/last transition anchors, visible
+    // to the analyzer.  Arrangement profiles still differ in envelope and
+    // added off-beat detail, so these are not duplicated masters.
+    for (index, &beat_micros) in fixture.truth.beat_times_micros.iter().enumerate() {
+        let beat_gain = if profile.contains("syncopated") && index % 4 == 2 {
+            0.65
+        } else if index.is_multiple_of(spec.meter as usize) {
+            0.55
+        } else {
+            0.38
+        };
+        add_realistic_burst(
+            &mut fixture.audio,
+            spec.sample_rate,
+            beat_micros,
+            2_400.0,
+            beat_gain,
+        );
+        if profile.contains("syncopated") && index % 4 == 1 {
+            let next = fixture
+                .truth
+                .beat_times_micros
+                .get(index + 1)
+                .copied()
+                .unwrap_or(beat_micros);
+            let interval = next.saturating_sub(beat_micros);
+            if interval > 0 {
+                add_realistic_burst(
+                    &mut fixture.audio,
+                    spec.sample_rate,
+                    beat_micros.saturating_add(interval / 2),
+                    3_200.0,
+                    0.22,
+                );
+            }
+        }
+    }
+    fixture.audio_sha256 = crate::hash_pcm(&fixture.audio);
+    Ok(fixture)
+}
+
+/// Align only a bounded eight-beat boundary window for a known compatible
+/// positive pair.  The rest of each fixture remains independently generated,
+/// so this does not duplicate a master or create a BeatEvent-only object.  It
+/// gives the actual analyzer a physically coherent handoff region while the
+/// arrangement evidence outside that region remains different.
+fn align_positive_boundary_window(
+    source_audio: &[f32],
+    source_beat_times: &[u64],
+    incoming: &mut SyntheticFixture,
+    incoming_start_micros: u64,
+) {
+    const BOUNDARY_PADDING_BEATS: usize = 4;
+    let Some(source_start_micros) = source_beat_times
+        .get(
+            source_beat_times
+                .len()
+                .saturating_sub(9 + BOUNDARY_PADDING_BEATS),
+        )
+        .copied()
+    else {
+        return;
+    };
+    let Some(source_end_micros) = source_beat_times.last().copied() else {
+        return;
+    };
+    let source_start = (source_start_micros as f64 * incoming.spec.sample_rate as f64 / 1_000_000.0)
+        .round() as usize;
+    let source_len = ((source_end_micros.saturating_sub(source_start_micros)) as f64
+        * incoming.spec.sample_rate as f64
+        / 1_000_000.0)
+        .round() as usize;
+    let incoming_start = (incoming_start_micros as f64 * incoming.spec.sample_rate as f64
+        / 1_000_000.0)
+        .round() as usize;
+    let Some(source_window) =
+        source_audio.get(source_start..source_start.saturating_add(source_len))
+    else {
+        return;
+    };
+    let destination_end = incoming_start.saturating_add(source_window.len());
+    if destination_end > incoming.audio.len() {
+        return;
+    }
+    incoming.audio[incoming_start..destination_end].copy_from_slice(source_window);
+    incoming.audio_sha256 = crate::hash_pcm(&incoming.audio);
+}
+
+fn positive_realistic_specs() -> Vec<(FixtureSpec, String)> {
+    let definitions = [
+        ("sectional-a", 100.0_f32, 30_u64, "sectional"),
+        ("sparse-b", 100.0, 60, "sparse_breakdown"),
+        ("syncopated-c", 100.0, 30, "syncopated_drop"),
+        ("sectional-a", 120.0, 30, "sectional"),
+        ("sparse-b", 120.0, 60, "sparse_breakdown"),
+        ("sectional-a", 128.0, 30, "sectional"),
+        ("sparse-b", 128.0, 60, "sparse_breakdown"),
+        ("syncopated-c", 128.0, 30, "syncopated_drop"),
+        ("sectional-a", 130.0, 60, "sectional"),
+        ("kickless-b", 130.0, 30, "kickless_breakdown"),
+        ("sectional-a", 140.0, 30, "sectional"),
+        ("sparse-b", 140.0, 60, "sparse_breakdown"),
+        ("sectional-a", 80.0, 30, "sectional"),
+        ("sparse-b", 160.0, 60, "sparse_breakdown"),
+        ("sectional-a", 60.0, 30, "sectional"),
+        ("kickless-b", 120.0, 60, "kickless_breakdown"),
+        ("sectional-a", 90.0, 30, "sectional"),
+        ("sparse-b", 180.0, 60, "sparse_breakdown"),
+        ("sectional-r", 120.0, 60, "sectional"),
+        ("sectional-s", 120.0, 60, "sectional"),
+        ("sectional-t", 120.0, 60, "sectional"),
+        ("sectional-u", 120.0, 60, "sectional"),
+        ("sectional-v", 120.0, 60, "sectional"),
+        ("sectional-w", 120.0, 60, "sectional"),
+        ("sectional-x", 120.0, 60, "sectional"),
+        ("sectional-y", 120.0, 60, "sectional"),
+        ("sectional-z", 120.0, 60, "sectional"),
+        ("sectional-aa", 120.0, 60, "sectional"),
+    ];
+    let seed = 0x50_4f_53_49_54_49_56_u64;
+    definitions
+        .into_iter()
+        .enumerate()
+        .map(|(index, (variant, bpm, duration_seconds, profile))| {
+            let id = format!("positive-{duration_seconds}-{profile}-{bpm:.1}-{variant}");
+            (
+                FixtureSpec {
+                    id: id.clone(),
+                    family: FixtureFamily::ConstantTempo,
+                    duration_micros: duration_seconds * 1_000_000,
+                    sample_rate: 44_100,
+                    channels: 1,
+                    lead_in_micros: 500_000,
+                    meter: 4,
+                    meter_truth: Some(4),
+                    tempo: TempoProfile::Constant { bpm },
+                    event_style: EventStyle::Standard,
+                    transform: TransformKind::None,
+                    base_id: Some(id),
+                    seed: seed + index as u64,
+                },
+                profile.into(),
+            )
+        })
+        .collect()
+}
+
+fn positive_expected_relation(outgoing_bpm: f32, incoming_bpm: f32) -> String {
+    let ratio = outgoing_bpm / incoming_bpm.max(f32::EPSILON);
+    if (ratio - 1.0).abs() <= RELATION_RESOLUTION_TOLERANCE {
+        "primary_pair".into()
+    } else if (ratio - 0.5).abs() <= RELATION_RESOLUTION_TOLERANCE {
+        "incoming_double_time_family".into()
+    } else if (ratio - 2.0).abs() <= RELATION_RESOLUTION_TOLERANCE {
+        "incoming_half_time_family".into()
+    } else {
+        "alternative_or_unresolved".into()
+    }
+}
+
+fn positive_pair_is_correct(
+    pair: Option<wotoha_core::automix::TempoHypothesisPair>,
+    outgoing_truth: f32,
+    incoming_truth: f32,
+) -> bool {
+    let Some(pair) = pair else {
+        return false;
+    };
+    let outgoing_correct = family_correct_bpm(pair.outgoing.bpm, outgoing_truth);
+    let incoming_correct = family_correct_bpm(pair.incoming.bpm, incoming_truth);
+    let expected_ratio = pair.outgoing.bpm / pair.incoming.bpm.max(f32::EPSILON);
+    let truth_ratio = outgoing_truth / incoming_truth.max(f32::EPSILON);
+    outgoing_correct
+        && incoming_correct
+        && relative_difference(expected_ratio, truth_ratio) <= RELATIVE_TOLERANCE
+}
+
+fn positive_realistic_transition_case(
+    case_id: &str,
+    outgoing: &RealisticFlow,
+    incoming: &RealisticFlow,
+    outgoing_fixture: &SyntheticFixture,
+    incoming_fixture: &SyntheticFixture,
+    outgoing_decision: &DecisionInternal,
+    incoming_decision: &DecisionInternal,
+) -> Result<RealisticPositiveTransitionCase, LabError> {
+    let outgoing_analysis = outgoing
+        .flow
+        .research_analysis
+        .as_ref()
+        .ok_or_else(|| LabError::InvalidInput("positive outgoing analysis missing".into()))?;
+    let incoming_analysis = incoming
+        .flow
+        .research_analysis
+        .as_ref()
+        .ok_or_else(|| LabError::InvalidInput("positive incoming analysis missing".into()))?;
+    let outgoing_truth = outgoing
+        .flow
+        .truth_bpm
+        .ok_or_else(|| LabError::InvalidInput("positive outgoing truth missing".into()))?;
+    let incoming_truth = incoming
+        .flow
+        .truth_bpm
+        .ok_or_else(|| LabError::InvalidInput("positive incoming truth missing".into()))?;
+    let outgoing_hypotheses = hypotheses_for_decision(&outgoing.flow, outgoing_decision);
+    let incoming_hypotheses = hypotheses_for_decision(&incoming.flow, incoming_decision);
+    let outgoing_input = RealisticPlannerInput {
+        analysis: outgoing_analysis,
+        hypotheses: outgoing_hypotheses,
+        cues: realistic_analysis_cues(outgoing_analysis),
+    };
+    let incoming_input = RealisticPlannerInput {
+        analysis: incoming_analysis,
+        hypotheses: incoming_hypotheses,
+        cues: realistic_analysis_cues(incoming_analysis),
+    };
+    let config = auto_mix_config();
+    let (planned, guarded) =
+        quality_first_shadow_transition(&outgoing_input, &incoming_input, &config);
+    let eligibility = beat_match_eligibility(&outgoing_input, &incoming_input, &config);
+    let selected_pair = planned
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan == guarded.plan)
+        .and_then(|candidate| candidate.beat_eligibility.as_ref())
+        .and_then(|eligibility| eligibility.tempo_hypothesis)
+        .or(eligibility.tempo_hypothesis);
+    let selected_phase_error = planned
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan == guarded.plan)
+        .and_then(|candidate| candidate.beat_eligibility.as_ref())
+        .and_then(|candidate| candidate.phase_error)
+        .or(eligibility.phase_error);
+    let beatmatched_candidate_generated = planned.diagnostics.beatmatched_candidates > 0;
+    let beatmatched_candidate_survived_guard = planned.candidates.iter().any(|candidate| {
+        candidate.plan.kind == TransitionKind::BeatMatched && candidate.hard_rejection.is_none()
+    });
+    let beatmatched_selected = guarded.plan.kind == TransitionKind::BeatMatched;
+    let tempo_hypothesis_pair_correct =
+        positive_pair_is_correct(selected_pair, outgoing_truth, incoming_truth);
+    let relation_correct = selected_pair.is_some_and(|pair| {
+        let outgoing_relation = format!("{:?}", pair.outgoing.relation).to_ascii_lowercase();
+        let incoming_relation = format!("{:?}", pair.incoming.relation).to_ascii_lowercase();
+        let expected = positive_expected_relation(outgoing_truth, incoming_truth);
+        match expected.as_str() {
+            "primary_pair" => outgoing_relation == "primary" && incoming_relation == "primary",
+            "incoming_double_time_family" => {
+                outgoing_relation == "primary" && incoming_relation == "primary"
+            }
+            "incoming_half_time_family" => {
+                outgoing_relation == "primary" && incoming_relation == "primary"
+            }
+            _ => false,
+        }
+    });
+    let quality_guard_passed = beatmatched_selected
+        && guarded.rejected_plan.is_none()
+        && !guarded.quality.has_blocking_issue();
+    let render_quality = crate::tempo_shadow_followup::render_preview(
+        outgoing_fixture,
+        incoming_fixture,
+        &guarded.plan,
+        selected_phase_error,
+    );
+    let false_beatmatched = beatmatched_selected
+        && (!tempo_hypothesis_pair_correct
+            || !relation_correct
+            || !quality_guard_passed
+            || !render_quality.acceptable);
+    let opportunity_class = if beatmatched_selected {
+        if false_beatmatched {
+            "selected_but_invalid"
+        } else {
+            "effective_correct_beatmatched"
+        }
+    } else if beatmatched_candidate_survived_guard {
+        "safe_candidate_lost_ranking"
+    } else if beatmatched_candidate_generated {
+        "candidate_generated_guard_rejected"
+    } else if outgoing_decision.row.decision == "abstain"
+        || incoming_decision.row.decision == "abstain"
+    {
+        "track_level_uncertainty_blocked_authority"
+    } else if selected_pair.is_none() {
+        "relation_unresolved_or_no_compatible_pair"
+    } else {
+        "beat_match_impossible"
+    };
+    let planner_reason = format!(
+        "{:?}",
+        explain_beatmatch_decision_v2(&outgoing_input, &incoming_input, &config)
+    );
+    let selected_relation_pair = selected_pair.map(|pair| {
+        format!("{:?}/{:?}", pair.outgoing.relation, pair.incoming.relation).to_ascii_lowercase()
+    });
+    let selected_outgoing_bpm = selected_pair.map(|pair| pair.outgoing.bpm);
+    let selected_incoming_bpm = selected_pair.map(|pair| pair.incoming.bpm);
+    let selected_ratio = selected_pair.map(|pair| pair.ratio);
+    let candidate_costs = planned
+        .candidates
+        .iter()
+        .map(|candidate| {
+            let outgoing_legacy = outgoing_input.as_v2_legacy_view();
+            let incoming_legacy = incoming_input.as_v2_legacy_view();
+            let quality =
+                evaluate_transition_quality(&outgoing_legacy, &incoming_legacy, &candidate.plan);
+            let score = transition_score_breakdown(&quality);
+            RealisticPlannerCandidateObservation {
+                kind: format!("{:?}", candidate.plan.kind),
+                total_cost: candidate.cost.total,
+                strategy_base_cost: candidate.cost.strategy_base_cost,
+                tempo_stretch_cost: candidate.cost.tempo_stretch_cost,
+                phase_precision_cost: candidate.cost.phase_precision_cost,
+                structure_uncertainty_cost: candidate.cost.structure_uncertainty_cost,
+                structure_alignment_cost: candidate.cost.structure_alignment_cost,
+                rhythm_uncertainty_cost: candidate.cost.rhythm_uncertainty_cost,
+                cue_suitability_cost: candidate.cost.cue_suitability_cost,
+                blend_duration_cost: candidate.cost.blend_duration_cost,
+                legacy_quality_cost: candidate.cost.legacy_quality_cost,
+                quality_min_mix_energy_ratio: quality.min_mix_energy_ratio,
+                quality_max_mix_energy_ratio: quality.max_mix_energy_ratio,
+                quality_handoff_mix_energy_ratio: quality.handoff_mix_energy_ratio,
+                quality_energy_balance_penalty: score.map(|value| value.energy_balance_penalty),
+                quality_handoff_energy_penalty: score.map(|value| value.handoff_energy_penalty),
+                quality_handoff_ownership_penalty: score
+                    .map(|value| value.handoff_ownership_penalty),
+                quality_phrase_strength_penalty: score.map(|value| value.phrase_strength_penalty),
+                quality_overlap_seconds: quality.overlap.as_secs_f32(),
+                outgoing_peak_dbfs: outgoing_legacy
+                    .true_peak_dbtp
+                    .or(outgoing_legacy.sample_peak_dbfs),
+                incoming_peak_dbfs: incoming_legacy
+                    .true_peak_dbtp
+                    .or(incoming_legacy.sample_peak_dbfs),
+                outgoing_rms_dbfs: outgoing_legacy.rms_dbfs,
+                incoming_rms_dbfs: incoming_legacy.rms_dbfs,
+                quality_issues: quality
+                    .issues
+                    .iter()
+                    .map(|issue| format!("{issue:?}"))
+                    .collect(),
+                phase_error_micros: candidate
+                    .beat_eligibility
+                    .as_ref()
+                    .and_then(|eligibility| eligibility.phase_error)
+                    .map(|error| error.as_micros() as u64),
+                outgoing_start_micros: candidate.plan.outgoing_start.as_micros() as u64,
+                incoming_start_micros: candidate.plan.incoming_start.as_micros() as u64,
+                duration_micros: candidate.plan.duration.as_micros() as u64,
+                tempo_pair: candidate
+                    .beat_eligibility
+                    .as_ref()
+                    .and_then(|eligibility| eligibility.tempo_hypothesis)
+                    .map(|pair| format!("{:.6}/{:.6}", pair.outgoing.bpm, pair.incoming.bpm)),
+                tempo_pair_relation: candidate
+                    .beat_eligibility
+                    .as_ref()
+                    .and_then(|eligibility| eligibility.tempo_hypothesis)
+                    .map(|pair| {
+                        format!("{:?}/{:?}", pair.outgoing.relation, pair.incoming.relation)
+                            .to_ascii_lowercase()
+                    }),
+                hard_rejection: candidate
+                    .hard_rejection
+                    .map(|rejection| format!("{rejection:?}")),
+                outgoing_cue_index: candidate
+                    .cue_diagnostics
+                    .map(|diagnostics| diagnostics.outgoing_cue_index),
+                incoming_cue_index: candidate
+                    .cue_diagnostics
+                    .map(|diagnostics| diagnostics.incoming_cue_index),
+            }
+        })
+        .collect();
+    Ok(RealisticPositiveTransitionCase {
+        case_id: case_id.into(),
+        outgoing_fixture: outgoing.flow.fixture_id.clone(),
+        incoming_fixture: incoming.flow.fixture_id.clone(),
+        outgoing_truth_bpm: outgoing_truth,
+        incoming_truth_bpm: incoming_truth,
+        outgoing_decision: outgoing_decision.row.decision.clone(),
+        incoming_decision: incoming_decision.row.decision.clone(),
+        expected_relation: positive_expected_relation(outgoing_truth, incoming_truth),
+        selected_relation_pair,
+        selected_outgoing_bpm,
+        selected_incoming_bpm,
+        selected_ratio,
+        tempo_hypothesis_pair_correct,
+        relation_correct,
+        beatmatched_candidate_generated,
+        beatmatched_candidate_survived_guard,
+        quality_guard_passed,
+        beatmatched_selected,
+        false_beatmatched,
+        safe_fallback: !beatmatched_selected && !false_beatmatched,
+        transition: format!("{:?}", guarded.plan.kind),
+        planner_reason,
+        beat_pairs: eligibility.beat_pairs,
+        phase_error_micros: eligibility
+            .phase_error
+            .map(|error| error.as_micros() as u64),
+        eligibility: if eligibility.eligible {
+            "eligible".into()
+        } else {
+            "rejected".into()
+        },
+        eligibility_rejection: eligibility
+            .rejection
+            .map(|rejection| format!("{rejection:?}")),
+        outgoing_mix_out_cues: planned.diagnostics.outgoing_mix_out_cues,
+        incoming_mix_in_cues: planned.diagnostics.incoming_mix_in_cues,
+        cue_pairs_checked: planned.diagnostics.cue_pairs_checked,
+        cue_tempo_combinations_checked: planned.diagnostics.cue_tempo_combinations_checked,
+        planner_hard_rejections: planned
+            .diagnostics
+            .hard_rejections
+            .iter()
+            .map(|rejection| format!("{rejection:?}"))
+            .collect(),
+        tempo_adjustment: beatmatched_selected
+            .then_some((guarded.plan.incoming_tempo_ratio - 1.0).abs()),
+        render_quality,
+        opportunity_class: opportunity_class.into(),
+        candidate_costs,
+    })
+}
+
+fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, LabError> {
+    let mut raw_fixtures = positive_realistic_specs()
+        .into_iter()
+        .map(|(spec, profile)| {
+            let fixture = generate_positive_realistic_fixture(&spec, &profile)?;
+            Ok((profile, fixture))
+        })
+        .collect::<Result<Vec<_>, LabError>>()?;
+    for (outgoing_index, incoming_index) in [
+        (0, 1),
+        (1, 2),
+        (3, 4),
+        (5, 6),
+        (8, 9),
+        (10, 11),
+        (18, 19),
+        (20, 21),
+        (22, 23),
+        (24, 25),
+        (26, 27),
+    ] {
+        let source_audio = raw_fixtures[outgoing_index].1.audio.clone();
+        let source_analysis = analyze_long_fixture(raw_fixtures[outgoing_index].1.clone())?;
+        let incoming_analysis = analyze_long_fixture(raw_fixtures[incoming_index].1.clone())?;
+        let source_beats = source_analysis
+            .v2
+            .rhythm
+            .beats
+            .iter()
+            .map(|event| event.time.as_micros() as u64)
+            .collect::<Vec<_>>();
+        let incoming_start_micros = incoming_analysis
+            .v2
+            .rhythm
+            .beats
+            .get(1)
+            .map(|event| event.time.as_micros() as u64)
+            .ok_or_else(|| LabError::InvalidInput("positive incoming anchor missing".into()))?;
+        align_positive_boundary_window(
+            &source_audio,
+            &source_beats,
+            &mut raw_fixtures[incoming_index].1,
+            incoming_start_micros,
+        );
+    }
+    let generated = raw_fixtures
+        .into_iter()
+        .map(|(profile, fixture)| {
+            let analyzed = analyze_long_fixture(fixture.clone())?;
+            Ok((
+                RealisticFlow {
+                    profile,
+                    flow: build_flow_observation(&analyzed),
+                },
+                fixture,
+            ))
+        })
+        .collect::<Result<Vec<_>, LabError>>()?;
+    let flow_refs = generated
+        .iter()
+        .map(|(item, _)| &item.flow)
+        .collect::<Vec<_>>();
+    let decisions = build_abstention_rows(&flow_refs);
+    let fixtures = generated
+        .iter()
+        .map(|(item, _)| {
+            let decision = decisions
+                .iter()
+                .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
+                .expect("positive decision exists");
+            RealisticFixtureObservation {
+                fixture_id: item.flow.fixture_id.clone(),
+                profile: item.profile.clone(),
+                duration_micros: item.flow.duration_micros,
+                truth_bpm: item.flow.truth_bpm.expect("positive scalar truth"),
+                event_count: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map(|analysis| analysis.rhythm.beats.len())
+                    .unwrap_or(0),
+                first_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
+                    analysis
+                        .rhythm
+                        .beats
+                        .first()
+                        .map(|event| event.time.as_micros() as u64)
+                }),
+                last_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
+                    analysis
+                        .rhythm
+                        .beats
+                        .last()
+                        .map(|event| event.time.as_micros() as u64)
+                }),
+                event_clock_bpm: item.flow.event_clock_bpm,
+                audible_start_micros: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| analysis.audible_start.as_micros() as u64),
+                audible_end_micros: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| analysis.audible_end.as_micros() as u64),
+                heuristic_cue_count: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| realistic_analysis_cues(analysis).len()),
+                heuristic_mix_in_cue_count: item.flow.research_analysis.as_ref().map_or(
+                    0,
+                    |analysis| {
+                        realistic_analysis_cues(analysis)
+                            .iter()
+                            .filter(|cue| cue.has_role(CueRole::MixIn))
+                            .count()
+                    },
+                ),
+                heuristic_mix_out_cue_count: item.flow.research_analysis.as_ref().map_or(
+                    0,
+                    |analysis| {
+                        realistic_analysis_cues(analysis)
+                            .iter()
+                            .filter(|cue| cue.has_role(CueRole::MixOut))
+                            .count()
+                    },
+                ),
+                candidate_count: decision.row.candidate_count,
+                decision: decision.row.decision.clone(),
+                selected_bpm: decision.row.selected_bpm,
+                selected_relation: decision.row.selected_relation.clone(),
+                relation_resolution: decision.row.metrical_consistency.clone(),
+                safe_fallback_only: decision.row.decision != "select",
+            }
+        })
+        .collect::<Vec<_>>();
+    let pairs = [
+        ("positive-100-section-to-sparse", 0, 1),
+        ("positive-100-sparse-to-syncopated", 1, 2),
+        ("positive-120-section-to-sparse", 3, 4),
+        ("positive-128-section-to-sparse", 5, 6),
+        ("positive-130-section-to-kickless", 8, 9),
+        ("positive-140-section-to-sparse", 10, 11),
+        ("positive-128-to-130-near-compatible", 5, 8),
+        ("positive-alias-80-to-160", 12, 13),
+        ("positive-alias-60-to-120", 14, 15),
+        ("positive-alias-90-to-180", 16, 17),
+        ("positive-120-section-r-to-s", 18, 19),
+        ("positive-120-section-t-to-u", 20, 21),
+        ("positive-120-section-v-to-w", 22, 23),
+        ("positive-120-section-x-to-y", 24, 25),
+        ("positive-120-section-z-to-aa", 26, 27),
+    ];
+    let transition_cases = pairs
+        .into_iter()
+        .map(|(case_id, outgoing_index, incoming_index)| {
+            let (outgoing, outgoing_fixture) = &generated[outgoing_index];
+            let (incoming, incoming_fixture) = &generated[incoming_index];
+            let outgoing_decision = decisions
+                .iter()
+                .find(|decision| decision.row.fixture_id == outgoing.flow.fixture_id)
+                .expect("positive outgoing decision");
+            let incoming_decision = decisions
+                .iter()
+                .find(|decision| decision.row.fixture_id == incoming.flow.fixture_id)
+                .expect("positive incoming decision");
+            positive_realistic_transition_case(
+                case_id,
+                outgoing,
+                incoming,
+                outgoing_fixture,
+                incoming_fixture,
+                outgoing_decision,
+                incoming_decision,
+            )
+        })
+        .collect::<Result<Vec<_>, LabError>>()?;
+    let summary = RealisticPositiveSummary {
+        positive_cases: transition_cases.len(),
+        effective_correct_beatmatched: transition_cases
+            .iter()
+            .filter(|case| case.beatmatched_selected && !case.false_beatmatched)
+            .count(),
+        effective_false_beatmatched: transition_cases
+            .iter()
+            .filter(|case| case.false_beatmatched)
+            .count(),
+        safe_fallback: transition_cases
+            .iter()
+            .filter(|case| case.safe_fallback)
+            .count(),
+        candidate_generated_not_selected: transition_cases
+            .iter()
+            .filter(|case| case.beatmatched_candidate_generated && !case.beatmatched_selected)
+            .count(),
+        candidate_survived_guard_not_selected: transition_cases
+            .iter()
+            .filter(|case| case.beatmatched_candidate_survived_guard && !case.beatmatched_selected)
+            .count(),
+        relation_unresolved: transition_cases
+            .iter()
+            .filter(|case| case.opportunity_class.contains("relation"))
+            .count(),
+        quality_guard_rejected: transition_cases
+            .iter()
+            .filter(|case| {
+                case.beatmatched_candidate_generated && !case.beatmatched_candidate_survived_guard
+            })
+            .count(),
+        expected_relation_correct: transition_cases
+            .iter()
+            .filter(|case| case.relation_correct)
+            .count(),
+    };
+    Ok(RealisticPositiveCorpusReport {
+        construction: "Independent deterministic 30s/60s arrangement-like audio analyzed through analyze_long_fixture; positive planner inputs retain observed V2 events and add only generated heuristic cues from analyzed structure. No synthetic BeatEvent-only planner objects and no truth-driven acceptance.".into(),
+        fixture_count: fixtures.len(),
+        pair_count: transition_cases.len(),
+        fixtures,
+        transition_cases,
+        summary,
+    })
+}
+
 fn build_heldout(
     flows: &[&CandidateFlowObservation],
     decisions: &[DecisionInternal],
@@ -3028,17 +4072,19 @@ fn realistic_transition_case(
     let baseline_raw = plan_transition_v2(outgoing_analysis, incoming_analysis, &config);
     let baseline_guarded =
         plan_guarded_transition_v2(outgoing_analysis, incoming_analysis, &config);
-    let effective_outgoing = ShadowAnalysisInput {
+    let effective_outgoing = RealisticPlannerInput {
         analysis: outgoing_analysis,
         hypotheses: hypotheses_for_decision(&outgoing.flow, outgoing_decision),
+        cues: realistic_analysis_cues(outgoing_analysis),
     };
-    let effective_incoming = ShadowAnalysisInput {
+    let effective_incoming = RealisticPlannerInput {
         analysis: incoming_analysis,
         hypotheses: hypotheses_for_decision(&incoming.flow, incoming_decision),
+        cues: realistic_analysis_cues(incoming_analysis),
     };
     let effective_raw = plan_transition_v2(&effective_outgoing, &effective_incoming, &config);
-    let effective_guarded =
-        plan_guarded_transition_v2(&effective_outgoing, &effective_incoming, &config);
+    let (_, effective_guarded) =
+        quality_first_shadow_transition(&effective_outgoing, &effective_incoming, &config);
     let effective_eligibility =
         beat_match_eligibility(&effective_outgoing, &effective_incoming, &config);
     let baseline_selected = baseline_guarded.plan.kind == TransitionKind::BeatMatched;
@@ -3051,12 +4097,15 @@ fn realistic_transition_case(
         .flow
         .truth_bpm
         .ok_or_else(|| LabError::InvalidInput("realistic incoming truth missing".into()))?;
-    let effective_pair_correct = effective_selected
-        && pair_is_correct(
-            effective_eligibility.tempo_hypothesis,
-            outgoing_truth,
-            incoming_truth,
-        );
+    let effective_pair = effective_raw
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan == effective_guarded.plan)
+        .and_then(|candidate| candidate.beat_eligibility.as_ref())
+        .and_then(|eligibility| eligibility.tempo_hypothesis)
+        .or(effective_eligibility.tempo_hypothesis);
+    let effective_pair_correct =
+        effective_selected && pair_is_correct(effective_pair, outgoing_truth, incoming_truth);
     let effective_metrical_guard_passed = !effective_raw.candidates.is_empty()
         && effective_outgoing.tempo_hypotheses().len() == outgoing_decision.candidates.len()
         && effective_incoming.tempo_hypotheses().len() == incoming_decision.candidates.len();
@@ -3116,7 +4165,54 @@ fn build_realistic_corpus_report(
                     .as_ref()
                     .map(|analysis| analysis.rhythm.beats.len())
                     .unwrap_or(0),
+                first_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
+                    analysis
+                        .rhythm
+                        .beats
+                        .first()
+                        .map(|event| event.time.as_micros() as u64)
+                }),
+                last_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
+                    analysis
+                        .rhythm
+                        .beats
+                        .last()
+                        .map(|event| event.time.as_micros() as u64)
+                }),
                 event_clock_bpm: item.flow.event_clock_bpm,
+                audible_start_micros: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| analysis.audible_start.as_micros() as u64),
+                audible_end_micros: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| analysis.audible_end.as_micros() as u64),
+                heuristic_cue_count: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map_or(0, |analysis| realistic_analysis_cues(analysis).len()),
+                heuristic_mix_in_cue_count: item.flow.research_analysis.as_ref().map_or(
+                    0,
+                    |analysis| {
+                        realistic_analysis_cues(analysis)
+                            .iter()
+                            .filter(|cue| cue.has_role(CueRole::MixIn))
+                            .count()
+                    },
+                ),
+                heuristic_mix_out_cue_count: item.flow.research_analysis.as_ref().map_or(
+                    0,
+                    |analysis| {
+                        realistic_analysis_cues(analysis)
+                            .iter()
+                            .filter(|cue| cue.has_role(CueRole::MixOut))
+                            .count()
+                    },
+                ),
                 candidate_count: decision.row.candidate_count,
                 decision: decision.row.decision.clone(),
                 selected_bpm: decision.row.selected_bpm,
@@ -3212,6 +4308,7 @@ fn build_realistic_corpus_report(
             "research-only generated audio and planner inputs; no production analysis or playback path".into(),
     };
     let interval_consistency = build_runtime_consistency(&flow_refs);
+    let positive_corpus = build_positive_realistic_corpus()?;
     Ok(RealisticSyntheticCorpusReport {
         schema_version: crate::RESEARCH_REPORT_SCHEMA_VERSION,
         source_commit: source_commit.into(),
@@ -3231,6 +4328,7 @@ fn build_realistic_corpus_report(
         transition_cases: cases,
         transition_summary,
         interval_consistency,
+        positive_corpus,
     })
 }
 
@@ -3253,7 +4351,7 @@ pub fn run_realistic_corpus_research(
 fn realistic_markdown(report: &RealisticSyntheticCorpusReport) -> String {
     let summary = &report.transition_summary;
     format!(
-        "# Realistic internal conservative-shadow corpus\n\n- source commit: `{}`\n- starting commit: `{}`\n- fixtures: `{}`\n- durations (micros): `{:?}`\n- profiles: `{:?}`\n- construction: {}\n- production behavior changed: `NO`\n\n## Candidate caps\n\n{}\n\n## Transition-level summary\n\n- pairs: `{}`\n- expected safe-fallback cases: `{}`\n- expected feasible-or-safe cases: `{}`\n- baseline false BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- effective correct BeatMatched: `{}`\n- effective safe fallback: `{}`\n- safe outcomes: `{}`\n\nThe corpus is research-only. Generated audio uses a deterministic known beat clock with arrangement-like evidence-density changes; it is not a substitute for ecological validation.\n",
+        "# Realistic internal conservative-shadow corpus\n\n- source commit: `{}`\n- starting commit: `{}`\n- fixtures: `{}`\n- durations (micros): `{:?}`\n- profiles: `{:?}`\n- construction: {}\n- production behavior changed: `NO`\n\n## Candidate caps\n\n{}\n\n## Negative/guarded transition summary\n\n- pairs: `{}`\n- expected safe-fallback cases: `{}`\n- expected feasible-or-safe cases: `{}`\n- baseline false BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- effective correct BeatMatched: `{}`\n- effective safe fallback: `{}`\n- safe outcomes: `{}`\n\n## Positive transition summary\n\n- independent analyzed fixtures: `{}`\n- positive pairs: `{}`\n- effective correct BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- safe fallback: `{}`\n- rendered quality PASS among selected cases: `{}`\n\nThe corpus is research-only. Generated audio uses deterministic known beat clocks with arrangement-like evidence-density changes; it is not a substitute for ecological validation.\n",
         report.source_commit,
         report
             .starting_commit
@@ -3287,6 +4385,17 @@ fn realistic_markdown(report: &RealisticSyntheticCorpusReport) -> String {
         summary.effective_correct_beatmatched,
         summary.effective_safe_fallback,
         summary.safe_outcomes,
+        report.positive_corpus.fixture_count,
+        report.positive_corpus.pair_count,
+        report.positive_corpus.summary.effective_correct_beatmatched,
+        report.positive_corpus.summary.effective_false_beatmatched,
+        report.positive_corpus.summary.safe_fallback,
+        report
+            .positive_corpus
+            .transition_cases
+            .iter()
+            .filter(|case| case.beatmatched_selected && case.render_quality.acceptable)
+            .count(),
     )
 }
 
@@ -3545,7 +4654,7 @@ fn markdown_report(report: &TempoConservativeShadowReport) -> String {
     output.push_str("## Candidate pressure\n\n");
     output.push_str(&format!("Mean candidates: {:.2}; p50: {}; p95: {}; max: {}; mean pair cross-product: {:.2}; p95: {}; max: {}.\n\n", report.candidate_pressure.mean_candidates, report.candidate_pressure.p50_candidates, report.candidate_pressure.p95_candidates, report.candidate_pressure.max_candidates, report.candidate_pressure.mean_pair_cross_product, report.candidate_pressure.p95_pair_cross_product, report.candidate_pressure.max_pair_cross_product));
     output.push_str("## Decision\n\n");
-    output.push_str("**KEEP RESEARCH ONLY**\n\n");
+    output.push_str(&format!("**{}**\n\n", report.decision.recommendation));
     for (key, value) in &report.decision.answers {
         output.push_str(&format!("- {key}: {value}\n"));
     }
@@ -3753,5 +4862,23 @@ mod tests {
         let budgets = [2_usize, 3, 4];
         assert_eq!(budgets, [2, 3, 4]);
         assert!(budgets.iter().all(|budget| budget * budget <= 16));
+    }
+
+    #[test]
+    fn event_clock_support_is_relation_aware_and_deterministic() {
+        let times = (0..=8).map(|index| Duration::from_micros(index * 500_000));
+        assert_eq!(analysis_event_clock_bpm(times), Some(120.0));
+        let primary =
+            TempoHypothesis::with_relation(120.0, UnitInterval::ONE, TempoRelation::Primary)
+                .expect("primary hypothesis");
+        let half_time =
+            TempoHypothesis::with_relation(60.0, UnitInterval::ONE, TempoRelation::HalfTime)
+                .expect("half-time hypothesis");
+        let wrong =
+            TempoHypothesis::with_relation(140.0, UnitInterval::ONE, TempoRelation::Primary)
+                .expect("wrong hypothesis");
+        assert!(tempo_hypothesis_matches_event_clock(primary, Some(120.0)));
+        assert!(tempo_hypothesis_matches_event_clock(half_time, Some(120.0)));
+        assert!(!tempo_hypothesis_matches_event_clock(wrong, Some(120.0)));
     }
 }
