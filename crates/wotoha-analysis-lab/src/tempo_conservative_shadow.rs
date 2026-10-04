@@ -38,8 +38,9 @@ const MAX_CANDIDATES: usize = 4;
 const ACCEPT_SCORE: f32 = 0.68;
 const ACCEPT_MARGIN: f32 = 0.08;
 const ACCEPT_EVENT_AGREEMENT: f32 = 0.80;
-const STATIONARY_DRIFT: f64 = 0.01;
-const STATIONARY_DISPERSION: f64 = 0.01;
+const STATIONARY_DRIFT: f64 = 0.005;
+const STATIONARY_DISPERSION: f64 = 0.005;
+const CLASSICAL_ANCHOR_BONUS: f32 = 0.15;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TempoConservativeShadowReport {
@@ -395,6 +396,7 @@ enum RankMode {
     Consensus,
     Margin,
     EventGated,
+    ClassicalAnchor,
 }
 
 #[derive(Clone, Debug)]
@@ -424,7 +426,7 @@ pub fn run_tempo_conservative_shadow_research(
     let ranking_variants = build_ranking_variants(&flows);
     let decisions = build_abstention_rows(&flows);
     let abstention = AbstentionReport {
-        rule_name: "fixed_conservative_select_or_retain_or_abstain_v1".into(),
+        rule_name: "classical_anchor_guarded_select_or_retain_or_abstain_v2".into(),
         pareto: build_pareto(&flows),
         rows: decisions.iter().map(|item| item.row.clone()).collect(),
     };
@@ -655,17 +657,22 @@ fn rank_value(item: &EvidenceCandidate, mode: RankMode, margin: f32) -> f32 {
     let support = (item.source_count as f32 / 3.0).min(1.0);
     let event = item.event_agreement.unwrap_or(0.0);
     let duration = item.duration_stability;
-    match mode {
+    let value = match mode {
         RankMode::Evidence => 0.45 * evidence + 0.25 * support + 0.20 * event + 0.10 * duration,
         RankMode::Consensus => 0.35 * support + 0.35 * event + 0.20 * evidence + 0.10 * duration,
         RankMode::Margin => 0.40 * evidence + 0.25 * margin + 0.20 * support + 0.15 * event,
-        RankMode::EventGated => {
+        RankMode::EventGated | RankMode::ClassicalAnchor => {
             if event >= ACCEPT_EVENT_AGREEMENT {
                 0.30 * evidence + 0.35 * event + 0.25 * support + 0.10 * duration
             } else {
                 0.55 * evidence + 0.20 * support + 0.15 * event + 0.10 * duration
             }
         }
+    };
+    if matches!(mode, RankMode::ClassicalAnchor) && item.has_full && item.has_low {
+        value + CLASSICAL_ANCHOR_BONUS
+    } else {
+        value
     }
 }
 
@@ -842,6 +849,11 @@ fn build_ranking_variants(flows: &[&CandidateFlowObservation]) -> Vec<RankingVar
         ("source_consensus", Some(RankMode::Consensus), 4usize),
         ("confidence_margin", Some(RankMode::Margin), 4usize),
         ("event_agreement_gated", Some(RankMode::EventGated), 4usize),
+        (
+            "classical_anchor_guarded",
+            Some(RankMode::ClassicalAnchor),
+            4usize,
+        ),
     ];
     variants
         .into_iter()
@@ -948,7 +960,8 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
         .iter()
         .map(|flow| {
             let truth = flow.truth_bpm.expect("scalar flow");
-            let candidates = rank_candidates(flow, flows, MAX_CANDIDATES, RankMode::EventGated);
+            let candidates =
+                rank_candidates(flow, flows, MAX_CANDIDATES, RankMode::ClassicalAnchor);
             let first = candidates.first().cloned();
             let second = candidates.get(1);
             let margin = first.as_ref().zip(second).map(|(one, two)| {
@@ -1028,7 +1041,8 @@ fn build_pareto(flows: &[&CandidateFlowObservation]) -> Vec<OperatingPoint> {
             let mut family_correct = 0;
             let mut false_confident = 0;
             for flow in flows {
-                let candidates = rank_candidates(flow, flows, MAX_CANDIDATES, RankMode::EventGated);
+                let candidates =
+                    rank_candidates(flow, flows, MAX_CANDIDATES, RankMode::ClassicalAnchor);
                 let Some(first) = candidates.first() else {
                     continue;
                 };
@@ -1151,10 +1165,31 @@ fn build_stationarity_observations() -> Result<Vec<StationarityObservation>, Lab
             },
         ),
         (
+            "ramp_minus_1",
+            TempoProfile::LinearRamp {
+                start_bpm: 130.0,
+                end_bpm: 129.0,
+            },
+        ),
+        (
             "ramp_minus_2",
             TempoProfile::LinearRamp {
                 start_bpm: 130.0,
                 end_bpm: 128.0,
+            },
+        ),
+        (
+            "ramp_plus_4",
+            TempoProfile::LinearRamp {
+                start_bpm: 130.0,
+                end_bpm: 134.0,
+            },
+        ),
+        (
+            "ramp_minus_4",
+            TempoProfile::LinearRamp {
+                start_bpm: 130.0,
+                end_bpm: 126.0,
             },
         ),
         (
@@ -1745,7 +1780,7 @@ fn build_heldout(
         .filter(|fold| !fold.exact_pcm_overlap && !fold.lineage_overlap)
         .count();
     HeldOutConservativeRanking {
-        rule_name: "fixed_conservative_select_or_retain_or_abstain_v1".into(),
+        rule_name: "classical_anchor_guarded_select_or_retain_or_abstain_v2".into(),
         rule_frozen_before_scoring: true,
         grouping_rule: "component-expanded family stress over exact PCM/master-lineage connected components; folds with any overlap are invalid".into(),
         aggregate: HeldOutConservativeAggregate {
@@ -2145,5 +2180,39 @@ mod tests {
         assert_eq!(source_flags(&candidate).len(), 0);
         assert!(candidate_key(120.0, 120.4));
         assert!(!candidate_key(120.0, 121.0));
+    }
+
+    #[test]
+    fn classical_anchor_bonus_requires_full_and_low_support() {
+        let candidate = TempoCandidate {
+            bpm: 128.0,
+            source: "test".into(),
+            relation: "primary".into(),
+            score: 0.8,
+            normalized_score: 0.8,
+            origin_stage: "test".into(),
+            relation_to_truth: "unscored".into(),
+            shadow_rank_score: 0.0,
+        };
+        let base = EvidenceCandidate {
+            candidate: candidate.clone(),
+            sources: BTreeSet::new(),
+            source_count: 2,
+            has_full: false,
+            has_low: false,
+            has_neural: false,
+            has_event: true,
+            has_v2: true,
+            event_agreement: Some(1.0),
+            duration_stability: 0.5,
+        };
+        let mut anchored = base.clone();
+        anchored.has_full = true;
+        anchored.has_low = true;
+        assert_eq!(
+            rank_value(&anchored, RankMode::ClassicalAnchor, 0.0)
+                - rank_value(&base, RankMode::ClassicalAnchor, 0.0),
+            CLASSICAL_ANCHOR_BONUS
+        );
     }
 }
