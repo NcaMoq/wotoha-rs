@@ -401,6 +401,32 @@ not production logic. Variable-tempo fixtures are retained as diagnostics and
 excluded from scalar-tempo accuracy. The command never changes beat markers,
 phase, downbeats, meter, backend selection, or production tempo behavior.
 
+## Long-duration tempo ambiguity research
+
+`research-tempo-ambiguity` generates a bounded, deterministic, vendor-neutral
+30-second and 60-second benchmark. It records Classical full/low-band peaks,
+Neural selected-grid and half/native/double candidate evidence, V2 beat-event
+intervals and tempo hypotheses, and controlled V1/V2 AutoMix planner outcomes.
+The benchmark includes a fine tempo sweep around the lower Classical boundary
+and 130 BPM, plus generic accent/subdivision archetypes and a small percussion
+robustness slice. Durations below 20 seconds are not part of its main score.
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+  cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-tempo-ambiguity \
+  --output /tmp/wotoha-tempo-ambiguity
+```
+
+The command writes the required JSON, CSV, and Markdown reports under the
+requested output directory. It is research-only: no production tempo bound,
+selector, beat-event timeline, AutoMix threshold, or authority is changed.
+The V2 planner is observed through its existing hypothesis cross-product,
+physical eligibility, phase evidence, and quality guard. Any follow-up
+ranking work must be validated on held-out rhythm families and must preserve
+the default production behavior until separately promoted.
+
 ## Final clean-room handoff
 
 The lab keeps three tempo interpretations separate: the current production

@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 
 mod classical_tempo_research;
 pub use classical_tempo_research::{ClassicalTempoResearchReport, run_classical_tempo_research};
+mod tempo_ambiguity_research;
 use sha2::{Digest, Sha256};
+pub use tempo_ambiguity_research::{TempoAmbiguityResearchReport, run_tempo_ambiguity_research};
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},
     audio_analysis::LowBandFilter,
@@ -34,7 +36,11 @@ const DEFAULT_SEED: u64 = 0x57_4f_54_4f_48_41;
 const DEFAULT_DURATION_MICROS: u64 = 12_000_000;
 const DEFAULT_SAMPLE_RATE: u32 = 22_050;
 const MAX_FIXTURES: usize = 256;
-const MAX_AUDIO_SAMPLES: usize = DEFAULT_SAMPLE_RATE as usize * 30;
+// The default corpus remains 12 seconds, but the lab also owns bounded
+// long-duration research fixtures.  This limit is intentionally below the
+// runtime model's much larger input bound and has no effect on production
+// analysis or black-box package generation.
+const MAX_AUDIO_SAMPLES: usize = DEFAULT_SAMPLE_RATE as usize * 120;
 const MAX_PACKAGE_ENTRIES: usize = MAX_FIXTURES + 8;
 const MAX_PACKAGE_FILE_BYTES: usize = 40 * 1024 * 1024;
 const MAX_PACKAGE_UNCOMPRESSED_BYTES: usize = 80 * 1024 * 1024;
@@ -365,7 +371,7 @@ impl FixtureSpec {
     fn validate(&self) -> Result<(), LabError> {
         if self.id.trim().is_empty()
             || self.duration_micros == 0
-            || self.duration_micros > 30_000_000
+            || self.duration_micros > 120_000_000
             || self.sample_rate == 0
             || self.channels == 0
             || !matches!(self.meter, 2 | 3 | 4 | 6)

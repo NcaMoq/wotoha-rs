@@ -4,7 +4,8 @@ use wotoha_analysis_lab::{
     AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
     generate_default_manifest, load_manifest, package_blackbox, run_classical_tempo_research,
-    run_ground_truth_research, run_tempo_advisor_research, verify_blackbox_package, write_json,
+    run_ground_truth_research, run_tempo_advisor_research, run_tempo_ambiguity_research,
+    verify_blackbox_package, write_json,
 };
 
 fn main() {
@@ -201,6 +202,22 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
                 evaluate.output.display()
             );
         }
+        "research-tempo-ambiguity" => {
+            let output = parse_output_dir(&mut args)?;
+            reject_unknown(args)?;
+            let source_commit = env::var("WOTOHA_SOURCE_COMMIT")
+                .map_err(|_| "research-tempo-ambiguity requires WOTOHA_SOURCE_COMMIT")?;
+            let report = run_tempo_ambiguity_research(
+                &output,
+                source_commit,
+                env::var("WOTOHA_STARTING_COMMIT").ok(),
+            )?;
+            println!(
+                "tempo ambiguity research complete: {} fixtures, output={}",
+                report.benchmark.fixture_count,
+                output.display()
+            );
+        }
         "--help" | "-h" => println!("{}", usage()),
         _ => return Err(usage().into()),
     }
@@ -343,6 +360,20 @@ fn parse_package_args(
     ))
 }
 
+fn parse_output_dir(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<PathBuf, Box<dyn Error + Send + Sync>> {
+    let mut output = None;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--output" => output = Some(next_path(args, "--output")?),
+            "--help" | "-h" => return Err(usage().into()),
+            _ => return Err(format!("unknown option: {argument}").into()),
+        }
+    }
+    output.ok_or_else(|| "--output is required".into())
+}
+
 fn next_path(
     args: &mut impl Iterator<Item = String>,
     flag: &str,
@@ -368,5 +399,5 @@ fn reject_unknown(
 }
 
 fn usage() -> &'static str {
-    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab package-blackbox --input DIRECTORY --output ZIP\n       analysis_lab verify-blackbox ZIP\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--audio-root PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-pass --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-tempo-advisor --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-classical-tempo --manifest PATH --audio-root DIRECTORY --output DIRECTORY"
+    "usage: analysis_lab generate --output PATH [--seed N]\n       analysis_lab export-blackbox --output DIRECTORY [--seed N]\n       analysis_lab package-blackbox --input DIRECTORY --output ZIP\n       analysis_lab verify-blackbox ZIP\n       analysis_lab evaluate --manifest PATH [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab evaluate-exported --manifest PATH --audio-root DIRECTORY [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab baseline [--external-observations PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-tempo [--manifest PATH] [--audio-root PATH] [--report PATH] [--mode hybrid|classical] [--split NAME]\n       analysis_lab research-pass --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-tempo-advisor --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-classical-tempo --manifest PATH --audio-root DIRECTORY --output DIRECTORY\n       analysis_lab research-tempo-ambiguity --output DIRECTORY"
 }
