@@ -427,6 +427,32 @@ physical eligibility, phase evidence, and quality guard. Any follow-up
 ranking work must be validated on held-out rhythm families and must preserve
 the default production behavior until separately promoted.
 
+## Tempo shadow follow-up
+
+The research-tempo-shadow command is the next-stage, research-only audit for
+long-duration tempo ambiguity. It keeps candidate generation, propagation,
+ranking, and event-clock refinement in separate reported pools. Event-clock
+variants preserve the selected Neural half/native/double relation; they do
+not resolve that relation from Ground Truth.
+
+Command:
+
+    WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+    WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+      cargo run --release --locked -p wotoha-analysis-lab -- \
+      research-tempo-shadow \
+      --output /tmp/wotoha-tempo-shadow
+
+The command writes candidate-flow CSV/JSON, re-anchor and failure taxonomy
+reports, duration-invariance decomposition, a strict known-positive
+BeatMatched planner harness, an alias shadow matrix with deterministic preview
+quality metrics, fixed-rule component-expanded family stress results, feature
+inventory, and the final Markdown/JSON summary. The positive harness uses
+synthetic truth only to construct a planner sanity case; it is not an inference
+feature or a production label. The shadow output can change only a reported
+tempo candidate. Classical beat events, grid phase, meter, downbeats, AutoMix,
+runtime, and playback remain unchanged.
+
 ## Final clean-room handoff
 
 The lab keeps three tempo interpretations separate: the current production

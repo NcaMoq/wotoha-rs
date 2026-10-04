@@ -345,11 +345,18 @@ pub struct DecisionSummary {
 }
 
 #[derive(Clone)]
-struct AnalyzedFixture {
-    fixture: SyntheticFixture,
-    legacy: wotoha_core::automix::TrackAnalysis,
-    v2: TrackAnalysisV2,
-    observation: TempoAmbiguityObservation,
+pub(crate) struct AnalyzedFixture {
+    pub(crate) fixture: SyntheticFixture,
+    pub(crate) legacy: wotoha_core::automix::TrackAnalysis,
+    pub(crate) v2: TrackAnalysisV2,
+    pub(crate) observation: TempoAmbiguityObservation,
+}
+
+pub(crate) fn collect_long_analyzed() -> Result<Vec<AnalyzedFixture>, LabError> {
+    long_fixture_specs()
+        .into_iter()
+        .map(|spec| generate_fixture(&spec).and_then(analyze_long_fixture))
+        .collect()
 }
 
 pub fn run_tempo_ambiguity_research(
@@ -358,11 +365,7 @@ pub fn run_tempo_ambiguity_research(
     starting_commit: Option<String>,
 ) -> Result<TempoAmbiguityResearchReport, LabError> {
     fs::create_dir_all(output_dir)?;
-    let specs = long_fixture_specs();
-    let mut analyzed = Vec::with_capacity(specs.len());
-    for spec in specs {
-        analyzed.push(analyze_long_fixture(generate_fixture(&spec)?)?);
-    }
+    let analyzed = collect_long_analyzed()?;
     let observations = analyzed
         .iter()
         .map(|item| item.observation.clone())
@@ -438,7 +441,7 @@ pub fn run_tempo_ambiguity_research(
     Ok(report)
 }
 
-fn long_fixture_specs() -> Vec<FixtureSpec> {
+pub(crate) fn long_fixture_specs() -> Vec<FixtureSpec> {
     let mut specs = Vec::new();
     for duration in LONG_DURATIONS {
         for bpm in TEMPO_SWEEP {
@@ -505,7 +508,7 @@ fn long_fixture_specs() -> Vec<FixtureSpec> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn long_spec(
+pub(crate) fn long_spec(
     id: String,
     master_id: String,
     family: FixtureFamily,
@@ -550,7 +553,7 @@ fn nominal_bpm(spec: &FixtureSpec) -> f32 {
     }
 }
 
-fn analyze_long_fixture(fixture: SyntheticFixture) -> Result<AnalyzedFixture, LabError> {
+pub(crate) fn analyze_long_fixture(fixture: SyntheticFixture) -> Result<AnalyzedFixture, LabError> {
     let mono = downmix(&fixture.audio, fixture.spec.channels);
     let analysis_audio = if fixture.spec.sample_rate == 22_050 {
         mono

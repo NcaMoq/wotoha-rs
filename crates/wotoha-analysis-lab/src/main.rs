@@ -5,7 +5,7 @@ use wotoha_analysis_lab::{
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
     generate_default_manifest, load_manifest, package_blackbox, run_classical_tempo_research,
     run_ground_truth_research, run_tempo_advisor_research, run_tempo_ambiguity_research,
-    verify_blackbox_package, write_json,
+    run_tempo_shadow_followup, verify_blackbox_package, write_json,
 };
 
 fn main() {
@@ -215,6 +215,22 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!(
                 "tempo ambiguity research complete: {} fixtures, output={}",
                 report.benchmark.fixture_count,
+                output.display()
+            );
+        }
+        "research-tempo-shadow" => {
+            let output = parse_output_dir(&mut args)?;
+            reject_unknown(args)?;
+            let source_commit = env::var("WOTOHA_SOURCE_COMMIT")
+                .map_err(|_| "research-tempo-shadow requires WOTOHA_SOURCE_COMMIT")?;
+            let report = run_tempo_shadow_followup(
+                &output,
+                source_commit,
+                env::var("WOTOHA_STARTING_COMMIT").ok(),
+            )?;
+            println!(
+                "tempo shadow follow-up complete: {} fixtures, output={}",
+                report.fixture_count,
                 output.display()
             );
         }
