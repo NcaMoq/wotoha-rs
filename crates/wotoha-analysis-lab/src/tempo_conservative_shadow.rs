@@ -1672,10 +1672,7 @@ fn build_heldout(
     let mut folds = Vec::new();
     let mut seen = BTreeSet::new();
     for requested in families {
-        let validation = flows
-            .iter()
-            .filter(|flow| flow.family == requested)
-            .collect::<Vec<_>>();
+        let validation = expanded_family_validation(flows, &requested);
         let validation_ids = validation
             .iter()
             .map(|flow| flow.fixture_id.clone())
@@ -1750,7 +1747,7 @@ fn build_heldout(
     HeldOutConservativeRanking {
         rule_name: "fixed_conservative_select_or_retain_or_abstain_v1".into(),
         rule_frozen_before_scoring: true,
-        grouping_rule: "component-expanded family stress; this implementation uses family exclusion and reports exact PCM/master overlap explicitly".into(),
+        grouping_rule: "component-expanded family stress over exact PCM/master-lineage connected components; folds with any overlap are invalid".into(),
         aggregate: HeldOutConservativeAggregate {
             fold_observations: folds.iter().map(|fold| fold.validation_size).sum(),
             unique_fixtures: seen.len(),
@@ -1763,6 +1760,38 @@ fn build_heldout(
         },
         folds,
     }
+}
+
+/// Expand a nominal family holdout to every fixture in a connected leakage
+/// component. Exact PCM identity and master lineage are both leakage edges;
+/// a family label is not a safe boundary when either edge crosses families.
+fn expanded_family_validation<'a>(
+    flows: &[&'a CandidateFlowObservation],
+    requested_family: &str,
+) -> Vec<&'a CandidateFlowObservation> {
+    let mut included = flows
+        .iter()
+        .enumerate()
+        .filter(|(_, flow)| flow.family == requested_family)
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for left in 0..flows.len() {
+            for right in 0..flows.len() {
+                let connected = flows[left].pcm_sha256 == flows[right].pcm_sha256
+                    || flows[left].master_id == flows[right].master_id;
+                if connected && (included.contains(&left) || included.contains(&right)) {
+                    let before = included.len();
+                    included.insert(left);
+                    included.insert(right);
+                    changed |= included.len() != before;
+                }
+            }
+        }
+    }
+    included.into_iter().map(|index| flows[index]).collect()
 }
 
 fn build_focus_slices(
