@@ -15,12 +15,12 @@ use std::{
 use serde::{Deserialize, Serialize};
 use wotoha_core::{
     analysis::{
-        BeatEvent, Confidence, MeterHypothesis, ModelScore, Support, TempoHypothesis,
-        TempoRelation, TrackAnalysisV2, UnitInterval,
+        BeatEvent, Confidence, DjCue, MeterHypothesis, ModelScore, PhraseBoundary, Support,
+        TempoHypothesis, TempoRelation, TrackAnalysisV2, UnitInterval,
     },
     automix::{
-        AutoMixConfig, TransitionKind, beat_match_eligibility, plan_guarded_transition_v2,
-        plan_transition_v2,
+        AutoMixConfig, TrackAnalysis, TransitionKind, V2AnalysisInput, beat_match_eligibility,
+        plan_guarded_transition_v2, plan_transition_v2,
     },
 };
 
@@ -41,6 +41,7 @@ const ACCEPT_EVENT_AGREEMENT: f32 = 0.80;
 const STATIONARY_DRIFT: f64 = 0.003;
 const STATIONARY_DISPERSION: f64 = 0.003;
 const CLASSICAL_ANCHOR_BONUS: f32 = 0.15;
+const RELATION_RESOLUTION_TOLERANCE: f32 = 0.02;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TempoConservativeShadowReport {
@@ -61,7 +62,12 @@ pub struct TempoConservativeShadowReport {
     pub candidate_pressure: CandidatePressureReport,
     pub pruning: Vec<PruningSummary>,
     pub conservative_matrix: ConservativeShadowMatrix,
+    pub effective_planner: EffectivePlannerSummary,
     pub heldout: HeldOutConservativeRanking,
+    pub runtime_feature_audit: Vec<RuntimeFeatureAudit>,
+    pub runtime_feasible: RuntimeFeasibleSummary,
+    pub runtime_consistency: Vec<RuntimeTempoConsistencyObservation>,
+    pub abstention_reasons: Vec<AbstentionReasonObservation>,
     pub focus_slices: ConservativeFocusSlices,
     pub decision: ConservativeDecision,
 }
@@ -104,7 +110,7 @@ pub struct RankingVariantSummary {
     pub family_correct: usize,
     pub canonical_precision: Option<f32>,
     pub family_precision: Option<f32>,
-    pub false_confident_accepts: usize,
+    pub false_confident_accepts: Option<usize>,
     pub candidate_family_recall: usize,
     pub candidate_canonical_recall: usize,
 }
@@ -245,6 +251,15 @@ pub struct MetricalAdversarialCase {
     pub invalid_before_guard: bool,
     pub invalid_after_guard: bool,
     pub transition: String,
+    pub baseline_transition: String,
+    pub baseline_beatmatched_selected: bool,
+    pub shadow_decision_outgoing: String,
+    pub shadow_decision_incoming: String,
+    pub effective_shadow_transition: String,
+    pub effective_shadow_beatmatched_selected: bool,
+    pub effective_shadow_false_beatmatched: bool,
+    pub effective_shadow_safe_fallback: bool,
+    pub valid_alias_representable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -304,6 +319,75 @@ pub struct ConservativeVariantCase {
     pub false_beatmatched: bool,
     pub safe_fallback: bool,
     pub missed_opportunity: bool,
+    pub baseline_transition: String,
+    pub baseline_beatmatched_selected: bool,
+    pub shadow_decision_outgoing: String,
+    pub shadow_decision_incoming: String,
+    pub effective_shadow_transition: String,
+    pub effective_shadow_beatmatched_selected: bool,
+    pub effective_shadow_false_beatmatched: bool,
+    pub effective_shadow_safe_fallback: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EffectivePlannerSummary {
+    pub baseline_transition_cases: usize,
+    pub baseline_beatmatched_selected: usize,
+    pub baseline_false_beatmatched: usize,
+    pub effective_transition_cases: usize,
+    pub effective_beatmatched_selected: usize,
+    pub effective_false_beatmatched: usize,
+    pub effective_safe_fallback: usize,
+    pub effective_missed_opportunity: usize,
+    pub aliases_representable: usize,
+    pub aliases_total: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeFeatureAudit {
+    pub name: String,
+    pub classification: String,
+    pub definition: String,
+    pub source: String,
+    pub missing_value_behavior: String,
+    pub production_time_available: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeFeasibleSummary {
+    pub rule_name: String,
+    pub scored: usize,
+    pub accepted: usize,
+    pub abstained_or_retained: usize,
+    pub canonical_correct: usize,
+    pub family_correct: usize,
+    pub canonical_precision: Option<f32>,
+    pub family_precision: Option<f32>,
+    pub false_confident_accepts: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuntimeTempoConsistencyObservation {
+    pub fixture_id: String,
+    pub family: String,
+    pub interval_count: usize,
+    pub interval_mad_ratio: Option<f64>,
+    pub early_middle_drift: Option<f64>,
+    pub middle_late_drift: Option<f64>,
+    pub early_late_drift: Option<f64>,
+    pub classification: String,
+    pub refinement_would_abstain: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AbstentionReasonObservation {
+    pub fixture_id: String,
+    pub family: String,
+    pub decision: String,
+    pub reason: String,
+    pub candidate_count: usize,
+    pub candidate_family_available: bool,
+    pub recoverable_by_current_candidate_set: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -404,6 +488,34 @@ enum RankMode {
 #[derive(Clone, Debug)]
 struct DecisionInternal {
     row: TempoShadowDecisionRow,
+    candidates: Vec<EvidenceCandidate>,
+}
+
+/// A research-only adapter that keeps the original V2 timeline and structural
+/// evidence while replacing only the tempo hypotheses supplied to the planner.
+/// This is the boundary that lets the effective shadow path exercise the real
+/// planner without mutating production analysis or BeatEvent timestamps.
+struct ShadowAnalysisInput<'a> {
+    analysis: &'a TrackAnalysisV2,
+    hypotheses: Vec<TempoHypothesis>,
+}
+
+impl V2AnalysisInput for ShadowAnalysisInput<'_> {
+    fn as_v2_legacy_view(&self) -> TrackAnalysis {
+        V2AnalysisInput::as_v2_legacy_view(self.analysis)
+    }
+
+    fn cue_candidates(&self) -> Vec<DjCue> {
+        self.analysis.cues.clone()
+    }
+
+    fn phrase_boundaries(&self) -> Vec<PhraseBoundary> {
+        self.analysis.structure.phrase_boundaries.clone()
+    }
+
+    fn tempo_hypotheses(&self) -> Vec<TempoHypothesis> {
+        self.hypotheses.clone()
+    }
 }
 
 pub fn run_tempo_conservative_shadow_research(
@@ -439,6 +551,13 @@ pub fn run_tempo_conservative_shadow_research(
     let candidate_pressure = build_candidate_pressure(&flows);
     let pruning = build_pruning_summaries(&flows);
     let conservative_matrix = build_conservative_matrix(&baseline, &flows, &decisions)?;
+    let mut effective_planner = summarize_effective_planner(&conservative_matrix);
+    effective_planner.aliases_representable = adversarial.valid_aliases_retained;
+    effective_planner.aliases_total = adversarial.valid_aliases_total;
+    let runtime_feature_audit = build_runtime_feature_audit(&flows);
+    let runtime_feasible = build_runtime_feasible_summary(&flows);
+    let runtime_consistency = build_runtime_consistency(&flows);
+    let abstention_reasons = build_abstention_reasons(&flows, &decisions);
     let heldout = build_heldout(&flows, &decisions);
     let focus_slices = build_focus_slices(&flows, &decisions);
     let scalar_count = flows.len();
@@ -508,7 +627,12 @@ pub fn run_tempo_conservative_shadow_research(
         candidate_pressure,
         pruning,
         conservative_matrix,
+        effective_planner,
         heldout,
+        runtime_feature_audit,
+        runtime_feasible,
+        runtime_consistency,
+        abstention_reasons,
         focus_slices,
         decision,
     };
@@ -890,11 +1014,13 @@ fn build_ranking_variants(flows: &[&CandidateFlowObservation]) -> Vec<RankingVar
             let mut canonical_correct = 0;
             let mut family_correct = 0;
             let mut false_confident = 0;
+            let mut confidence_defined = true;
             let mut candidate_family_recall = 0;
             let mut candidate_canonical_recall = 0;
             for flow in flows {
                 let truth = flow.truth_bpm.expect("scalar flow");
                 if name == "current_v2" {
+                    confidence_defined = false;
                     let candidate = flow.current_v2_top1.as_ref();
                     accepted += usize::from(candidate.is_some());
                     canonical_correct +=
@@ -906,6 +1032,7 @@ fn build_ranking_variants(flows: &[&CandidateFlowObservation]) -> Vec<RankingVar
                     continue;
                 }
                 if name == "classical_propagated" {
+                    confidence_defined = false;
                     let candidate = flow.pools.classical_propagated.first();
                     accepted += usize::from(candidate.is_some());
                     canonical_correct +=
@@ -969,7 +1096,7 @@ fn build_ranking_variants(flows: &[&CandidateFlowObservation]) -> Vec<RankingVar
                 family_correct,
                 canonical_precision: family_precision(canonical_correct, accepted),
                 family_precision: family_precision(family_correct, accepted),
-                false_confident_accepts: false_confident,
+                false_confident_accepts: confidence_defined.then_some(false_confident),
                 candidate_family_recall,
                 candidate_canonical_recall,
             }
@@ -1002,6 +1129,7 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
                     && margin.unwrap_or(1.0) >= ACCEPT_MARGIN
                     && item.source_count >= 2
                     && event_agreement.is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT)
+                    && resolved_relation(item, flow.event_clock_bpm).is_some()
                     && classical_anchor_allows(item, &candidates)
             });
             let classical_anchor_available = classical_anchor_available(&candidates);
@@ -1024,12 +1152,13 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
                 decision: decision.into(),
                 selected_bpm: safe.then(|| first.as_ref().expect("safe candidate").candidate.bpm),
                 selected_relation: safe.then(|| {
-                    first
-                        .as_ref()
-                        .expect("safe candidate")
-                        .candidate
-                        .relation
-                        .clone()
+                    relation_name(
+                        resolved_relation(
+                            first.as_ref().expect("safe candidate"),
+                            flow.event_clock_bpm,
+                        )
+                        .expect("safe candidate relation"),
+                    )
                 }),
                 candidate_count: candidates.len(),
                 top1_score: first.as_ref().map(|item| item.candidate.shadow_rank_score),
@@ -1048,21 +1177,14 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
                     .unwrap_or(0.0),
                 metrical_consistency: first
                     .as_ref()
-                    .map(|item| {
-                        consistency_for(
-                            item.candidate.bpm,
-                            &item.candidate.relation,
-                            flow.event_clock_bpm,
-                        )
-                        .0
-                    })
+                    .map(|item| relation_status(item, flow.event_clock_bpm))
                     .unwrap_or_else(|| "unavailable".into()),
                 canonical_correct: safe && canonical_correct,
                 family_correct: safe && family_correct,
                 false_confident_accept: safe && !family_correct,
                 correct_abstention: !safe && !canonical_correct,
             };
-            DecisionInternal { row }
+            DecisionInternal { row, candidates }
         })
         .collect()
 }
@@ -1378,6 +1500,99 @@ fn consistency_for(
     (status.into(), Some(expected), Some(error.min(1.0)))
 }
 
+/// Resolve an unlabeled candidate only from the observed event clock.  The
+/// result is an inference-time relation label, never a Ground Truth label.
+/// Candidates outside the primary/half/double neighborhoods remain
+/// unresolved and therefore cannot authorize an effective BeatMatched plan.
+fn resolved_relation(
+    candidate: &EvidenceCandidate,
+    event_bpm: Option<f32>,
+) -> Option<TempoRelation> {
+    let label = candidate.candidate.relation.to_ascii_lowercase();
+    if label != "unlabeled" {
+        let relation = parse_relation(&label);
+        return event_bpm
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|_| consistency_for(candidate.candidate.bpm, &label, event_bpm).0)
+            .map_or(Some(relation), |status| {
+                (status == "consistent").then_some(relation)
+            });
+    }
+    let event = event_bpm.filter(|value| value.is_finite() && *value > 0.0)?;
+    [
+        (0.5_f32, TempoRelation::HalfTime),
+        (1.0_f32, TempoRelation::Primary),
+        (2.0_f32, TempoRelation::DoubleTime),
+    ]
+    .into_iter()
+    .map(|(multiplier, relation)| {
+        (
+            relative_difference(candidate.candidate.bpm, event * multiplier),
+            relation,
+        )
+    })
+    .min_by(|left, right| left.0.total_cmp(&right.0))
+    .and_then(|(error, relation)| (error <= RELATION_RESOLUTION_TOLERANCE).then_some(relation))
+}
+
+fn relation_name(relation: TempoRelation) -> String {
+    match relation {
+        TempoRelation::Primary => "primary",
+        TempoRelation::HalfTime => "half_time",
+        TempoRelation::DoubleTime => "double_time",
+        TempoRelation::Alternative => "alternative",
+    }
+    .into()
+}
+
+fn relation_status(candidate: &EvidenceCandidate, event_bpm: Option<f32>) -> String {
+    if resolved_relation(candidate, event_bpm).is_some() {
+        "consistent".into()
+    } else {
+        consistency_for(
+            candidate.candidate.bpm,
+            &candidate.candidate.relation,
+            event_bpm,
+        )
+        .0
+    }
+}
+
+fn hypotheses_for_decision(
+    flow: &CandidateFlowObservation,
+    decision: &DecisionInternal,
+) -> Vec<TempoHypothesis> {
+    let candidates: Vec<&EvidenceCandidate> = match decision.row.decision.as_str() {
+        "select" => decision.candidates.first().into_iter().collect(),
+        "retain_multiple" => decision.candidates.iter().collect(),
+        _ => Vec::new(),
+    };
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let relation = resolved_relation(candidate, flow.event_clock_bpm)?;
+            TempoHypothesis::with_relation(
+                candidate.candidate.bpm,
+                UnitInterval::clamped(candidate.candidate.normalized_score.max(0.7)),
+                relation,
+            )
+        })
+        .collect()
+}
+
+fn hypotheses_from_candidates(candidates: &[TempoCandidate]) -> Vec<TempoHypothesis> {
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            TempoHypothesis::with_relation(
+                candidate.bpm,
+                UnitInterval::clamped(candidate.normalized_score.max(0.7)),
+                parse_relation(&candidate.relation),
+            )
+        })
+        .collect()
+}
+
 fn build_metrical_consistency(flows: &[&CandidateFlowObservation]) -> MetricalConsistencyAudit {
     let mut observations = Vec::new();
     let mut counts = BTreeMap::new();
@@ -1418,6 +1633,15 @@ fn parse_relation(relation: &str) -> TempoRelation {
         "double_time" => TempoRelation::DoubleTime,
         "alternative" => TempoRelation::Alternative,
         _ => TempoRelation::Primary,
+    }
+}
+
+fn auto_mix_config() -> AutoMixConfig {
+    AutoMixConfig {
+        enabled: true,
+        crossfade: Duration::from_secs(8),
+        max_tempo_adjustment: 0.05,
+        min_beat_confidence: 0.70,
     }
 }
 
@@ -1486,10 +1710,42 @@ fn build_adversarial_report() -> Result<MetricalAdversarialReport, LabError> {
         let guarded = plan_guarded_transition_v2(&outgoing, &incoming, &config);
         let eligibility = beat_match_eligibility(&outgoing, &incoming, &config);
         let (consistency, _, _) = consistency_for(candidate_bpm, relation, Some(event_bpm));
-        let quality_selected = guarded.plan.kind == TransitionKind::BeatMatched;
-        let invalid_before = quality_selected && !declared_valid_alias;
-        let metrical_survives = consistency != "inconsistent";
-        let invalid_after = invalid_before && metrical_survives;
+        let baseline_selected = guarded.plan.kind == TransitionKind::BeatMatched;
+        let invalid_before = baseline_selected && !declared_valid_alias;
+        let relation_is_safe = consistency == "consistent";
+        let decision = if relation_is_safe {
+            "select"
+        } else {
+            "abstain"
+        };
+        let effective_hypotheses = if relation_is_safe {
+            TempoHypothesis::with_relation(
+                candidate_bpm,
+                UnitInterval::ONE,
+                parse_relation(relation),
+            )
+            .into_iter()
+            .collect()
+        } else {
+            Vec::new()
+        };
+        let effective_outgoing = ShadowAnalysisInput {
+            analysis: &outgoing,
+            hypotheses: effective_hypotheses.clone(),
+        };
+        let effective_incoming = ShadowAnalysisInput {
+            analysis: &incoming,
+            hypotheses: effective_hypotheses,
+        };
+        let effective_planned =
+            plan_guarded_transition_v2(&effective_outgoing, &effective_incoming, &config);
+        let effective_selected = effective_planned.plan.kind == TransitionKind::BeatMatched;
+        let effective_invalid = effective_selected && !declared_valid_alias;
+        let valid_alias_representable = declared_valid_alias
+            && effective_outgoing
+                .tempo_hypotheses()
+                .iter()
+                .any(|hypothesis| relation_name(hypothesis.relation) == relation);
         output.push(MetricalAdversarialCase {
             case_id: case_id.into(),
             event_clock_bpm: event_bpm,
@@ -1499,12 +1755,21 @@ fn build_adversarial_report() -> Result<MetricalAdversarialReport, LabError> {
             consistency,
             planner_physical_eligible: eligibility.eligible,
             beatmatched_generated: planned.diagnostics.beatmatched_candidates > 0,
-            quality_guard_selected: quality_selected,
-            guarded_beatmatched: quality_selected,
-            beatmatched_after_metrical_guard: quality_selected && metrical_survives,
+            quality_guard_selected: baseline_selected,
+            guarded_beatmatched: baseline_selected,
+            beatmatched_after_metrical_guard: effective_selected,
             invalid_before_guard: invalid_before,
-            invalid_after_guard: invalid_after,
-            transition: format!("{:?}", guarded.plan.kind),
+            invalid_after_guard: effective_invalid,
+            transition: format!("{:?}", effective_planned.plan.kind),
+            baseline_transition: format!("{:?}", guarded.plan.kind),
+            baseline_beatmatched_selected: baseline_selected,
+            shadow_decision_outgoing: decision.into(),
+            shadow_decision_incoming: decision.into(),
+            effective_shadow_transition: format!("{:?}", effective_planned.plan.kind),
+            effective_shadow_beatmatched_selected: effective_selected,
+            effective_shadow_false_beatmatched: effective_invalid,
+            effective_shadow_safe_fallback: !effective_selected,
+            valid_alias_representable,
         });
     }
     let invalid_before_guard = output
@@ -1521,7 +1786,7 @@ fn build_adversarial_report() -> Result<MetricalAdversarialReport, LabError> {
         .count();
     let valid_aliases_retained = output
         .iter()
-        .filter(|case| case.declared_valid_alias && case.consistency == "consistent")
+        .filter(|case| case.valid_alias_representable)
         .count();
     Ok(MetricalAdversarialReport {
         cases: output,
@@ -1627,6 +1892,37 @@ fn build_pruning_summaries(flows: &[&CandidateFlowObservation]) -> Vec<PruningSu
     .collect()
 }
 
+fn analysis_with_candidates(
+    base: &TrackAnalysisV2,
+    candidates: &[TempoCandidate],
+) -> TrackAnalysisV2 {
+    let mut analysis = base.clone();
+    analysis.rhythm.tempo_hypotheses = hypotheses_from_candidates(candidates);
+    analysis
+}
+
+fn pair_is_correct(
+    pair: Option<wotoha_core::automix::TempoHypothesisPair>,
+    outgoing_truth: f32,
+    incoming_truth: f32,
+) -> bool {
+    let Some(pair) = pair else {
+        return false;
+    };
+    let outgoing_family = [0.5_f32, 1.0, 2.0].iter().any(|ratio| {
+        relative_difference(pair.outgoing.bpm, outgoing_truth * ratio) <= RELATIVE_TOLERANCE
+    });
+    let incoming_family = [0.5_f32, 1.0, 2.0].iter().any(|ratio| {
+        relative_difference(pair.incoming.bpm, incoming_truth * ratio) <= RELATIVE_TOLERANCE
+    });
+    outgoing_family
+        && incoming_family
+        && relative_difference(
+            pair.outgoing.bpm / pair.incoming.bpm,
+            outgoing_truth / incoming_truth,
+        ) <= RELATIVE_TOLERANCE
+}
+
 fn build_conservative_matrix(
     baseline: &TempoShadowFollowupReport,
     flows: &[&CandidateFlowObservation],
@@ -1643,16 +1939,75 @@ fn build_conservative_matrix(
         let incoming = flows
             .iter()
             .find(|flow| flow.fixture_id == case.incoming_fixture);
-        let outgoing_decision = outgoing.and_then(|flow| {
-            decisions
-                .iter()
-                .find(|row| row.row.fixture_id == flow.fixture_id)
-        });
-        let incoming_decision = incoming.and_then(|flow| {
-            decisions
-                .iter()
-                .find(|row| row.row.fixture_id == flow.fixture_id)
-        });
+        let (Some(outgoing), Some(incoming)) = (outgoing, incoming) else {
+            continue;
+        };
+        let outgoing_analysis = outgoing
+            .research_analysis
+            .as_ref()
+            .ok_or_else(|| LabError::InvalidInput("missing research analysis".into()))?;
+        let incoming_analysis = incoming
+            .research_analysis
+            .as_ref()
+            .ok_or_else(|| LabError::InvalidInput("missing research analysis".into()))?;
+        let outgoing_decision = decisions
+            .iter()
+            .find(|row| row.row.fixture_id == outgoing.fixture_id);
+        let incoming_decision = decisions
+            .iter()
+            .find(|row| row.row.fixture_id == incoming.fixture_id);
+        let outgoing_decision = outgoing_decision
+            .ok_or_else(|| LabError::InvalidInput("missing outgoing shadow decision".into()))?;
+        let incoming_decision = incoming_decision
+            .ok_or_else(|| LabError::InvalidInput("missing incoming shadow decision".into()))?;
+
+        let baseline_outgoing = if case.variant == "current_v2" {
+            outgoing_analysis.clone()
+        } else {
+            analysis_with_candidates(outgoing_analysis, &case.outgoing_candidates)
+        };
+        let baseline_incoming = if case.variant == "current_v2" {
+            incoming_analysis.clone()
+        } else {
+            analysis_with_candidates(incoming_analysis, &case.incoming_candidates)
+        };
+        let config = auto_mix_config();
+        let baseline_planned =
+            plan_guarded_transition_v2(&baseline_outgoing, &baseline_incoming, &config);
+        let baseline_eligibility =
+            beat_match_eligibility(&baseline_outgoing, &baseline_incoming, &config);
+        let effective_outgoing_hypotheses = hypotheses_for_decision(outgoing, outgoing_decision);
+        let effective_incoming_hypotheses = hypotheses_for_decision(incoming, incoming_decision);
+        let effective_outgoing = ShadowAnalysisInput {
+            analysis: outgoing_analysis,
+            hypotheses: effective_outgoing_hypotheses,
+        };
+        let effective_incoming = ShadowAnalysisInput {
+            analysis: incoming_analysis,
+            hypotheses: effective_incoming_hypotheses,
+        };
+        let effective_planned =
+            plan_guarded_transition_v2(&effective_outgoing, &effective_incoming, &config);
+        let effective_eligibility =
+            beat_match_eligibility(&effective_outgoing, &effective_incoming, &config);
+        let baseline_selected = baseline_planned.plan.kind == TransitionKind::BeatMatched;
+        let effective_selected = effective_planned.plan.kind == TransitionKind::BeatMatched;
+        let baseline_correct = baseline_selected
+            && pair_is_correct(
+                baseline_eligibility.tempo_hypothesis,
+                case.outgoing_truth_bpm,
+                case.incoming_truth_bpm,
+            );
+        let effective_correct = effective_selected
+            && pair_is_correct(
+                effective_eligibility.tempo_hypothesis,
+                case.outgoing_truth_bpm,
+                case.incoming_truth_bpm,
+            );
+        let baseline_false = baseline_selected && !baseline_correct;
+        let effective_false = effective_selected && !effective_correct;
+        let effective_safe = !effective_selected && !effective_false;
+        let use_effective = case.variant == "merged_shadow";
         variants.push(ConservativeVariantCase {
             pair_id: case.pair_id.clone(),
             variant: if case.variant == "merged_shadow" {
@@ -1661,26 +2016,50 @@ fn build_conservative_matrix(
                 "current_v2"
             }
             .into(),
-            selected_bpm_outgoing: outgoing_decision.and_then(|row| row.row.selected_bpm),
-            selected_bpm_incoming: incoming_decision.and_then(|row| row.row.selected_bpm),
-            decision_outgoing: outgoing_decision
-                .map(|row| row.row.decision.clone())
-                .unwrap_or_else(|| "abstain".into()),
-            decision_incoming: incoming_decision
-                .map(|row| row.row.decision.clone())
-                .unwrap_or_else(|| "abstain".into()),
-            metrical_guard_outgoing: outgoing_decision
-                .map(|row| row.row.metrical_consistency.clone())
-                .unwrap_or_else(|| "unavailable".into()),
-            metrical_guard_incoming: incoming_decision
-                .map(|row| row.row.metrical_consistency.clone())
-                .unwrap_or_else(|| "unavailable".into()),
-            beatmatched_generated: case.beatmatched_candidate_generated,
-            beatmatched_selected: case.beatmatched_selected,
-            correct_beatmatched: case.correct_beatmatched,
-            false_beatmatched: case.false_beatmatched,
-            safe_fallback: case.safe_fallback,
-            missed_opportunity: case.missed_opportunity,
+            selected_bpm_outgoing: outgoing_decision.row.selected_bpm,
+            selected_bpm_incoming: incoming_decision.row.selected_bpm,
+            decision_outgoing: outgoing_decision.row.decision.clone(),
+            decision_incoming: incoming_decision.row.decision.clone(),
+            metrical_guard_outgoing: outgoing_decision.row.metrical_consistency.clone(),
+            metrical_guard_incoming: incoming_decision.row.metrical_consistency.clone(),
+            beatmatched_generated: if use_effective {
+                effective_planned.diagnostics.beatmatched_candidates > 0
+            } else {
+                baseline_planned.diagnostics.beatmatched_candidates > 0
+            },
+            beatmatched_selected: if use_effective {
+                effective_selected
+            } else {
+                baseline_selected
+            },
+            correct_beatmatched: if use_effective {
+                effective_correct
+            } else {
+                baseline_correct
+            },
+            false_beatmatched: if use_effective {
+                effective_false
+            } else {
+                baseline_false
+            },
+            safe_fallback: if use_effective {
+                effective_safe
+            } else {
+                !baseline_selected
+            },
+            missed_opportunity: if use_effective {
+                !effective_selected && effective_planned.diagnostics.beatmatched_candidates > 0
+            } else {
+                !baseline_selected && baseline_planned.diagnostics.beatmatched_candidates > 0
+            },
+            baseline_transition: format!("{:?}", baseline_planned.plan.kind),
+            baseline_beatmatched_selected: baseline_selected,
+            shadow_decision_outgoing: outgoing_decision.row.decision.clone(),
+            shadow_decision_incoming: incoming_decision.row.decision.clone(),
+            effective_shadow_transition: format!("{:?}", effective_planned.plan.kind),
+            effective_shadow_beatmatched_selected: effective_selected,
+            effective_shadow_false_beatmatched: effective_false,
+            effective_shadow_safe_fallback: effective_safe,
         });
     }
     let current_cases = variants
@@ -1702,27 +2081,15 @@ fn build_conservative_matrix(
             .count(),
         conservative_correct_beatmatched: shadow_cases
             .iter()
-            .filter(|case| {
-                case.correct_beatmatched
-                    && case.decision_outgoing == "select"
-                    && case.decision_incoming == "select"
-            })
+            .filter(|case| case.effective_shadow_beatmatched_selected && case.correct_beatmatched)
             .count(),
         conservative_false_beatmatched: shadow_cases
             .iter()
-            .filter(|case| {
-                case.false_beatmatched
-                    && case.decision_outgoing == "select"
-                    && case.decision_incoming == "select"
-            })
+            .filter(|case| case.effective_shadow_false_beatmatched)
             .count(),
         safe_fallback: shadow_cases
             .iter()
-            .filter(|case| {
-                case.safe_fallback
-                    || case.decision_outgoing != "select"
-                    || case.decision_incoming != "select"
-            })
+            .filter(|case| case.effective_shadow_safe_fallback)
             .count(),
         missed_opportunity: shadow_cases
             .iter()
@@ -1730,6 +2097,346 @@ fn build_conservative_matrix(
             .count(),
         variants,
     })
+}
+
+fn summarize_effective_planner(matrix: &ConservativeShadowMatrix) -> EffectivePlannerSummary {
+    let baseline = matrix
+        .variants
+        .iter()
+        .filter(|case| case.variant == "current_v2")
+        .collect::<Vec<_>>();
+    let effective = matrix
+        .variants
+        .iter()
+        .filter(|case| case.variant == "conservative_shadow")
+        .collect::<Vec<_>>();
+    EffectivePlannerSummary {
+        baseline_transition_cases: baseline.len(),
+        baseline_beatmatched_selected: baseline
+            .iter()
+            .filter(|case| case.baseline_beatmatched_selected)
+            .count(),
+        baseline_false_beatmatched: baseline
+            .iter()
+            .filter(|case| case.false_beatmatched)
+            .count(),
+        effective_transition_cases: effective.len(),
+        effective_beatmatched_selected: effective
+            .iter()
+            .filter(|case| case.effective_shadow_beatmatched_selected)
+            .count(),
+        effective_false_beatmatched: effective
+            .iter()
+            .filter(|case| case.effective_shadow_false_beatmatched)
+            .count(),
+        effective_safe_fallback: effective
+            .iter()
+            .filter(|case| case.effective_shadow_safe_fallback)
+            .count(),
+        effective_missed_opportunity: effective
+            .iter()
+            .filter(|case| case.missed_opportunity)
+            .count(),
+        aliases_representable: 0,
+        aliases_total: 0,
+    }
+}
+
+fn build_runtime_feature_audit(_flows: &[&CandidateFlowObservation]) -> Vec<RuntimeFeatureAudit> {
+    [
+        (
+            "candidate_evidence",
+            "RUNTIME_AVAILABLE",
+            "normalized score attached to a generated tempo candidate",
+            "Classical and Neural candidate generation",
+            "zero when the candidate is absent",
+            true,
+        ),
+        (
+            "event_agreement",
+            "RUNTIME_AVAILABLE",
+            "bounded agreement with the observed event interval clock",
+            "decoded BeatEvent intervals",
+            "missing event clock maps to zero",
+            true,
+        ),
+        (
+            "source_provenance",
+            "RUNTIME_AVAILABLE",
+            "bounded count of independent candidate evidence sources",
+            "candidate provenance during one analysis",
+            "zero when no source is available",
+            true,
+        ),
+        (
+            "full_low_agreement",
+            "RUNTIME_AVAILABLE",
+            "whether full-band and low-band Classical evidence merge at one BPM",
+            "same-pass Classical candidates",
+            "false when either band is missing",
+            true,
+        ),
+        (
+            "explicit_relation",
+            "RUNTIME_AVAILABLE",
+            "declared primary, half-time, double-time, or alternative relation",
+            "TempoRelation metadata",
+            "unlabeled candidates require event-clock resolution",
+            true,
+        ),
+        (
+            "event_interval_dispersion",
+            "RUNTIME_DERIVABLE",
+            "robust interval MAD divided by median interval",
+            "BeatEvent timestamps in one pass",
+            "unavailable below five intervals",
+            false,
+        ),
+        (
+            "single_pass_segment_consistency",
+            "RUNTIME_DERIVABLE",
+            "early, middle, and late interval medians from one analysis",
+            "BeatEvent timestamps in one pass",
+            "unavailable below three segments",
+            false,
+        ),
+        (
+            "duration_stability",
+            "OFFLINE_ONLY",
+            "agreement across independently analyzed duration variants",
+            "cross-duration research corpus",
+            "neutral value when no duration sibling exists",
+            false,
+        ),
+        (
+            "cross_duration_recurrence",
+            "OFFLINE_ONLY",
+            "recurrence of a candidate across separate duration runs",
+            "cross-duration research corpus",
+            "unavailable for a single runtime analysis",
+            false,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            name,
+            classification,
+            definition,
+            source,
+            missing_value_behavior,
+            production_time_available,
+        )| RuntimeFeatureAudit {
+            name: name.into(),
+            classification: classification.into(),
+            definition: definition.into(),
+            source: source.into(),
+            missing_value_behavior: missing_value_behavior.into(),
+            production_time_available,
+        },
+    )
+    .collect()
+}
+
+fn rank_candidates_runtime(
+    flow: &CandidateFlowObservation,
+    flows: &[&CandidateFlowObservation],
+    budget: usize,
+) -> Vec<EvidenceCandidate> {
+    let mut candidates = merge_evidence(flow, flows, budget);
+    for candidate in &mut candidates {
+        candidate.duration_stability = 0.5;
+    }
+    candidates.sort_by(|left, right| {
+        let margin = left.candidate.normalized_score - right.candidate.normalized_score;
+        rank_value(right, RankMode::ClassicalAnchor, margin)
+            .total_cmp(&rank_value(left, RankMode::ClassicalAnchor, margin))
+            .then_with(|| {
+                right
+                    .candidate
+                    .normalized_score
+                    .total_cmp(&left.candidate.normalized_score)
+            })
+            .then_with(|| left.candidate.bpm.total_cmp(&right.candidate.bpm))
+    });
+    for candidate in &mut candidates {
+        candidate.candidate.shadow_rank_score =
+            rank_value(candidate, RankMode::ClassicalAnchor, 0.0);
+    }
+    candidates
+}
+
+fn build_runtime_feasible_summary(flows: &[&CandidateFlowObservation]) -> RuntimeFeasibleSummary {
+    let mut accepted = 0;
+    let mut canonical_correct = 0;
+    let mut family_correct = 0;
+    let mut false_confident = 0;
+    for flow in flows {
+        let Some(truth) = flow.truth_bpm else {
+            continue;
+        };
+        let candidates = rank_candidates_runtime(flow, flows, MAX_CANDIDATES);
+        let first = candidates.first();
+        let margin = first
+            .zip(candidates.get(1))
+            .map(|(one, two)| one.candidate.shadow_rank_score - two.candidate.shadow_rank_score)
+            .unwrap_or(1.0);
+        let safe = first.is_some_and(|item| {
+            item.candidate.shadow_rank_score >= ACCEPT_SCORE
+                && margin >= ACCEPT_MARGIN
+                && item.source_count >= 2
+                && item
+                    .event_agreement
+                    .is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT)
+                && resolved_relation(item, flow.event_clock_bpm).is_some()
+                && classical_anchor_allows(item, &candidates)
+        });
+        if safe {
+            accepted += 1;
+            canonical_correct += usize::from(canonical(first.expect("safe"), truth));
+            family_correct += usize::from(candidate_family_correct(first.expect("safe"), truth));
+            false_confident += usize::from(!candidate_family_correct(first.expect("safe"), truth));
+        }
+    }
+    RuntimeFeasibleSummary {
+        rule_name: "classical_anchor_guarded_without_cross_duration_features".into(),
+        scored: flows.iter().filter(|flow| flow.truth_bpm.is_some()).count(),
+        accepted,
+        abstained_or_retained: flows
+            .iter()
+            .filter(|flow| flow.truth_bpm.is_some())
+            .count()
+            .saturating_sub(accepted),
+        canonical_correct,
+        family_correct,
+        canonical_precision: family_precision(canonical_correct, accepted),
+        family_precision: family_precision(family_correct, accepted),
+        false_confident_accepts: false_confident,
+    }
+}
+
+fn build_runtime_consistency(
+    flows: &[&CandidateFlowObservation],
+) -> Vec<RuntimeTempoConsistencyObservation> {
+    flows
+        .iter()
+        .filter_map(|flow| {
+            let analysis = flow.research_analysis.as_ref()?;
+            let intervals = analysis
+                .rhythm
+                .beats
+                .windows(2)
+                .filter_map(|window| window[1].time.checked_sub(window[0].time))
+                .map(|duration| duration.as_micros() as f64)
+                .filter(|value| *value > 0.0)
+                .collect::<Vec<_>>();
+            let median = median_f64(&intervals);
+            let mad_ratio = median.map(|center| {
+                let deviations = intervals
+                    .iter()
+                    .map(|value| (value - center).abs())
+                    .collect::<Vec<_>>();
+                median_f64(&deviations).unwrap_or(0.0) / center.max(1.0)
+            });
+            let third = intervals.len() / 3;
+            let early = median_f64(&intervals[..third.max(1).min(intervals.len())]);
+            let middle = median_f64(
+                &intervals
+                    [third.min(intervals.len())..(2 * third).max(third + 1).min(intervals.len())],
+            );
+            let late = median_f64(&intervals[(2 * third).min(intervals.len())..]);
+            let drift = |left: Option<f64>, right: Option<f64>| {
+                left.zip(right)
+                    .zip(median)
+                    .map(|((left, right), center)| (left - right).abs() / center.max(1.0))
+            };
+            let early_middle = drift(early, middle);
+            let middle_late = drift(middle, late);
+            let early_late = drift(early, late);
+            let max_drift = [early_middle, middle_late, early_late]
+                .into_iter()
+                .flatten()
+                .fold(0.0, f64::max);
+            let abstain = intervals.len() < 5
+                || max_drift > STATIONARY_DRIFT
+                || mad_ratio.is_some_and(|value| value > STATIONARY_DISPERSION);
+            let classification = if intervals.len() < 5 {
+                "insufficient_support"
+            } else if max_drift > 0.05 {
+                "strong_drift"
+            } else if max_drift > STATIONARY_DRIFT {
+                "slow_drift"
+            } else {
+                "single_pass_stationary"
+            };
+            Some(RuntimeTempoConsistencyObservation {
+                fixture_id: flow.fixture_id.clone(),
+                family: flow.family.clone(),
+                interval_count: intervals.len(),
+                interval_mad_ratio: mad_ratio,
+                early_middle_drift: early_middle,
+                middle_late_drift: middle_late,
+                early_late_drift: early_late,
+                classification: classification.into(),
+                refinement_would_abstain: abstain,
+            })
+        })
+        .collect()
+}
+
+fn build_abstention_reasons(
+    flows: &[&CandidateFlowObservation],
+    decisions: &[DecisionInternal],
+) -> Vec<AbstentionReasonObservation> {
+    decisions
+        .iter()
+        .filter(|decision| decision.row.decision != "select")
+        .filter_map(|decision| {
+            let flow = flows
+                .iter()
+                .find(|flow| flow.fixture_id == decision.row.fixture_id)?;
+            let first = decision.candidates.first();
+            let margin = first.zip(decision.candidates.get(1)).map(|(one, two)| {
+                one.candidate.shadow_rank_score - two.candidate.shadow_rank_score
+            });
+            let reason = if first.is_none() {
+                "candidate_unavailable"
+            } else if first
+                .is_some_and(|item| resolved_relation(item, flow.event_clock_bpm).is_none())
+            {
+                "relation_unresolved"
+            } else if margin.is_some_and(|value| value < ACCEPT_MARGIN) {
+                "ambiguous_score_margin"
+            } else if first.is_some_and(|item| item.source_count < 2) {
+                "weak_provenance"
+            } else if first
+                .and_then(|item| item.event_agreement)
+                .is_none_or(|value| value < ACCEPT_EVENT_AGREEMENT)
+            {
+                "event_disagreement"
+            } else if first.is_some_and(|item| !classical_anchor_allows(item, &decision.candidates))
+            {
+                "classical_anchor_missing"
+            } else {
+                "conservative_guard"
+            };
+            let candidate_family_available = flow.truth_bpm.is_some_and(|truth| {
+                decision
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate_family_correct(candidate, truth))
+            });
+            Some(AbstentionReasonObservation {
+                fixture_id: decision.row.fixture_id.clone(),
+                family: decision.row.family.clone(),
+                decision: decision.row.decision.clone(),
+                reason: reason.into(),
+                candidate_count: decision.candidates.len(),
+                candidate_family_available,
+                recoverable_by_current_candidate_set: candidate_family_available,
+            })
+        })
+        .collect()
 }
 
 fn build_heldout(
@@ -2034,6 +2741,26 @@ fn write_outputs(
         &report.conservative_matrix,
     )?;
     write_json(
+        &output_dir.join("effective-shadow-planner.json"),
+        &report.effective_planner,
+    )?;
+    write_json(
+        &output_dir.join("runtime-feasible-shadow.json"),
+        &report.runtime_feasible,
+    )?;
+    write_json(
+        &output_dir.join("runtime-tempo-consistency.json"),
+        &report.runtime_consistency,
+    )?;
+    write_json(
+        &output_dir.join("runtime-feature-audit.json"),
+        &report.runtime_feature_audit,
+    )?;
+    write_json(
+        &output_dir.join("abstention-reasons.json"),
+        &report.abstention_reasons,
+    )?;
+    write_json(
         &output_dir.join("heldout-conservative-ranking.json"),
         &report.heldout,
     )?;
@@ -2140,6 +2867,69 @@ fn markdown_report(report: &TempoConservativeShadowReport) -> String {
         report.adversarial.invalid_after_guard,
         report.adversarial.valid_aliases_retained,
         report.adversarial.valid_aliases_total
+    ));
+    output.push_str("## Effective shadow planner\n\n");
+    output.push_str(&format!(
+        "Baseline BeatMatched selected: {}/{} (false {}). Effective shadow BeatMatched selected: {}/{} (false {}, safe fallback {}, missed {}). Valid aliases representable: {}/{}.\n\n",
+        report.effective_planner.baseline_beatmatched_selected,
+        report.effective_planner.baseline_transition_cases,
+        report.effective_planner.baseline_false_beatmatched,
+        report.effective_planner.effective_beatmatched_selected,
+        report.effective_planner.effective_transition_cases,
+        report.effective_planner.effective_false_beatmatched,
+        report.effective_planner.effective_safe_fallback,
+        report.effective_planner.effective_missed_opportunity,
+        report.effective_planner.aliases_representable,
+        report.effective_planner.aliases_total,
+    ));
+    output.push_str("## Runtime-feasible audit\n\n");
+    output.push_str(&format!(
+        "{}: accepted {}, abstained/retained {}, canonical {}/{}, family {}/{}, false-confident {}.\n\n",
+        report.runtime_feasible.rule_name,
+        report.runtime_feasible.accepted,
+        report.runtime_feasible.abstained_or_retained,
+        report.runtime_feasible.canonical_correct,
+        report.runtime_feasible.scored,
+        report.runtime_feasible.family_correct,
+        report.runtime_feasible.scored,
+        report.runtime_feasible.false_confident_accepts,
+    ));
+    output.push_str("Feature classifications: ");
+    output.push_str(
+        &report
+            .runtime_feature_audit
+            .iter()
+            .map(|feature| format!("{}={}", feature.name, feature.classification))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str(".\n\n");
+    let runtime_abstentions = report
+        .runtime_consistency
+        .iter()
+        .filter(|item| item.refinement_would_abstain)
+        .count();
+    output.push_str(&format!(
+        "Single-pass interval consistency: {}/{} would abstain from a global constant-tempo refinement. Classifications: {:?}.\n\n",
+        runtime_abstentions,
+        report.runtime_consistency.len(),
+        report
+            .runtime_consistency
+            .iter()
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, item| {
+                *counts.entry(item.classification.clone()).or_insert(0) += 1;
+                counts
+            })
+    ));
+    output.push_str("## Non-selected reasons\n\n");
+    let mut reason_counts = BTreeMap::<String, usize>::new();
+    for row in &report.abstention_reasons {
+        *reason_counts.entry(row.reason.clone()).or_insert(0) += 1;
+    }
+    output.push_str(&format!(
+        "{} non-selected rows classified: {:?}.\n\n",
+        report.abstention_reasons.len(),
+        reason_counts
     ));
     output.push_str("## Candidate pressure\n\n");
     output.push_str(&format!("Mean candidates: {:.2}; p50: {}; p95: {}; max: {}; mean pair cross-product: {:.2}; p95: {}; max: {}.\n\n", report.candidate_pressure.mean_candidates, report.candidate_pressure.p50_candidates, report.candidate_pressure.p95_candidates, report.candidate_pressure.max_candidates, report.candidate_pressure.mean_pair_cross_product, report.candidate_pressure.p95_pair_cross_product, report.candidate_pressure.max_pair_cross_product));
@@ -2258,5 +3048,63 @@ mod tests {
         let mut full_only = base;
         full_only.has_full = true;
         assert!(!classical_anchor_allows(&full_only, &[full_only.clone()]));
+    }
+
+    #[test]
+    fn unlabeled_relation_is_resolved_only_from_event_clock() {
+        let candidate = TempoCandidate {
+            bpm: 60.0,
+            source: "classical_full".into(),
+            relation: "unlabeled".into(),
+            score: 1.0,
+            normalized_score: 1.0,
+            origin_stage: "test".into(),
+            relation_to_truth: "unscored".into(),
+            shadow_rank_score: 0.0,
+        };
+        let evidence = EvidenceCandidate {
+            candidate,
+            sources: BTreeSet::from(["full".into()]),
+            source_count: 1,
+            has_full: true,
+            has_low: false,
+            has_neural: false,
+            has_event: false,
+            has_v2: false,
+            event_agreement: Some(1.0),
+            duration_stability: 0.5,
+        };
+        assert_eq!(
+            resolved_relation(&evidence, Some(120.0)),
+            Some(TempoRelation::HalfTime)
+        );
+        assert_eq!(resolved_relation(&evidence, Some(125.0)), None);
+        assert_eq!(resolved_relation(&evidence, None), None);
+    }
+
+    #[test]
+    fn empty_shadow_hypotheses_do_not_derive_primary_from_beats() {
+        let analysis = synthetic_analysis(120.0, 120.0, "primary");
+        let input = ShadowAnalysisInput {
+            analysis: &analysis,
+            hypotheses: Vec::new(),
+        };
+        let eligibility = beat_match_eligibility(&input, &input, &auto_mix_config());
+        assert!(!eligibility.eligible);
+        assert!(eligibility.tempo_hypothesis.is_none());
+    }
+
+    #[test]
+    fn adversarial_effective_guard_removes_invalid_and_keeps_aliases() {
+        let report = build_adversarial_report().expect("adversarial report");
+        assert_eq!(report.invalid_after_guard, 0);
+        assert_eq!(report.valid_aliases_retained, report.valid_aliases_total);
+        assert!(
+            report
+                .cases
+                .iter()
+                .filter(|case| !case.declared_valid_alias)
+                .all(|case| !case.effective_shadow_beatmatched_selected)
+        );
     }
 }

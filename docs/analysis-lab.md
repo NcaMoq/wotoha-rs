@@ -258,6 +258,13 @@ component-aware family stress reports outside Git. All thresholds are fixed
 research rules; no Ground Truth, fixture identity, external observation, or
 production output is used as an inference feature. Classical remains the
 production beat/grid/tempo authority and all AutoMix results are shadow-only.
+The effective shadow matrix now sends the selected, retained, or abstained
+tempo hypotheses through the existing V2 planner and reports baseline and
+effective transitions separately. It also records runtime-feasible versus
+offline-only features, single-pass interval-consistency diagnostics, and a
+reason for every non-selected decision. Invalid metrical pairs must end in a
+non-BeatMatched effective transition, while declared harmonic aliases remain
+representable without requiring that the shadow planner select them.
 
 Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
 downbeat evidence, off-phase leakage, periodic consistency, bar-cycle

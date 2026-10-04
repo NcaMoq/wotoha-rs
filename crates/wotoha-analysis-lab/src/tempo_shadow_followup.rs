@@ -80,6 +80,12 @@ pub struct CandidateFlowObservation {
     pub primary_failure_class: String,
     pub secondary_failure_classes: Vec<String>,
     pub quantization: Option<NeuralQuantizationObservation>,
+    /// In-memory research handle used by the conservative shadow planner.
+    /// It is intentionally omitted from serialized reports so generated
+    /// artifacts remain a neutral candidate-flow record rather than a second
+    /// copy of the full analysis object.
+    #[serde(skip)]
+    pub research_analysis: Option<TrackAnalysisV2>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -699,6 +705,7 @@ fn build_flow_observation(analyzed: &AnalyzedFixture) -> CandidateFlowObservatio
         primary_failure_class,
         secondary_failure_classes,
         quantization,
+        research_analysis: Some(analyzed.v2.clone()),
     }
 }
 
