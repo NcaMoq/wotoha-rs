@@ -598,10 +598,9 @@ fn duration_stability(
     }
 }
 
-fn merge_evidence(
+fn merge_evidence_all(
     flow: &CandidateFlowObservation,
     flows: &[&CandidateFlowObservation],
-    budget: usize,
 ) -> Vec<EvidenceCandidate> {
     let raw = collect_raw_candidates(flow);
     let mut merged = Vec::<EvidenceCandidate>::new();
@@ -650,8 +649,60 @@ fn merge_evidence(
             .total_cmp(&left.candidate.normalized_score)
             .then_with(|| left.candidate.bpm.total_cmp(&right.candidate.bpm))
     });
+    merged
+}
+
+fn merge_evidence(
+    flow: &CandidateFlowObservation,
+    flows: &[&CandidateFlowObservation],
+    budget: usize,
+) -> Vec<EvidenceCandidate> {
+    let mut merged = merge_evidence_all(flow, flows);
     merged.truncate(budget);
     merged
+}
+
+/// Keep a bounded classical tail for the anchor ranking. The ordinary score
+/// sort can fill the cap with event/V2 candidates when the classical scores
+/// are uniformly small, even though a second full/low peak still carries a
+/// valid harmonic family. Two candidates per independent classical band are
+/// enough to preserve that evidence without increasing the cap.
+fn merge_evidence_classical_tail(
+    flow: &CandidateFlowObservation,
+    flows: &[&CandidateFlowObservation],
+    budget: usize,
+) -> Vec<EvidenceCandidate> {
+    let all = merge_evidence_all(flow, flows);
+    if budget == 0 || all.is_empty() {
+        return Vec::new();
+    }
+    let mut selected = BTreeSet::new();
+    for band in ["full", "low"] {
+        let mut retained = 0usize;
+        for (index, candidate) in all.iter().enumerate() {
+            let matches_band = if band == "full" {
+                candidate.has_full
+            } else {
+                candidate.has_low
+            };
+            if matches_band && selected.insert(index) {
+                retained += 1;
+                if retained == 2 {
+                    break;
+                }
+            }
+        }
+    }
+    for index in 0..all.len() {
+        if selected.len() >= budget {
+            break;
+        }
+        selected.insert(index);
+    }
+    selected
+        .into_iter()
+        .map(|index| all[index].clone())
+        .collect()
 }
 
 fn rank_value(item: &EvidenceCandidate, mode: RankMode, margin: f32) -> f32 {
@@ -697,10 +748,8 @@ fn classical_anchor_allows(first: &EvidenceCandidate, candidates: &[EvidenceCand
     if classical_anchor_available(candidates) {
         (first.has_full && first.has_low)
             || (first.has_neural && first.has_event && first.source_count >= 3)
-    } else if (first.has_full ^ first.has_low) && !first.has_neural {
-        false
     } else {
-        true
+        !(first.has_full ^ first.has_low) || first.has_neural
     }
 }
 
@@ -710,7 +759,11 @@ fn rank_candidates(
     budget: usize,
     mode: RankMode,
 ) -> Vec<EvidenceCandidate> {
-    let mut candidates = merge_evidence(flow, flows, budget);
+    let mut candidates = if matches!(mode, RankMode::ClassicalAnchor) {
+        merge_evidence_classical_tail(flow, flows, budget)
+    } else {
+        merge_evidence(flow, flows, budget)
+    };
     candidates.sort_by(|left, right| {
         let margin = left.candidate.normalized_score - right.candidate.normalized_score;
         rank_value(right, mode, margin)
