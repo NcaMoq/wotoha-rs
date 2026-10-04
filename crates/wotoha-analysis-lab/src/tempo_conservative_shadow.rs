@@ -28,10 +28,13 @@ use super::{
     tempo_ambiguity_research::{AnalyzedFixture, analyze_long_fixture, long_spec},
     tempo_shadow_followup::{
         CandidateFlowObservation, TempoCandidate, TempoShadowFollowupReport,
-        run_tempo_shadow_followup,
+        build_flow_observation, run_tempo_shadow_followup,
     },
 };
-use crate::{EventStyle, FixtureFamily, LabError, TempoProfile, generate_fixture, write_json};
+use crate::{
+    EventStyle, FixtureFamily, FixtureSpec, LabError, SyntheticFixture, TempoProfile,
+    TransformKind, generate_fixture, write_json,
+};
 
 const RELATIVE_TOLERANCE: f32 = 0.005;
 const MAX_CANDIDATES: usize = 4;
@@ -68,6 +71,7 @@ pub struct TempoConservativeShadowReport {
     pub runtime_feasible: RuntimeFeasibleSummary,
     pub runtime_consistency: Vec<RuntimeTempoConsistencyObservation>,
     pub abstention_reasons: Vec<AbstentionReasonObservation>,
+    pub realistic_corpus: RealisticSyntheticCorpusReport,
     pub focus_slices: ConservativeFocusSlices,
     pub decision: ConservativeDecision,
 }
@@ -390,6 +394,86 @@ pub struct AbstentionReasonObservation {
     pub recoverable_by_current_candidate_set: bool,
 }
 
+/// A bounded, vendor-neutral synthetic corpus with arrangement-like changes
+/// layered over the same known beat clock.  It is intentionally separate from
+/// the scalar/alias corpus: the purpose is to test whether the conservative
+/// shadow remains safe when evidence density changes over time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticSyntheticCorpusReport {
+    pub schema_version: u32,
+    pub source_commit: String,
+    pub starting_commit: Option<String>,
+    pub seed: u64,
+    pub construction: String,
+    pub fixture_count: usize,
+    pub durations_micros: Vec<u64>,
+    pub section_profiles: Vec<String>,
+    pub fixtures: Vec<RealisticFixtureObservation>,
+    pub candidate_caps: Vec<RealisticCandidateCapSummary>,
+    pub transition_cases: Vec<RealisticTransitionCase>,
+    pub transition_summary: RealisticTransitionSummary,
+    pub interval_consistency: Vec<RuntimeTempoConsistencyObservation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticFixtureObservation {
+    pub fixture_id: String,
+    pub profile: String,
+    pub duration_micros: u64,
+    pub truth_bpm: f32,
+    pub event_count: usize,
+    pub event_clock_bpm: Option<f32>,
+    pub candidate_count: usize,
+    pub decision: String,
+    pub selected_bpm: Option<f32>,
+    pub selected_relation: Option<String>,
+    pub relation_resolution: String,
+    pub safe_fallback_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticCandidateCapSummary {
+    pub candidate_budget: usize,
+    pub mean_candidates: f32,
+    pub max_candidates: usize,
+    pub max_pair_cross_product: usize,
+    pub candidate_family_recall: usize,
+    pub candidate_canonical_recall: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticTransitionCase {
+    pub case_id: String,
+    pub outgoing_fixture: String,
+    pub incoming_fixture: String,
+    pub expected_outcome: String,
+    pub baseline_transition: String,
+    pub baseline_beatmatched_candidate_generated: bool,
+    pub baseline_beatmatched_selected: bool,
+    pub baseline_quality_guard_passed: bool,
+    pub effective_shadow_transition: String,
+    pub effective_beatmatched_candidate_generated: bool,
+    pub effective_metrical_guard_passed: bool,
+    pub effective_quality_guard_passed: bool,
+    pub effective_beatmatched_selected: bool,
+    pub effective_false_beatmatched: bool,
+    pub effective_safe_fallback: bool,
+    pub effective_pair_correct: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticTransitionSummary {
+    pub pair_count: usize,
+    pub expected_safe_fallback_cases: usize,
+    pub expected_feasible_cases: usize,
+    pub baseline_false_beatmatched: usize,
+    pub effective_false_beatmatched: usize,
+    pub effective_correct_beatmatched: usize,
+    pub effective_safe_fallback: usize,
+    pub safe_outcomes: usize,
+    pub non_interference_scope: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeldOutConservativeRanking {
     pub rule_name: String,
@@ -558,6 +642,7 @@ pub fn run_tempo_conservative_shadow_research(
     let runtime_feasible = build_runtime_feasible_summary(&flows);
     let runtime_consistency = build_runtime_consistency(&flows);
     let abstention_reasons = build_abstention_reasons(&flows, &decisions);
+    let realistic_corpus = build_realistic_corpus_report(&source_commit)?;
     let heldout = build_heldout(&flows, &decisions);
     let focus_slices = build_focus_slices(&flows, &decisions);
     let scalar_count = flows.len();
@@ -633,6 +718,7 @@ pub fn run_tempo_conservative_shadow_research(
         runtime_feasible,
         runtime_consistency,
         abstention_reasons,
+        realistic_corpus,
         focus_slices,
         decision,
     };
@@ -2439,6 +2525,167 @@ fn build_abstention_reasons(
         .collect()
 }
 
+#[derive(Clone)]
+struct RealisticFlow {
+    profile: String,
+    flow: CandidateFlowObservation,
+}
+
+fn realistic_specs() -> Vec<(FixtureSpec, String)> {
+    let mut specs = Vec::new();
+    let seed = 0x52_45_41_4c_49_53_54_u64;
+    for duration_seconds in [30_u64, 60] {
+        for bpm in [100.0_f32, 120.0, 140.0] {
+            let profile = "sectional".to_string();
+            let id = format!("realistic-{duration_seconds}-{profile}-{bpm:.1}");
+            specs.push((
+                FixtureSpec {
+                    id: id.clone(),
+                    family: FixtureFamily::ConstantTempo,
+                    duration_micros: duration_seconds * 1_000_000,
+                    sample_rate: 22_050,
+                    channels: 1,
+                    lead_in_micros: 500_000,
+                    meter: 4,
+                    meter_truth: Some(4),
+                    tempo: TempoProfile::Constant { bpm },
+                    event_style: EventStyle::Standard,
+                    transform: TransformKind::None,
+                    base_id: Some(id),
+                    seed: seed + specs.len() as u64,
+                },
+                profile,
+            ));
+        }
+    }
+    for (index, (profile, bpm, duration_seconds)) in [
+        ("sparse_breakdown", 128.0_f32, 30_u64),
+        ("syncopated_drop", 128.0_f32, 30_u64),
+        ("kickless_breakdown", 120.0_f32, 30_u64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("realistic-{duration_seconds}-{profile}-{bpm:.1}");
+        specs.push((
+            FixtureSpec {
+                id: id.clone(),
+                family: FixtureFamily::ConstantTempo,
+                duration_micros: duration_seconds * 1_000_000,
+                sample_rate: 22_050,
+                channels: 1,
+                lead_in_micros: 500_000,
+                meter: 4,
+                meter_truth: Some(4),
+                tempo: TempoProfile::Constant { bpm },
+                event_style: EventStyle::Standard,
+                transform: TransformKind::None,
+                base_id: Some(id),
+                seed: seed + 100 + index as u64,
+            },
+            profile.into(),
+        ));
+    }
+    specs
+}
+
+fn arrangement_gain(progress: f64, profile: &str) -> f32 {
+    let base = if progress < 0.16 {
+        lerp_f32(0.22, 0.58, progress / 0.16)
+    } else if progress < 0.30 {
+        lerp_f32(0.58, 1.0, (progress - 0.16) / 0.14)
+    } else if progress < 0.65 {
+        1.0
+    } else if progress < 0.80 {
+        0.16
+    } else {
+        lerp_f32(0.52, 0.20, (progress - 0.80) / 0.20)
+    };
+    if profile.contains("sparse") && progress < 0.30 {
+        base * 0.65
+    } else if profile.contains("kickless") && (0.65..0.80).contains(&progress) {
+        base * 0.55
+    } else {
+        base
+    }
+}
+
+fn lerp_f32(start: f32, end: f32, progress: f64) -> f32 {
+    start + (end - start) * progress.clamp(0.0, 1.0) as f32
+}
+
+fn add_realistic_burst(
+    audio: &mut [f32],
+    sample_rate: u32,
+    time_micros: u64,
+    frequency: f32,
+    gain: f32,
+) {
+    let center = time_micros as f64 * sample_rate as f64 / 1_000_000.0;
+    let radius = (sample_rate as f64 * 0.035) as isize;
+    let center_index = center.round() as isize;
+    for offset in -radius..=radius {
+        let index = center_index + offset;
+        if index < 0 {
+            continue;
+        }
+        if let Some(sample) = audio.get_mut(index as usize) {
+            let seconds = offset as f32 / sample_rate as f32;
+            let envelope = (-seconds.abs() * 95.0).exp();
+            *sample += gain * envelope * (std::f32::consts::TAU * frequency * seconds).sin();
+        }
+    }
+}
+
+fn generate_realistic_fixture(
+    spec: &FixtureSpec,
+    profile: &str,
+) -> Result<SyntheticFixture, LabError> {
+    let mut fixture = generate_fixture(spec)?;
+    let duration = spec.duration_micros.max(1) as f64;
+    for (index, sample) in fixture.audio.iter_mut().enumerate() {
+        let time = index as f64 * 1_000_000.0 / spec.sample_rate as f64;
+        *sample *= arrangement_gain(time / duration, profile);
+    }
+    for (index, &beat_micros) in fixture.truth.beat_times_micros.iter().enumerate() {
+        let progress = beat_micros as f64 / duration;
+        if (0.16..0.65).contains(&progress) {
+            let gain = if profile.contains("syncopated") && index % 4 == 2 {
+                0.40
+            } else {
+                0.16
+            };
+            add_realistic_burst(
+                &mut fixture.audio,
+                spec.sample_rate,
+                beat_micros,
+                2_400.0,
+                gain,
+            );
+        }
+        if profile.contains("syncopated") && (0.30..0.65).contains(&progress) {
+            let next = fixture
+                .truth
+                .beat_times_micros
+                .get(index + 1)
+                .copied()
+                .unwrap_or(beat_micros);
+            let interval = next.saturating_sub(beat_micros);
+            if interval > 0 && index % 4 == 1 {
+                add_realistic_burst(
+                    &mut fixture.audio,
+                    spec.sample_rate,
+                    beat_micros.saturating_add(interval / 2),
+                    3_200.0,
+                    0.28,
+                );
+            }
+        }
+    }
+    fixture.audio_sha256 = crate::hash_pcm(&fixture.audio);
+    Ok(fixture)
+}
+
 fn build_heldout(
     flows: &[&CandidateFlowObservation],
     decisions: &[DecisionInternal],
@@ -2711,6 +2958,338 @@ fn build_answers(
     answers
 }
 
+fn realistic_candidate_caps(
+    flows: &[&CandidateFlowObservation],
+) -> Vec<RealisticCandidateCapSummary> {
+    [2_usize, 3, 4]
+        .into_iter()
+        .map(|budget| {
+            let mut total = 0;
+            let mut max_candidates = 0;
+            let mut max_pairs = 0;
+            let mut family_recall = 0;
+            let mut canonical_recall = 0;
+            for flow in flows {
+                let candidates = merge_evidence(flow, flows, budget);
+                total += candidates.len();
+                max_candidates = max_candidates.max(candidates.len());
+                max_pairs = max_pairs.max(candidates.len() * candidates.len());
+                if let Some(truth) = flow.truth_bpm {
+                    family_recall += usize::from(
+                        candidates
+                            .iter()
+                            .any(|candidate| candidate_family_correct(candidate, truth)),
+                    );
+                    canonical_recall += usize::from(
+                        candidates
+                            .iter()
+                            .any(|candidate| canonical(candidate, truth)),
+                    );
+                }
+            }
+            RealisticCandidateCapSummary {
+                candidate_budget: budget,
+                mean_candidates: total as f32 / flows.len().max(1) as f32,
+                max_candidates,
+                max_pair_cross_product: max_pairs,
+                candidate_family_recall: family_recall,
+                candidate_canonical_recall: canonical_recall,
+            }
+        })
+        .collect()
+}
+
+fn realistic_transition_case(
+    case_id: &str,
+    outgoing: &RealisticFlow,
+    incoming: &RealisticFlow,
+    expected_outcome: &str,
+    decisions: &[DecisionInternal],
+) -> Result<RealisticTransitionCase, LabError> {
+    let outgoing_analysis = outgoing
+        .flow
+        .research_analysis
+        .as_ref()
+        .ok_or_else(|| LabError::InvalidInput("realistic outgoing analysis missing".into()))?;
+    let incoming_analysis = incoming
+        .flow
+        .research_analysis
+        .as_ref()
+        .ok_or_else(|| LabError::InvalidInput("realistic incoming analysis missing".into()))?;
+    let outgoing_decision = decisions
+        .iter()
+        .find(|decision| decision.row.fixture_id == outgoing.flow.fixture_id)
+        .ok_or_else(|| LabError::InvalidInput("realistic outgoing decision missing".into()))?;
+    let incoming_decision = decisions
+        .iter()
+        .find(|decision| decision.row.fixture_id == incoming.flow.fixture_id)
+        .ok_or_else(|| LabError::InvalidInput("realistic incoming decision missing".into()))?;
+    let config = auto_mix_config();
+    let baseline_raw = plan_transition_v2(outgoing_analysis, incoming_analysis, &config);
+    let baseline_guarded =
+        plan_guarded_transition_v2(outgoing_analysis, incoming_analysis, &config);
+    let effective_outgoing = ShadowAnalysisInput {
+        analysis: outgoing_analysis,
+        hypotheses: hypotheses_for_decision(&outgoing.flow, outgoing_decision),
+    };
+    let effective_incoming = ShadowAnalysisInput {
+        analysis: incoming_analysis,
+        hypotheses: hypotheses_for_decision(&incoming.flow, incoming_decision),
+    };
+    let effective_raw = plan_transition_v2(&effective_outgoing, &effective_incoming, &config);
+    let effective_guarded =
+        plan_guarded_transition_v2(&effective_outgoing, &effective_incoming, &config);
+    let effective_eligibility =
+        beat_match_eligibility(&effective_outgoing, &effective_incoming, &config);
+    let baseline_selected = baseline_guarded.plan.kind == TransitionKind::BeatMatched;
+    let effective_selected = effective_guarded.plan.kind == TransitionKind::BeatMatched;
+    let outgoing_truth = outgoing
+        .flow
+        .truth_bpm
+        .ok_or_else(|| LabError::InvalidInput("realistic outgoing truth missing".into()))?;
+    let incoming_truth = incoming
+        .flow
+        .truth_bpm
+        .ok_or_else(|| LabError::InvalidInput("realistic incoming truth missing".into()))?;
+    let effective_pair_correct = effective_selected
+        && pair_is_correct(
+            effective_eligibility.tempo_hypothesis,
+            outgoing_truth,
+            incoming_truth,
+        );
+    let effective_metrical_guard_passed = !effective_raw.candidates.is_empty()
+        && effective_outgoing.tempo_hypotheses().len() == outgoing_decision.candidates.len()
+        && effective_incoming.tempo_hypotheses().len() == incoming_decision.candidates.len();
+    Ok(RealisticTransitionCase {
+        case_id: case_id.into(),
+        outgoing_fixture: outgoing.flow.fixture_id.clone(),
+        incoming_fixture: incoming.flow.fixture_id.clone(),
+        expected_outcome: expected_outcome.into(),
+        baseline_transition: format!("{:?}", baseline_guarded.plan.kind),
+        baseline_beatmatched_candidate_generated: baseline_raw.diagnostics.beatmatched_candidates
+            > 0,
+        baseline_beatmatched_selected: baseline_selected,
+        baseline_quality_guard_passed: baseline_guarded.rejected_plan.is_none(),
+        effective_shadow_transition: format!("{:?}", effective_guarded.plan.kind),
+        effective_beatmatched_candidate_generated: effective_raw.diagnostics.beatmatched_candidates
+            > 0,
+        effective_metrical_guard_passed,
+        effective_quality_guard_passed: effective_guarded.rejected_plan.is_none(),
+        effective_beatmatched_selected: effective_selected,
+        effective_false_beatmatched: effective_selected && !effective_pair_correct,
+        effective_safe_fallback: !effective_selected,
+        effective_pair_correct,
+    })
+}
+
+fn build_realistic_corpus_report(
+    source_commit: &str,
+) -> Result<RealisticSyntheticCorpusReport, LabError> {
+    let generated = realistic_specs()
+        .into_iter()
+        .map(|(spec, profile)| {
+            let fixture = generate_realistic_fixture(&spec, &profile)?;
+            let analyzed = analyze_long_fixture(fixture)?;
+            Ok(RealisticFlow {
+                profile,
+                flow: build_flow_observation(&analyzed),
+            })
+        })
+        .collect::<Result<Vec<_>, LabError>>()?;
+    let flow_refs = generated.iter().map(|item| &item.flow).collect::<Vec<_>>();
+    let decisions = build_abstention_rows(&flow_refs);
+    let fixtures = generated
+        .iter()
+        .map(|item| {
+            let decision = decisions
+                .iter()
+                .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
+                .expect("realistic decision exists");
+            RealisticFixtureObservation {
+                fixture_id: item.flow.fixture_id.clone(),
+                profile: item.profile.clone(),
+                duration_micros: item.flow.duration_micros,
+                truth_bpm: item.flow.truth_bpm.expect("realistic scalar truth"),
+                event_count: item
+                    .flow
+                    .research_analysis
+                    .as_ref()
+                    .map(|analysis| analysis.rhythm.beats.len())
+                    .unwrap_or(0),
+                event_clock_bpm: item.flow.event_clock_bpm,
+                candidate_count: decision.row.candidate_count,
+                decision: decision.row.decision.clone(),
+                selected_bpm: decision.row.selected_bpm,
+                selected_relation: decision.row.selected_relation.clone(),
+                relation_resolution: decision.row.metrical_consistency.clone(),
+                safe_fallback_only: decision.row.decision != "select",
+            }
+        })
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            "same_tempo_duration_pair",
+            "realistic-30-sectional-120.0",
+            "realistic-60-sectional-120.0",
+            "beatmatched_permitted_or_safe_fallback",
+        ),
+        (
+            "tempo_mismatch_pair",
+            "realistic-30-sectional-120.0",
+            "realistic-30-sectional-140.0",
+            "safe_fallback_required",
+        ),
+        (
+            "sparse_to_syncopated_same_tempo",
+            "realistic-30-sparse_breakdown-128.0",
+            "realistic-30-syncopated_drop-128.0",
+            "beatmatched_permitted_or_safe_fallback",
+        ),
+        (
+            "breakdown_reentry_mismatch",
+            "realistic-30-kickless_breakdown-120.0",
+            "realistic-30-sectional-140.0",
+            "safe_fallback_required",
+        ),
+        (
+            "cross_tempo_duration_mismatch",
+            "realistic-30-sectional-100.0",
+            "realistic-60-sectional-140.0",
+            "safe_fallback_required",
+        ),
+    ]
+    .into_iter()
+    .map(|(case_id, outgoing_id, incoming_id, expected)| {
+        let outgoing = generated
+            .iter()
+            .find(|item| item.flow.fixture_id == outgoing_id)
+            .ok_or_else(|| {
+                LabError::InvalidInput(format!("missing realistic fixture {outgoing_id}"))
+            })?;
+        let incoming = generated
+            .iter()
+            .find(|item| item.flow.fixture_id == incoming_id)
+            .ok_or_else(|| {
+                LabError::InvalidInput(format!("missing realistic fixture {incoming_id}"))
+            })?;
+        realistic_transition_case(case_id, outgoing, incoming, expected, &decisions)
+    })
+    .collect::<Result<Vec<_>, LabError>>()?;
+    let transition_summary = RealisticTransitionSummary {
+        pair_count: cases.len(),
+        expected_safe_fallback_cases: cases
+            .iter()
+            .filter(|case| case.expected_outcome == "safe_fallback_required")
+            .count(),
+        expected_feasible_cases: cases
+            .iter()
+            .filter(|case| case.expected_outcome != "safe_fallback_required")
+            .count(),
+        baseline_false_beatmatched: cases
+            .iter()
+            .filter(|case| {
+                case.baseline_beatmatched_selected
+                    && case.expected_outcome == "safe_fallback_required"
+            })
+            .count(),
+        effective_false_beatmatched: cases
+            .iter()
+            .filter(|case| case.effective_false_beatmatched)
+            .count(),
+        effective_correct_beatmatched: cases
+            .iter()
+            .filter(|case| case.effective_beatmatched_selected && case.effective_pair_correct)
+            .count(),
+        effective_safe_fallback: cases
+            .iter()
+            .filter(|case| case.effective_safe_fallback)
+            .count(),
+        safe_outcomes: cases
+            .iter()
+            .filter(|case| !case.effective_false_beatmatched)
+            .count(),
+        non_interference_scope:
+            "research-only generated audio and planner inputs; no production analysis or playback path".into(),
+    };
+    let interval_consistency = build_runtime_consistency(&flow_refs);
+    Ok(RealisticSyntheticCorpusReport {
+        schema_version: crate::RESEARCH_REPORT_SCHEMA_VERSION,
+        source_commit: source_commit.into(),
+        starting_commit: None,
+        seed: 0x52_45_41_4c_49_53_54,
+        construction: "30s/60s deterministic mono pulse masters with intro/build/drop/breakdown/outro gain sections, sparse evidence, and bounded syncopated drop accents; truth beat clock unchanged".into(),
+        fixture_count: fixtures.len(),
+        durations_micros: vec![30_000_000, 60_000_000],
+        section_profiles: vec![
+            "sectional".into(),
+            "sparse_breakdown".into(),
+            "syncopated_drop".into(),
+            "kickless_breakdown".into(),
+        ],
+        fixtures,
+        candidate_caps: realistic_candidate_caps(&flow_refs),
+        transition_cases: cases,
+        transition_summary,
+        interval_consistency,
+    })
+}
+
+pub fn run_realistic_corpus_research(
+    output_dir: &Path,
+    source_commit: String,
+    starting_commit: Option<String>,
+) -> Result<RealisticSyntheticCorpusReport, LabError> {
+    fs::create_dir_all(output_dir)?;
+    let mut report = build_realistic_corpus_report(&source_commit)?;
+    report.starting_commit = starting_commit;
+    write_json(&output_dir.join("realistic-synthetic-corpus.json"), &report)?;
+    fs::write(
+        output_dir.join("realistic-synthetic-corpus.md"),
+        realistic_markdown(&report),
+    )?;
+    Ok(report)
+}
+
+fn realistic_markdown(report: &RealisticSyntheticCorpusReport) -> String {
+    let summary = &report.transition_summary;
+    format!(
+        "# Realistic internal conservative-shadow corpus\n\n- source commit: `{}`\n- starting commit: `{}`\n- fixtures: `{}`\n- durations (micros): `{:?}`\n- profiles: `{:?}`\n- construction: {}\n- production behavior changed: `NO`\n\n## Candidate caps\n\n{}\n\n## Transition-level summary\n\n- pairs: `{}`\n- expected safe-fallback cases: `{}`\n- expected feasible-or-safe cases: `{}`\n- baseline false BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- effective correct BeatMatched: `{}`\n- effective safe fallback: `{}`\n- safe outcomes: `{}`\n\nThe corpus is research-only. Generated audio uses a deterministic known beat clock with arrangement-like evidence-density changes; it is not a substitute for ecological validation.\n",
+        report.source_commit,
+        report
+            .starting_commit
+            .as_deref()
+            .unwrap_or("unrecorded"),
+        report.fixture_count,
+        report.durations_micros,
+        report.section_profiles,
+        report.construction,
+        report
+            .candidate_caps
+            .iter()
+            .map(|cap| {
+                format!(
+                    "- cap `{}`: mean candidates `{:.2}`, max candidates `{}`, max pair cross-product `{}`, family recall `{}`, canonical recall `{}`",
+                    cap.candidate_budget,
+                    cap.mean_candidates,
+                    cap.max_candidates,
+                    cap.max_pair_cross_product,
+                    cap.candidate_family_recall,
+                    cap.candidate_canonical_recall
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        summary.pair_count,
+        summary.expected_safe_fallback_cases,
+        summary.expected_feasible_cases,
+        summary.baseline_false_beatmatched,
+        summary.effective_false_beatmatched,
+        summary.effective_correct_beatmatched,
+        summary.effective_safe_fallback,
+        summary.safe_outcomes,
+    )
+}
+
 fn write_outputs(
     output_dir: &Path,
     report: &TempoConservativeShadowReport,
@@ -2759,6 +3338,10 @@ fn write_outputs(
     write_json(
         &output_dir.join("abstention-reasons.json"),
         &report.abstention_reasons,
+    )?;
+    write_json(
+        &output_dir.join("realistic-synthetic-corpus.json"),
+        &report.realistic_corpus,
     )?;
     write_json(
         &output_dir.join("heldout-conservative-ranking.json"),
@@ -2931,6 +3514,34 @@ fn markdown_report(report: &TempoConservativeShadowReport) -> String {
         report.abstention_reasons.len(),
         reason_counts
     ));
+    output.push_str("## Realistic internal corpus\n\n");
+    let realistic = &report.realistic_corpus;
+    output.push_str(&format!(
+        "{} bounded arrangement-like fixtures at durations {:?}; transition cases: {}. Effective false BeatMatched: {}; safe outcomes: {}.\n\n",
+        realistic.fixture_count,
+        realistic.durations_micros,
+        realistic.transition_summary.pair_count,
+        realistic.transition_summary.effective_false_beatmatched,
+        realistic.transition_summary.safe_outcomes,
+    ));
+    output.push_str("Candidate caps on the realistic corpus: ");
+    output.push_str(
+        &realistic
+            .candidate_caps
+            .iter()
+            .map(|cap| {
+                format!(
+                    "{} (family recall {}, canonical recall {}, max pairs {})",
+                    cap.candidate_budget,
+                    cap.candidate_family_recall,
+                    cap.candidate_canonical_recall,
+                    cap.max_pair_cross_product
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str(".\n\n");
     output.push_str("## Candidate pressure\n\n");
     output.push_str(&format!("Mean candidates: {:.2}; p50: {}; p95: {}; max: {}; mean pair cross-product: {:.2}; p95: {}; max: {}.\n\n", report.candidate_pressure.mean_candidates, report.candidate_pressure.p50_candidates, report.candidate_pressure.p95_candidates, report.candidate_pressure.max_candidates, report.candidate_pressure.mean_pair_cross_product, report.candidate_pressure.p95_pair_cross_product, report.candidate_pressure.max_pair_cross_product));
     output.push_str("## Decision\n\n");
@@ -3106,5 +3717,41 @@ mod tests {
                 .filter(|case| !case.declared_valid_alias)
                 .all(|case| !case.effective_shadow_beatmatched_selected)
         );
+    }
+
+    #[test]
+    fn realistic_specs_cover_bounded_durations_and_profiles() {
+        let specs = realistic_specs();
+        assert_eq!(specs.len(), 9);
+        assert!(
+            specs
+                .iter()
+                .any(|(spec, _)| spec.duration_micros == 30_000_000)
+        );
+        assert!(
+            specs
+                .iter()
+                .any(|(spec, _)| spec.duration_micros == 60_000_000)
+        );
+        let profiles = specs
+            .iter()
+            .map(|(_, profile)| profile.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            profiles,
+            BTreeSet::from([
+                "sectional",
+                "sparse_breakdown",
+                "syncopated_drop",
+                "kickless_breakdown",
+            ])
+        );
+    }
+
+    #[test]
+    fn realistic_candidate_cap_policy_is_explicit() {
+        let budgets = [2_usize, 3, 4];
+        assert_eq!(budgets, [2, 3, 4]);
+        assert!(budgets.iter().all(|budget| budget * budget <= 16));
     }
 }

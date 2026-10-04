@@ -266,6 +266,25 @@ reason for every non-selected decision. Invalid metrical pairs must end in a
 non-BeatMatched effective transition, while declared harmonic aliases remain
 representable without requiring that the shadow planner select them.
 
+The bounded arrangement-like corpus can also be run independently when the
+full conservative report is not needed:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-tempo-realistic-shadow \
+  --output /tmp/wotoha-realistic-shadow
+```
+
+This command generates deterministic 30-second and 60-second mono fixtures
+with intro/build/drop/breakdown/outro evidence-density changes, sparse and
+syncopated variants, bounded candidate-cap measurements, and a small set of
+transition pairs. It records baseline and effective planner outcomes and
+requires safe fallback for tempo-mismatched pairs. The generated corpus is
+research-only: its known beat clock is useful for safety checks but is not a
+replacement for ecological or external validation.
+
 Meter research evaluates fixed 2/3/4/6 meter × phase candidates using target
 downbeat evidence, off-phase leakage, periodic consistency, bar-cycle
 consistency, and beat-event confidence. Its primary set is only the `Meter`

@@ -464,7 +464,7 @@ pub fn run_tempo_shadow_followup(
     Ok(report)
 }
 
-fn build_flow_observation(analyzed: &AnalyzedFixture) -> CandidateFlowObservation {
+pub(crate) fn build_flow_observation(analyzed: &AnalyzedFixture) -> CandidateFlowObservation {
     let observation = &analyzed.observation;
     let truth = observation.ground_truth.primary_bpm;
     let full = peak_candidates(&observation.classical.full_band.top_peaks, "classical_full");
