@@ -130,6 +130,8 @@ pub struct TempoShadowDecisionRow {
     pub top2_score: Option<f32>,
     pub score_margin: Option<f32>,
     pub source_support: usize,
+    pub selected_sources: Vec<String>,
+    pub classical_anchor_available: bool,
     pub event_agreement: Option<f32>,
     pub duration_stability: f32,
     pub metrical_consistency: String,
@@ -390,7 +392,7 @@ struct EvidenceCandidate {
     duration_stability: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RankMode {
     Evidence,
     Consensus,
@@ -661,8 +663,17 @@ fn rank_value(item: &EvidenceCandidate, mode: RankMode, margin: f32) -> f32 {
         RankMode::Evidence => 0.45 * evidence + 0.25 * support + 0.20 * event + 0.10 * duration,
         RankMode::Consensus => 0.35 * support + 0.35 * event + 0.20 * evidence + 0.10 * duration,
         RankMode::Margin => 0.40 * evidence + 0.25 * margin + 0.20 * support + 0.15 * event,
-        RankMode::EventGated | RankMode::ClassicalAnchor => {
+        RankMode::EventGated => {
             if event >= ACCEPT_EVENT_AGREEMENT {
+                0.30 * evidence + 0.35 * event + 0.25 * support + 0.10 * duration
+            } else {
+                0.55 * evidence + 0.20 * support + 0.15 * event + 0.10 * duration
+            }
+        }
+        RankMode::ClassicalAnchor => {
+            if item.has_full && item.has_low {
+                0.60 * evidence + 0.15 * support + 0.25 * duration
+            } else if event >= ACCEPT_EVENT_AGREEMENT {
                 0.30 * evidence + 0.35 * event + 0.25 * support + 0.10 * duration
             } else {
                 0.55 * evidence + 0.20 * support + 0.15 * event + 0.10 * duration
@@ -674,6 +685,18 @@ fn rank_value(item: &EvidenceCandidate, mode: RankMode, margin: f32) -> f32 {
     } else {
         value
     }
+}
+
+fn classical_anchor_available(candidates: &[EvidenceCandidate]) -> bool {
+    candidates
+        .iter()
+        .any(|candidate| candidate.has_full && candidate.has_low)
+}
+
+fn classical_anchor_allows(first: &EvidenceCandidate, candidates: &[EvidenceCandidate]) -> bool {
+    !classical_anchor_available(candidates)
+        || (first.has_full && first.has_low)
+        || (first.has_neural && first.has_event && first.source_count >= 3)
 }
 
 fn rank_candidates(
@@ -916,6 +939,8 @@ fn build_ranking_variants(flows: &[&CandidateFlowObservation]) -> Vec<RankingVar
                         && item
                             .event_agreement
                             .is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT)
+                        && (mode != Some(RankMode::ClassicalAnchor)
+                            || classical_anchor_allows(item, &candidates))
                 });
                 if safe {
                     accepted += 1;
@@ -974,7 +999,9 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
                     && margin.unwrap_or(1.0) >= ACCEPT_MARGIN
                     && item.source_count >= 2
                     && event_agreement.is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT)
+                    && classical_anchor_allows(item, &candidates)
             });
+            let classical_anchor_available = classical_anchor_available(&candidates);
             let decision = if safe {
                 "select"
             } else if first.is_some() && margin.is_some_and(|value| value < ACCEPT_MARGIN) {
@@ -1006,6 +1033,11 @@ fn build_abstention_rows(flows: &[&CandidateFlowObservation]) -> Vec<DecisionInt
                 top2_score: second.map(|item| item.candidate.shadow_rank_score),
                 score_margin: margin,
                 source_support,
+                selected_sources: first
+                    .as_ref()
+                    .map(|item| item.sources.iter().cloned().collect())
+                    .unwrap_or_default(),
+                classical_anchor_available,
                 event_agreement,
                 duration_stability: first
                     .as_ref()
@@ -1057,7 +1089,8 @@ fn build_pareto(flows: &[&CandidateFlowObservation]) -> Vec<OperatingPoint> {
                     && first.source_count >= 2
                     && first
                         .event_agreement
-                        .is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT);
+                        .is_some_and(|value| value >= ACCEPT_EVENT_AGREEMENT)
+                    && classical_anchor_allows(first, &candidates);
                 if select {
                     accepted += 1;
                     let truth = flow.truth_bpm.expect("scalar flow");
@@ -2019,11 +2052,11 @@ fn write_outputs(
 
 fn write_csv(path: &Path, rows: &[TempoShadowDecisionRow]) -> Result<(), LabError> {
     let mut output = String::from(
-        "fixture_id,family,truth_bpm,decision,selected_bpm,candidate_count,top1_score,score_margin,source_support,event_agreement,metrical_consistency,canonical_correct,family_correct,false_confident\n",
+        "fixture_id,family,truth_bpm,decision,selected_bpm,candidate_count,top1_score,score_margin,source_support,selected_sources,classical_anchor_available,event_agreement,metrical_consistency,canonical_correct,family_correct,false_confident\n",
     );
     for row in rows {
         output.push_str(&format!(
-            "{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{}\n",
+            "{},{},{:.4},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
             row.fixture_id,
             row.family,
             row.truth_bpm,
@@ -2039,6 +2072,8 @@ fn write_csv(path: &Path, rows: &[TempoShadowDecisionRow]) -> Result<(), LabErro
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_default(),
             row.source_support,
+            row.selected_sources.join("+"),
+            row.classical_anchor_available,
             row.event_agreement
                 .map(|value| format!("{value:.6}"))
                 .unwrap_or_default(),
@@ -2209,10 +2244,9 @@ mod tests {
         let mut anchored = base.clone();
         anchored.has_full = true;
         anchored.has_low = true;
-        assert_eq!(
+        assert!(
             rank_value(&anchored, RankMode::ClassicalAnchor, 0.0)
-                - rank_value(&base, RankMode::ClassicalAnchor, 0.0),
-            CLASSICAL_ANCHOR_BONUS
+                > rank_value(&base, RankMode::ClassicalAnchor, 0.0)
         );
     }
 }
