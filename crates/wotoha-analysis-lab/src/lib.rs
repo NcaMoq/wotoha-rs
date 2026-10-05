@@ -26,7 +26,8 @@ mod tempo_shadow_followup;
 pub use tempo_shadow_followup::{TempoShadowFollowupReport, run_tempo_shadow_followup};
 mod tempo_conservative_shadow;
 pub use tempo_conservative_shadow::{
-    RealisticSyntheticCorpusReport, TempoConservativeShadowReport, run_realistic_corpus_research,
+    RealisticSyntheticCorpusReport, TempoConservativeShadowReport,
+    run_independent_positive_corpus_research, run_realistic_corpus_research,
     run_tempo_conservative_shadow_research,
 };
 use wotoha_core::{

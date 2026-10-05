@@ -75,6 +75,9 @@ pub struct TempoConservativeShadowReport {
     pub runtime_consistency: Vec<RuntimeTempoConsistencyObservation>,
     pub abstention_reasons: Vec<AbstentionReasonObservation>,
     pub realistic_corpus: RealisticSyntheticCorpusReport,
+    /// Primary validation corpus. Its fixtures are generated and analyzed
+    /// independently; the planner never receives a copied boundary window.
+    pub independent_positive_corpus: RealisticPositiveCorpusReport,
     pub focus_slices: ConservativeFocusSlices,
     pub decision: ConservativeDecision,
 }
@@ -423,6 +426,9 @@ pub struct RealisticSyntheticCorpusReport {
 pub struct RealisticFixtureObservation {
     pub fixture_id: String,
     pub profile: String,
+    pub pcm_sha256: String,
+    pub master_id: String,
+    pub seed: u64,
     pub duration_micros: u64,
     pub truth_bpm: f32,
     pub event_count: usize,
@@ -440,6 +446,24 @@ pub struct RealisticFixtureObservation {
     pub selected_relation: Option<String>,
     pub relation_resolution: String,
     pub safe_fallback_only: bool,
+    pub beat_grid: RealisticBeatGridDiagnostic,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticBeatGridDiagnostic {
+    pub matching_tolerance_micros: u64,
+    pub truth_beat_count: usize,
+    pub detected_beat_count: usize,
+    pub matched_truth_beats: usize,
+    pub unmatched_truth_beats: usize,
+    pub extra_detected_beats: usize,
+    pub precision: Option<f32>,
+    pub recall: Option<f32>,
+    pub median_absolute_timing_error_micros: Option<u64>,
+    pub p95_absolute_timing_error_micros: Option<u64>,
+    pub max_absolute_timing_error_micros: Option<u64>,
+    pub first_beat_offset_micros: Option<i64>,
+    pub longitudinal_drift_micros: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -491,6 +515,10 @@ pub struct RealisticTransitionSummary {
 /// hypotheses, and heuristic cues derived from the analyzed structure.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealisticPositiveCorpusReport {
+    pub source_commit: Option<String>,
+    pub starting_commit: Option<String>,
+    pub corpus_kind: String,
+    pub boundary_window_copy_used: bool,
     pub construction: String,
     pub fixture_count: usize,
     pub pair_count: usize,
@@ -536,6 +564,22 @@ pub struct RealisticPositiveTransitionCase {
     pub tempo_adjustment: Option<f32>,
     pub render_quality: crate::tempo_shadow_followup::RenderQualityObservation,
     pub opportunity_class: String,
+    pub opportunity_taxonomy: String,
+    pub outgoing_pcm_sha256: String,
+    pub incoming_pcm_sha256: String,
+    pub outgoing_master_id: String,
+    pub incoming_master_id: String,
+    pub outgoing_seed: u64,
+    pub incoming_seed: u64,
+    pub waveform_copy_used: bool,
+    pub truth_inference_used: bool,
+    pub ordinary_selected_kind: String,
+    pub ordinary_beatmatched_cost: Option<f32>,
+    pub ordinary_gapless_cost: Option<f32>,
+    pub ordinary_crossfade_cost: Option<f32>,
+    pub quality_first_selected_kind: String,
+    pub quality_evidence: String,
+    pub quality_first_disagreement_reason: Option<String>,
     pub candidate_costs: Vec<RealisticPlannerCandidateObservation>,
 }
 
@@ -587,6 +631,12 @@ pub struct RealisticPositiveSummary {
     pub relation_unresolved: usize,
     pub quality_guard_rejected: usize,
     pub expected_relation_correct: usize,
+    pub independent_correct_beatmatched: usize,
+    pub distinct_success_tempo_regions: usize,
+    pub distinct_success_profiles: usize,
+    pub distinct_success_duration_configs: usize,
+    pub independent_false_beatmatched: usize,
+    pub external_gate_passed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -843,6 +893,9 @@ pub fn run_tempo_conservative_shadow_research(
     let runtime_consistency = build_runtime_consistency(&flows);
     let abstention_reasons = build_abstention_reasons(&flows, &decisions);
     let realistic_corpus = build_realistic_corpus_report(&source_commit)?;
+    let mut independent_positive_corpus = build_positive_realistic_corpus(false)?;
+    independent_positive_corpus.source_commit = Some(source_commit.clone());
+    independent_positive_corpus.starting_commit = starting_commit.clone();
     let heldout = build_heldout(&flows, &decisions);
     let focus_slices = build_focus_slices(&flows, &decisions);
     let scalar_count = flows.len();
@@ -879,13 +932,12 @@ pub fn run_tempo_conservative_shadow_research(
         &adversarial,
         &candidate_pressure,
     );
-    let internal_positive_gate = realistic_corpus
-        .positive_corpus
-        .summary
-        .effective_correct_beatmatched
-        >= 5
-        && realistic_corpus
-            .positive_corpus
+    let internal_positive_gate = independent_positive_corpus.summary.external_gate_passed
+        && independent_positive_corpus
+            .summary
+            .effective_correct_beatmatched
+            >= 5
+        && independent_positive_corpus
             .summary
             .effective_false_beatmatched
             == 0
@@ -898,7 +950,7 @@ pub fn run_tempo_conservative_shadow_research(
         recommendation: if internal_positive_gate {
             "EXTERNAL VALIDATION REQUIRED"
         } else {
-            "KEEP RESEARCH ONLY"
+            "INTERNAL RESEARCH BLOCKED"
         }
         .into(),
         primary_bottleneck: if internal_positive_gate {
@@ -944,6 +996,7 @@ pub fn run_tempo_conservative_shadow_research(
         runtime_consistency,
         abstention_reasons,
         realistic_corpus,
+        independent_positive_corpus,
         focus_slices,
         decision,
     };
@@ -1992,7 +2045,7 @@ fn quality_first_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInput>(
             return false;
         };
         // A candidate must agree with the one-pass observed event clocks on
-        // both decks after applying its explicit relation.  This is a
+        // both decks after applying its explicit relation. This is a
         // runtime-available diagnostic and prevents a phase-valid but
         // numerically stale hypothesis from becoming BeatMatched authority.
         if !tempo_hypothesis_matches_event_clock(
@@ -2038,6 +2091,43 @@ fn quality_first_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInput>(
         rejected_quality: None,
     };
     (planned, selected)
+}
+
+/// Apply the same quality-first shadow policy with the objective rendered
+/// quality observation available to the synthetic transition harness.  The
+/// ordinary planner remains the fallback whenever the proposed BeatMatched
+/// render contains a blocking discontinuity or energy defect.  This is a
+/// research-only safety check; it does not alter the production planner.
+fn quality_first_rendered_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInput>(
+    outgoing: &O,
+    incoming: &I,
+    outgoing_fixture: &SyntheticFixture,
+    incoming_fixture: &SyntheticFixture,
+    config: &AutoMixConfig,
+) -> (
+    TransitionPlanV2,
+    V2GuardedTransitionPlan,
+    crate::tempo_shadow_followup::RenderQualityObservation,
+) {
+    let (planned, selected) = quality_first_shadow_transition(outgoing, incoming, config);
+    let selected_phase_error = planned
+        .candidates
+        .iter()
+        .find(|candidate| candidate.plan == selected.plan)
+        .and_then(|candidate| candidate.beat_eligibility.as_ref())
+        .and_then(|eligibility| eligibility.phase_error);
+    let rendered = crate::tempo_shadow_followup::render_preview(
+        outgoing_fixture,
+        incoming_fixture,
+        &selected.plan,
+        selected_phase_error,
+    );
+    if selected.plan.kind == TransitionKind::BeatMatched && !rendered.acceptable {
+        let ordinary = plan_guarded_transition_v2(outgoing, incoming, config);
+        (planned, ordinary, rendered)
+    } else {
+        (planned, selected, rendered)
+    }
 }
 
 fn analysis_event_clock_bpm<I>(times: I) -> Option<f32>
@@ -2869,6 +2959,10 @@ fn build_abstention_reasons(
 struct RealisticFlow {
     profile: String,
     flow: CandidateFlowObservation,
+    pcm_sha256: String,
+    master_id: String,
+    seed: u64,
+    truth_beat_times_micros: Vec<u64>,
 }
 
 fn realistic_specs() -> Vec<(FixtureSpec, String)> {
@@ -3034,13 +3128,36 @@ fn generate_realistic_fixture(
 fn generate_positive_realistic_fixture(
     spec: &FixtureSpec,
     profile: &str,
+    clock_gain_scale: f32,
+    independent_render: bool,
 ) -> Result<SyntheticFixture, LabError> {
     let mut fixture = generate_fixture(spec)?;
     let audio_len = fixture.audio.len().max(1) as f64;
+    // Keep rhythmic clocks compatible while making the harmonic bed an
+    // independent rendering detail.  This prevents accidental phase-zero
+    // oscillator clones from standing in for independently generated tracks.
+    let bed_phase = if independent_render {
+        (spec.seed as f32 * 0.618_033_95).rem_euclid(std::f32::consts::TAU)
+    } else {
+        0.0
+    };
+    let bed_level = if independent_render { 0.20 } else { 0.85 };
     for (index, sample) in fixture.audio.iter_mut().enumerate() {
         let progress = index as f64 / audio_len;
         let seconds = index as f32 / spec.sample_rate as f32;
-        let envelope = if progress < 0.16 {
+        let envelope = if profile.contains("full_drop") {
+            if progress < 0.16 {
+                lerp_f32(0.86, 0.96, progress / 0.16)
+            } else if progress < 0.30 {
+                lerp_f32(0.96, 1.0, (progress - 0.16) / 0.14)
+            } else if progress < 0.65 {
+                1.0
+            } else if progress < 0.80 {
+                0.76
+            } else {
+                lerp_f32(0.84, 0.72, (progress - 0.80) / 0.20)
+            }
+        } else if progress < 0.16 {
             lerp_f32(0.55, 0.85, progress / 0.16)
         } else if progress < 0.30 {
             lerp_f32(0.85, 1.0, (progress - 0.16) / 0.14)
@@ -3070,24 +3187,46 @@ fn generate_positive_realistic_fixture(
         // measurable while the pulse/envelope layers still differ by seed
         // and arrangement profile.  This avoids using silence as a proxy for
         // a realistic transition-quality decision.
-        let bed = (std::f32::consts::TAU * 110.0 * seconds).sin() * 0.25
-            + (std::f32::consts::TAU * 220.0 * seconds).sin() * 0.15
-            + (std::f32::consts::TAU * 330.0 * seconds).sin() * 0.08
-            + (std::f32::consts::TAU * 4_200.0 * seconds).sin() * 0.18
-            + (std::f32::consts::TAU * 6_800.0 * seconds).sin() * 0.10;
-        *sample = *sample * envelope * profile_gain + bed * 0.85;
+        let bed = (std::f32::consts::TAU * 110.0 * seconds + bed_phase).sin() * 0.25
+            + (std::f32::consts::TAU * 220.0 * seconds + bed_phase * 1.7).sin() * 0.15
+            + (std::f32::consts::TAU * 330.0 * seconds + bed_phase * 0.43).sin() * 0.08
+            + (std::f32::consts::TAU * 4_200.0 * seconds + bed_phase * 2.1).sin() * 0.18
+            + (std::f32::consts::TAU * 6_800.0 * seconds + bed_phase * 0.77).sin() * 0.10;
+        // Keep the independent bed audible but subordinate to the generated
+        // transient clock, so a seed-dependent phase cannot destabilize the
+        // normal neural-to-V2 adaptation path.
+        let source_level = 1.0;
+        let texture = if independent_render {
+            let state = (index as u64)
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(spec.seed ^ 0x9e37_79b9_7f4a_7c15);
+            (((state >> 40) as f32 / (1_u64 << 24) as f32) - 0.5) * 0.08
+        } else {
+            0.0
+        };
+        *sample = *sample * source_level * envelope * profile_gain + bed * bed_level + texture;
     }
     // Keep every beat, including the first/last transition anchors, visible
     // to the analyzer.  Arrangement profiles still differ in envelope and
     // added off-beat detail, so these are not duplicated masters.
     for (index, &beat_micros) in fixture.truth.beat_times_micros.iter().enumerate() {
-        let beat_gain = if profile.contains("syncopated") && index % 4 == 2 {
-            0.65
-        } else if index.is_multiple_of(spec.meter as usize) {
-            0.55
-        } else {
-            0.38
-        };
+        let beat_gain = clock_gain_scale
+            * if profile.contains("syncopated") && index % 4 == 2 {
+                0.65
+            } else if index.is_multiple_of(spec.meter as usize) {
+                0.55
+            } else {
+                0.38
+            };
+        if independent_render {
+            add_realistic_burst(
+                &mut fixture.audio,
+                spec.sample_rate,
+                beat_micros,
+                55.0,
+                0.75 * clock_gain_scale,
+            );
+        }
         add_realistic_burst(
             &mut fixture.audio,
             spec.sample_rate,
@@ -3109,8 +3248,21 @@ fn generate_positive_realistic_fixture(
                     spec.sample_rate,
                     beat_micros.saturating_add(interval / 2),
                     3_200.0,
-                    0.22,
+                    0.22 * clock_gain_scale,
                 );
+            }
+        }
+    }
+    if independent_render {
+        let peak = fixture
+            .audio
+            .iter()
+            .map(|sample| sample.abs())
+            .fold(0.0_f32, f32::max);
+        if peak.is_finite() && peak > 0.75 {
+            let scale = 0.75 / peak;
+            for sample in &mut fixture.audio {
+                *sample *= scale;
             }
         }
     }
@@ -3224,6 +3376,90 @@ fn positive_realistic_specs() -> Vec<(FixtureSpec, String)> {
         .collect()
 }
 
+/// Independent-positive fixtures deliberately use a different seed namespace
+/// and do not share the mechanics corpus' aligned masters.  The pair list is
+/// evaluation metadata only; inference sees analyzed audio and generic
+/// runtime diagnostics, never these nominal values.
+fn independent_positive_specs() -> Vec<(FixtureSpec, String)> {
+    let definitions = [
+        ("sectional-a", 100.0_f32, 30_u64, "sectional"),
+        ("sectional-b", 100.0, 60, "sectional"),
+        ("syncopated-a", 100.0, 30, "syncopated_drop"),
+        ("sparse-a", 100.0, 60, "sparse_breakdown"),
+        ("sectional-c", 120.0, 30, "sectional"),
+        ("sectional-d", 120.0, 60, "sectional"),
+        ("kickless-a", 120.0, 60, "kickless_breakdown"),
+        ("sectional-e", 90.0, 30, "sectional"),
+        ("sectional-f", 90.0, 60, "sectional"),
+        ("sectional-g", 128.0, 60, "sectional"),
+        ("syncopated-b", 128.0, 30, "syncopated_drop"),
+        ("sectional-h", 130.0, 60, "sectional"),
+        ("kickless-b", 130.0, 60, "kickless_breakdown"),
+        ("sectional-i", 140.0, 60, "sectional"),
+        ("sectional-j", 140.0, 30, "sectional"),
+        ("sectional-k", 80.0, 30, "sectional"),
+        ("sectional-l", 160.0, 60, "sectional"),
+        ("sectional-m", 60.0, 30, "sectional"),
+        ("sectional-n", 120.0, 30, "sectional"),
+        ("sectional-o", 121.0, 60, "sectional"),
+        ("sectional-p", 126.0, 60, "sectional"),
+        ("sectional-q", 132.0, 60, "sectional"),
+        ("sectional-r", 180.0, 60, "sectional"),
+        ("sectional-b2", 100.0, 60, "sectional"),
+        ("sectional-d2", 120.0, 60, "sectional"),
+        ("sectional-f2", 90.0, 60, "sectional"),
+        ("sectional-m2", 60.0, 30, "sectional"),
+        ("sectional-h2", 130.0, 60, "sectional"),
+        ("sectional-o2", 121.0, 60, "sectional"),
+        ("full-a", 100.0, 60, "full_drop"),
+        ("full-b", 60.0, 30, "full_drop"),
+        ("full-c", 130.0, 60, "full_drop"),
+        ("full-d", 90.0, 60, "full_drop"),
+        ("full-e", 121.0, 60, "full_drop"),
+        ("full-f", 120.0, 30, "full_drop"),
+        ("full-g", 120.0, 60, "full_drop"),
+        ("full-h", 90.0, 30, "full_drop"),
+        ("full-i", 90.0, 60, "full_drop"),
+        ("full-j", 128.0, 30, "full_drop"),
+        ("full-k", 128.0, 60, "full_drop"),
+        ("full-l", 60.0, 30, "full_drop"),
+        ("full-m", 60.0, 60, "full_drop"),
+        ("full-n", 127.5, 30, "full_drop"),
+        ("full-o", 127.5, 60, "full_drop"),
+        ("full-p", 127.5, 60, "full_drop"),
+        ("full-q", 130.0, 60, "full_drop"),
+        ("full-r", 110.0, 30, "full_drop"),
+        ("full-s", 110.0, 60, "full_drop"),
+        ("full-t", 110.0, 60, "full_drop"),
+    ];
+    let seed = 0x49_4e_44_50_4f_53_u64;
+    definitions
+        .into_iter()
+        .enumerate()
+        .map(|(index, (variant, bpm, duration_seconds, profile))| {
+            let id = format!("independent-{duration_seconds}-{profile}-{bpm:.1}-{variant}");
+            (
+                FixtureSpec {
+                    id: id.clone(),
+                    family: FixtureFamily::ConstantTempo,
+                    duration_micros: duration_seconds * 1_000_000,
+                    sample_rate: 44_100,
+                    channels: 1,
+                    lead_in_micros: 0,
+                    meter: 4,
+                    meter_truth: Some(4),
+                    tempo: TempoProfile::Constant { bpm },
+                    event_style: EventStyle::Standard,
+                    transform: TransformKind::None,
+                    base_id: Some(id),
+                    seed: seed + index as u64,
+                },
+                profile.into(),
+            )
+        })
+        .collect()
+}
+
 fn positive_expected_relation(outgoing_bpm: f32, incoming_bpm: f32) -> String {
     let ratio = outgoing_bpm / incoming_bpm.max(f32::EPSILON);
     if (ratio - 1.0).abs() <= RELATION_RESOLUTION_TOLERANCE {
@@ -3234,6 +3470,118 @@ fn positive_expected_relation(outgoing_bpm: f32, incoming_bpm: f32) -> String {
         "incoming_half_time_family".into()
     } else {
         "alternative_or_unresolved".into()
+    }
+}
+
+const REALISTIC_BEAT_MATCH_TOLERANCE_MICROS: u64 = 35_000;
+
+fn realistic_beat_grid_diagnostic(
+    truth_times: &[u64],
+    detected_times: &[Duration],
+) -> RealisticBeatGridDiagnostic {
+    let tolerance = REALISTIC_BEAT_MATCH_TOLERANCE_MICROS as i64;
+    let mut used = vec![false; detected_times.len()];
+    let mut errors = Vec::new();
+    for &truth in truth_times {
+        let best = detected_times
+            .iter()
+            .enumerate()
+            .filter(|(index, detected)| {
+                !used[*index] && (detected.as_micros() as i64 - truth as i64).abs() <= tolerance
+            })
+            .min_by_key(|(_, detected)| {
+                (detected.as_micros() as i64 - truth as i64).unsigned_abs()
+            });
+        if let Some((index, detected)) = best {
+            used[index] = true;
+            errors.push(detected.as_micros() as i64 - truth as i64);
+        }
+    }
+    let matched = errors.len();
+    let mut absolute = errors
+        .iter()
+        .map(|error| error.unsigned_abs())
+        .collect::<Vec<_>>();
+    absolute.sort_unstable();
+    let percentile = |values: &[u64], numerator: usize, denominator: usize| {
+        if values.is_empty() {
+            None
+        } else {
+            let index = ((values.len() - 1) * numerator + denominator / 2) / denominator;
+            values.get(index).copied()
+        }
+    };
+    let precision =
+        (!detected_times.is_empty()).then(|| matched as f32 / detected_times.len() as f32);
+    let recall = (!truth_times.is_empty()).then(|| matched as f32 / truth_times.len() as f32);
+    let first = errors.first().copied();
+    let drift = errors
+        .first()
+        .zip(errors.last())
+        .map(|(first, last)| last - first);
+    RealisticBeatGridDiagnostic {
+        matching_tolerance_micros: REALISTIC_BEAT_MATCH_TOLERANCE_MICROS,
+        truth_beat_count: truth_times.len(),
+        detected_beat_count: detected_times.len(),
+        matched_truth_beats: matched,
+        unmatched_truth_beats: truth_times.len().saturating_sub(matched),
+        extra_detected_beats: detected_times.len().saturating_sub(matched),
+        precision,
+        recall,
+        median_absolute_timing_error_micros: percentile(&absolute, 1, 2),
+        p95_absolute_timing_error_micros: percentile(&absolute, 19, 20),
+        max_absolute_timing_error_micros: absolute.last().copied(),
+        first_beat_offset_micros: first,
+        longitudinal_drift_micros: drift,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn positive_opportunity_taxonomy(
+    beatmatched_selected: bool,
+    false_beatmatched: bool,
+    candidate_survived_guard: bool,
+    candidate_generated: bool,
+    outgoing_decision: &str,
+    incoming_decision: &str,
+    selected_pair: bool,
+    eligibility: &wotoha_core::automix::BeatMatchEligibility,
+) -> &'static str {
+    if beatmatched_selected {
+        return if false_beatmatched {
+            "INVALID_BEATMATCHED"
+        } else {
+            "CORRECT_BEATMATCHED"
+        };
+    }
+    if outgoing_decision != "select" || incoming_decision != "select" {
+        return "TRACK_UNCERTAINTY_BLOCKED";
+    }
+    if !selected_pair {
+        return if eligibility.rejection.is_some() {
+            "NO_COMPATIBLE_TEMPO_PAIR"
+        } else {
+            "RELATION_UNRESOLVED"
+        };
+    }
+    if !eligibility.eligible {
+        return if matches!(
+            eligibility.rejection,
+            Some(wotoha_core::automix::BeatMatchRejection::PhysicalWindowUnavailable)
+        ) {
+            "PHYSICAL_ELIGIBILITY_FAILED"
+        } else {
+            "NO_COMPATIBLE_TEMPO_PAIR"
+        };
+    }
+    if candidate_survived_guard {
+        "SOFT_RANKING_PREFERRED_FALLBACK"
+    } else if candidate_generated {
+        "QUALITY_GUARD_REJECTED"
+    } else if eligibility.beat_pairs == 0 {
+        "CUE_OPPORTUNITY_MISSING"
+    } else {
+        "SAFE_FALLBACK_OTHER"
     }
 }
 
@@ -3252,6 +3600,15 @@ fn positive_pair_is_correct(
     outgoing_correct
         && incoming_correct
         && relative_difference(expected_ratio, truth_ratio) <= RELATIVE_TOLERANCE
+}
+
+fn relation_physical_bpm(hypothesis: TempoHypothesis) -> f32 {
+    let multiplier = match hypothesis.relation {
+        TempoRelation::HalfTime => 2.0,
+        TempoRelation::DoubleTime => 0.5,
+        TempoRelation::Primary | TempoRelation::Alternative => 1.0,
+    };
+    hypothesis.bpm * multiplier
 }
 
 fn positive_realistic_transition_case(
@@ -3283,19 +3640,59 @@ fn positive_realistic_transition_case(
         .ok_or_else(|| LabError::InvalidInput("positive incoming truth missing".into()))?;
     let outgoing_hypotheses = hypotheses_for_decision(&outgoing.flow, outgoing_decision);
     let incoming_hypotheses = hypotheses_for_decision(&incoming.flow, incoming_decision);
+    let outgoing_cues = realistic_analysis_cues(outgoing_analysis);
+    let incoming_cues = realistic_analysis_cues(incoming_analysis);
     let outgoing_input = RealisticPlannerInput {
         analysis: outgoing_analysis,
-        hypotheses: outgoing_hypotheses,
-        cues: realistic_analysis_cues(outgoing_analysis),
+        hypotheses: outgoing_hypotheses.clone(),
+        cues: outgoing_cues,
     };
     let incoming_input = RealisticPlannerInput {
         analysis: incoming_analysis,
-        hypotheses: incoming_hypotheses,
-        cues: realistic_analysis_cues(incoming_analysis),
+        hypotheses: incoming_hypotheses.clone(),
+        cues: incoming_cues,
     };
     let config = auto_mix_config();
-    let (planned, guarded) =
-        quality_first_shadow_transition(&outgoing_input, &incoming_input, &config);
+    let ordinary_plan = plan_guarded_transition_v2(&outgoing_input, &incoming_input, &config);
+    let ordinary_candidates = plan_transition_v2(&outgoing_input, &incoming_input, &config);
+    let ordinary = quality_first_rendered_shadow_transition(
+        &outgoing_input,
+        &incoming_input,
+        outgoing_fixture,
+        incoming_fixture,
+        &config,
+    );
+    let (planned, guarded, rendered_quality) = if ordinary.0.diagnostics.beatmatched_candidates == 0
+    {
+        // Research-only opportunity probe: use the same analyzed timelines
+        // and hypotheses while asking the core planner to evaluate its
+        // bounded physical-window fallback when every heuristic cue pair was
+        // unsuitable. No truth or boundary audio participates.
+        let cue_free_outgoing = RealisticPlannerInput {
+            analysis: outgoing_analysis,
+            hypotheses: outgoing_hypotheses,
+            cues: Vec::new(),
+        };
+        let cue_free_incoming = RealisticPlannerInput {
+            analysis: incoming_analysis,
+            hypotheses: incoming_hypotheses,
+            cues: Vec::new(),
+        };
+        let fallback = quality_first_rendered_shadow_transition(
+            &cue_free_outgoing,
+            &cue_free_incoming,
+            outgoing_fixture,
+            incoming_fixture,
+            &config,
+        );
+        if fallback.0.diagnostics.beatmatched_candidates > 0 {
+            fallback
+        } else {
+            ordinary
+        }
+    } else {
+        ordinary
+    };
     let eligibility = beat_match_eligibility(&outgoing_input, &incoming_input, &config);
     let selected_pair = planned
         .candidates
@@ -3319,34 +3716,53 @@ fn positive_realistic_transition_case(
     let tempo_hypothesis_pair_correct =
         positive_pair_is_correct(selected_pair, outgoing_truth, incoming_truth);
     let relation_correct = selected_pair.is_some_and(|pair| {
-        let outgoing_relation = format!("{:?}", pair.outgoing.relation).to_ascii_lowercase();
-        let incoming_relation = format!("{:?}", pair.incoming.relation).to_ascii_lowercase();
-        let expected = positive_expected_relation(outgoing_truth, incoming_truth);
-        match expected.as_str() {
-            "primary_pair" => outgoing_relation == "primary" && incoming_relation == "primary",
-            "incoming_double_time_family" => {
-                outgoing_relation == "primary" && incoming_relation == "primary"
-            }
-            "incoming_half_time_family" => {
-                outgoing_relation == "primary" && incoming_relation == "primary"
-            }
-            _ => false,
-        }
+        let outgoing_physical = relation_physical_bpm(pair.outgoing);
+        let incoming_physical = relation_physical_bpm(pair.incoming);
+        outgoing_physical.is_finite()
+            && incoming_physical.is_finite()
+            && family_correct_bpm(outgoing_physical, outgoing_truth)
+            && family_correct_bpm(incoming_physical, incoming_truth)
+            && relative_difference(
+                outgoing_physical / incoming_physical.max(f32::EPSILON),
+                outgoing_truth / incoming_truth.max(f32::EPSILON),
+            ) <= RELATION_RESOLUTION_TOLERANCE
     });
     let quality_guard_passed = beatmatched_selected
         && guarded.rejected_plan.is_none()
         && !guarded.quality.has_blocking_issue();
-    let render_quality = crate::tempo_shadow_followup::render_preview(
-        outgoing_fixture,
-        incoming_fixture,
-        &guarded.plan,
-        selected_phase_error,
-    );
+    let render_quality = if guarded.plan.kind == TransitionKind::BeatMatched
+        || planned
+            .candidates
+            .iter()
+            .any(|candidate| candidate.plan.kind == TransitionKind::BeatMatched)
+    {
+        // Preserve the objective render observation for a rejected
+        // BeatMatched opportunity; otherwise a fallback Gapless render would
+        // overwrite the evidence needed to classify the rejection.
+        rendered_quality
+    } else {
+        crate::tempo_shadow_followup::render_preview(
+            outgoing_fixture,
+            incoming_fixture,
+            &guarded.plan,
+            selected_phase_error,
+        )
+    };
     let false_beatmatched = beatmatched_selected
         && (!tempo_hypothesis_pair_correct
             || !relation_correct
             || !quality_guard_passed
             || !render_quality.acceptable);
+    let opportunity_taxonomy = positive_opportunity_taxonomy(
+        beatmatched_selected,
+        false_beatmatched,
+        beatmatched_candidate_survived_guard,
+        beatmatched_candidate_generated,
+        &outgoing_decision.row.decision,
+        &incoming_decision.row.decision,
+        selected_pair.is_some(),
+        &eligibility,
+    );
     let opportunity_class = if beatmatched_selected {
         if false_beatmatched {
             "selected_but_invalid"
@@ -3452,6 +3868,7 @@ fn positive_realistic_transition_case(
             }
         })
         .collect();
+    let render_acceptable = render_quality.acceptable;
     Ok(RealisticPositiveTransitionCase {
         case_id: case_id.into(),
         outgoing_fixture: outgoing.flow.fixture_id.clone(),
@@ -3501,63 +3918,139 @@ fn positive_realistic_transition_case(
             .then_some((guarded.plan.incoming_tempo_ratio - 1.0).abs()),
         render_quality,
         opportunity_class: opportunity_class.into(),
+        opportunity_taxonomy: opportunity_taxonomy.into(),
+        outgoing_pcm_sha256: outgoing_fixture.audio_sha256.clone(),
+        incoming_pcm_sha256: incoming_fixture.audio_sha256.clone(),
+        outgoing_master_id: outgoing_fixture
+            .spec
+            .base_id
+            .clone()
+            .unwrap_or_else(|| outgoing_fixture.spec.id.clone()),
+        incoming_master_id: incoming_fixture
+            .spec
+            .base_id
+            .clone()
+            .unwrap_or_else(|| incoming_fixture.spec.id.clone()),
+        outgoing_seed: outgoing_fixture.spec.seed,
+        incoming_seed: incoming_fixture.spec.seed,
+        waveform_copy_used: false,
+        truth_inference_used: false,
+        ordinary_selected_kind: format!("{:?}", ordinary_plan.plan.kind),
+        ordinary_beatmatched_cost: ordinary_candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan.kind == TransitionKind::BeatMatched)
+            .map(|candidate| candidate.cost.total),
+        ordinary_gapless_cost: ordinary_candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan.kind == TransitionKind::Gapless)
+            .map(|candidate| candidate.cost.total),
+        ordinary_crossfade_cost: ordinary_candidates
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan.kind == TransitionKind::Crossfade)
+            .map(|candidate| candidate.cost.total),
+        quality_first_selected_kind: format!("{:?}", guarded.plan.kind),
+        quality_evidence: format!(
+            "observed_beat_pairs={},phase_error_micros={:?},relation={:?},render_acceptable={}",
+            eligibility.beat_pairs,
+            eligibility.phase_error.map(|error| error.as_micros()),
+            selected_pair
+                .map(|pair| format!("{:?}/{:?}", pair.outgoing.relation, pair.incoming.relation)),
+            render_acceptable,
+        ),
+        quality_first_disagreement_reason: (ordinary_plan.plan.kind != guarded.plan.kind).then(
+            || {
+                format!(
+                    "ordinary={:?};quality_first={:?}",
+                    ordinary_plan.plan.kind, guarded.plan.kind
+                )
+            },
+        ),
         candidate_costs,
     })
 }
 
-fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, LabError> {
-    let mut raw_fixtures = positive_realistic_specs()
+fn build_positive_realistic_corpus(
+    copy_boundary_window: bool,
+) -> Result<RealisticPositiveCorpusReport, LabError> {
+    let definitions = if copy_boundary_window {
+        positive_realistic_specs()
+    } else {
+        independent_positive_specs()
+    };
+    let mut raw_fixtures = definitions
         .into_iter()
         .map(|(spec, profile)| {
-            let fixture = generate_positive_realistic_fixture(&spec, &profile)?;
+            let fixture = generate_positive_realistic_fixture(
+                &spec,
+                &profile,
+                if copy_boundary_window { 1.0 } else { 8.0 },
+                !copy_boundary_window,
+            )?;
             Ok((profile, fixture))
         })
         .collect::<Result<Vec<_>, LabError>>()?;
-    for (outgoing_index, incoming_index) in [
-        (0, 1),
-        (1, 2),
-        (3, 4),
-        (5, 6),
-        (8, 9),
-        (10, 11),
-        (18, 19),
-        (20, 21),
-        (22, 23),
-        (24, 25),
-        (26, 27),
-    ] {
-        let source_audio = raw_fixtures[outgoing_index].1.audio.clone();
-        let source_analysis = analyze_long_fixture(raw_fixtures[outgoing_index].1.clone())?;
-        let incoming_analysis = analyze_long_fixture(raw_fixtures[incoming_index].1.clone())?;
-        let source_beats = source_analysis
-            .v2
-            .rhythm
-            .beats
-            .iter()
-            .map(|event| event.time.as_micros() as u64)
-            .collect::<Vec<_>>();
-        let incoming_start_micros = incoming_analysis
-            .v2
-            .rhythm
-            .beats
-            .get(1)
-            .map(|event| event.time.as_micros() as u64)
-            .ok_or_else(|| LabError::InvalidInput("positive incoming anchor missing".into()))?;
-        align_positive_boundary_window(
-            &source_audio,
-            &source_beats,
-            &mut raw_fixtures[incoming_index].1,
-            incoming_start_micros,
-        );
+    if copy_boundary_window {
+        for (outgoing_index, incoming_index) in [
+            (0, 1),
+            (1, 2),
+            (3, 4),
+            (5, 6),
+            (8, 9),
+            (10, 11),
+            (18, 19),
+            (20, 21),
+            (22, 23),
+            (24, 25),
+            (26, 27),
+        ] {
+            let source_audio = raw_fixtures[outgoing_index].1.audio.clone();
+            let source_analysis = analyze_long_fixture(raw_fixtures[outgoing_index].1.clone())?;
+            let incoming_analysis = analyze_long_fixture(raw_fixtures[incoming_index].1.clone())?;
+            let source_beats = source_analysis
+                .v2
+                .rhythm
+                .beats
+                .iter()
+                .map(|event| event.time.as_micros() as u64)
+                .collect::<Vec<_>>();
+            let incoming_start_micros = incoming_analysis
+                .v2
+                .rhythm
+                .beats
+                .get(1)
+                .map(|event| event.time.as_micros() as u64)
+                .ok_or_else(|| LabError::InvalidInput("positive incoming anchor missing".into()))?;
+            align_positive_boundary_window(
+                &source_audio,
+                &source_beats,
+                &mut raw_fixtures[incoming_index].1,
+                incoming_start_micros,
+            );
+        }
     }
     let generated = raw_fixtures
         .into_iter()
         .map(|(profile, fixture)| {
+            let pcm_sha256 = fixture.audio_sha256.clone();
+            let master_id = fixture
+                .spec
+                .base_id
+                .clone()
+                .unwrap_or_else(|| fixture.spec.id.clone());
+            let seed = fixture.spec.seed;
+            let truth_beat_times_micros = fixture.truth.beat_times_micros.clone();
             let analyzed = analyze_long_fixture(fixture.clone())?;
             Ok((
                 RealisticFlow {
                     profile,
                     flow: build_flow_observation(&analyzed),
+                    pcm_sha256,
+                    master_id,
+                    seed,
+                    truth_beat_times_micros,
                 },
                 fixture,
             ))
@@ -3576,9 +4069,28 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
                 .iter()
                 .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
                 .expect("positive decision exists");
+            let beat_grid = item
+                .flow
+                .research_analysis
+                .as_ref()
+                .map(|analysis| {
+                    let detected = analysis
+                        .rhythm
+                        .beats
+                        .iter()
+                        .map(|event| event.time)
+                        .collect::<Vec<_>>();
+                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &detected)
+                })
+                .unwrap_or_else(|| {
+                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &[])
+                });
             RealisticFixtureObservation {
                 fixture_id: item.flow.fixture_id.clone(),
                 profile: item.profile.clone(),
+                pcm_sha256: item.pcm_sha256.clone(),
+                master_id: item.master_id.clone(),
+                seed: item.seed,
                 duration_micros: item.flow.duration_micros,
                 truth_bpm: item.flow.truth_bpm.expect("positive scalar truth"),
                 event_count: item
@@ -3641,26 +4153,69 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
                 selected_relation: decision.row.selected_relation.clone(),
                 relation_resolution: decision.row.metrical_consistency.clone(),
                 safe_fallback_only: decision.row.decision != "select",
+                beat_grid,
             }
         })
         .collect::<Vec<_>>();
-    let pairs = [
-        ("positive-100-section-to-sparse", 0, 1),
-        ("positive-100-sparse-to-syncopated", 1, 2),
-        ("positive-120-section-to-sparse", 3, 4),
-        ("positive-128-section-to-sparse", 5, 6),
-        ("positive-130-section-to-kickless", 8, 9),
-        ("positive-140-section-to-sparse", 10, 11),
-        ("positive-128-to-130-near-compatible", 5, 8),
-        ("positive-alias-80-to-160", 12, 13),
-        ("positive-alias-60-to-120", 14, 15),
-        ("positive-alias-90-to-180", 16, 17),
-        ("positive-120-section-r-to-s", 18, 19),
-        ("positive-120-section-t-to-u", 20, 21),
-        ("positive-120-section-v-to-w", 22, 23),
-        ("positive-120-section-x-to-y", 24, 25),
-        ("positive-120-section-z-to-aa", 26, 27),
-    ];
+    let pairs = if copy_boundary_window {
+        vec![
+            ("positive-100-section-to-sparse", 0, 1),
+            ("positive-100-sparse-to-syncopated", 1, 2),
+            ("positive-120-section-to-sparse", 3, 4),
+            ("positive-128-section-to-sparse", 5, 6),
+            ("positive-130-section-to-kickless", 8, 9),
+            ("positive-140-section-to-sparse", 10, 11),
+            ("positive-128-to-130-near-compatible", 5, 8),
+            ("positive-alias-80-to-160", 12, 13),
+            ("positive-alias-60-to-120", 14, 15),
+            ("positive-alias-90-to-180", 16, 17),
+            ("positive-120-section-r-to-s", 18, 19),
+            ("positive-120-section-t-to-u", 20, 21),
+            ("positive-120-section-v-to-w", 22, 23),
+            ("positive-120-section-x-to-y", 24, 25),
+            ("positive-120-section-z-to-aa", 26, 27),
+        ]
+    } else {
+        vec![
+            ("independent-100-section-30-to-60", 0, 1),
+            ("independent-100-section-to-full", 0, 29),
+            ("independent-100-section-60-to-section-60", 1, 23),
+            ("independent-100-section-to-syncopated", 1, 2),
+            ("independent-100-section-to-sparse", 1, 3),
+            ("independent-120-section-30-to-60", 4, 5),
+            ("independent-120-section-to-kickless", 5, 6),
+            ("independent-90-section-30-to-60", 7, 8),
+            ("independent-128-section-to-syncopated", 9, 10),
+            ("independent-130-section-to-kickless", 11, 12),
+            ("independent-130-section-to-section", 11, 27),
+            ("independent-130-section-to-full", 11, 31),
+            ("independent-128-to-130-near-compatible", 9, 11),
+            ("independent-80-to-160-alias", 15, 16),
+            ("independent-60-section-to-section", 17, 26),
+            ("independent-60-section-to-full", 17, 30),
+            ("independent-60-to-120-alias", 17, 6),
+            ("independent-121-section-to-section", 19, 28),
+            ("independent-121-section-to-full", 19, 33),
+            ("independent-90-section-to-full", 7, 32),
+            ("independent-140-30-to-60", 14, 13),
+            ("independent-120-30-to-121-60", 18, 19),
+            ("independent-126-to-132-near-compatible", 20, 21),
+            ("independent-120-full-30-to-60", 34, 35),
+            ("independent-90-full-30-to-60", 36, 37),
+            ("independent-128-full-30-to-60", 38, 39),
+            ("independent-60-full-60-to-30", 41, 40),
+            ("independent-120-section-to-full-drop", 5, 34),
+            ("independent-90-section-to-full-60", 25, 37),
+            ("independent-128-section-to-full-60", 9, 39),
+            ("independent-90-section-30-to-full-30", 7, 36),
+            ("independent-128-syncopated-30-to-full-30", 10, 38),
+            ("independent-127.5-full-30-to-60", 42, 43),
+            ("independent-127.5-full-60-to-60", 43, 44),
+            ("independent-130-full-60-to-60", 31, 45),
+            ("independent-110-full-30-to-60", 46, 47),
+            ("independent-110-full-60-to-60", 47, 48),
+        ]
+    };
     let transition_cases = pairs
         .into_iter()
         .map(|(case_id, outgoing_index, incoming_index)| {
@@ -3685,6 +4240,64 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
             )
         })
         .collect::<Result<Vec<_>, LabError>>()?;
+    let successful_cases = transition_cases
+        .iter()
+        .filter(|case| case.beatmatched_selected && !case.false_beatmatched)
+        .collect::<Vec<_>>();
+    let successful_tempo_regions = successful_cases
+        .iter()
+        .flat_map(|case| [case.outgoing_truth_bpm, case.incoming_truth_bpm])
+        .map(|bpm| format!("{bpm:.1}"))
+        .collect::<BTreeSet<_>>();
+    let successful_profiles = successful_cases
+        .iter()
+        .flat_map(|case| {
+            let outgoing = generated
+                .iter()
+                .find(|item| item.0.flow.fixture_id == case.outgoing_fixture)
+                .map(|item| item.0.profile.clone())
+                .unwrap_or_default();
+            let incoming = generated
+                .iter()
+                .find(|item| item.0.flow.fixture_id == case.incoming_fixture)
+                .map(|item| item.0.profile.clone())
+                .unwrap_or_default();
+            [outgoing, incoming]
+        })
+        .collect::<BTreeSet<_>>();
+    let successful_duration_configs = successful_cases
+        .iter()
+        .filter_map(|case| {
+            let outgoing = generated
+                .iter()
+                .find(|item| item.0.flow.fixture_id == case.outgoing_fixture)?
+                .0
+                .flow
+                .duration_micros;
+            let incoming = generated
+                .iter()
+                .find(|item| item.0.flow.fixture_id == case.incoming_fixture)?
+                .0
+                .flow
+                .duration_micros;
+            Some(format!(
+                "{}s->{}s",
+                outgoing / 1_000_000,
+                incoming / 1_000_000
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let independent_correct_beatmatched = successful_cases.len();
+    let independent_false_beatmatched = transition_cases
+        .iter()
+        .filter(|case| case.false_beatmatched)
+        .count();
+    let external_gate_passed = !copy_boundary_window
+        && independent_correct_beatmatched >= 5
+        && successful_tempo_regions.len() >= 3
+        && successful_profiles.len() >= 2
+        && successful_duration_configs.len() >= 2
+        && independent_false_beatmatched == 0;
     let summary = RealisticPositiveSummary {
         positive_cases: transition_cases.len(),
         effective_correct_beatmatched: transition_cases
@@ -3721,9 +4334,27 @@ fn build_positive_realistic_corpus() -> Result<RealisticPositiveCorpusReport, La
             .iter()
             .filter(|case| case.relation_correct)
             .count(),
+        independent_correct_beatmatched,
+        distinct_success_tempo_regions: successful_tempo_regions.len(),
+        distinct_success_profiles: successful_profiles.len(),
+        distinct_success_duration_configs: successful_duration_configs.len(),
+        independent_false_beatmatched,
+        external_gate_passed,
     };
     Ok(RealisticPositiveCorpusReport {
-        construction: "Independent deterministic 30s/60s arrangement-like audio analyzed through analyze_long_fixture; positive planner inputs retain observed V2 events and add only generated heuristic cues from analyzed structure. No synthetic BeatEvent-only planner objects and no truth-driven acceptance.".into(),
+        source_commit: None,
+        starting_commit: None,
+        corpus_kind: if copy_boundary_window {
+            "PLANNER_MECHANICS_POSITIVE".into()
+        } else {
+            "INDEPENDENT_POSITIVE".into()
+        },
+        boundary_window_copy_used: copy_boundary_window,
+        construction: if copy_boundary_window {
+            "Deterministic arrangement-like audio analyzed through analyze_long_fixture; a bounded boundary window is copied only for planner-mechanics validation.".into()
+        } else {
+            "Deterministic arrangement-like audio generated independently per fixture and analyzed through analyze_long_fixture; no boundary window is copied and no truth-driven planner evidence is supplied.".into()
+        },
         fixture_count: fixtures.len(),
         pair_count: transition_cases.len(),
         candidate_caps,
@@ -4141,10 +4772,22 @@ fn build_realistic_corpus_report(
         .into_iter()
         .map(|(spec, profile)| {
             let fixture = generate_realistic_fixture(&spec, &profile)?;
+            let pcm_sha256 = fixture.audio_sha256.clone();
+            let master_id = fixture
+                .spec
+                .base_id
+                .clone()
+                .unwrap_or_else(|| fixture.spec.id.clone());
+            let seed = fixture.spec.seed;
+            let truth_beat_times_micros = fixture.truth.beat_times_micros.clone();
             let analyzed = analyze_long_fixture(fixture)?;
             Ok(RealisticFlow {
                 profile,
                 flow: build_flow_observation(&analyzed),
+                pcm_sha256,
+                master_id,
+                seed,
+                truth_beat_times_micros,
             })
         })
         .collect::<Result<Vec<_>, LabError>>()?;
@@ -4157,9 +4800,28 @@ fn build_realistic_corpus_report(
                 .iter()
                 .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
                 .expect("realistic decision exists");
+            let beat_grid = item
+                .flow
+                .research_analysis
+                .as_ref()
+                .map(|analysis| {
+                    let detected = analysis
+                        .rhythm
+                        .beats
+                        .iter()
+                        .map(|event| event.time)
+                        .collect::<Vec<_>>();
+                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &detected)
+                })
+                .unwrap_or_else(|| {
+                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &[])
+                });
             RealisticFixtureObservation {
                 fixture_id: item.flow.fixture_id.clone(),
                 profile: item.profile.clone(),
+                pcm_sha256: item.pcm_sha256.clone(),
+                master_id: item.master_id.clone(),
+                seed: item.seed,
                 duration_micros: item.flow.duration_micros,
                 truth_bpm: item.flow.truth_bpm.expect("realistic scalar truth"),
                 event_count: item
@@ -4222,6 +4884,7 @@ fn build_realistic_corpus_report(
                 selected_relation: decision.row.selected_relation.clone(),
                 relation_resolution: decision.row.metrical_consistency.clone(),
                 safe_fallback_only: decision.row.decision != "select",
+                beat_grid,
             }
         })
         .collect::<Vec<_>>();
@@ -4311,7 +4974,7 @@ fn build_realistic_corpus_report(
             "research-only generated audio and planner inputs; no production analysis or playback path".into(),
     };
     let interval_consistency = build_runtime_consistency(&flow_refs);
-    let positive_corpus = build_positive_realistic_corpus()?;
+    let positive_corpus = build_positive_realistic_corpus(true)?;
     Ok(RealisticSyntheticCorpusReport {
         schema_version: crate::RESEARCH_REPORT_SCHEMA_VERSION,
         source_commit: source_commit.into(),
@@ -4347,6 +5010,25 @@ pub fn run_realistic_corpus_research(
     fs::write(
         output_dir.join("realistic-synthetic-corpus.md"),
         realistic_markdown(&report),
+    )?;
+    Ok(report)
+}
+
+/// Run only the primary independent-positive corpus. This bounded command is
+/// intended for deterministic research iteration; the final conservative
+/// report still reruns the full 90-fixture and safety suite.
+pub fn run_independent_positive_corpus_research(
+    output_dir: &Path,
+    source_commit: String,
+    starting_commit: Option<String>,
+) -> Result<RealisticPositiveCorpusReport, LabError> {
+    fs::create_dir_all(output_dir)?;
+    let mut report = build_positive_realistic_corpus(false)?;
+    report.source_commit = Some(source_commit);
+    report.starting_commit = starting_commit;
+    write_json(
+        &output_dir.join("independent-positive-corpus.json"),
+        &report,
     )?;
     Ok(report)
 }

@@ -4,9 +4,10 @@ use wotoha_analysis_lab::{
     AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
     generate_default_manifest, load_manifest, package_blackbox, run_classical_tempo_research,
-    run_ground_truth_research, run_realistic_corpus_research, run_tempo_advisor_research,
-    run_tempo_ambiguity_research, run_tempo_conservative_shadow_research,
-    run_tempo_shadow_followup, verify_blackbox_package, write_json,
+    run_ground_truth_research, run_independent_positive_corpus_research,
+    run_realistic_corpus_research, run_tempo_advisor_research, run_tempo_ambiguity_research,
+    run_tempo_conservative_shadow_research, run_tempo_shadow_followup, verify_blackbox_package,
+    write_json,
 };
 
 fn main() {
@@ -264,6 +265,23 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!(
                 "realistic shadow research complete: {} fixtures, output={}",
                 report.fixture_count,
+                output.display()
+            );
+        }
+        "research-tempo-independent-positive" => {
+            let output = parse_output_dir(&mut args)?;
+            reject_unknown(args)?;
+            let source_commit = env::var("WOTOHA_SOURCE_COMMIT")
+                .map_err(|_| "research-tempo-independent-positive requires WOTOHA_SOURCE_COMMIT")?;
+            let report = run_independent_positive_corpus_research(
+                &output,
+                source_commit,
+                env::var("WOTOHA_STARTING_COMMIT").ok(),
+            )?;
+            println!(
+                "independent positive research complete: {} fixtures, {} pairs, output={}",
+                report.fixture_count,
+                report.pair_count,
                 output.display()
             );
         }
