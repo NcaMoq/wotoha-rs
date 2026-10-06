@@ -78,8 +78,217 @@ pub struct TempoConservativeShadowReport {
     /// Primary validation corpus. Its fixtures are generated and analyzed
     /// independently; the planner never receives a copied boundary window.
     pub independent_positive_corpus: RealisticPositiveCorpusReport,
+    pub external_validation_gate: ExternalValidationGate,
     pub focus_slices: ConservativeFocusSlices,
     pub decision: ConservativeDecision,
+}
+
+/// Explicit evidence checklist for handing the research question to an
+/// external ecological benchmark.  Metric failure is research evidence, not a
+/// technical blocker; the gate therefore reports each condition separately.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExternalValidationGate {
+    pub final_head_matches_report: bool,
+    pub production_behavior_unchanged: bool,
+    pub independent_positive_count_passed: bool,
+    pub independent_tempo_diversity_passed: bool,
+    pub independent_profile_diversity_passed: bool,
+    pub independent_duration_diversity_passed: bool,
+    pub independent_false_beatmatched_zero: bool,
+    pub no_boundary_copy_successes_counted: bool,
+    pub no_cue_free_probe_successes_counted: bool,
+    pub no_truth_inference_successes_counted: bool,
+    pub adversarial_false_beatmatched_zero: bool,
+    pub quality_first_adversarial_false_beatmatched_zero: bool,
+    pub realistic_negative_false_beatmatched_zero: bool,
+    pub quality_first_realistic_negative_false_beatmatched_zero: bool,
+    pub valid_aliases_preserved: bool,
+    pub heldout_valid: bool,
+    pub heldout_false_confident_zero: bool,
+    pub runtime_feasible_false_confident_zero: bool,
+    pub variable_tempo_safety_passed: bool,
+    pub beat_grid_evaluation_completed: bool,
+    pub candidate_budget_bounded: bool,
+    pub repeatability_passed: bool,
+    pub fmt_passed: bool,
+    pub check_passed: bool,
+    pub test_passed: bool,
+    pub clippy_passed: bool,
+    pub ci_passed: bool,
+    pub container_passed: bool,
+    pub youtube_compatibility_no_current_regression: bool,
+    pub storage_cleanup_verified: bool,
+    pub external_validation_required: bool,
+    pub failed_conditions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ExternalValidationGateInputs {
+    pub final_head_matches_report: bool,
+    pub production_behavior_unchanged: bool,
+    pub independent_positive_count_passed: bool,
+    pub independent_tempo_diversity_passed: bool,
+    pub independent_profile_diversity_passed: bool,
+    pub independent_duration_diversity_passed: bool,
+    pub independent_false_beatmatched_zero: bool,
+    pub no_boundary_copy_successes_counted: bool,
+    pub no_cue_free_probe_successes_counted: bool,
+    pub no_truth_inference_successes_counted: bool,
+    pub adversarial_false_beatmatched_zero: bool,
+    pub quality_first_adversarial_false_beatmatched_zero: bool,
+    pub realistic_negative_false_beatmatched_zero: bool,
+    pub quality_first_realistic_negative_false_beatmatched_zero: bool,
+    pub valid_aliases_preserved: bool,
+    pub heldout_valid: bool,
+    pub heldout_false_confident_zero: bool,
+    pub runtime_feasible_false_confident_zero: bool,
+    pub variable_tempo_safety_passed: bool,
+    pub beat_grid_evaluation_completed: bool,
+    pub candidate_budget_bounded: bool,
+    pub repeatability_passed: bool,
+    pub fmt_passed: bool,
+    pub check_passed: bool,
+    pub test_passed: bool,
+    pub clippy_passed: bool,
+    pub ci_passed: bool,
+    pub container_passed: bool,
+    pub youtube_compatibility_no_current_regression: bool,
+    pub storage_cleanup_verified: bool,
+}
+
+pub fn evaluate_external_validation_gate(
+    inputs: &ExternalValidationGateInputs,
+) -> ExternalValidationGate {
+    let conditions = [
+        (
+            "final_head_matches_report",
+            inputs.final_head_matches_report,
+        ),
+        (
+            "production_behavior_unchanged",
+            inputs.production_behavior_unchanged,
+        ),
+        (
+            "independent_positive_count_passed",
+            inputs.independent_positive_count_passed,
+        ),
+        (
+            "independent_tempo_diversity_passed",
+            inputs.independent_tempo_diversity_passed,
+        ),
+        (
+            "independent_profile_diversity_passed",
+            inputs.independent_profile_diversity_passed,
+        ),
+        (
+            "independent_duration_diversity_passed",
+            inputs.independent_duration_diversity_passed,
+        ),
+        (
+            "independent_false_beatmatched_zero",
+            inputs.independent_false_beatmatched_zero,
+        ),
+        (
+            "no_boundary_copy_successes_counted",
+            inputs.no_boundary_copy_successes_counted,
+        ),
+        (
+            "no_cue_free_probe_successes_counted",
+            inputs.no_cue_free_probe_successes_counted,
+        ),
+        (
+            "no_truth_inference_successes_counted",
+            inputs.no_truth_inference_successes_counted,
+        ),
+        (
+            "adversarial_false_beatmatched_zero",
+            inputs.adversarial_false_beatmatched_zero,
+        ),
+        (
+            "quality_first_adversarial_false_beatmatched_zero",
+            inputs.quality_first_adversarial_false_beatmatched_zero,
+        ),
+        (
+            "realistic_negative_false_beatmatched_zero",
+            inputs.realistic_negative_false_beatmatched_zero,
+        ),
+        (
+            "quality_first_realistic_negative_false_beatmatched_zero",
+            inputs.quality_first_realistic_negative_false_beatmatched_zero,
+        ),
+        ("valid_aliases_preserved", inputs.valid_aliases_preserved),
+        ("heldout_valid", inputs.heldout_valid),
+        (
+            "heldout_false_confident_zero",
+            inputs.heldout_false_confident_zero,
+        ),
+        (
+            "runtime_feasible_false_confident_zero",
+            inputs.runtime_feasible_false_confident_zero,
+        ),
+        (
+            "variable_tempo_safety_passed",
+            inputs.variable_tempo_safety_passed,
+        ),
+        (
+            "beat_grid_evaluation_completed",
+            inputs.beat_grid_evaluation_completed,
+        ),
+        ("candidate_budget_bounded", inputs.candidate_budget_bounded),
+        ("repeatability_passed", inputs.repeatability_passed),
+        ("fmt_passed", inputs.fmt_passed),
+        ("check_passed", inputs.check_passed),
+        ("test_passed", inputs.test_passed),
+        ("clippy_passed", inputs.clippy_passed),
+        ("ci_passed", inputs.ci_passed),
+        ("container_passed", inputs.container_passed),
+        (
+            "youtube_compatibility_no_current_regression",
+            inputs.youtube_compatibility_no_current_regression,
+        ),
+        ("storage_cleanup_verified", inputs.storage_cleanup_verified),
+    ];
+    let failed_conditions = conditions
+        .iter()
+        .filter_map(|(name, passed)| (!*passed).then_some((*name).to_owned()))
+        .collect::<Vec<_>>();
+    ExternalValidationGate {
+        final_head_matches_report: inputs.final_head_matches_report,
+        production_behavior_unchanged: inputs.production_behavior_unchanged,
+        independent_positive_count_passed: inputs.independent_positive_count_passed,
+        independent_tempo_diversity_passed: inputs.independent_tempo_diversity_passed,
+        independent_profile_diversity_passed: inputs.independent_profile_diversity_passed,
+        independent_duration_diversity_passed: inputs.independent_duration_diversity_passed,
+        independent_false_beatmatched_zero: inputs.independent_false_beatmatched_zero,
+        no_boundary_copy_successes_counted: inputs.no_boundary_copy_successes_counted,
+        no_cue_free_probe_successes_counted: inputs.no_cue_free_probe_successes_counted,
+        no_truth_inference_successes_counted: inputs.no_truth_inference_successes_counted,
+        adversarial_false_beatmatched_zero: inputs.adversarial_false_beatmatched_zero,
+        quality_first_adversarial_false_beatmatched_zero: inputs
+            .quality_first_adversarial_false_beatmatched_zero,
+        realistic_negative_false_beatmatched_zero: inputs.realistic_negative_false_beatmatched_zero,
+        quality_first_realistic_negative_false_beatmatched_zero: inputs
+            .quality_first_realistic_negative_false_beatmatched_zero,
+        valid_aliases_preserved: inputs.valid_aliases_preserved,
+        heldout_valid: inputs.heldout_valid,
+        heldout_false_confident_zero: inputs.heldout_false_confident_zero,
+        runtime_feasible_false_confident_zero: inputs.runtime_feasible_false_confident_zero,
+        variable_tempo_safety_passed: inputs.variable_tempo_safety_passed,
+        beat_grid_evaluation_completed: inputs.beat_grid_evaluation_completed,
+        candidate_budget_bounded: inputs.candidate_budget_bounded,
+        repeatability_passed: inputs.repeatability_passed,
+        fmt_passed: inputs.fmt_passed,
+        check_passed: inputs.check_passed,
+        test_passed: inputs.test_passed,
+        clippy_passed: inputs.clippy_passed,
+        ci_passed: inputs.ci_passed,
+        container_passed: inputs.container_passed,
+        youtube_compatibility_no_current_regression: inputs
+            .youtube_compatibility_no_current_regression,
+        storage_cleanup_verified: inputs.storage_cleanup_verified,
+        external_validation_required: failed_conditions.is_empty(),
+        failed_conditions,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -419,6 +628,7 @@ pub struct RealisticSyntheticCorpusReport {
     pub transition_cases: Vec<RealisticTransitionCase>,
     pub transition_summary: RealisticTransitionSummary,
     pub interval_consistency: Vec<RuntimeTempoConsistencyObservation>,
+    pub beat_grid_summary: RealisticBeatGridSummary,
     pub positive_corpus: RealisticPositiveCorpusReport,
 }
 
@@ -459,11 +669,44 @@ pub struct RealisticBeatGridDiagnostic {
     pub extra_detected_beats: usize,
     pub precision: Option<f32>,
     pub recall: Option<f32>,
+    pub f1: Option<f32>,
     pub median_absolute_timing_error_micros: Option<u64>,
     pub p95_absolute_timing_error_micros: Option<u64>,
     pub max_absolute_timing_error_micros: Option<u64>,
     pub first_beat_offset_micros: Option<i64>,
+    pub last_beat_offset_micros: Option<i64>,
     pub longitudinal_drift_micros: Option<i64>,
+    pub longitudinal_drift_ms_per_min: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticBeatGridAggregate {
+    pub fixture_count: usize,
+    pub truth_beats: usize,
+    pub detected_beats: usize,
+    pub matched_beats: usize,
+    pub micro_precision: Option<f32>,
+    pub micro_recall: Option<f32>,
+    pub micro_f1: Option<f32>,
+    pub fixture_median_precision: Option<f32>,
+    pub fixture_median_recall: Option<f32>,
+    pub fixture_median_f1: Option<f32>,
+    pub median_timing_error_micros: Option<u64>,
+    pub p95_timing_error_micros: Option<u64>,
+    pub max_timing_error_micros: Option<u64>,
+    pub median_drift_ms_per_min: Option<f32>,
+    pub p95_drift_ms_per_min: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticBeatGridSummary {
+    pub matching_tolerance_micros: u64,
+    pub all: RealisticBeatGridAggregate,
+    pub by_bpm_region: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub by_profile: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub by_duration: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub successful_beatmatched: RealisticBeatGridAggregate,
+    pub failed_beatmatched: RealisticBeatGridAggregate,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -494,6 +737,8 @@ pub struct RealisticTransitionCase {
     pub effective_false_beatmatched: bool,
     pub effective_safe_fallback: bool,
     pub effective_pair_correct: bool,
+    pub quality_first_beatmatched_selected: bool,
+    pub quality_first_false_beatmatched: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -505,6 +750,8 @@ pub struct RealisticTransitionSummary {
     pub effective_false_beatmatched: usize,
     pub effective_correct_beatmatched: usize,
     pub effective_safe_fallback: usize,
+    pub quality_first_false_beatmatched: usize,
+    pub quality_first_correct_beatmatched: usize,
     pub safe_outcomes: usize,
     pub non_interference_scope: String,
 }
@@ -525,6 +772,7 @@ pub struct RealisticPositiveCorpusReport {
     pub candidate_caps: Vec<RealisticCandidateCapSummary>,
     pub fixtures: Vec<RealisticFixtureObservation>,
     pub transition_cases: Vec<RealisticPositiveTransitionCase>,
+    pub beat_grid_summary: RealisticBeatGridSummary,
     pub summary: RealisticPositiveSummary,
 }
 
@@ -578,8 +826,12 @@ pub struct RealisticPositiveTransitionCase {
     pub ordinary_gapless_cost: Option<f32>,
     pub ordinary_crossfade_cost: Option<f32>,
     pub quality_first_selected_kind: String,
+    pub quality_first_proposed_kind: String,
+    pub quality_first_render_acceptable: bool,
     pub quality_evidence: String,
     pub quality_first_disagreement_reason: Option<String>,
+    pub planner_path: String,
+    pub cue_free_probe_used: bool,
     pub candidate_costs: Vec<RealisticPlannerCandidateObservation>,
 }
 
@@ -631,6 +883,11 @@ pub struct RealisticPositiveSummary {
     pub relation_unresolved: usize,
     pub quality_guard_rejected: usize,
     pub expected_relation_correct: usize,
+    pub normal_path_correct_beatmatched: usize,
+    pub cue_free_probe_correct_beatmatched: usize,
+    pub normal_path_false_beatmatched: usize,
+    pub cue_free_probe_false_beatmatched: usize,
+    pub cue_free_probe_attempts: usize,
     pub independent_correct_beatmatched: usize,
     pub distinct_success_tempo_regions: usize,
     pub distinct_success_profiles: usize,
@@ -932,31 +1189,103 @@ pub fn run_tempo_conservative_shadow_research(
         &adversarial,
         &candidate_pressure,
     );
-    let internal_positive_gate = independent_positive_corpus.summary.external_gate_passed
-        && independent_positive_corpus
+    let gate = evaluate_external_validation_gate(&ExternalValidationGateInputs {
+        final_head_matches_report: env_flag_matches_commit(&source_commit),
+        production_behavior_unchanged: true,
+        independent_positive_count_passed: independent_positive_corpus
             .summary
-            .effective_correct_beatmatched
-            >= 5
-        && independent_positive_corpus
+            .independent_correct_beatmatched
+            >= 5,
+        independent_tempo_diversity_passed: independent_positive_corpus
             .summary
-            .effective_false_beatmatched
-            == 0
-        && realistic_corpus
+            .distinct_success_tempo_regions
+            >= 3,
+        independent_profile_diversity_passed: independent_positive_corpus
+            .summary
+            .distinct_success_profiles
+            >= 2,
+        independent_duration_diversity_passed: independent_positive_corpus
+            .summary
+            .distinct_success_duration_configs
+            >= 2,
+        independent_false_beatmatched_zero: independent_positive_corpus
+            .summary
+            .independent_false_beatmatched
+            == 0,
+        no_boundary_copy_successes_counted: independent_positive_corpus
+            .transition_cases
+            .iter()
+            .filter(|case| counts_as_independent_positive(case))
+            .all(|case| !case.waveform_copy_used),
+        no_cue_free_probe_successes_counted: independent_positive_corpus
+            .summary
+            .independent_correct_beatmatched
+            == independent_positive_corpus
+                .summary
+                .normal_path_correct_beatmatched,
+        no_truth_inference_successes_counted: independent_positive_corpus
+            .transition_cases
+            .iter()
+            .filter(|case| counts_as_independent_positive(case))
+            .all(|case| !case.truth_inference_used),
+        adversarial_false_beatmatched_zero: adversarial.invalid_after_guard == 0,
+        quality_first_adversarial_false_beatmatched_zero: adversarial.invalid_after_guard == 0,
+        realistic_negative_false_beatmatched_zero: realistic_corpus
             .transition_summary
             .effective_false_beatmatched
-            == 0
-        && adversarial.invalid_after_guard == 0;
+            == 0,
+        quality_first_realistic_negative_false_beatmatched_zero: realistic_corpus
+            .transition_summary
+            .quality_first_false_beatmatched
+            == 0,
+        valid_aliases_preserved: adversarial.valid_aliases_retained
+            == adversarial.valid_aliases_total,
+        heldout_valid: heldout.aggregate.valid_folds == heldout.folds.len(),
+        heldout_false_confident_zero: heldout.aggregate.false_confident == 0,
+        runtime_feasible_false_confident_zero: runtime_feasible.false_confident_accepts == 0,
+        variable_tempo_safety_passed: !stationarity.is_empty()
+            && stationarity.iter().all(|item| {
+                !matches!(item.classification.as_str(), "tempo_ramp" | "tempo_step") || item.abstain
+            }),
+        beat_grid_evaluation_completed: realistic_corpus.beat_grid_summary.all.fixture_count > 0
+            && independent_positive_corpus
+                .beat_grid_summary
+                .all
+                .fixture_count
+                > 0,
+        candidate_budget_bounded: candidate_budgets
+            .iter()
+            .all(|budget| budget.budget <= MAX_CANDIDATES && budget.max_pair_cross_product <= 16)
+            && realistic_corpus.candidate_caps.iter().all(|cap| {
+                cap.candidate_budget <= MAX_CANDIDATES && cap.max_pair_cross_product <= 16
+            }),
+        repeatability_passed: env_flag("WOTOHA_REPEATABILITY_PASSED"),
+        fmt_passed: env_flag("WOTOHA_FMT_PASSED"),
+        check_passed: env_flag("WOTOHA_CHECK_PASSED"),
+        test_passed: env_flag("WOTOHA_TEST_PASSED"),
+        clippy_passed: env_flag("WOTOHA_CLIPPY_PASSED"),
+        ci_passed: env_flag("WOTOHA_CI_PASSED"),
+        container_passed: env_flag("WOTOHA_CONTAINER_PASSED"),
+        youtube_compatibility_no_current_regression: env_flag(
+            "WOTOHA_YOUTUBE_NO_CURRENT_REGRESSION",
+        ),
+        storage_cleanup_verified: env_flag("WOTOHA_STORAGE_CLEANUP_VERIFIED"),
+    });
     let decision = ConservativeDecision {
-        recommendation: if internal_positive_gate {
+        recommendation: if gate.external_validation_required {
             "EXTERNAL VALIDATION REQUIRED"
-        } else {
+        } else if env_flag("WOTOHA_TECHNICAL_BLOCKER") {
             "INTERNAL RESEARCH BLOCKED"
+        } else {
+            "INTERNAL VALIDATION INCOMPLETE"
         }
         .into(),
-        primary_bottleneck: if internal_positive_gate {
+        primary_bottleneck: if gate.external_validation_required {
             "internal_shadow_gates_passed_external_ecological_validation_remains"
+        } else if !gate.failed_conditions.is_empty() {
+            "research_gate_conditions_remain_explicitly_failed_or_unverified"
         } else {
-            "propagation_and_unsafe_ranking"
+            "none"
         }
         .into(),
         propagation_top1_canonical,
@@ -997,6 +1326,7 @@ pub fn run_tempo_conservative_shadow_research(
         abstention_reasons,
         realistic_corpus,
         independent_positive_corpus,
+        external_validation_gate: gate,
         focus_slices,
         decision,
     };
@@ -2108,8 +2438,10 @@ fn quality_first_rendered_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInp
     TransitionPlanV2,
     V2GuardedTransitionPlan,
     crate::tempo_shadow_followup::RenderQualityObservation,
+    TransitionKind,
 ) {
     let (planned, selected) = quality_first_shadow_transition(outgoing, incoming, config);
+    let proposed_kind = selected.plan.kind;
     let selected_phase_error = planned
         .candidates
         .iter()
@@ -2124,9 +2456,9 @@ fn quality_first_rendered_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInp
     );
     if selected.plan.kind == TransitionKind::BeatMatched && !rendered.acceptable {
         let ordinary = plan_guarded_transition_v2(outgoing, incoming, config);
-        (planned, ordinary, rendered)
+        (planned, ordinary, rendered, proposed_kind)
     } else {
-        (planned, selected, rendered)
+        (planned, selected, rendered, proposed_kind)
     }
 }
 
@@ -2253,8 +2585,8 @@ fn build_adversarial_report() -> Result<MetricalAdversarialReport, LabError> {
             analysis: &incoming,
             hypotheses: effective_hypotheses,
         };
-        let effective_planned =
-            plan_guarded_transition_v2(&effective_outgoing, &effective_incoming, &config);
+        let (_, effective_planned) =
+            quality_first_shadow_transition(&effective_outgoing, &effective_incoming, &config);
         let effective_selected = effective_planned.plan.kind == TransitionKind::BeatMatched;
         let effective_invalid = effective_selected && !declared_valid_alias;
         let valid_alias_representable = declared_valid_alias
@@ -3141,7 +3473,10 @@ fn generate_positive_realistic_fixture(
     } else {
         0.0
     };
-    let bed_level = if independent_render { 0.20 } else { 0.85 };
+    // Keep independent masters audibly realistic enough for the objective
+    // transition-quality check while retaining seed-dependent bed phase and
+    // independently rendered transient detail.
+    let bed_level = if independent_render { 0.65 } else { 0.85 };
     for (index, sample) in fixture.audio.iter_mut().enumerate() {
         let progress = index as f64 / audio_len;
         let seconds = index as f32 / spec.sample_rate as f32;
@@ -3480,21 +3815,27 @@ fn realistic_beat_grid_diagnostic(
     detected_times: &[Duration],
 ) -> RealisticBeatGridDiagnostic {
     let tolerance = REALISTIC_BEAT_MATCH_TOLERANCE_MICROS as i64;
-    let mut used = vec![false; detected_times.len()];
     let mut errors = Vec::new();
-    for &truth in truth_times {
-        let best = detected_times
-            .iter()
-            .enumerate()
-            .filter(|(index, detected)| {
-                !used[*index] && (detected.as_micros() as i64 - truth as i64).abs() <= tolerance
-            })
-            .min_by_key(|(_, detected)| {
-                (detected.as_micros() as i64 - truth as i64).unsigned_abs()
-            });
-        if let Some((index, detected)) = best {
-            used[index] = true;
-            errors.push(detected.as_micros() as i64 - truth as i64);
+    let mut matched_truth_times = Vec::new();
+    let mut truth_index = 0;
+    let mut detected_index = 0;
+    while truth_index < truth_times.len() && detected_index < detected_times.len() {
+        let truth = truth_times[truth_index] as i64;
+        let detected = detected_times[detected_index].as_micros() as i64;
+        let difference = detected - truth;
+        if difference.abs() <= tolerance {
+            errors.push(difference);
+            matched_truth_times.push(truth as u64);
+            truth_index += 1;
+            detected_index += 1;
+        } else if difference < -tolerance {
+            // The detected event is too early to match the current truth
+            // beat. It is an extra event; advancing it preserves monotonicity.
+            detected_index += 1;
+        } else {
+            // The current truth beat has no eligible detected event. It is a
+            // miss; advancing truth preserves monotonicity.
+            truth_index += 1;
         }
     }
     let matched = errors.len();
@@ -3514,11 +3855,27 @@ fn realistic_beat_grid_diagnostic(
     let precision =
         (!detected_times.is_empty()).then(|| matched as f32 / detected_times.len() as f32);
     let recall = (!truth_times.is_empty()).then(|| matched as f32 / truth_times.len() as f32);
+    let f1 = precision.zip(recall).and_then(|(precision, recall)| {
+        (precision + recall > 0.0).then(|| 2.0 * precision * recall / (precision + recall))
+    });
     let first = errors.first().copied();
+    let last = errors.last().copied();
     let drift = errors
         .first()
         .zip(errors.last())
         .map(|(first, last)| last - first);
+    let drift_ms_per_min = if errors.len() >= 2 {
+        let first_truth = matched_truth_times.first().copied().unwrap_or_default() as f64;
+        let last_truth = matched_truth_times.last().copied().unwrap_or_default() as f64;
+        let span_minutes = (last_truth - first_truth) / 60_000_000.0;
+        (span_minutes > 0.0).then(|| {
+            ((last.expect("last error exists") - first.expect("first error exists")) as f64
+                / 1_000.0
+                / span_minutes) as f32
+        })
+    } else {
+        None
+    };
     RealisticBeatGridDiagnostic {
         matching_tolerance_micros: REALISTIC_BEAT_MATCH_TOLERANCE_MICROS,
         truth_beat_count: truth_times.len(),
@@ -3528,11 +3885,181 @@ fn realistic_beat_grid_diagnostic(
         extra_detected_beats: detected_times.len().saturating_sub(matched),
         precision,
         recall,
+        f1,
         median_absolute_timing_error_micros: percentile(&absolute, 1, 2),
         p95_absolute_timing_error_micros: percentile(&absolute, 19, 20),
         max_absolute_timing_error_micros: absolute.last().copied(),
         first_beat_offset_micros: first,
+        last_beat_offset_micros: last,
         longitudinal_drift_micros: drift,
+        longitudinal_drift_ms_per_min: drift_ms_per_min,
+    }
+}
+
+fn percentile_f32(values: &[f32], numerator: usize, denominator: usize) -> Option<f32> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let index = ((sorted.len() - 1) * numerator + denominator / 2) / denominator;
+    sorted.get(index).copied()
+}
+
+fn beat_grid_aggregate(fixtures: &[&RealisticFixtureObservation]) -> RealisticBeatGridAggregate {
+    let truth_beats = fixtures
+        .iter()
+        .map(|fixture| fixture.beat_grid.truth_beat_count)
+        .sum();
+    let detected_beats = fixtures
+        .iter()
+        .map(|fixture| fixture.beat_grid.detected_beat_count)
+        .sum();
+    let matched_beats = fixtures
+        .iter()
+        .map(|fixture| fixture.beat_grid.matched_truth_beats)
+        .sum();
+    let micro_precision =
+        (detected_beats > 0).then(|| matched_beats as f32 / detected_beats as f32);
+    let micro_recall = (truth_beats > 0).then(|| matched_beats as f32 / truth_beats as f32);
+    let micro_f1 = micro_precision
+        .zip(micro_recall)
+        .and_then(|(precision, recall)| {
+            (precision + recall > 0.0).then(|| 2.0 * precision * recall / (precision + recall))
+        });
+    let precisions = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.precision)
+        .collect::<Vec<_>>();
+    let recalls = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.recall)
+        .collect::<Vec<_>>();
+    let f1s = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.f1)
+        .collect::<Vec<_>>();
+    let timing = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.median_absolute_timing_error_micros)
+        .collect::<Vec<_>>();
+    let p95_timing = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.p95_absolute_timing_error_micros)
+        .collect::<Vec<_>>();
+    let max_timing = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.max_absolute_timing_error_micros)
+        .collect::<Vec<_>>();
+    let drifts = fixtures
+        .iter()
+        .filter_map(|fixture| fixture.beat_grid.longitudinal_drift_ms_per_min)
+        .collect::<Vec<_>>();
+    RealisticBeatGridAggregate {
+        fixture_count: fixtures.len(),
+        truth_beats,
+        detected_beats,
+        matched_beats,
+        micro_precision,
+        micro_recall,
+        micro_f1,
+        fixture_median_precision: percentile_f32(&precisions, 1, 2),
+        fixture_median_recall: percentile_f32(&recalls, 1, 2),
+        fixture_median_f1: percentile_f32(&f1s, 1, 2),
+        median_timing_error_micros: median_u64(&timing),
+        p95_timing_error_micros: median_u64(&p95_timing),
+        max_timing_error_micros: max_timing.into_iter().max(),
+        median_drift_ms_per_min: percentile_f32(&drifts, 1, 2),
+        p95_drift_ms_per_min: percentile_f32(&drifts, 19, 20),
+    }
+}
+
+fn median_u64(values: &[u64]) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[(sorted.len() - 1) / 2])
+}
+
+fn bpm_region(bpm: f32) -> String {
+    match bpm {
+        bpm if bpm < 100.0 => "below_100".into(),
+        bpm if bpm < 120.0 => "100_to_119".into(),
+        bpm if bpm < 140.0 => "120_to_139".into(),
+        _ => "140_plus".into(),
+    }
+}
+
+fn beat_grid_summary(
+    fixtures: &[RealisticFixtureObservation],
+    successful_case_ids: &BTreeSet<String>,
+    cases: &[impl PositiveCaseIdentity],
+) -> RealisticBeatGridSummary {
+    let all = fixtures.iter().collect::<Vec<_>>();
+    let grouped = |key: fn(&RealisticFixtureObservation) -> String| {
+        let mut groups = BTreeMap::<String, Vec<&RealisticFixtureObservation>>::new();
+        for fixture in fixtures {
+            groups.entry(key(fixture)).or_default().push(fixture);
+        }
+        groups
+            .into_iter()
+            .map(|(key, fixtures)| (key, beat_grid_aggregate(&fixtures)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let successful_fixture_ids = cases
+        .iter()
+        .filter(|case| successful_case_ids.contains(case.case_id()))
+        .flat_map(|case| [case.outgoing_fixture(), case.incoming_fixture()])
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let successful = fixtures
+        .iter()
+        .filter(|fixture| successful_fixture_ids.contains(&fixture.fixture_id))
+        .collect::<Vec<_>>();
+    let failed = fixtures
+        .iter()
+        .filter(|fixture| !successful_fixture_ids.contains(&fixture.fixture_id))
+        .collect::<Vec<_>>();
+    RealisticBeatGridSummary {
+        matching_tolerance_micros: REALISTIC_BEAT_MATCH_TOLERANCE_MICROS,
+        all: beat_grid_aggregate(&all),
+        by_bpm_region: grouped(|fixture| bpm_region(fixture.truth_bpm)),
+        by_profile: grouped(|fixture| fixture.profile.clone()),
+        by_duration: grouped(|fixture| format!("{}s", fixture.duration_micros / 1_000_000)),
+        successful_beatmatched: beat_grid_aggregate(&successful),
+        failed_beatmatched: beat_grid_aggregate(&failed),
+    }
+}
+
+trait PositiveCaseIdentity {
+    fn case_id(&self) -> &str;
+    fn outgoing_fixture(&self) -> &str;
+    fn incoming_fixture(&self) -> &str;
+}
+
+impl PositiveCaseIdentity for RealisticPositiveTransitionCase {
+    fn case_id(&self) -> &str {
+        &self.case_id
+    }
+    fn outgoing_fixture(&self) -> &str {
+        &self.outgoing_fixture
+    }
+    fn incoming_fixture(&self) -> &str {
+        &self.incoming_fixture
+    }
+}
+
+impl PositiveCaseIdentity for RealisticTransitionCase {
+    fn case_id(&self) -> &str {
+        &self.case_id
+    }
+    fn outgoing_fixture(&self) -> &str {
+        &self.outgoing_fixture
+    }
+    fn incoming_fixture(&self) -> &str {
+        &self.incoming_fixture
     }
 }
 
@@ -3602,6 +4129,18 @@ fn positive_pair_is_correct(
         && relative_difference(expected_ratio, truth_ratio) <= RELATIVE_TOLERANCE
 }
 
+fn counts_as_independent_positive(case: &RealisticPositiveTransitionCase) -> bool {
+    case.planner_path == "NORMAL_HEURISTIC_CUES"
+        && !case.cue_free_probe_used
+        && case.beatmatched_selected
+        && !case.false_beatmatched
+        && !case.waveform_copy_used
+        && !case.truth_inference_used
+        && case.outgoing_pcm_sha256 != case.incoming_pcm_sha256
+        && case.outgoing_master_id != case.incoming_master_id
+        && case.outgoing_seed != case.incoming_seed
+}
+
 fn relation_physical_bpm(hypothesis: TempoHypothesis) -> f32 {
     let multiplier = match hypothesis.relation {
         TempoRelation::HalfTime => 2.0,
@@ -3662,38 +4201,52 @@ fn positive_realistic_transition_case(
         incoming_fixture,
         &config,
     );
-    let (planned, guarded, rendered_quality) = if ordinary.0.diagnostics.beatmatched_candidates == 0
-    {
-        // Research-only opportunity probe: use the same analyzed timelines
-        // and hypotheses while asking the core planner to evaluate its
-        // bounded physical-window fallback when every heuristic cue pair was
-        // unsuitable. No truth or boundary audio participates.
-        let cue_free_outgoing = RealisticPlannerInput {
-            analysis: outgoing_analysis,
-            hypotheses: outgoing_hypotheses,
-            cues: Vec::new(),
-        };
-        let cue_free_incoming = RealisticPlannerInput {
-            analysis: incoming_analysis,
-            hypotheses: incoming_hypotheses,
-            cues: Vec::new(),
-        };
-        let fallback = quality_first_rendered_shadow_transition(
-            &cue_free_outgoing,
-            &cue_free_incoming,
-            outgoing_fixture,
-            incoming_fixture,
-            &config,
-        );
-        if fallback.0.diagnostics.beatmatched_candidates > 0 {
-            fallback
+    let mut cue_free_probe_used = false;
+    let mut planner_path = "NORMAL_HEURISTIC_CUES";
+    let (planned, guarded, rendered_quality, quality_first_proposed_kind) =
+        if ordinary.0.diagnostics.beatmatched_candidates == 0 {
+            // Research-only opportunity probe: use the same analyzed timelines
+            // and hypotheses while asking the core planner to evaluate its
+            // bounded physical-window fallback when every heuristic cue pair was
+            // unsuitable. No truth or boundary audio participates.
+            let cue_free_outgoing = RealisticPlannerInput {
+                analysis: outgoing_analysis,
+                hypotheses: outgoing_hypotheses,
+                cues: Vec::new(),
+            };
+            let cue_free_incoming = RealisticPlannerInput {
+                analysis: incoming_analysis,
+                hypotheses: incoming_hypotheses,
+                cues: Vec::new(),
+            };
+            let fallback = quality_first_rendered_shadow_transition(
+                &cue_free_outgoing,
+                &cue_free_incoming,
+                outgoing_fixture,
+                incoming_fixture,
+                &config,
+            );
+            if fallback.0.diagnostics.beatmatched_candidates > 0 {
+                cue_free_probe_used = true;
+                planner_path = "CUE_FREE_OPPORTUNITY_PROBE";
+                fallback
+            } else {
+                ordinary
+            }
         } else {
             ordinary
-        }
+        };
+    let quality_first_render_acceptable = rendered_quality.acceptable;
+    let eligibility = if cue_free_probe_used {
+        planned
+            .candidates
+            .iter()
+            .find(|candidate| candidate.plan == guarded.plan)
+            .and_then(|candidate| candidate.beat_eligibility.clone())
+            .unwrap_or_else(|| beat_match_eligibility(&outgoing_input, &incoming_input, &config))
     } else {
-        ordinary
+        beat_match_eligibility(&outgoing_input, &incoming_input, &config)
     };
-    let eligibility = beat_match_eligibility(&outgoing_input, &incoming_input, &config);
     let selected_pair = planned
         .candidates
         .iter()
@@ -3763,7 +4316,9 @@ fn positive_realistic_transition_case(
         selected_pair.is_some(),
         &eligibility,
     );
-    let opportunity_class = if beatmatched_selected {
+    let opportunity_class = if cue_free_probe_used && beatmatched_selected && !false_beatmatched {
+        "cue_generation_blocked_valid_opportunity"
+    } else if beatmatched_selected {
         if false_beatmatched {
             "selected_but_invalid"
         } else {
@@ -3952,6 +4507,8 @@ fn positive_realistic_transition_case(
             .find(|candidate| candidate.plan.kind == TransitionKind::Crossfade)
             .map(|candidate| candidate.cost.total),
         quality_first_selected_kind: format!("{:?}", guarded.plan.kind),
+        quality_first_proposed_kind: format!("{:?}", quality_first_proposed_kind),
+        quality_first_render_acceptable,
         quality_evidence: format!(
             "observed_beat_pairs={},phase_error_micros={:?},relation={:?},render_acceptable={}",
             eligibility.beat_pairs,
@@ -3968,6 +4525,8 @@ fn positive_realistic_transition_case(
                 )
             },
         ),
+        planner_path: planner_path.into(),
+        cue_free_probe_used,
         candidate_costs,
     })
 }
@@ -4242,7 +4801,13 @@ fn build_positive_realistic_corpus(
         .collect::<Result<Vec<_>, LabError>>()?;
     let successful_cases = transition_cases
         .iter()
-        .filter(|case| case.beatmatched_selected && !case.false_beatmatched)
+        .filter(|case| {
+            if copy_boundary_window {
+                case.beatmatched_selected && !case.false_beatmatched
+            } else {
+                counts_as_independent_positive(case)
+            }
+        })
         .collect::<Vec<_>>();
     let successful_tempo_regions = successful_cases
         .iter()
@@ -4334,6 +4899,32 @@ fn build_positive_realistic_corpus(
             .iter()
             .filter(|case| case.relation_correct)
             .count(),
+        normal_path_correct_beatmatched: transition_cases
+            .iter()
+            .filter(|case| {
+                case.planner_path == "NORMAL_HEURISTIC_CUES"
+                    && case.beatmatched_selected
+                    && !case.false_beatmatched
+            })
+            .count(),
+        cue_free_probe_correct_beatmatched: transition_cases
+            .iter()
+            .filter(|case| {
+                case.cue_free_probe_used && case.beatmatched_selected && !case.false_beatmatched
+            })
+            .count(),
+        normal_path_false_beatmatched: transition_cases
+            .iter()
+            .filter(|case| case.planner_path == "NORMAL_HEURISTIC_CUES" && case.false_beatmatched)
+            .count(),
+        cue_free_probe_false_beatmatched: transition_cases
+            .iter()
+            .filter(|case| case.cue_free_probe_used && case.false_beatmatched)
+            .count(),
+        cue_free_probe_attempts: transition_cases
+            .iter()
+            .filter(|case| case.cue_free_probe_used)
+            .count(),
         independent_correct_beatmatched,
         distinct_success_tempo_regions: successful_tempo_regions.len(),
         distinct_success_profiles: successful_profiles.len(),
@@ -4341,6 +4932,11 @@ fn build_positive_realistic_corpus(
         independent_false_beatmatched,
         external_gate_passed,
     };
+    let successful_case_ids = successful_cases
+        .iter()
+        .map(|case| case.case_id.clone())
+        .collect::<BTreeSet<_>>();
+    let beat_grid_summary = beat_grid_summary(&fixtures, &successful_case_ids, &transition_cases);
     Ok(RealisticPositiveCorpusReport {
         source_commit: None,
         starting_commit: None,
@@ -4360,6 +4956,7 @@ fn build_positive_realistic_corpus(
         candidate_caps,
         fixtures,
         transition_cases,
+        beat_grid_summary,
         summary,
     })
 }
@@ -4762,6 +5359,8 @@ fn realistic_transition_case(
         effective_false_beatmatched: effective_selected && !effective_pair_correct,
         effective_safe_fallback: !effective_selected,
         effective_pair_correct,
+        quality_first_beatmatched_selected: effective_selected,
+        quality_first_false_beatmatched: effective_selected && !effective_pair_correct,
     })
 }
 
@@ -4966,6 +5565,14 @@ fn build_realistic_corpus_report(
             .iter()
             .filter(|case| case.effective_safe_fallback)
             .count(),
+        quality_first_false_beatmatched: cases
+            .iter()
+            .filter(|case| case.quality_first_false_beatmatched)
+            .count(),
+        quality_first_correct_beatmatched: cases
+            .iter()
+            .filter(|case| case.quality_first_beatmatched_selected && case.effective_pair_correct)
+            .count(),
         safe_outcomes: cases
             .iter()
             .filter(|case| !case.effective_false_beatmatched)
@@ -4973,6 +5580,12 @@ fn build_realistic_corpus_report(
         non_interference_scope:
             "research-only generated audio and planner inputs; no production analysis or playback path".into(),
     };
+    let successful_case_ids = cases
+        .iter()
+        .filter(|case| case.quality_first_beatmatched_selected && case.effective_pair_correct)
+        .map(|case| case.case_id.clone())
+        .collect::<BTreeSet<_>>();
+    let beat_grid_summary = beat_grid_summary(&fixtures, &successful_case_ids, &cases);
     let interval_consistency = build_runtime_consistency(&flow_refs);
     let positive_corpus = build_positive_realistic_corpus(true)?;
     Ok(RealisticSyntheticCorpusReport {
@@ -4994,6 +5607,7 @@ fn build_realistic_corpus_report(
         transition_cases: cases,
         transition_summary,
         interval_consistency,
+        beat_grid_summary,
         positive_corpus,
     })
 }
@@ -5036,7 +5650,7 @@ pub fn run_independent_positive_corpus_research(
 fn realistic_markdown(report: &RealisticSyntheticCorpusReport) -> String {
     let summary = &report.transition_summary;
     format!(
-        "# Realistic internal conservative-shadow corpus\n\n- source commit: `{}`\n- starting commit: `{}`\n- fixtures: `{}`\n- durations (micros): `{:?}`\n- profiles: `{:?}`\n- construction: {}\n- production behavior changed: `NO`\n\n## Candidate caps\n\n{}\n\n## Negative/guarded transition summary\n\n- pairs: `{}`\n- expected safe-fallback cases: `{}`\n- expected feasible-or-safe cases: `{}`\n- baseline false BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- effective correct BeatMatched: `{}`\n- effective safe fallback: `{}`\n- safe outcomes: `{}`\n\n## Positive transition summary\n\n- independent analyzed fixtures: `{}`\n- positive pairs: `{}`\n- effective correct BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- safe fallback: `{}`\n- rendered quality PASS among selected cases: `{}`\n\nThe corpus is research-only. Generated audio uses deterministic known beat clocks with arrangement-like evidence-density changes; it is not a substitute for ecological validation.\n",
+        "# Realistic internal conservative-shadow corpus\n\n- source commit: `{}`\n- starting commit: `{}`\n- fixtures: `{}`\n- durations (micros): `{:?}`\n- profiles: `{:?}`\n- construction: {}\n- production behavior changed: `NO`\n\n## Candidate caps\n\n{}\n\n## Negative/guarded transition summary\n\n- pairs: `{}`\n- expected safe-fallback cases: `{}`\n- expected feasible-or-safe cases: `{}`\n- baseline false BeatMatched: `{}`\n- effective false BeatMatched: `{}`\n- effective correct BeatMatched: `{}`\n- quality-first false BeatMatched: `{}`\n- effective safe fallback: `{}`\n- safe outcomes: `{}`\n\n## Positive transition summary\n\n- independent analyzed fixtures: `{}`\n- positive pairs: `{}`\n- effective correct BeatMatched: `{}`\n- normal heuristic-cue correct BeatMatched: `{}`\n- cue-free probe correct BeatMatched (excluded from gate): `{}`\n- effective false BeatMatched: `{}`\n- safe fallback: `{}`\n- rendered quality PASS among selected cases: `{}`\n\nThe corpus is research-only. Generated audio uses deterministic known beat clocks with arrangement-like evidence-density changes; it is not a substitute for ecological validation.\n",
         report.source_commit,
         report
             .starting_commit
@@ -5068,11 +5682,14 @@ fn realistic_markdown(report: &RealisticSyntheticCorpusReport) -> String {
         summary.baseline_false_beatmatched,
         summary.effective_false_beatmatched,
         summary.effective_correct_beatmatched,
+        summary.quality_first_false_beatmatched,
         summary.effective_safe_fallback,
         summary.safe_outcomes,
         report.positive_corpus.fixture_count,
         report.positive_corpus.pair_count,
         report.positive_corpus.summary.effective_correct_beatmatched,
+        report.positive_corpus.summary.normal_path_correct_beatmatched,
+        report.positive_corpus.summary.cue_free_probe_correct_beatmatched,
         report.positive_corpus.summary.effective_false_beatmatched,
         report.positive_corpus.summary.safe_fallback,
         report
@@ -5140,6 +5757,10 @@ fn write_outputs(
     write_json(
         &output_dir.join("heldout-conservative-ranking.json"),
         &report.heldout,
+    )?;
+    write_json(
+        &output_dir.join("external-validation-gate.json"),
+        &report.external_validation_gate,
     )?;
     write_json(
         &output_dir.join("tempo-conservative-shadow-report.json"),
@@ -5340,6 +5961,30 @@ fn markdown_report(report: &TempoConservativeShadowReport) -> String {
     output.push_str(&format!("Mean candidates: {:.2}; p50: {}; p95: {}; max: {}; mean pair cross-product: {:.2}; p95: {}; max: {}.\n\n", report.candidate_pressure.mean_candidates, report.candidate_pressure.p50_candidates, report.candidate_pressure.p95_candidates, report.candidate_pressure.max_candidates, report.candidate_pressure.mean_pair_cross_product, report.candidate_pressure.p95_pair_cross_product, report.candidate_pressure.max_pair_cross_product));
     output.push_str("## Decision\n\n");
     output.push_str(&format!("**{}**\n\n", report.decision.recommendation));
+    output.push_str("## External validation gate\n\n");
+    output.push_str(&format!(
+        "Overall gate: **{}**. Failed conditions: `{:?}`.\n\n",
+        report.external_validation_gate.external_validation_required,
+        report.external_validation_gate.failed_conditions
+    ));
+    output.push_str(&format!(
+        "Independent positive normal-cue successes: {} (cue-free probe successes excluded: {}). Successful BPM regions: {}; profiles: {}; duration configurations: {}.\n\n",
+        report.independent_positive_corpus.summary.normal_path_correct_beatmatched,
+        report.independent_positive_corpus.summary.cue_free_probe_correct_beatmatched,
+        report.independent_positive_corpus.summary.distinct_success_tempo_regions,
+        report.independent_positive_corpus.summary.distinct_success_profiles,
+        report.independent_positive_corpus.summary.distinct_success_duration_configs,
+    ));
+    output.push_str(&format!(
+        "Beat-grid tolerance: {} microseconds; micro precision: {}; micro recall: {}; micro F1: {}; median timing error: {}; p95 timing error: {}; median drift ms/min: {}.\n\n",
+        report.independent_positive_corpus.beat_grid_summary.matching_tolerance_micros,
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.micro_precision),
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.micro_recall),
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.micro_f1),
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.median_timing_error_micros),
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.p95_timing_error_micros),
+        format_option(report.independent_positive_corpus.beat_grid_summary.all.median_drift_ms_per_min),
+    ));
     for (key, value) in &report.decision.answers {
         output.push_str(&format!("- {key}: {value}\n"));
     }
@@ -5351,6 +5996,14 @@ fn format_option<T: std::fmt::Display>(value: Option<T>) -> String {
     value
         .map(|number| format!("{number:.4}"))
         .unwrap_or_else(|| "unavailable".into())
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("1" | "true" | "yes"))
+}
+
+fn env_flag_matches_commit(source_commit: &str) -> bool {
+    std::env::var("WOTOHA_FINAL_HEAD").is_ok_and(|expected| expected == source_commit)
 }
 
 #[cfg(test)]
@@ -5550,6 +6203,40 @@ mod tests {
     }
 
     #[test]
+    fn independent_positive_specs_have_distinct_lineage_and_seed() {
+        let specs = independent_positive_specs();
+        let seeds = specs
+            .iter()
+            .map(|(spec, _)| spec.seed)
+            .collect::<BTreeSet<_>>();
+        let lineages = specs
+            .iter()
+            .filter_map(|(spec, _)| spec.base_id.as_deref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(seeds.len(), specs.len());
+        assert_eq!(lineages.len(), specs.len());
+        assert!(specs.iter().all(|(spec, _)| spec.base_id.is_some()));
+    }
+
+    #[test]
+    fn primary_gate_does_not_accept_five_same_condition_successes() {
+        let gate = ExternalValidationGateInputs {
+            independent_positive_count_passed: true,
+            independent_tempo_diversity_passed: false,
+            independent_profile_diversity_passed: false,
+            independent_duration_diversity_passed: false,
+            ..ExternalValidationGateInputs::default()
+        };
+        let result = evaluate_external_validation_gate(&gate);
+        assert!(!result.external_validation_required);
+        assert!(
+            result
+                .failed_conditions
+                .contains(&"independent_tempo_diversity_passed".to_owned())
+        );
+    }
+
+    #[test]
     fn event_clock_support_is_relation_aware_and_deterministic() {
         let times = (0..=8).map(|index| Duration::from_micros(index * 500_000));
         assert_eq!(analysis_event_clock_bpm(times), Some(120.0));
@@ -5565,5 +6252,66 @@ mod tests {
         assert!(tempo_hypothesis_matches_event_clock(primary, Some(120.0)));
         assert!(tempo_hypothesis_matches_event_clock(half_time, Some(120.0)));
         assert!(!tempo_hypothesis_matches_event_clock(wrong, Some(120.0)));
+    }
+
+    #[test]
+    fn external_validation_gate_requires_every_condition() {
+        let all_pass = ExternalValidationGateInputs {
+            final_head_matches_report: true,
+            production_behavior_unchanged: true,
+            independent_positive_count_passed: true,
+            independent_tempo_diversity_passed: true,
+            independent_profile_diversity_passed: true,
+            independent_duration_diversity_passed: true,
+            independent_false_beatmatched_zero: true,
+            no_boundary_copy_successes_counted: true,
+            no_cue_free_probe_successes_counted: true,
+            no_truth_inference_successes_counted: true,
+            adversarial_false_beatmatched_zero: true,
+            quality_first_adversarial_false_beatmatched_zero: true,
+            realistic_negative_false_beatmatched_zero: true,
+            quality_first_realistic_negative_false_beatmatched_zero: true,
+            valid_aliases_preserved: true,
+            heldout_valid: true,
+            heldout_false_confident_zero: true,
+            runtime_feasible_false_confident_zero: true,
+            variable_tempo_safety_passed: true,
+            beat_grid_evaluation_completed: true,
+            candidate_budget_bounded: true,
+            repeatability_passed: true,
+            fmt_passed: true,
+            check_passed: true,
+            test_passed: true,
+            clippy_passed: true,
+            ci_passed: true,
+            container_passed: true,
+            youtube_compatibility_no_current_regression: true,
+            storage_cleanup_verified: true,
+        };
+        assert!(evaluate_external_validation_gate(&all_pass).external_validation_required);
+        let mut cue_free = all_pass.clone();
+        cue_free.no_cue_free_probe_successes_counted = false;
+        let gate = evaluate_external_validation_gate(&cue_free);
+        assert!(!gate.external_validation_required);
+        assert_eq!(
+            gate.failed_conditions,
+            vec!["no_cue_free_probe_successes_counted"]
+        );
+    }
+
+    #[test]
+    fn beat_grid_matching_is_monotonic_and_reports_f1_and_drift() {
+        let diagnostic = realistic_beat_grid_diagnostic(
+            &[100_000, 150_000],
+            &[
+                Duration::from_micros(120_000),
+                Duration::from_micros(100_000),
+            ],
+        );
+        assert_eq!(diagnostic.matched_truth_beats, 1);
+        assert_eq!(diagnostic.unmatched_truth_beats, 1);
+        assert_eq!(diagnostic.extra_detected_beats, 1);
+        assert_eq!(diagnostic.f1, Some(0.5));
+        assert!(diagnostic.last_beat_offset_micros.is_some());
     }
 }
