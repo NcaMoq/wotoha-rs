@@ -49,6 +49,22 @@ const STATIONARY_DISPERSION: f64 = 0.003;
 const CLASSICAL_ANCHOR_BONUS: f32 = 0.15;
 const RELATION_RESOLUTION_TOLERANCE: f32 = 0.02;
 
+/// The synthetic grid gate is deliberately stricter than any production
+/// confidence policy.  It only answers whether this known-clock research
+/// corpus is healthy enough to hand an ecological question to an external
+/// benchmark.
+const GRID_GATE_MIN_MICRO_PRECISION: f32 = 0.90;
+const GRID_GATE_MIN_MICRO_RECALL: f32 = 0.90;
+const GRID_GATE_MIN_MICRO_F1: f32 = 0.90;
+const GRID_GATE_MIN_CONSTANT_RECALL: f32 = 0.75;
+const GRID_GATE_MAX_P95_TIMING_MICROS: u64 = 35_000;
+const GRID_GATE_MAX_P95_DRIFT_MS_PER_MIN: f32 = 35.0;
+const GRID_REFINEMENT_MIN_EVENTS: usize = 8;
+const GRID_REFINEMENT_RESIDUAL_TOLERANCE_MICROS: i64 = 35_000;
+const GRID_REFINEMENT_MAX_MEDIAN_RESIDUAL_MICROS: u64 = 20_000;
+const GRID_REFINEMENT_INTEGER_BPM_MAX_DISTANCE: f32 = 0.35;
+const GRID_REFINEMENT_MAX_STATIONARY_DRIFT: f64 = 0.005;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TempoConservativeShadowReport {
     pub schema_version: u32,
@@ -108,6 +124,7 @@ pub struct ExternalValidationGate {
     pub runtime_feasible_false_confident_zero: bool,
     pub variable_tempo_safety_passed: bool,
     pub beat_grid_evaluation_completed: bool,
+    pub beat_grid_quality_passed: bool,
     pub candidate_budget_bounded: bool,
     pub repeatability_passed: bool,
     pub fmt_passed: bool,
@@ -120,6 +137,17 @@ pub struct ExternalValidationGate {
     pub storage_cleanup_verified: bool,
     pub external_validation_required: bool,
     pub failed_conditions: Vec<String>,
+    pub condition_statuses: BTreeMap<String, String>,
+    pub evidence: BTreeMap<String, GateEvidenceRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GateEvidenceRecord {
+    pub condition: String,
+    pub value: bool,
+    pub evidence_source: String,
+    pub evidence_digest: Option<String>,
+    pub command_or_run: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -144,6 +172,7 @@ pub struct ExternalValidationGateInputs {
     pub runtime_feasible_false_confident_zero: bool,
     pub variable_tempo_safety_passed: bool,
     pub beat_grid_evaluation_completed: bool,
+    pub beat_grid_quality_passed: bool,
     pub candidate_budget_bounded: bool,
     pub repeatability_passed: bool,
     pub fmt_passed: bool,
@@ -154,7 +183,20 @@ pub struct ExternalValidationGateInputs {
     pub container_passed: bool,
     pub youtube_compatibility_no_current_regression: bool,
     pub storage_cleanup_verified: bool,
+    pub evidence: BTreeMap<String, GateEvidenceRecord>,
 }
+
+const EXTERNAL_EVIDENCE_CONDITIONS: [&str; 9] = [
+    "repeatability_passed",
+    "fmt_passed",
+    "check_passed",
+    "test_passed",
+    "clippy_passed",
+    "ci_passed",
+    "container_passed",
+    "youtube_compatibility_no_current_regression",
+    "storage_cleanup_verified",
+];
 
 pub fn evaluate_external_validation_gate(
     inputs: &ExternalValidationGateInputs,
@@ -234,6 +276,7 @@ pub fn evaluate_external_validation_gate(
             "beat_grid_evaluation_completed",
             inputs.beat_grid_evaluation_completed,
         ),
+        ("beat_grid_quality_passed", inputs.beat_grid_quality_passed),
         ("candidate_budget_bounded", inputs.candidate_budget_bounded),
         ("repeatability_passed", inputs.repeatability_passed),
         ("fmt_passed", inputs.fmt_passed),
@@ -248,9 +291,30 @@ pub fn evaluate_external_validation_gate(
         ),
         ("storage_cleanup_verified", inputs.storage_cleanup_verified),
     ];
-    let failed_conditions = conditions
+    let condition_statuses = conditions
         .iter()
-        .filter_map(|(name, passed)| (!*passed).then_some((*name).to_owned()))
+        .map(|(name, passed)| {
+            let status = if !passed {
+                "FAIL"
+            } else if EXTERNAL_EVIDENCE_CONDITIONS.contains(name)
+                && !inputs.evidence.get(*name).is_some_and(|evidence| {
+                    evidence.value
+                        && evidence
+                            .evidence_digest
+                            .as_ref()
+                            .is_some_and(|digest| !digest.is_empty())
+                })
+            {
+                "UNVERIFIED"
+            } else {
+                "PASS"
+            };
+            ((*name).to_owned(), status.to_owned())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let failed_conditions = condition_statuses
+        .iter()
+        .filter_map(|(name, status)| (status != "PASS").then_some(name.clone()))
         .collect::<Vec<_>>();
     ExternalValidationGate {
         final_head_matches_report: inputs.final_head_matches_report,
@@ -275,6 +339,7 @@ pub fn evaluate_external_validation_gate(
         runtime_feasible_false_confident_zero: inputs.runtime_feasible_false_confident_zero,
         variable_tempo_safety_passed: inputs.variable_tempo_safety_passed,
         beat_grid_evaluation_completed: inputs.beat_grid_evaluation_completed,
+        beat_grid_quality_passed: inputs.beat_grid_quality_passed,
         candidate_budget_bounded: inputs.candidate_budget_bounded,
         repeatability_passed: inputs.repeatability_passed,
         fmt_passed: inputs.fmt_passed,
@@ -286,8 +351,10 @@ pub fn evaluate_external_validation_gate(
         youtube_compatibility_no_current_regression: inputs
             .youtube_compatibility_no_current_regression,
         storage_cleanup_verified: inputs.storage_cleanup_verified,
-        external_validation_required: failed_conditions.is_empty(),
+        external_validation_required: condition_statuses.values().all(|status| status == "PASS"),
         failed_conditions,
+        condition_statuses,
+        evidence: inputs.evidence.clone(),
     }
 }
 
@@ -642,6 +709,10 @@ pub struct RealisticFixtureObservation {
     pub duration_micros: u64,
     pub truth_bpm: f32,
     pub event_count: usize,
+    pub raw_event_count: usize,
+    pub refined_event_count: usize,
+    pub raw_event_times_micros: Vec<u64>,
+    pub refined_grid_times_micros: Vec<u64>,
     pub first_event_micros: Option<u64>,
     pub last_event_micros: Option<u64>,
     pub event_clock_bpm: Option<f32>,
@@ -656,7 +727,35 @@ pub struct RealisticFixtureObservation {
     pub selected_relation: Option<String>,
     pub relation_resolution: String,
     pub safe_fallback_only: bool,
+    pub raw_beat_grid: RealisticBeatGridDiagnostic,
+    pub refined_beat_grid: RealisticBeatGridDiagnostic,
+    pub grid_refinement: ResearchBeatGridRefinement,
+    /// Compatibility view used by older lab consumers.  It is the accepted
+    /// research refined grid, never a production timeline.
     pub beat_grid: RealisticBeatGridDiagnostic,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResearchBeatGridRefinement {
+    pub algorithm: String,
+    pub accepted: bool,
+    pub stationarity_status: String,
+    pub raw_event_count: usize,
+    pub refined_event_count: usize,
+    pub fit_period_micros: Option<f64>,
+    pub fit_bpm: Option<f32>,
+    pub grid_period_micros: Option<f64>,
+    pub grid_bpm: Option<f32>,
+    pub classical_anchor_bpm: Option<f32>,
+    pub phase_anchor_micros: Option<u64>,
+    pub phase_anchor_used: bool,
+    pub phase_micros: Option<f64>,
+    pub residual_median_micros: Option<u64>,
+    pub residual_p95_micros: Option<u64>,
+    pub raw_events_explained_fraction: Option<f32>,
+    pub inserted_grid_count: usize,
+    pub rejected_event_count: usize,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -677,6 +776,8 @@ pub struct RealisticBeatGridDiagnostic {
     pub last_beat_offset_micros: Option<i64>,
     pub longitudinal_drift_micros: Option<i64>,
     pub longitudinal_drift_ms_per_min: Option<f32>,
+    #[serde(skip)]
+    pub(crate) matched_timing_errors_micros: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -693,6 +794,7 @@ pub struct RealisticBeatGridAggregate {
     pub fixture_median_f1: Option<f32>,
     pub median_timing_error_micros: Option<u64>,
     pub p95_timing_error_micros: Option<u64>,
+    pub pooled_p95_timing_error_micros: Option<u64>,
     pub max_timing_error_micros: Option<u64>,
     pub median_drift_ms_per_min: Option<f32>,
     pub p95_drift_ms_per_min: Option<f32>,
@@ -701,12 +803,44 @@ pub struct RealisticBeatGridAggregate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RealisticBeatGridSummary {
     pub matching_tolerance_micros: u64,
+    pub raw_all: RealisticBeatGridAggregate,
+    pub refined_all: RealisticBeatGridAggregate,
+    pub raw_by_bpm_region: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub refined_by_bpm_region: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub raw_by_profile: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub refined_by_profile: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub raw_by_duration: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub refined_by_duration: BTreeMap<String, RealisticBeatGridAggregate>,
+    pub raw_successful_beatmatched: RealisticBeatGridAggregate,
+    pub refined_successful_beatmatched: RealisticBeatGridAggregate,
+    pub raw_failed_beatmatched: RealisticBeatGridAggregate,
+    pub refined_failed_beatmatched: RealisticBeatGridAggregate,
+    /// Refined compatibility fields retained for existing report readers.
     pub all: RealisticBeatGridAggregate,
     pub by_bpm_region: BTreeMap<String, RealisticBeatGridAggregate>,
     pub by_profile: BTreeMap<String, RealisticBeatGridAggregate>,
     pub by_duration: BTreeMap<String, RealisticBeatGridAggregate>,
     pub successful_beatmatched: RealisticBeatGridAggregate,
     pub failed_beatmatched: RealisticBeatGridAggregate,
+    pub quality_gate: RealisticBeatGridQualityGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RealisticBeatGridQualityGate {
+    pub pre_registered: bool,
+    pub min_micro_precision: f32,
+    pub min_micro_recall: f32,
+    pub min_micro_f1: f32,
+    pub min_constant_fixture_recall: f32,
+    pub max_pooled_p95_timing_error_micros: u64,
+    pub max_absolute_p95_drift_ms_per_min: f32,
+    pub refined_micro_precision: Option<f32>,
+    pub refined_micro_recall: Option<f32>,
+    pub refined_micro_f1: Option<f32>,
+    pub minimum_constant_fixture_recall: Option<f32>,
+    pub refined_pooled_p95_timing_error_micros: Option<u64>,
+    pub refined_absolute_p95_drift_ms_per_min: Option<f32>,
+    pub passed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -890,6 +1024,7 @@ pub struct RealisticPositiveSummary {
     pub cue_free_probe_attempts: usize,
     pub independent_correct_beatmatched: usize,
     pub distinct_success_tempo_regions: usize,
+    pub success_tempo_region_centers_bpm: Vec<f32>,
     pub distinct_success_profiles: usize,
     pub distinct_success_duration_configs: usize,
     pub independent_false_beatmatched: usize,
@@ -1253,6 +1388,11 @@ pub fn run_tempo_conservative_shadow_research(
                 .all
                 .fixture_count
                 > 0,
+        beat_grid_quality_passed: realistic_corpus.beat_grid_summary.quality_gate.passed
+            && independent_positive_corpus
+                .beat_grid_summary
+                .quality_gate
+                .passed,
         candidate_budget_bounded: candidate_budgets
             .iter()
             .all(|budget| budget.budget <= MAX_CANDIDATES && budget.max_pair_cross_product <= 16)
@@ -1270,6 +1410,7 @@ pub fn run_tempo_conservative_shadow_research(
             "WOTOHA_YOUTUBE_NO_CURRENT_REGRESSION",
         ),
         storage_cleanup_verified: env_flag("WOTOHA_STORAGE_CLEANUP_VERIFIED"),
+        evidence: external_gate_evidence(),
     });
     let decision = ConservativeDecision {
         recommendation: if gate.external_validation_required {
@@ -3295,6 +3436,9 @@ struct RealisticFlow {
     master_id: String,
     seed: u64,
     truth_beat_times_micros: Vec<u64>,
+    raw_beat_times: Vec<Duration>,
+    refined_beat_times: Vec<Duration>,
+    grid_refinement: ResearchBeatGridRefinement,
 }
 
 fn realistic_specs() -> Vec<(FixtureSpec, String)> {
@@ -3810,6 +3954,385 @@ fn positive_expected_relation(outgoing_bpm: f32, incoming_bpm: f32) -> String {
 
 const REALISTIC_BEAT_MATCH_TOLERANCE_MICROS: u64 = 35_000;
 
+#[derive(Clone, Debug)]
+struct GridFit {
+    period_micros: f64,
+    endpoint_period_micros: Option<f64>,
+    phase_micros: f64,
+    residuals_micros: Vec<u64>,
+    unique_indices: BTreeSet<i64>,
+    stationarity_drift: f64,
+}
+
+/// Fit a research-only constant grid to the observed event clock.  The fit
+/// never receives fixture truth.  It uses a bounded robust phase/slope fit:
+/// events are assigned to nearby integer beat indices, duplicate indices are
+/// represented by the event closest to the provisional grid, and the slope
+/// is refit from those representatives.  Missing beats therefore create
+/// bounded inserted grid positions, while extras do not drag the slope.
+fn fit_stationary_grid(times_micros: &[u64]) -> Option<GridFit> {
+    if times_micros.len() < GRID_REFINEMENT_MIN_EVENTS {
+        return None;
+    }
+    let mut intervals = times_micros
+        .windows(2)
+        .map(|window| window[1].saturating_sub(window[0]) as f64)
+        .filter(|interval| *interval > 0.0)
+        .collect::<Vec<_>>();
+    if intervals.is_empty() {
+        return None;
+    }
+    intervals.sort_by(f64::total_cmp);
+    let seed_period = intervals[(intervals.len() - 1) / 2];
+    if !(200_000.0..=1_500_000.0).contains(&seed_period) {
+        return None;
+    }
+
+    let mut period = seed_period;
+    let mut phase = times_micros[0] as f64;
+    for _ in 0..8 {
+        let indices: Vec<i64> = times_micros
+            .iter()
+            .map(|time| ((*time as f64 - phase) / period).round() as i64)
+            .collect();
+        let unique_indices = indices.iter().copied().collect::<BTreeSet<_>>();
+        let mut representatives = Vec::new();
+        for &index in &unique_indices {
+            let representative = indices
+                .iter()
+                .enumerate()
+                .filter(|(_, assigned)| **assigned == index)
+                .min_by(|(left_index, _), (right_index, _)| {
+                    let left_error =
+                        (times_micros[*left_index] as f64 - (phase + index as f64 * period)).abs();
+                    let right_error =
+                        (times_micros[*right_index] as f64 - (phase + index as f64 * period)).abs();
+                    left_error.total_cmp(&right_error)
+                })
+                .map(|(event_index, _)| (index, times_micros[event_index] as f64));
+            if let Some(representative) = representative {
+                representatives.push(representative);
+            }
+        }
+        if representatives.len() < GRID_REFINEMENT_MIN_EVENTS {
+            return None;
+        }
+        let n = representatives.len() as f64;
+        let mean_x = representatives
+            .iter()
+            .map(|(index, _)| *index as f64)
+            .sum::<f64>()
+            / n;
+        let mean_y = representatives.iter().map(|(_, time)| *time).sum::<f64>() / n;
+        let denominator = representatives
+            .iter()
+            .map(|(index, _)| (*index as f64 - mean_x).powi(2))
+            .sum::<f64>();
+        if denominator <= f64::EPSILON {
+            return None;
+        }
+        let fitted_period = representatives
+            .iter()
+            .map(|(index, time)| (*index as f64 - mean_x) * (*time - mean_y))
+            .sum::<f64>()
+            / denominator;
+        if !(200_000.0..=1_500_000.0).contains(&fitted_period) || !fitted_period.is_finite() {
+            // Keep the bounded median-period seed when a single sparse or
+            // duplicated interval makes the provisional regression
+            // ill-conditioned.  The residual and stationarity guards below
+            // still decide whether this fallback is acceptable.
+            break;
+        }
+        let fitted_phase = mean_y - fitted_period * mean_x;
+        if (fitted_period - period).abs() < 0.5 && (fitted_phase - phase).abs() < 0.5 {
+            period = fitted_period;
+            phase = fitted_phase;
+            break;
+        }
+        period = fitted_period;
+        phase = fitted_phase;
+    }
+
+    let indices: Vec<i64> = times_micros
+        .iter()
+        .map(|time| ((*time as f64 - phase) / period).round() as i64)
+        .collect();
+    let unique_indices = indices.iter().copied().collect::<BTreeSet<_>>();
+    let residuals_micros = times_micros
+        .iter()
+        .zip(indices.iter())
+        .map(|(time, index)| ((*time as f64 - (phase + *index as f64 * period)).abs()) as u64)
+        .collect::<Vec<_>>();
+    let mut segment_periods = Vec::new();
+    let indexed = unique_indices
+        .iter()
+        .map(|index| (*index as f64, phase + *index as f64 * period))
+        .collect::<Vec<_>>();
+    for segment in indexed.chunks((indexed.len() / 3).max(2)) {
+        if segment.len() >= 2 {
+            let first = segment.first().expect("segment is non-empty");
+            let last = segment.last().expect("segment is non-empty");
+            let index_span = last.0 - first.0;
+            if index_span > 0.0 {
+                segment_periods.push((last.1 - first.1) / index_span);
+            }
+        }
+    }
+    let stationarity_drift = segment_periods
+        .first()
+        .zip(segment_periods.last())
+        .map(|(first, last)| (last - first).abs() / first.max(f64::EPSILON))
+        .unwrap_or(0.0);
+    let endpoint_period_micros = unique_indices
+        .iter()
+        .next()
+        .zip(unique_indices.iter().next_back())
+        .and_then(|(first_index, last_index)| {
+            let span = *last_index - *first_index;
+            if span < 8 {
+                return None;
+            }
+            let first_time = times_micros
+                .iter()
+                .zip(indices.iter())
+                .filter(|(_, index)| **index == *first_index)
+                .map(|(time, _)| *time as f64)
+                .min_by(f64::total_cmp)?;
+            let last_time = times_micros
+                .iter()
+                .zip(indices.iter())
+                .filter(|(_, index)| **index == *last_index)
+                .map(|(time, _)| *time as f64)
+                .max_by(f64::total_cmp)?;
+            Some((last_time - first_time) / span as f64)
+        });
+    Some(GridFit {
+        period_micros: period,
+        endpoint_period_micros,
+        phase_micros: phase,
+        residuals_micros,
+        unique_indices,
+        stationarity_drift,
+    })
+}
+
+fn percentile_u64(values: &[u64], numerator: usize, denominator: usize) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) * numerator + denominator / 2) / denominator;
+    sorted.get(index).copied()
+}
+
+fn refine_research_grid(
+    raw_events: &[BeatEvent],
+    classical_anchor_bpm: Option<f32>,
+    grid_end_micros: Option<u64>,
+    phase_anchor_micros: Option<u64>,
+) -> (Vec<BeatEvent>, ResearchBeatGridRefinement) {
+    let raw_times = raw_events
+        .iter()
+        .map(|event| event.time.as_micros() as u64)
+        .collect::<Vec<_>>();
+    let unavailable = |status: &str, reason: &str| {
+        (
+            raw_events.to_vec(),
+            ResearchBeatGridRefinement {
+                algorithm: "robust_phase_period_fit_v1".into(),
+                accepted: false,
+                stationarity_status: status.into(),
+                raw_event_count: raw_events.len(),
+                refined_event_count: raw_events.len(),
+                fit_period_micros: None,
+                fit_bpm: None,
+                grid_period_micros: None,
+                grid_bpm: None,
+                classical_anchor_bpm,
+                phase_anchor_micros,
+                phase_anchor_used: false,
+                phase_micros: None,
+                residual_median_micros: None,
+                residual_p95_micros: None,
+                raw_events_explained_fraction: None,
+                inserted_grid_count: 0,
+                rejected_event_count: 0,
+                reason: reason.into(),
+            },
+        )
+    };
+    if raw_events.len() < GRID_REFINEMENT_MIN_EVENTS {
+        return unavailable("insufficient_support", "fewer_than_minimum_events");
+    }
+    let Some(fit) = fit_stationary_grid(&raw_times) else {
+        return unavailable("unavailable", "bounded_fit_failed");
+    };
+    let residual_median = percentile_u64(&fit.residuals_micros, 1, 2);
+    let residual_p95 = percentile_u64(&fit.residuals_micros, 19, 20);
+    let explained = fit
+        .residuals_micros
+        .iter()
+        .filter(|residual| **residual <= GRID_REFINEMENT_RESIDUAL_TOLERANCE_MICROS as u64)
+        .count();
+    let explained_fraction = explained as f32 / raw_events.len() as f32;
+    let accepted = fit.stationarity_drift <= GRID_REFINEMENT_MAX_STATIONARY_DRIFT
+        && residual_median.is_some_and(|value| value <= GRID_REFINEMENT_MAX_MEDIAN_RESIDUAL_MICROS)
+        && explained_fraction >= 0.80;
+    if !accepted {
+        return (
+            raw_events.to_vec(),
+            ResearchBeatGridRefinement {
+                algorithm: "robust_phase_period_fit_v1".into(),
+                accepted: false,
+                stationarity_status: if fit.stationarity_drift
+                    > GRID_REFINEMENT_MAX_STATIONARY_DRIFT
+                {
+                    "nonstationary"
+                } else {
+                    "residual_rejected"
+                }
+                .into(),
+                raw_event_count: raw_events.len(),
+                refined_event_count: raw_events.len(),
+                fit_period_micros: Some(fit.period_micros),
+                fit_bpm: Some((60_000_000.0 / fit.period_micros) as f32),
+                grid_period_micros: None,
+                grid_bpm: None,
+                classical_anchor_bpm,
+                phase_anchor_micros,
+                phase_anchor_used: false,
+                phase_micros: Some(fit.phase_micros),
+                residual_median_micros: residual_median,
+                residual_p95_micros: residual_p95,
+                raw_events_explained_fraction: Some(explained_fraction),
+                inserted_grid_count: 0,
+                rejected_event_count: raw_events.len().saturating_sub(explained),
+                reason: "stationarity_or_residual_guard_rejected".into(),
+            },
+        );
+    }
+
+    let fit_period = if let Some(endpoint_period) = fit.endpoint_period_micros {
+        let regression_bpm = 60_000_000.0 / fit.period_micros;
+        let regression_near_integer = (regression_bpm - regression_bpm.round()).abs() <= 0.35;
+        let endpoint_near_regression = (endpoint_period - fit.period_micros).abs()
+            / fit.period_micros.max(f64::EPSILON)
+            <= 0.005;
+        if !regression_near_integer && endpoint_near_regression {
+            endpoint_period
+        } else {
+            fit.period_micros
+        }
+    } else {
+        fit.period_micros
+    };
+    let fit_bpm = (60_000_000.0 / fit_period) as f32;
+    let fit_integer_bpm = fit_bpm.round();
+    let integer_consensus = fit_integer_bpm.is_finite()
+        && (fit_bpm - fit_integer_bpm).abs() <= GRID_REFINEMENT_INTEGER_BPM_MAX_DISTANCE;
+    let grid_bpm = integer_consensus.then_some(fit_integer_bpm);
+    let grid_period = grid_bpm
+        .map(|bpm| 60_000_000.0 / bpm as f64)
+        .unwrap_or(fit_period);
+    let raw_phase = raw_times.first().copied().unwrap_or_default();
+    let grid_phase = phase_anchor_micros
+        .filter(|anchor| {
+            let gap = raw_phase.saturating_sub(*anchor) as f64;
+            *anchor == 0
+                || (*anchor >= 250_000
+                    && *anchor as f64 >= grid_period * 0.25
+                    && gap > grid_period * 0.95)
+        })
+        .unwrap_or(raw_phase) as f64;
+    let min_index = 0;
+    let grid_end = grid_end_micros
+        .or_else(|| raw_times.last().copied())
+        .unwrap_or_default();
+    let max_index = ((grid_end as f64 - grid_phase) / grid_period)
+        .floor()
+        .max(0.0) as i64;
+    let mut refined = Vec::new();
+    for index in min_index..=max_index {
+        let time = (grid_phase + index as f64 * grid_period).round();
+        if !(0.0..=u64::MAX as f64).contains(&time) {
+            continue;
+        }
+        let time = Duration::from_micros(time as u64);
+        let nearest = raw_events
+            .iter()
+            .min_by_key(|event| event.time.abs_diff(time));
+        if let Some(nearest) = nearest {
+            let mut event = nearest.clone();
+            event.time = time;
+            refined.push(event);
+        }
+    }
+    if refined.len() < GRID_REFINEMENT_MIN_EVENTS {
+        return unavailable("unavailable", "refined_grid_too_short");
+    }
+    let inserted = refined.len().saturating_sub(fit.unique_indices.len());
+    (
+        refined.clone(),
+        ResearchBeatGridRefinement {
+            algorithm: "robust_phase_period_fit_v1".into(),
+            accepted: true,
+            stationarity_status: "stationary".into(),
+            raw_event_count: raw_events.len(),
+            refined_event_count: refined.len(),
+            fit_period_micros: Some(fit.period_micros),
+            fit_bpm: Some((60_000_000.0 / fit.period_micros) as f32),
+            grid_period_micros: Some(grid_period),
+            grid_bpm: Some((60_000_000.0 / grid_period) as f32),
+            classical_anchor_bpm,
+            phase_anchor_micros,
+            phase_anchor_used: (grid_phase - raw_phase as f64).abs() > f64::EPSILON,
+            phase_micros: Some(grid_phase),
+            residual_median_micros: residual_median,
+            residual_p95_micros: residual_p95,
+            raw_events_explained_fraction: Some(explained_fraction),
+            inserted_grid_count: inserted,
+            rejected_event_count: raw_events.len().saturating_sub(explained),
+            reason: "accepted_stationary_global_phase_period_fit".into(),
+        },
+    )
+}
+
+fn refined_analysis_for_research(
+    analysis: &TrackAnalysisV2,
+    classical_anchor_bpm: Option<f32>,
+    grid_end_micros: u64,
+) -> (
+    TrackAnalysisV2,
+    Vec<Duration>,
+    Vec<Duration>,
+    ResearchBeatGridRefinement,
+) {
+    let raw_times = analysis
+        .rhythm
+        .beats
+        .iter()
+        .map(|event| event.time)
+        .collect::<Vec<_>>();
+    let (refined_events, refinement) = refine_research_grid(
+        &analysis.rhythm.beats,
+        classical_anchor_bpm,
+        Some(grid_end_micros),
+        Some(analysis.audible_start.as_micros() as u64),
+    );
+    let mut refined_analysis = analysis.clone();
+    if refinement.accepted {
+        refined_analysis.rhythm.beats = refined_events;
+    }
+    let refined_times = refined_analysis
+        .rhythm
+        .beats
+        .iter()
+        .map(|event| event.time)
+        .collect::<Vec<_>>();
+    (refined_analysis, raw_times, refined_times, refinement)
+}
+
 fn realistic_beat_grid_diagnostic(
     truth_times: &[u64],
     detected_times: &[Duration],
@@ -3893,6 +4416,7 @@ fn realistic_beat_grid_diagnostic(
         last_beat_offset_micros: last,
         longitudinal_drift_micros: drift,
         longitudinal_drift_ms_per_min: drift_ms_per_min,
+        matched_timing_errors_micros: absolute,
     }
 }
 
@@ -3907,17 +4431,41 @@ fn percentile_f32(values: &[f32], numerator: usize, denominator: usize) -> Optio
 }
 
 fn beat_grid_aggregate(fixtures: &[&RealisticFixtureObservation]) -> RealisticBeatGridAggregate {
+    beat_grid_aggregate_with(fixtures, false)
+}
+
+fn raw_beat_grid_aggregate(
+    fixtures: &[&RealisticFixtureObservation],
+) -> RealisticBeatGridAggregate {
+    beat_grid_aggregate_with(fixtures, true)
+}
+
+fn selected_grid(fixture: &RealisticFixtureObservation, raw: bool) -> &RealisticBeatGridDiagnostic {
+    if raw {
+        &fixture.raw_beat_grid
+    } else {
+        &fixture.beat_grid
+    }
+}
+
+fn beat_grid_aggregate_with(
+    fixtures: &[&RealisticFixtureObservation],
+    raw: bool,
+) -> RealisticBeatGridAggregate {
     let truth_beats = fixtures
         .iter()
-        .map(|fixture| fixture.beat_grid.truth_beat_count)
+        .map(|fixture| selected_grid(fixture, raw))
+        .map(|grid| grid.truth_beat_count)
         .sum();
     let detected_beats = fixtures
         .iter()
-        .map(|fixture| fixture.beat_grid.detected_beat_count)
+        .map(|fixture| selected_grid(fixture, raw))
+        .map(|grid| grid.detected_beat_count)
         .sum();
     let matched_beats = fixtures
         .iter()
-        .map(|fixture| fixture.beat_grid.matched_truth_beats)
+        .map(|fixture| selected_grid(fixture, raw))
+        .map(|grid| grid.matched_truth_beats)
         .sum();
     let micro_precision =
         (detected_beats > 0).then(|| matched_beats as f32 / detected_beats as f32);
@@ -3929,31 +4477,43 @@ fn beat_grid_aggregate(fixtures: &[&RealisticFixtureObservation]) -> RealisticBe
         });
     let precisions = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.precision)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.precision)
         .collect::<Vec<_>>();
     let recalls = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.recall)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.recall)
         .collect::<Vec<_>>();
     let f1s = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.f1)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.f1)
         .collect::<Vec<_>>();
     let timing = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.median_absolute_timing_error_micros)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.median_absolute_timing_error_micros)
         .collect::<Vec<_>>();
     let p95_timing = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.p95_absolute_timing_error_micros)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.p95_absolute_timing_error_micros)
         .collect::<Vec<_>>();
     let max_timing = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.max_absolute_timing_error_micros)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.max_absolute_timing_error_micros)
+        .collect::<Vec<_>>();
+    let pooled_timing = fixtures
+        .iter()
+        .map(|fixture| selected_grid(fixture, raw))
+        .flat_map(|grid| grid.matched_timing_errors_micros.iter().copied())
         .collect::<Vec<_>>();
     let drifts = fixtures
         .iter()
-        .filter_map(|fixture| fixture.beat_grid.longitudinal_drift_ms_per_min)
+        .map(|fixture| selected_grid(fixture, raw))
+        .filter_map(|grid| grid.longitudinal_drift_ms_per_min.map(f32::abs))
         .collect::<Vec<_>>();
     RealisticBeatGridAggregate {
         fixture_count: fixtures.len(),
@@ -3968,6 +4528,7 @@ fn beat_grid_aggregate(fixtures: &[&RealisticFixtureObservation]) -> RealisticBe
         fixture_median_f1: percentile_f32(&f1s, 1, 2),
         median_timing_error_micros: median_u64(&timing),
         p95_timing_error_micros: median_u64(&p95_timing),
+        pooled_p95_timing_error_micros: percentile_u64(&pooled_timing, 19, 20),
         max_timing_error_micros: max_timing.into_iter().max(),
         median_drift_ms_per_min: percentile_f32(&drifts, 1, 2),
         p95_drift_ms_per_min: percentile_f32(&drifts, 19, 20),
@@ -4022,14 +4583,80 @@ fn beat_grid_summary(
         .iter()
         .filter(|fixture| !successful_fixture_ids.contains(&fixture.fixture_id))
         .collect::<Vec<_>>();
+    let raw_grouped = |key: fn(&RealisticFixtureObservation) -> String| {
+        let mut groups = BTreeMap::<String, Vec<&RealisticFixtureObservation>>::new();
+        for fixture in fixtures {
+            groups.entry(key(fixture)).or_default().push(fixture);
+        }
+        groups
+            .into_iter()
+            .map(|(key, fixtures)| (key, raw_beat_grid_aggregate(&fixtures)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let raw_all = raw_beat_grid_aggregate(&all);
+    let refined_all = beat_grid_aggregate(&all);
+    let raw_successful = raw_beat_grid_aggregate(&successful);
+    let refined_successful = beat_grid_aggregate(&successful);
+    let raw_failed = raw_beat_grid_aggregate(&failed);
+    let refined_failed = beat_grid_aggregate(&failed);
+    let minimum_constant_fixture_recall = fixtures
+        .iter()
+        .filter(|fixture| fixture.truth_bpm.is_finite())
+        .filter_map(|fixture| fixture.refined_beat_grid.recall)
+        .min_by(f32::total_cmp);
+    let refined_absolute_p95_drift_ms_per_min = refined_all.p95_drift_ms_per_min;
+    let quality_passed = refined_all
+        .micro_precision
+        .is_some_and(|value| value >= GRID_GATE_MIN_MICRO_PRECISION)
+        && refined_all
+            .micro_recall
+            .is_some_and(|value| value >= GRID_GATE_MIN_MICRO_RECALL)
+        && refined_all
+            .micro_f1
+            .is_some_and(|value| value >= GRID_GATE_MIN_MICRO_F1)
+        && minimum_constant_fixture_recall
+            .is_some_and(|value| value >= GRID_GATE_MIN_CONSTANT_RECALL)
+        && refined_all
+            .pooled_p95_timing_error_micros
+            .is_some_and(|value| value <= GRID_GATE_MAX_P95_TIMING_MICROS)
+        && refined_absolute_p95_drift_ms_per_min
+            .is_some_and(|value| value <= GRID_GATE_MAX_P95_DRIFT_MS_PER_MIN);
     RealisticBeatGridSummary {
         matching_tolerance_micros: REALISTIC_BEAT_MATCH_TOLERANCE_MICROS,
-        all: beat_grid_aggregate(&all),
+        raw_all,
+        refined_all: refined_all.clone(),
+        raw_by_bpm_region: raw_grouped(|fixture| bpm_region(fixture.truth_bpm)),
+        refined_by_bpm_region: grouped(|fixture| bpm_region(fixture.truth_bpm)),
+        raw_by_profile: raw_grouped(|fixture| fixture.profile.clone()),
+        refined_by_profile: grouped(|fixture| fixture.profile.clone()),
+        raw_by_duration: raw_grouped(|fixture| format!("{}s", fixture.duration_micros / 1_000_000)),
+        refined_by_duration: grouped(|fixture| format!("{}s", fixture.duration_micros / 1_000_000)),
+        raw_successful_beatmatched: raw_successful,
+        refined_successful_beatmatched: refined_successful.clone(),
+        raw_failed_beatmatched: raw_failed,
+        refined_failed_beatmatched: refined_failed.clone(),
+        all: refined_all.clone(),
         by_bpm_region: grouped(|fixture| bpm_region(fixture.truth_bpm)),
         by_profile: grouped(|fixture| fixture.profile.clone()),
         by_duration: grouped(|fixture| format!("{}s", fixture.duration_micros / 1_000_000)),
-        successful_beatmatched: beat_grid_aggregate(&successful),
-        failed_beatmatched: beat_grid_aggregate(&failed),
+        successful_beatmatched: refined_successful,
+        failed_beatmatched: refined_failed,
+        quality_gate: RealisticBeatGridQualityGate {
+            pre_registered: true,
+            min_micro_precision: GRID_GATE_MIN_MICRO_PRECISION,
+            min_micro_recall: GRID_GATE_MIN_MICRO_RECALL,
+            min_micro_f1: GRID_GATE_MIN_MICRO_F1,
+            min_constant_fixture_recall: GRID_GATE_MIN_CONSTANT_RECALL,
+            max_pooled_p95_timing_error_micros: GRID_GATE_MAX_P95_TIMING_MICROS,
+            max_absolute_p95_drift_ms_per_min: GRID_GATE_MAX_P95_DRIFT_MS_PER_MIN,
+            refined_micro_precision: refined_all.micro_precision,
+            refined_micro_recall: refined_all.micro_recall,
+            refined_micro_f1: refined_all.micro_f1,
+            minimum_constant_fixture_recall,
+            refined_pooled_p95_timing_error_micros: refined_all.pooled_p95_timing_error_micros,
+            refined_absolute_p95_drift_ms_per_min,
+            passed: quality_passed,
+        },
     }
 }
 
@@ -4120,9 +4747,11 @@ fn positive_pair_is_correct(
     let Some(pair) = pair else {
         return false;
     };
-    let outgoing_correct = family_correct_bpm(pair.outgoing.bpm, outgoing_truth);
-    let incoming_correct = family_correct_bpm(pair.incoming.bpm, incoming_truth);
-    let expected_ratio = pair.outgoing.bpm / pair.incoming.bpm.max(f32::EPSILON);
+    let outgoing_physical = relation_physical_bpm(pair.outgoing);
+    let incoming_physical = relation_physical_bpm(pair.incoming);
+    let outgoing_correct = family_correct_bpm(outgoing_physical, outgoing_truth);
+    let incoming_correct = family_correct_bpm(incoming_physical, incoming_truth);
+    let expected_ratio = outgoing_physical / incoming_physical.max(f32::EPSILON);
     let truth_ratio = outgoing_truth / incoming_truth.max(f32::EPSILON);
     outgoing_correct
         && incoming_correct
@@ -4139,6 +4768,38 @@ fn counts_as_independent_positive(case: &RealisticPositiveTransitionCase) -> boo
         && case.outgoing_pcm_sha256 != case.incoming_pcm_sha256
         && case.outgoing_master_id != case.incoming_master_id
         && case.outgoing_seed != case.incoming_seed
+}
+
+const TEMPO_REGION_RELATIVE_WINDOW: f32 = 0.05;
+
+/// Stable evaluation-only clustering for successful transition tempo centers.
+/// The representative is fixed when a cluster starts, so nearby values do
+/// not form a transitive chain.  This is never exposed to inference.
+fn cluster_tempo_regions(mut centers: Vec<f32>) -> Vec<f32> {
+    centers.retain(|center| center.is_finite() && *center > 0.0);
+    centers.sort_by(f32::total_cmp);
+    let mut representatives = Vec::new();
+    for center in centers {
+        let joins = representatives.last().is_some_and(|representative: &f32| {
+            (center - *representative).abs() / (*representative).max(f32::EPSILON)
+                <= TEMPO_REGION_RELATIVE_WINDOW
+        });
+        if !joins {
+            representatives.push(center);
+        }
+    }
+    representatives
+}
+
+fn positive_tempo_region_center(case: &RealisticPositiveTransitionCase) -> f32 {
+    let ratio = case.outgoing_truth_bpm / case.incoming_truth_bpm.max(f32::EPSILON);
+    if (ratio - 0.5).abs() <= RELATION_RESOLUTION_TOLERANCE
+        || (ratio - 2.0).abs() <= RELATION_RESOLUTION_TOLERANCE
+    {
+        case.outgoing_truth_bpm.min(case.incoming_truth_bpm)
+    } else {
+        (case.outgoing_truth_bpm * case.incoming_truth_bpm).sqrt()
+    }
 }
 
 fn relation_physical_bpm(hypothesis: TempoHypothesis) -> f32 {
@@ -4600,16 +5261,28 @@ fn build_positive_realistic_corpus(
                 .clone()
                 .unwrap_or_else(|| fixture.spec.id.clone());
             let seed = fixture.spec.seed;
+            let grid_end_micros = fixture.spec.duration_micros;
             let truth_beat_times_micros = fixture.truth.beat_times_micros.clone();
             let analyzed = analyze_long_fixture(fixture.clone())?;
+            let (research_analysis, raw_beat_times, refined_beat_times, grid_refinement) =
+                refined_analysis_for_research(
+                    &analyzed.v2,
+                    analyzed.observation.classical.production_selected_bpm,
+                    grid_end_micros,
+                );
+            let mut flow = build_flow_observation(&analyzed);
+            flow.research_analysis = Some(research_analysis);
             Ok((
                 RealisticFlow {
                     profile,
-                    flow: build_flow_observation(&analyzed),
+                    flow,
                     pcm_sha256,
                     master_id,
                     seed,
                     truth_beat_times_micros,
+                    raw_beat_times,
+                    refined_beat_times,
+                    grid_refinement,
                 },
                 fixture,
             ))
@@ -4628,22 +5301,12 @@ fn build_positive_realistic_corpus(
                 .iter()
                 .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
                 .expect("positive decision exists");
-            let beat_grid = item
-                .flow
-                .research_analysis
-                .as_ref()
-                .map(|analysis| {
-                    let detected = analysis
-                        .rhythm
-                        .beats
-                        .iter()
-                        .map(|event| event.time)
-                        .collect::<Vec<_>>();
-                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &detected)
-                })
-                .unwrap_or_else(|| {
-                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &[])
-                });
+            let raw_beat_grid =
+                realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &item.raw_beat_times);
+            let refined_beat_grid = realistic_beat_grid_diagnostic(
+                &item.truth_beat_times_micros,
+                &item.refined_beat_times,
+            );
             RealisticFixtureObservation {
                 fixture_id: item.flow.fixture_id.clone(),
                 profile: item.profile.clone(),
@@ -4658,6 +5321,18 @@ fn build_positive_realistic_corpus(
                     .as_ref()
                     .map(|analysis| analysis.rhythm.beats.len())
                     .unwrap_or(0),
+                raw_event_count: item.raw_beat_times.len(),
+                refined_event_count: item.refined_beat_times.len(),
+                raw_event_times_micros: item
+                    .raw_beat_times
+                    .iter()
+                    .map(|time| time.as_micros() as u64)
+                    .collect(),
+                refined_grid_times_micros: item
+                    .refined_beat_times
+                    .iter()
+                    .map(|time| time.as_micros() as u64)
+                    .collect(),
                 first_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
                     analysis
                         .rhythm
@@ -4712,7 +5387,10 @@ fn build_positive_realistic_corpus(
                 selected_relation: decision.row.selected_relation.clone(),
                 relation_resolution: decision.row.metrical_consistency.clone(),
                 safe_fallback_only: decision.row.decision != "select",
-                beat_grid,
+                raw_beat_grid,
+                refined_beat_grid: refined_beat_grid.clone(),
+                grid_refinement: item.grid_refinement.clone(),
+                beat_grid: refined_beat_grid,
             }
         })
         .collect::<Vec<_>>();
@@ -4809,11 +5487,12 @@ fn build_positive_realistic_corpus(
             }
         })
         .collect::<Vec<_>>();
-    let successful_tempo_regions = successful_cases
-        .iter()
-        .flat_map(|case| [case.outgoing_truth_bpm, case.incoming_truth_bpm])
-        .map(|bpm| format!("{bpm:.1}"))
-        .collect::<BTreeSet<_>>();
+    let successful_tempo_region_centers = cluster_tempo_regions(
+        successful_cases
+            .iter()
+            .map(|case| positive_tempo_region_center(case))
+            .collect(),
+    );
     let successful_profiles = successful_cases
         .iter()
         .flat_map(|case| {
@@ -4859,7 +5538,7 @@ fn build_positive_realistic_corpus(
         .count();
     let external_gate_passed = !copy_boundary_window
         && independent_correct_beatmatched >= 5
-        && successful_tempo_regions.len() >= 3
+        && successful_tempo_region_centers.len() >= 3
         && successful_profiles.len() >= 2
         && successful_duration_configs.len() >= 2
         && independent_false_beatmatched == 0;
@@ -4926,7 +5605,8 @@ fn build_positive_realistic_corpus(
             .filter(|case| case.cue_free_probe_used)
             .count(),
         independent_correct_beatmatched,
-        distinct_success_tempo_regions: successful_tempo_regions.len(),
+        distinct_success_tempo_regions: successful_tempo_region_centers.len(),
+        success_tempo_region_centers_bpm: successful_tempo_region_centers,
         distinct_success_profiles: successful_profiles.len(),
         distinct_success_duration_configs: successful_duration_configs.len(),
         independent_false_beatmatched,
@@ -5378,15 +6058,27 @@ fn build_realistic_corpus_report(
                 .clone()
                 .unwrap_or_else(|| fixture.spec.id.clone());
             let seed = fixture.spec.seed;
+            let grid_end_micros = fixture.spec.duration_micros;
             let truth_beat_times_micros = fixture.truth.beat_times_micros.clone();
             let analyzed = analyze_long_fixture(fixture)?;
+            let (research_analysis, raw_beat_times, refined_beat_times, grid_refinement) =
+                refined_analysis_for_research(
+                    &analyzed.v2,
+                    analyzed.observation.classical.production_selected_bpm,
+                    grid_end_micros,
+                );
+            let mut flow = build_flow_observation(&analyzed);
+            flow.research_analysis = Some(research_analysis);
             Ok(RealisticFlow {
                 profile,
-                flow: build_flow_observation(&analyzed),
+                flow,
                 pcm_sha256,
                 master_id,
                 seed,
                 truth_beat_times_micros,
+                raw_beat_times,
+                refined_beat_times,
+                grid_refinement,
             })
         })
         .collect::<Result<Vec<_>, LabError>>()?;
@@ -5399,22 +6091,12 @@ fn build_realistic_corpus_report(
                 .iter()
                 .find(|decision| decision.row.fixture_id == item.flow.fixture_id)
                 .expect("realistic decision exists");
-            let beat_grid = item
-                .flow
-                .research_analysis
-                .as_ref()
-                .map(|analysis| {
-                    let detected = analysis
-                        .rhythm
-                        .beats
-                        .iter()
-                        .map(|event| event.time)
-                        .collect::<Vec<_>>();
-                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &detected)
-                })
-                .unwrap_or_else(|| {
-                    realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &[])
-                });
+            let raw_beat_grid =
+                realistic_beat_grid_diagnostic(&item.truth_beat_times_micros, &item.raw_beat_times);
+            let refined_beat_grid = realistic_beat_grid_diagnostic(
+                &item.truth_beat_times_micros,
+                &item.refined_beat_times,
+            );
             RealisticFixtureObservation {
                 fixture_id: item.flow.fixture_id.clone(),
                 profile: item.profile.clone(),
@@ -5429,6 +6111,18 @@ fn build_realistic_corpus_report(
                     .as_ref()
                     .map(|analysis| analysis.rhythm.beats.len())
                     .unwrap_or(0),
+                raw_event_count: item.raw_beat_times.len(),
+                refined_event_count: item.refined_beat_times.len(),
+                raw_event_times_micros: item
+                    .raw_beat_times
+                    .iter()
+                    .map(|time| time.as_micros() as u64)
+                    .collect(),
+                refined_grid_times_micros: item
+                    .refined_beat_times
+                    .iter()
+                    .map(|time| time.as_micros() as u64)
+                    .collect(),
                 first_event_micros: item.flow.research_analysis.as_ref().and_then(|analysis| {
                     analysis
                         .rhythm
@@ -5483,7 +6177,10 @@ fn build_realistic_corpus_report(
                 selected_relation: decision.row.selected_relation.clone(),
                 relation_resolution: decision.row.metrical_consistency.clone(),
                 safe_fallback_only: decision.row.decision != "select",
-                beat_grid,
+                raw_beat_grid,
+                refined_beat_grid: refined_beat_grid.clone(),
+                grid_refinement: item.grid_refinement.clone(),
+                beat_grid: refined_beat_grid,
             }
         })
         .collect::<Vec<_>>();
@@ -6002,6 +6699,45 @@ fn env_flag(name: &str) -> bool {
     matches!(std::env::var(name).as_deref(), Ok("1" | "true" | "yes"))
 }
 
+fn external_gate_evidence() -> BTreeMap<String, GateEvidenceRecord> {
+    let source = std::env::var("WOTOHA_GATE_EVIDENCE_SOURCE")
+        .unwrap_or_else(|_| "unprovided orchestration evidence".into());
+    let digest = std::env::var("WOTOHA_GATE_EVIDENCE_DIGEST").ok();
+    EXTERNAL_EVIDENCE_CONDITIONS
+        .iter()
+        .map(|condition| {
+            let env_name = match *condition {
+                "repeatability_passed" => "WOTOHA_REPEATABILITY_PASSED",
+                "fmt_passed" => "WOTOHA_FMT_PASSED",
+                "check_passed" => "WOTOHA_CHECK_PASSED",
+                "test_passed" => "WOTOHA_TEST_PASSED",
+                "clippy_passed" => "WOTOHA_CLIPPY_PASSED",
+                "ci_passed" => "WOTOHA_CI_PASSED",
+                "container_passed" => "WOTOHA_CONTAINER_PASSED",
+                "youtube_compatibility_no_current_regression" => {
+                    "WOTOHA_YOUTUBE_NO_CURRENT_REGRESSION"
+                }
+                "storage_cleanup_verified" => "WOTOHA_STORAGE_CLEANUP_VERIFIED",
+                _ => unreachable!("all external evidence conditions have an env mapping"),
+            };
+            (
+                (*condition).to_owned(),
+                GateEvidenceRecord {
+                    condition: (*condition).to_owned(),
+                    value: env_flag(env_name),
+                    evidence_source: source.clone(),
+                    evidence_digest: digest.clone(),
+                    command_or_run: std::env::var(format!(
+                        "WOTOHA_{}_COMMAND",
+                        condition.to_ascii_uppercase()
+                    ))
+                    .unwrap_or_else(|_| "see packaged gate evidence manifest".into()),
+                },
+            )
+        })
+        .collect()
+}
+
 fn env_flag_matches_commit(source_commit: &str) -> bool {
     std::env::var("WOTOHA_FINAL_HEAD").is_ok_and(|expected| expected == source_commit)
 }
@@ -6009,6 +6745,24 @@ fn env_flag_matches_commit(source_commit: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verified_external_evidence() -> BTreeMap<String, GateEvidenceRecord> {
+        EXTERNAL_EVIDENCE_CONDITIONS
+            .iter()
+            .map(|condition| {
+                (
+                    (*condition).to_owned(),
+                    GateEvidenceRecord {
+                        condition: (*condition).to_owned(),
+                        value: true,
+                        evidence_source: "unit-test evidence".to_owned(),
+                        evidence_digest: Some("unit-test-digest".to_owned()),
+                        command_or_run: "unit-test".to_owned(),
+                    },
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn metrical_guard_accepts_primary_and_harmonic_aliases() {
@@ -6277,6 +7031,7 @@ mod tests {
             runtime_feasible_false_confident_zero: true,
             variable_tempo_safety_passed: true,
             beat_grid_evaluation_completed: true,
+            beat_grid_quality_passed: true,
             candidate_budget_bounded: true,
             repeatability_passed: true,
             fmt_passed: true,
@@ -6287,8 +7042,17 @@ mod tests {
             container_passed: true,
             youtube_compatibility_no_current_regression: true,
             storage_cleanup_verified: true,
+            evidence: verified_external_evidence(),
         };
         assert!(evaluate_external_validation_gate(&all_pass).external_validation_required);
+        let mut missing_evidence = all_pass.clone();
+        missing_evidence.evidence.remove("fmt_passed");
+        let missing_evidence_gate = evaluate_external_validation_gate(&missing_evidence);
+        assert_eq!(
+            missing_evidence_gate.condition_statuses["fmt_passed"],
+            "UNVERIFIED"
+        );
+        assert!(!missing_evidence_gate.external_validation_required);
         let mut cue_free = all_pass.clone();
         cue_free.no_cue_free_probe_successes_counted = false;
         let gate = evaluate_external_validation_gate(&cue_free);
@@ -6296,6 +7060,131 @@ mod tests {
         assert_eq!(
             gate.failed_conditions,
             vec!["no_cue_free_probe_successes_counted"]
+        );
+        let mut poor_grid = all_pass;
+        poor_grid.beat_grid_quality_passed = false;
+        assert_eq!(
+            evaluate_external_validation_gate(&poor_grid).failed_conditions,
+            vec!["beat_grid_quality_passed"]
+        );
+    }
+
+    #[test]
+    fn research_grid_corrects_quantized_period_and_uses_bounded_endpoint() {
+        let template = synthetic_analysis(100.0, 100.0, "primary").rhythm.beats[0].clone();
+        let raw = (0..12)
+            .map(|index| {
+                let mut event = template.clone();
+                event.time = Duration::from_micros(503_000 + index * 601_000);
+                event
+            })
+            .collect::<Vec<_>>();
+        let (refined, diagnostics) =
+            refine_research_grid(&raw, None, Some(6_000_000), Some(467_000));
+        assert!(diagnostics.accepted);
+        assert_eq!(diagnostics.grid_bpm, Some(100.0));
+        assert_eq!(diagnostics.grid_period_micros, Some(600_000.0));
+        assert!(refined.len() >= 9);
+        assert_eq!(
+            refined.first().map(|event| event.time),
+            Some(Duration::from_micros(503_000))
+        );
+    }
+
+    #[test]
+    fn research_grid_can_reanchor_a_late_first_event_without_truth() {
+        let template = synthetic_analysis(140.0, 140.0, "primary").rhythm.beats[0].clone();
+        let raw = (0..12)
+            .map(|index| {
+                let mut event = template.clone();
+                event.time = Duration::from_micros(3_580_000 + index * 429_000);
+                event
+            })
+            .collect::<Vec<_>>();
+        let (refined, diagnostics) =
+            refine_research_grid(&raw, Some(69.9), Some(6_000_000), Some(467_000));
+        assert!(diagnostics.accepted);
+        assert!(diagnostics.phase_anchor_used);
+        assert_eq!(
+            refined.first().map(|event| event.time),
+            Some(Duration::from_micros(467_000))
+        );
+    }
+
+    #[test]
+    fn research_grid_uses_zero_phase_anchor_for_zero_lead_in() {
+        let template = synthetic_analysis(100.0, 100.0, "primary").rhythm.beats[0].clone();
+        let raw = (0..12)
+            .map(|index| {
+                let mut event = template.clone();
+                event.time = Duration::from_micros(59_863 + index * 600_000);
+                event
+            })
+            .collect::<Vec<_>>();
+        let (refined, diagnostics) = refine_research_grid(&raw, None, Some(6_000_000), Some(0));
+        assert!(diagnostics.accepted);
+        assert!(diagnostics.phase_anchor_used);
+        assert_eq!(diagnostics.phase_micros, Some(0.0));
+        assert_eq!(
+            refined.first().map(|event| event.time),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn research_grid_accepts_slightly_long_one_second_intervals() {
+        let template = synthetic_analysis(60.0, 60.0, "primary").rhythm.beats[0].clone();
+        let raw = (0..31)
+            .map(|index| {
+                let mut event = template.clone();
+                event.time = Duration::from_micros(index * 1_002_000);
+                event
+            })
+            .collect::<Vec<_>>();
+        let (_, diagnostics) = refine_research_grid(&raw, None, Some(30_000_000), Some(0));
+        assert!(diagnostics.accepted, "{diagnostics:?}");
+    }
+
+    #[test]
+    fn research_grid_rejects_insufficient_support_and_nonstationarity() {
+        let template = synthetic_analysis(120.0, 120.0, "primary").rhythm.beats[0].clone();
+        let short = (0..GRID_REFINEMENT_MIN_EVENTS - 1)
+            .map(|index| {
+                let mut event = template.clone();
+                event.time = Duration::from_micros(index as u64 * 500_000);
+                event
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !refine_research_grid(&short, None, Some(5_000_000), Some(0))
+                .1
+                .accepted
+        );
+
+        let drifting = (0..16)
+            .map(|index| {
+                let mut event = template.clone();
+                let index = index as u64;
+                event.time = Duration::from_micros(
+                    index * 500_000 + index.saturating_mul(index).saturating_mul(8_000),
+                );
+                event
+            })
+            .collect::<Vec<_>>();
+        let diagnostics = refine_research_grid(&drifting, None, Some(9_000_000), Some(0)).1;
+        assert!(!diagnostics.accepted);
+        assert!(matches!(
+            diagnostics.stationarity_status.as_str(),
+            "nonstationary" | "residual_rejected"
+        ));
+    }
+
+    #[test]
+    fn tempo_region_clustering_keeps_nearby_values_together_without_chaining() {
+        assert_eq!(cluster_tempo_regions(vec![128.0, 130.0]), vec![128.0]);
+        assert_eq!(
+            cluster_tempo_regions(vec![120.0, 126.0, 132.0]),
+            vec![120.0, 132.0]
         );
     }
 
