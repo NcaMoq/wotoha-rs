@@ -9,5 +9,7 @@ repository.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
+symphonia.workspace = true
 wotoha-core = { path = "../wotoha-core" }
 wotoha-runtime = { path = "../wotoha-runtime" }

@@ -5454,6 +5454,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "symphonia 0.5.5",
+ "tokio",
  "wotoha-core",
  "wotoha-runtime",
 ]

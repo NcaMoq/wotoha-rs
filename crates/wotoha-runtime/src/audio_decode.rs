@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
@@ -184,6 +185,35 @@ pub(crate) fn analyze_input_with_cancel_outcome(
         ANALYSIS_RATE as usize * MAX_ANALYSIS_SECONDS,
         cancelled,
     )
+}
+
+/// Research-only file boundary for the existing production decoder.
+///
+/// This additive entry point is intentionally not called by playback or cache
+/// code. It lets analysis-lab exercise the same Songbird/Symphonia promotion,
+/// resampling, classical analysis, and neural analysis path for local files
+/// without duplicating decoder semantics in the lab crate.
+pub async fn analyze_file_for_research(path: PathBuf) -> Option<AnalysisOutcome> {
+    let input = Input::from(songbird::input::File::new(path));
+    analyze_input_for_research(input).await
+}
+
+/// Research-only in-memory boundary used for independently decoded segments.
+/// The bytes are expected to be a self-contained audio container (the lab
+/// currently supplies PCM/WAVE). Production callers do not use this path.
+pub async fn analyze_bytes_for_research(bytes: Vec<u8>) -> Option<AnalysisOutcome> {
+    analyze_input_for_research(Input::from(bytes)).await
+}
+
+async fn analyze_input_for_research(input: Input) -> Option<AnalysisOutcome> {
+    let playable = input
+        .make_playable_async(
+            songbird::input::codecs::get_codec_registry(),
+            songbird::input::codecs::get_probe(),
+        )
+        .await
+        .ok()?;
+    analyze_input_with_cancel_outcome(playable, &AtomicBool::new(false))
 }
 
 fn analyze_input_with_limit(

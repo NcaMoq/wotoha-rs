@@ -27,10 +27,12 @@ pub use tempo_shadow_followup::{TempoShadowFollowupReport, run_tempo_shadow_foll
 mod tempo_conservative_shadow;
 pub use tempo_conservative_shadow::{
     ExternalValidationGate, ExternalValidationGateInputs, RealisticSyntheticCorpusReport,
-    TempoConservativeShadowReport, evaluate_external_validation_gate,
+    TempoConservativeShadowReport, evaluate_external_validation_gate, quality_first_shadow_plan,
     run_independent_positive_corpus_research, run_realistic_corpus_research,
     run_tempo_conservative_shadow_research,
 };
+mod real_song_research;
+pub use real_song_research::{RealSongResearchReport, run_real_song_research};
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},
     audio_analysis::LowBandFilter,

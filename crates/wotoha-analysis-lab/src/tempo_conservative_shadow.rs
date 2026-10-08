@@ -2564,6 +2564,18 @@ fn quality_first_shadow_transition<O: V2AnalysisInput, I: V2AnalysisInput>(
     (planned, selected)
 }
 
+/// Public research-only adapter for the quality-first shadow policy. The
+/// production planner remains unchanged; this merely exposes the exact
+/// already-tested policy to other lab reports that need to compare ordinary
+/// and quality-first research outcomes.
+pub fn quality_first_shadow_plan<O: V2AnalysisInput, I: V2AnalysisInput>(
+    outgoing: &O,
+    incoming: &I,
+    config: &AutoMixConfig,
+) -> (TransitionPlanV2, V2GuardedTransitionPlan) {
+    quality_first_shadow_transition(outgoing, incoming, config)
+}
+
 /// Apply the same quality-first shadow policy with the objective rendered
 /// quality observation available to the synthetic transition harness.  The
 /// ordinary planner remains the fallback whenever the proposed BeatMatched

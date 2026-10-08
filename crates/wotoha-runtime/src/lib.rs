@@ -15,7 +15,9 @@ mod tempo_stretch;
 mod transition_dsp;
 mod validated_hls;
 
-pub use audio_decode::{AnalysisBackend, AnalysisOutcome};
+pub use audio_decode::{
+    AnalysisBackend, AnalysisOutcome, analyze_bytes_for_research, analyze_file_for_research,
+};
 pub use automix_cache::{
     ANALYSIS_CACHE_SCHEMA_VERSION, ANALYSIS_CACHE_V2_MAX_FILE_BYTES,
     ANALYSIS_CACHE_V2_SCHEMA_VERSION, ANALYSIS_CACHE_V2_UNKNOWN_SCORE, AnalysisCache,
