@@ -257,11 +257,22 @@ cargo run --release --locked -p wotoha-analysis-lab -- \
 The consensus report keeps physical-period estimation separate from canonical
 primary/half/double layer selection. It compares local interval medians,
 segment clocks, bounded global regressions, endpoint estimates, the existing
-robust grid fit, and Classical candidate evidence. Fixed representative
-clusters avoid transitive-chain inflation; unresolved independent conflicts
-produce `RETAIN_MULTIPLE` or `ABSTAIN`. The command is research-only, uses no
-external observer value as an inference feature, and does not change beat
-events, production tempo authority, or AutoMix behavior.
+robust grid fit, and Classical candidate evidence. Each candidate records its
+source, derivation, and evidence channel. Fixed representative clusters use
+only the best candidate from each channel, so sequential and missing-jump
+estimators cannot masquerade as independent votes. Unresolved independent
+conflicts produce `RETAIN_MULTIPLE` or `ABSTAIN`.
+
+Candidate phase is fitted from a bounded sample of event remainders and fixed
+phase buckets with a trimmed residual objective. The first BeatEvent is not a
+phase anchor, so isolated endpoint errors do not shift the global candidate.
+The report exposes `SELECTED_STRONG`, `SELECTED_MODERATE`, `RETAIN_MULTIPLE`,
+and `ABSTAIN` confidence states, plus a deterministic synthetic hardening
+suite covering non-integer periods, missing/extra events, endpoint corruption,
+nearby false periods, correlated-channel duplication, metrical alternatives,
+and non-stationarity. The command is research-only, uses no external observer
+value as an inference feature, and does not change beat events, production
+tempo authority, or AutoMix behavior.
 
 ### Conservative tempo shadow
 
