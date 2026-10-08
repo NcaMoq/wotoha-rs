@@ -62,7 +62,6 @@ const GRID_GATE_MAX_P95_DRIFT_MS_PER_MIN: f32 = 35.0;
 const GRID_REFINEMENT_MIN_EVENTS: usize = 8;
 const GRID_REFINEMENT_RESIDUAL_TOLERANCE_MICROS: i64 = 35_000;
 const GRID_REFINEMENT_MAX_MEDIAN_RESIDUAL_MICROS: u64 = 20_000;
-const GRID_REFINEMENT_INTEGER_BPM_MAX_DISTANCE: f32 = 0.35;
 const GRID_REFINEMENT_MAX_STATIONARY_DRIFT: f64 = 0.005;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3969,7 +3968,6 @@ const REALISTIC_BEAT_MATCH_TOLERANCE_MICROS: u64 = 35_000;
 #[derive(Clone, Debug)]
 struct GridFit {
     period_micros: f64,
-    endpoint_period_micros: Option<f64>,
     phase_micros: f64,
     residuals_micros: Vec<u64>,
     unique_indices: BTreeSet<i64>,
@@ -4095,32 +4093,8 @@ fn fit_stationary_grid(times_micros: &[u64]) -> Option<GridFit> {
         .zip(segment_periods.last())
         .map(|(first, last)| (last - first).abs() / first.max(f64::EPSILON))
         .unwrap_or(0.0);
-    let endpoint_period_micros = unique_indices
-        .iter()
-        .next()
-        .zip(unique_indices.iter().next_back())
-        .and_then(|(first_index, last_index)| {
-            let span = *last_index - *first_index;
-            if span < 8 {
-                return None;
-            }
-            let first_time = times_micros
-                .iter()
-                .zip(indices.iter())
-                .filter(|(_, index)| **index == *first_index)
-                .map(|(time, _)| *time as f64)
-                .min_by(f64::total_cmp)?;
-            let last_time = times_micros
-                .iter()
-                .zip(indices.iter())
-                .filter(|(_, index)| **index == *last_index)
-                .map(|(time, _)| *time as f64)
-                .max_by(f64::total_cmp)?;
-            Some((last_time - first_time) / span as f64)
-        });
     Some(GridFit {
         period_micros: period,
-        endpoint_period_micros,
         phase_micros: phase,
         residuals_micros,
         unique_indices,
@@ -4225,28 +4199,10 @@ fn refine_research_grid(
         );
     }
 
-    let fit_period = if let Some(endpoint_period) = fit.endpoint_period_micros {
-        let regression_bpm = 60_000_000.0 / fit.period_micros;
-        let regression_near_integer = (regression_bpm - regression_bpm.round()).abs() <= 0.35;
-        let endpoint_near_regression = (endpoint_period - fit.period_micros).abs()
-            / fit.period_micros.max(f64::EPSILON)
-            <= 0.005;
-        if !regression_near_integer && endpoint_near_regression {
-            endpoint_period
-        } else {
-            fit.period_micros
-        }
-    } else {
-        fit.period_micros
-    };
-    let fit_bpm = (60_000_000.0 / fit_period) as f32;
-    let fit_integer_bpm = fit_bpm.round();
-    let integer_consensus = fit_integer_bpm.is_finite()
-        && (fit_bpm - fit_integer_bpm).abs() <= GRID_REFINEMENT_INTEGER_BPM_MAX_DISTANCE;
-    let grid_bpm = integer_consensus.then_some(fit_integer_bpm);
-    let grid_period = grid_bpm
-        .map(|bpm| 60_000_000.0 / bpm as f64)
-        .unwrap_or(fit_period);
+    // Keep the fitted physical period. Integer BPM snapping remains an
+    // audit-only diagnostic elsewhere; it must never become grid authority.
+    let fit_period = fit.period_micros;
+    let grid_period = fit_period;
     let raw_phase = raw_times.first().copied().unwrap_or_default();
     let grid_phase = phase_anchor_micros
         .filter(|anchor| {
@@ -7082,7 +7038,7 @@ mod tests {
     }
 
     #[test]
-    fn research_grid_corrects_quantized_period_and_uses_bounded_endpoint() {
+    fn research_grid_preserves_fractional_period_without_integer_snap() {
         let template = synthetic_analysis(100.0, 100.0, "primary").rhythm.beats[0].clone();
         let raw = (0..12)
             .map(|index| {
@@ -7094,8 +7050,8 @@ mod tests {
         let (refined, diagnostics) =
             refine_research_grid(&raw, None, Some(6_000_000), Some(467_000));
         assert!(diagnostics.accepted);
-        assert_eq!(diagnostics.grid_bpm, Some(100.0));
-        assert_eq!(diagnostics.grid_period_micros, Some(600_000.0));
+        assert!((diagnostics.grid_bpm.unwrap() - (60_000_000.0 / 601_000.0)).abs() < 0.001);
+        assert_eq!(diagnostics.grid_period_micros, Some(601_000.0));
         assert!(refined.len() >= 9);
         assert_eq!(
             refined.first().map(|event| event.time),

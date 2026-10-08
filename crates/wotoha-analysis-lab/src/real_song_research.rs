@@ -30,13 +30,12 @@ use wotoha_core::{
 };
 use wotoha_runtime::{AnalysisOutcome, analyze_bytes_for_research, analyze_file_for_research};
 
-use crate::{LabError, write_json};
+use crate::{LabError, fit_stable_tempo_grid, write_json};
 
 const REPORT_SCHEMA: u32 = 1;
 const SEGMENT_SECONDS: [u64; 2] = [30, 60];
 const STATIONARY_RELATIVE_DRIFT: f64 = 0.03;
 const STATIONARY_RELATIVE_MAD: f64 = 0.08;
-const REFINEMENT_RESIDUAL_MICROS: u64 = 40_000;
 const INTEGER_SNAP_RISK_RELATIVE: f64 = 0.0025;
 const MAX_PAIR_REPORTS: usize = 16;
 
@@ -96,6 +95,7 @@ pub struct RealSongAnalysisReport {
     pub raw_event_times_micros: Vec<u64>,
     pub raw_event_digest: String,
     pub raw_event_clock: RawEventClockReport,
+    pub grid_method_comparison: GridMethodComparisonReport,
     pub refined_grid: RefinedGridReport,
     pub integer_snap_audit: IntegerSnapAudit,
     pub stationarity: StationarityReport,
@@ -131,6 +131,22 @@ pub struct RawEventClockReport {
     pub confidence_min: Option<f32>,
     pub confidence_median: Option<f32>,
     pub confidence_max: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GridMethodComparisonReport {
+    pub adjacent_median_bpm: Option<f64>,
+    pub trimmed_adjacent_median_bpm: Option<f64>,
+    pub early_event_clock_bpm: Option<f64>,
+    pub middle_event_clock_bpm: Option<f64>,
+    pub late_event_clock_bpm: Option<f64>,
+    pub sequential_global_regression_bpm: Option<f64>,
+    pub missing_jump_global_regression_bpm: Option<f64>,
+    pub sequential_endpoint_bpm: Option<f64>,
+    pub missing_jump_endpoint_bpm: Option<f64>,
+    pub classical_selected_bpm: Option<f32>,
+    pub classical_candidate_bpms: Vec<f32>,
+    pub selected_primary_relation: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -612,6 +628,13 @@ fn analysis_report(
         .primary_tempo_hypothesis()
         .map(|hypothesis| format_relation(hypothesis.relation))
         .unwrap_or_else(|| "unknown".into());
+    let grid_method_comparison = grid_method_comparison(
+        &raw_events,
+        &raw_event_clock,
+        legacy.bpm,
+        &tempo_hypotheses,
+        &relation,
+    );
     Ok(RealSongAnalysisReport {
         analysis_backend: if v2.has_native_rhythm_provenance() {
             "neural_v2".into()
@@ -634,10 +657,116 @@ fn analysis_report(
         raw_event_digest: digest_u64s(&raw_events),
         raw_event_times_micros: raw_events,
         raw_event_clock: raw_event_clock.clone(),
+        grid_method_comparison,
         refined_grid,
         integer_snap_audit: integer,
         stationarity: stationarity(&raw_event_clock),
     })
+}
+
+fn grid_method_comparison(
+    events: &[u64],
+    clock: &RawEventClockReport,
+    classical_selected_bpm: Option<f32>,
+    classical_candidates: &[TempoHypothesisReport],
+    relation: &str,
+) -> GridMethodComparisonReport {
+    let intervals = events
+        .windows(2)
+        .filter_map(|pair| (pair[1] > pair[0]).then_some((pair[1] - pair[0]) as f64))
+        .collect::<Vec<_>>();
+    let mut sorted = intervals.clone();
+    sorted.sort_by(f64::total_cmp);
+    let trim = (sorted.len() / 20).min(sorted.len().saturating_sub(1));
+    let trimmed = if sorted.is_empty() {
+        None
+    } else {
+        median(&sorted[trim..sorted.len().saturating_sub(trim)])
+    };
+    let sequential = regression_period(events, None);
+    let base = median(&intervals);
+    let jump_indices = base.map(|period| cumulative_indices(events, period));
+    let missing_jump = jump_indices
+        .as_deref()
+        .and_then(|indices| regression_period(events, Some(indices)));
+    let sequential_endpoint = endpoint_bpm(events, None);
+    let missing_jump_endpoint = jump_indices
+        .as_deref()
+        .and_then(|indices| endpoint_bpm(events, Some(indices)));
+    GridMethodComparisonReport {
+        adjacent_median_bpm: clock.event_clock_bpm,
+        trimmed_adjacent_median_bpm: trimmed.map(|period| 60_000_000.0 / period),
+        early_event_clock_bpm: clock.early_bpm,
+        middle_event_clock_bpm: clock.middle_bpm,
+        late_event_clock_bpm: clock.late_bpm,
+        sequential_global_regression_bpm: sequential.map(|period| 60_000_000.0 / period),
+        missing_jump_global_regression_bpm: missing_jump.map(|period| 60_000_000.0 / period),
+        sequential_endpoint_bpm: sequential_endpoint,
+        missing_jump_endpoint_bpm: missing_jump_endpoint,
+        classical_selected_bpm,
+        classical_candidate_bpms: classical_candidates
+            .iter()
+            .map(|candidate| candidate.bpm)
+            .collect(),
+        selected_primary_relation: relation.into(),
+    }
+}
+
+fn cumulative_indices(events: &[u64], base_period: f64) -> Vec<i64> {
+    let mut indices = vec![0_i64];
+    for pair in events.windows(2) {
+        let interval = pair[1].saturating_sub(pair[0]) as f64;
+        let multiple = (interval / base_period).round().clamp(1.0, 4.0) as i64;
+        indices.push(indices.last().copied().unwrap_or_default() + multiple);
+    }
+    indices
+}
+
+fn regression_period(events: &[u64], indices: Option<&[i64]>) -> Option<f64> {
+    if events.len() < 2 {
+        return None;
+    }
+    let points = events
+        .iter()
+        .enumerate()
+        .map(|(position, time)| {
+            (
+                indices
+                    .and_then(|values| values.get(position).copied())
+                    .unwrap_or(position as i64) as f64,
+                *time as f64,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mean_x = points.iter().map(|(x, _)| *x).sum::<f64>() / points.len() as f64;
+    let mean_y = points.iter().map(|(_, y)| *y).sum::<f64>() / points.len() as f64;
+    let denominator = points
+        .iter()
+        .map(|(x, _)| (*x - mean_x).powi(2))
+        .sum::<f64>();
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    let period = points
+        .iter()
+        .map(|(x, y)| (*x - mean_x) * (*y - mean_y))
+        .sum::<f64>()
+        / denominator;
+    (period.is_finite() && period > 0.0).then_some(period)
+}
+
+fn endpoint_bpm(events: &[u64], indices: Option<&[i64]>) -> Option<f64> {
+    if events.len() < 2 {
+        return None;
+    }
+    let first_index = indices
+        .and_then(|values| values.first().copied())
+        .unwrap_or(0);
+    let last_index = indices
+        .and_then(|values| values.last().copied())
+        .unwrap_or(events.len().saturating_sub(1) as i64);
+    let span = last_index - first_index;
+    (span > 0).then(|| 60_000_000.0 * span as f64 / (events[events.len() - 1] - events[0]) as f64)
 }
 
 fn raw_event_clock(events: &[u64], confidence_values: &[f64]) -> RawEventClockReport {
@@ -735,140 +864,27 @@ fn stationarity(clock: &RawEventClockReport) -> StationarityReport {
 }
 
 fn refine_grid(events: &[u64], duration_micros: u64) -> RefinedGridReport {
-    if events.len() < 8 {
-        return refine_grid_empty(events.len(), "insufficient_support");
-    }
-    let intervals = events
-        .windows(2)
-        .map(|pair| (pair[1] - pair[0]) as f64)
-        .collect::<Vec<_>>();
-    let base = median(&intervals).unwrap_or(0.0);
-    if !base.is_finite() || base <= 0.0 {
-        return refine_grid_empty(events.len(), "ambiguous");
-    }
-    let mut indexes = vec![0.0_f64];
-    let mut period_observations = Vec::new();
-    for interval in &intervals {
-        let multiple = (*interval / base).round().clamp(1.0, 4.0);
-        indexes.push(indexes.last().copied().unwrap_or(0.0) + multiple);
-        period_observations.push(*interval / multiple);
-    }
-    let period = median(&period_observations).unwrap_or(base);
-    let phases = events
-        .iter()
-        .zip(&indexes)
-        .map(|(time, index)| *time as f64 - index * period)
-        .collect::<Vec<_>>();
-    let phase = median(&phases).unwrap_or(events[0] as f64);
-    let residuals = events
-        .iter()
-        .zip(&indexes)
-        .map(|(time, index)| (*time as f64 - (phase + index * period)).abs())
-        .collect::<Vec<_>>();
-    let residual_median = median(&residuals).unwrap_or(f64::INFINITY);
-    let residual_p95 = percentile(&residuals, 0.95).unwrap_or(f64::INFINITY);
-    let drift = {
-        let half = events.len() / 2;
-        if half >= 2 {
-            let early = median(
-                &events[..=half]
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]) as f64)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or(period);
-            let late = median(
-                &events[half..]
-                    .windows(2)
-                    .map(|pair| (pair[1] - pair[0]) as f64)
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or(period);
-            let index_span = indexes.last().copied().unwrap_or(1.0).max(1.0);
-            (late / early - 1.0).abs().max(
-                (((*events.last().unwrap_or(&events[0]) - events[0]) as f64 / period) - index_span)
-                    .abs()
-                    / index_span,
-            )
-        } else {
-            1.0
-        }
-    };
-    let mad = median(
-        &period_observations
-            .iter()
-            .map(|value| (*value - period).abs())
-            .collect::<Vec<_>>(),
-    )
-    .unwrap_or(f64::INFINITY)
-        / period.max(1.0);
-    let stationarity_status =
-        if drift <= STATIONARY_RELATIVE_DRIFT && mad <= STATIONARY_RELATIVE_MAD {
-            "stationary"
-        } else {
-            "nonstationary_or_ambiguous"
-        };
-    let accepted =
-        stationarity_status == "stationary" && residual_p95 <= REFINEMENT_RESIDUAL_MICROS as f64;
-    let first_index = indexes.first().copied().unwrap_or(0.0) as i64;
-    let last_index = indexes.last().copied().unwrap_or(0.0) as i64;
-    let mut grid = Vec::new();
-    if accepted && period.is_finite() && period > 0.0 {
-        for index in first_index..=last_index {
-            let time = phase + index as f64 * period;
-            if time >= 0.0 && time <= duration_micros as f64 {
-                grid.push(time.round() as u64);
-            }
-        }
-    }
-    let explained = if accepted {
-        events
-            .iter()
-            .filter(|time| {
-                let residual = (**time as f64
-                    - (phase + ((**time as f64 - phase) / period).round() * period))
-                    .abs();
-                residual <= REFINEMENT_RESIDUAL_MICROS as f64
-            })
-            .count() as f64
-            / events.len() as f64
-    } else {
-        0.0
-    };
+    let fit = fit_stable_tempo_grid(events, duration_micros, None);
     RefinedGridReport {
-        accepted,
-        stationarity_status: stationarity_status.into(),
-        fit_period_micros: Some(period),
-        fit_bpm: Some(60_000_000.0 / period),
-        phase_micros: Some(phase),
-        residual_median_micros: Some(residual_median),
-        residual_p95_micros: Some(residual_p95),
-        explained_event_fraction: explained,
-        raw_event_count: events.len(),
-        refined_grid_count: grid.len(),
-        inserted_grid_count: grid.len().saturating_sub(events.len()),
-        rejected_event_count: events
-            .len()
-            .saturating_sub((explained * events.len() as f64).round() as usize),
-        refined_grid_times_micros: grid,
-    }
-}
-
-fn refine_grid_empty(event_count: usize, status: &str) -> RefinedGridReport {
-    RefinedGridReport {
-        accepted: false,
-        stationarity_status: status.into(),
-        fit_period_micros: None,
-        fit_bpm: None,
-        phase_micros: None,
-        residual_median_micros: None,
-        residual_p95_micros: None,
-        explained_event_fraction: 0.0,
-        raw_event_count: event_count,
-        refined_grid_count: 0,
-        inserted_grid_count: 0,
-        rejected_event_count: 0,
-        refined_grid_times_micros: Vec::new(),
+        accepted: fit.accepted,
+        stationarity_status: fit.stationarity_status,
+        fit_period_micros: fit.fit_period_micros,
+        fit_bpm: fit.fit_bpm.map(f64::from),
+        phase_micros: fit.phase_micros,
+        residual_median_micros: fit
+            .inlier_residual_median_micros
+            .or(fit.raw_residual_median_micros)
+            .map(|value| value as f64),
+        residual_p95_micros: fit
+            .inlier_residual_p95_micros
+            .or(fit.raw_residual_p95_micros)
+            .map(|value| value as f64),
+        explained_event_fraction: f64::from(fit.explained_event_fraction),
+        raw_event_count: fit.raw_event_count,
+        refined_grid_count: fit.grid_times_micros.len(),
+        inserted_grid_count: fit.inserted_grid_count,
+        rejected_event_count: fit.rejected_event_count,
+        refined_grid_times_micros: fit.grid_times_micros,
     }
 }
 
