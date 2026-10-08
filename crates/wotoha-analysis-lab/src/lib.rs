@@ -35,6 +35,10 @@ mod real_song_research;
 pub use real_song_research::{RealSongResearchReport, run_real_song_research};
 mod fixed_tempo_grid_research;
 pub use fixed_tempo_grid_research::{StableTempoGrid, fit_stable_tempo_grid};
+mod fixed_tempo_consensus_research;
+pub use fixed_tempo_consensus_research::{
+    FixedTempoConsensusReport, run_fixed_tempo_consensus_research,
+};
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},
     audio_analysis::LowBandFilter,

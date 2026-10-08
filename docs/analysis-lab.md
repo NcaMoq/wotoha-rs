@@ -233,6 +233,36 @@ nominal family fold is invalid as generalization evidence if either exact PCM
 or lineage overlap is present; the expanded validation sample list is retained
 in the report.
 
+### Fixed-tempo period consensus research
+
+`research-real-songs` records a blind, runtime-observable analysis report for
+development-only fixed-tempo investigations. `research-fixed-tempo-consensus`
+then compares bounded physical-period estimators without consuming an external
+tempo during inference:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+WOTOHA_STARTING_COMMIT=$(git rev-parse HEAD) \
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-real-songs \
+  --audio-root /tmp/wotoha-songs \
+  --output /tmp/wotoha-real-song-research
+
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-fixed-tempo-consensus \
+  --input /tmp/wotoha-real-song-research/real-song-research.json \
+  --output /tmp/wotoha-fixed-tempo-consensus
+```
+
+The consensus report keeps physical-period estimation separate from canonical
+primary/half/double layer selection. It compares local interval medians,
+segment clocks, bounded global regressions, endpoint estimates, the existing
+robust grid fit, and Classical candidate evidence. Fixed representative
+clusters avoid transitive-chain inflation; unresolved independent conflicts
+produce `RETAIN_MULTIPLE` or `ABSTAIN`. The command is research-only, uses no
+external observer value as an inference feature, and does not change beat
+events, production tempo authority, or AutoMix behavior.
+
 ### Conservative tempo shadow
 
 `research-tempo-conservative-shadow` is a follow-up research command. It
