@@ -31,6 +31,8 @@ const CHANNEL_LONG_BASELINE: &str = "LONG_BASELINE";
 const CHANNEL_ROBUST_GRID: &str = "ROBUST_GRID";
 const CHANNEL_SEGMENT_CLOCK: &str = "SEGMENT_CLOCK";
 const CHANNEL_CLASSICAL_METRICAL: &str = "CLASSICAL_METRICAL";
+const ORIGIN_BEAT_EVENTS: &str = "BEAT_EVENTS";
+const ORIGIN_INDEPENDENT_METRICAL: &str = "INDEPENDENT_METRICAL_OBSERVATION";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FixedTempoConsensusReport {
@@ -59,6 +61,9 @@ pub struct SyntheticHardeningSummary {
     pub safe_abstain: usize,
     pub false_confident_selections: usize,
     pub unexpected_failures: usize,
+    pub selected_strong: usize,
+    pub selected_strong_with_genuine_independent_origins: usize,
+    pub strong_independence_passed: bool,
     pub channel_duplication_invariance: bool,
     pub all_passed: bool,
 }
@@ -77,6 +82,7 @@ pub struct SyntheticHardeningCase {
     pub relative_error: Option<f64>,
     pub selected_error_relative: Option<f64>,
     pub candidate_count: usize,
+    pub candidates: Vec<FixedTempoPeriodCandidate>,
     pub clusters: Vec<PeriodCluster>,
     pub winning_channels: Vec<String>,
     pub competing_channels: Vec<String>,
@@ -165,6 +171,7 @@ pub struct FixedTempoPeriodCandidate {
     pub source: String,
     pub evidence_channel: String,
     pub derived_from: String,
+    pub independence_origin: String,
     pub bpm: f64,
     pub period_micros: f64,
     pub support_events: usize,
@@ -193,6 +200,7 @@ pub struct PeriodCluster {
     pub member_count: usize,
     pub score: f64,
     pub independent_channels: Vec<String>,
+    pub independent_origins: Vec<String>,
     pub channel_scores: BTreeMap<String, f64>,
 }
 
@@ -237,6 +245,7 @@ struct CandidateSpec {
     bpm: f64,
     channel: &'static str,
     derived_from: &'static str,
+    independence_origin: &'static str,
     weight: f64,
 }
 
@@ -292,7 +301,7 @@ pub fn run_fixed_tempo_consensus_research(
             selection_rule: "fixed representative clusters; long-baseline and robust channels are scored independently; unresolved material conflict retains multiple or abstains".into(),
             channel_aggregation_rule: "within each fixed representative cluster, each evidence channel contributes only its highest-scoring candidate; correlated estimators share one bounded vote and cannot inflate the cluster score".into(),
             phase_estimation_rule: "candidate phase is selected from bounded event remainders and fixed phase buckets using a trimmed residual objective; it is never anchored to the first BeatEvent".into(),
-            confidence_rule: "SELECTED_STRONG requires two or more distinct evidence channels; SELECTED_MODERATE is reserved for a selected single-channel cluster; unresolved conflict is RETAIN_MULTIPLE and non-stationary or insufficient evidence is ABSTAIN".into(),
+            confidence_rule: "SELECTED_STRONG requires two or more genuine evidence origins; SELECTED_MODERATE is reserved for a selected cluster supported only by one origin; algorithmic channels derived from the same BeatEvent stream do not create a second origin; unresolved conflict is RETAIN_MULTIPLE and non-stationary or insufficient evidence is ABSTAIN".into(),
             canonical_layer_rule: "physical period is resolved first; a metrical alternative is retained only when a runtime tempo hypothesis is an exact half/double layer with substantial weight and no decisive separation".into(),
             external_reference_used_for_inference: false,
         },
@@ -361,6 +370,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.adjacent_median_bpm,
         CHANNEL_LOCAL_INTERVAL,
         "RAW_ADJACENT_INTERVALS",
+        ORIGIN_BEAT_EVENTS,
         1.0,
     );
     add_spec(
@@ -369,6 +379,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.trimmed_adjacent_median_bpm,
         CHANNEL_LOCAL_INTERVAL,
         "TRIMMED_ADJACENT_INTERVALS",
+        ORIGIN_BEAT_EVENTS,
         1.0,
     );
     add_spec(
@@ -377,6 +388,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.early_event_clock_bpm,
         CHANNEL_SEGMENT_CLOCK,
         "RAW_EVENT_SEGMENT_CLOCK",
+        ORIGIN_BEAT_EVENTS,
         0.5,
     );
     add_spec(
@@ -385,6 +397,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.middle_event_clock_bpm,
         CHANNEL_SEGMENT_CLOCK,
         "RAW_EVENT_SEGMENT_CLOCK",
+        ORIGIN_BEAT_EVENTS,
         0.5,
     );
     add_spec(
@@ -393,6 +406,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.late_event_clock_bpm,
         CHANNEL_SEGMENT_CLOCK,
         "RAW_EVENT_SEGMENT_CLOCK",
+        ORIGIN_BEAT_EVENTS,
         0.5,
     );
     add_spec(
@@ -401,6 +415,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.sequential_global_regression_bpm,
         CHANNEL_LONG_BASELINE,
         "SEQUENTIAL_EVENT_INDEX_GLOBAL_FIT",
+        ORIGIN_BEAT_EVENTS,
         3.0,
     );
     add_spec(
@@ -409,6 +424,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.missing_jump_global_regression_bpm,
         CHANNEL_LONG_BASELINE,
         "MISSING_JUMP_GLOBAL_FIT",
+        ORIGIN_BEAT_EVENTS,
         3.0,
     );
     add_spec(
@@ -417,6 +433,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.sequential_endpoint_bpm,
         CHANNEL_LONG_BASELINE,
         "SEQUENTIAL_ENDPOINT_FIT",
+        ORIGIN_BEAT_EVENTS,
         2.0,
     );
     add_spec(
@@ -425,6 +442,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         grid.missing_jump_endpoint_bpm,
         CHANNEL_LONG_BASELINE,
         "MISSING_JUMP_ENDPOINT_FIT",
+        ORIGIN_BEAT_EVENTS,
         2.0,
     );
     add_spec(
@@ -433,6 +451,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         full.refined_grid.fit_bpm,
         CHANNEL_ROBUST_GRID,
         "RUNTIME_REFINED_GRID_FIT",
+        ORIGIN_BEAT_EVENTS,
         2.0,
     );
     if let Some(bpm) = full.classical_candidates_bpm.first() {
@@ -442,6 +461,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
             Some(f64::from(*bpm)),
             CHANNEL_CLASSICAL_METRICAL,
             "CLASSICAL_TEMPO_HYPOTHESIS",
+            ORIGIN_INDEPENDENT_METRICAL,
             0.25,
         );
     }
@@ -452,6 +472,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
             Some(f64::from(*bpm)),
             CHANNEL_CLASSICAL_METRICAL,
             "CLASSICAL_TEMPO_HYPOTHESIS",
+            ORIGIN_INDEPENDENT_METRICAL,
             0.25,
         );
     }
@@ -489,6 +510,7 @@ fn add_spec(
     bpm: Option<f64>,
     channel: &'static str,
     derived_from: &'static str,
+    independence_origin: &'static str,
     weight: f64,
 ) {
     if let Some(bpm) = bpm.filter(|value| value.is_finite() && *value > 0.0) {
@@ -497,6 +519,7 @@ fn add_spec(
             bpm,
             channel,
             derived_from,
+            independence_origin,
             weight,
         });
     }
@@ -530,6 +553,7 @@ fn score_candidate(
         source: spec.source.into(),
         evidence_channel: spec.channel.into(),
         derived_from: spec.derived_from.into(),
+        independence_origin: spec.independence_origin.into(),
         bpm: spec.bpm,
         period_micros: period,
         support_events: support,
@@ -691,6 +715,7 @@ fn make_clusters(candidates: &mut [FixedTempoPeriodCandidate]) -> Vec<PeriodClus
                 member_count: 0,
                 score: 0.0,
                 independent_channels: Vec::new(),
+                independent_origins: Vec::new(),
                 channel_scores: BTreeMap::new(),
             });
             id
@@ -710,6 +735,10 @@ fn make_clusters(candidates: &mut [FixedTempoPeriodCandidate]) -> Vec<PeriodClus
             .or_insert(candidate.score);
         if !cluster.independent_channels.contains(&channel) {
             cluster.independent_channels.push(channel);
+        }
+        let origin = candidate.independence_origin.clone();
+        if !cluster.independent_origins.contains(&origin) {
+            cluster.independent_origins.push(origin);
         }
         cluster.score = cluster.channel_scores.values().sum();
     }
@@ -802,14 +831,14 @@ fn period_confidence(
     if status != "SELECTED" || selected_bpm.is_none() {
         return "ABSTAIN".into();
     }
-    let channels = clusters
+    let independent_origins = clusters
         .iter()
         .find(|cluster| {
             (cluster.representative_bpm / selected_bpm.unwrap_or(0.0) - 1.0).abs()
                 <= PERIOD_CONSENSUS_RELATIVE
         })
-        .map_or(0, |cluster| cluster.independent_channels.len());
-    if channels >= 2 {
+        .map_or(0, |cluster| cluster.independent_origins.len());
+    if independent_origins >= 2 {
         "SELECTED_STRONG".into()
     } else {
         "SELECTED_MODERATE".into()
@@ -968,6 +997,7 @@ fn synthetic_candidate(
         source: source.into(),
         evidence_channel: channel.into(),
         derived_from: "SYNTHETIC_TEST".into(),
+        independence_origin: ORIGIN_BEAT_EVENTS.into(),
         bpm,
         period_micros: 60_000_000.0 / bpm,
         support_events: 32,
@@ -1028,42 +1058,15 @@ fn synthetic_track_from_observations(
     fixture_id: &str,
     observations: &SyntheticObservedEvidence,
 ) -> RealSongTrackReport {
-    // First derive candidate values from the blind observed event stream.  The
-    // truth object is intentionally not accepted by this function.
-    let derived = analysis_report_from_observed_events(
-        observations.events.clone(),
-        observations.duration_micros,
-        None,
-        Vec::new(),
-        observations.tempo_hypotheses.clone(),
-        observations.primary_relation.clone(),
-        "synthetic_observed_events",
-    );
-    let grid = &derived.grid_method_comparison;
-    let mut candidates = [
-        grid.adjacent_median_bpm,
-        grid.trimmed_adjacent_median_bpm,
-        grid.early_event_clock_bpm,
-        grid.middle_event_clock_bpm,
-        grid.late_event_clock_bpm,
-        grid.sequential_global_regression_bpm,
-        grid.missing_jump_global_regression_bpm,
-        grid.sequential_endpoint_bpm,
-        grid.missing_jump_endpoint_bpm,
-        derived.refined_grid.fit_bpm,
-    ]
-    .into_iter()
-    .flatten()
-    .map(|bpm| bpm as f32)
-    .collect::<Vec<_>>();
-    candidates.extend(observations.classical_candidates_bpm.iter().copied());
-    candidates.sort_by(f32::total_cmp);
-    candidates.dedup_by(|left, right| (*left - *right).abs() <= 0.000_1);
+    // The event-derived estimators are reconstructed inside `build_track` from
+    // the observed event stream.  Keep the classical candidate list limited to
+    // explicitly injected metrical observations; copying event-derived BPMs
+    // into this field would manufacture a second evidence origin.
     let full = analysis_report_from_observed_events(
         observations.events.clone(),
         observations.duration_micros,
-        candidates.first().copied(),
-        candidates,
+        observations.classical_candidates_bpm.first().copied(),
+        observations.classical_candidates_bpm.clone(),
         observations.tempo_hypotheses.clone(),
         observations.primary_relation.clone(),
         "synthetic_observed_events",
@@ -1139,6 +1142,11 @@ fn with_observed_hypotheses(
     hypotheses: &[(f32, &str, f32)],
     primary_relation: &str,
 ) -> SyntheticFixture {
+    // These fixtures intentionally model an independent metrical observation.
+    // Ordinary event-clock fixtures leave this list empty, so no
+    // CLASSICAL_METRICAL candidate can be manufactured from BeatEvents.
+    fixture.observations.classical_candidates_bpm =
+        hypotheses.iter().map(|(bpm, _, _)| *bpm).collect();
     fixture.observations.tempo_hypotheses = hypotheses
         .iter()
         .map(|(bpm, relation, relative_weight)| TempoHypothesisReport {
@@ -1268,6 +1276,7 @@ fn synthetic_case_from_result(
         relative_error: evaluation.selected_error_relative,
         selected_error_relative: evaluation.selected_error_relative,
         candidate_count: result.period_candidates.len(),
+        candidates: result.period_candidates.clone(),
         clusters: result.period_clusters.clone(),
         winning_channels,
         competing_channels,
@@ -1520,9 +1529,26 @@ fn synthetic_hardening_summary() -> SyntheticHardeningSummary {
         .iter()
         .filter(|case| case.evaluation_class == "UNEXPECTED_FAILURE")
         .count();
+    let selected_strong = cases
+        .iter()
+        .filter(|case| case.period_confidence == "SELECTED_STRONG")
+        .count();
+    let selected_strong_with_genuine_independent_origins = cases
+        .iter()
+        .filter(|case| {
+            case.period_confidence == "SELECTED_STRONG"
+                && case
+                    .clusters
+                    .iter()
+                    .any(|cluster| cluster.independent_origins.len() >= 2)
+        })
+        .count();
+    let strong_independence_passed =
+        selected_strong == selected_strong_with_genuine_independent_origins;
     let channel_duplication_invariance = synthetic_channel_duplication_invariance();
     let all_passed = cases.iter().all(|case| case.passed)
         && false_confident == 0
+        && strong_independence_passed
         && channel_duplication_invariance;
     SyntheticHardeningSummary {
         suite: "fixed_tempo_consensus_synthetic_hardening_e2e".into(),
@@ -1537,6 +1563,9 @@ fn synthetic_hardening_summary() -> SyntheticHardeningSummary {
         safe_abstain,
         false_confident_selections: false_confident,
         unexpected_failures,
+        selected_strong,
+        selected_strong_with_genuine_independent_origins,
+        strong_independence_passed,
         channel_duplication_invariance,
         all_passed,
     }
@@ -1614,6 +1643,9 @@ fn synthetic_markdown(summary: &SyntheticHardeningSummary, source_commit: &str) 
          - SAFE_ABSTAIN: {}\n\
          - FALSE_CONFIDENT: {}\n\
          - UNEXPECTED_FAILURE: {}\n\
+         - SELECTED_STRONG: {}\n\
+         - SELECTED_STRONG with >=2 genuine independent origins: {}/{}\n\
+         - strong independence: {}\n\
          - channel duplication invariance: {}\n\
          - all passed: {}\n\n\
          Each case entered the same candidate generation, channel aggregation,\
@@ -1628,6 +1660,10 @@ fn synthetic_markdown(summary: &SyntheticHardeningSummary, source_commit: &str) 
         summary.safe_abstain,
         summary.false_confident_selections,
         summary.unexpected_failures,
+        summary.selected_strong,
+        summary.selected_strong_with_genuine_independent_origins,
+        summary.selected_strong,
+        summary.strong_independence_passed,
         summary.channel_duplication_invariance,
         summary.all_passed,
     )
@@ -1679,6 +1715,7 @@ mod tests {
             source: "a".into(),
             evidence_channel: CHANNEL_LONG_BASELINE.into(),
             derived_from: "TEST".into(),
+            independence_origin: ORIGIN_BEAT_EVENTS.into(),
             bpm: 120.0,
             period_micros: 0.0,
             support_events: 0,
@@ -1813,6 +1850,11 @@ mod tests {
         assert!(summary.cases.len() >= 19);
         assert_eq!(summary.false_confident_selections, 0);
         assert_eq!(summary.unexpected_failures, 0);
+        assert!(summary.strong_independence_passed);
+        assert_eq!(
+            summary.selected_strong,
+            summary.selected_strong_with_genuine_independent_origins
+        );
         assert!(summary.channel_duplication_invariance);
         assert!(summary.all_passed);
         assert_eq!(
@@ -1826,6 +1868,54 @@ mod tests {
         );
         assert!(!summary.external_reference_used_for_inference);
         assert!(!summary.truth_used_for_inference);
+    }
+
+    #[test]
+    fn event_only_synthetic_fixtures_have_one_genuine_origin() {
+        let fixture = synthetic_hardening_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "clean_stationary_119.8")
+            .expect("event-only fixture");
+        assert!(fixture.observations.classical_candidates_bpm.is_empty());
+        let observed =
+            synthetic_track_from_observations(&fixture.fixture_id, &fixture.observations);
+        let result = build_track(&observed);
+        assert!(
+            result
+                .period_candidates
+                .iter()
+                .all(|candidate| candidate.evidence_channel != CHANNEL_CLASSICAL_METRICAL)
+        );
+        assert!(
+            result
+                .period_clusters
+                .iter()
+                .all(|cluster| cluster.independent_origins == vec![ORIGIN_BEAT_EVENTS])
+        );
+        assert_eq!(result.period_confidence, "SELECTED_MODERATE");
+    }
+
+    #[test]
+    fn explicit_metrical_fixture_records_a_second_origin() {
+        let fixture = synthetic_hardening_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "clear_primary_layer")
+            .expect("explicit metrical fixture");
+        assert!(!fixture.observations.classical_candidates_bpm.is_empty());
+        let observed =
+            synthetic_track_from_observations(&fixture.fixture_id, &fixture.observations);
+        let result = build_track(&observed);
+        assert!(result.period_candidates.iter().any(|candidate| {
+            candidate.evidence_channel == CHANNEL_CLASSICAL_METRICAL
+                && candidate.independence_origin == ORIGIN_INDEPENDENT_METRICAL
+        }));
+        assert!(
+            result
+                .period_clusters
+                .iter()
+                .any(|cluster| cluster.independent_origins.len() >= 2)
+        );
+        assert_eq!(result.period_confidence, "SELECTED_STRONG");
     }
 
     #[test]
