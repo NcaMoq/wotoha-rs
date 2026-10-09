@@ -27,7 +27,7 @@ pin-project = "1.1.10"
 rand = "0.9.2"
 regex = "1.12.2"
 realfft = "3.5.0"
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "http2", "cookies", "json"] }
+reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls", "http2", "cookies", "json", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 serenity = { version = "0.12.5", default-features = false, features = ["cache", "client", "gateway", "model", "rustls_backend"] }

@@ -1,5 +1,10 @@
 # Unreleased main release notes — draft only
 
+> Document role: rolling notes for merged changes on `main`. This file is not
+> a release candidate, tag, or publishable changelog. When a version is
+> selected, copy only verified production-facing changes into the versioned
+> release draft.
+
 The current candidate release draft is [v0.6.0 — AutoMix V2](release-notes-v0.6.0-draft.md).
 
 > This document is a maintainer draft for the current `main` branch. It is

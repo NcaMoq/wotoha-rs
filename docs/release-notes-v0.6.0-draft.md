@@ -2,6 +2,9 @@
 
 > Draft only. This file is not a published GitHub Release. The current
 > published release is [v0.5.36](https://github.com/NcaMoq/wotoha-rs/releases/tag/v0.5.36).
+> This is the versioned candidate draft. Rolling changes belong in
+> [`release-notes-main-draft.md`](release-notes-main-draft.md); neither file
+> is publishable until the release preflight is complete.
 
 ## Highlights
 
@@ -27,8 +30,9 @@ planner's evidence and fallbacks easier to operate.
 - Extends the shared analysis surface for rhythm, tempo hypotheses, beat
   timelines, structure, vocal activity, energy, tonal information, and
   loudness/peak measurements.
-- Keeps analysis-lab experiments and controlled reference packets outside the
-  production decision path.
+- Keeps analysis-lab experiments, fixed-tempo consensus work, and controlled
+  reference packets outside the production decision path. These are research
+  and validation artifacts, not release features or production authority.
 - Documents the planner boundary and data flow in
   [`docs/automix.md`](automix.md).
 
@@ -71,3 +75,21 @@ planner's evidence and fallbacks easier to operate.
   superiority or real-world benchmark performance.
 - This document remains a draft until a maintainer verifies the final release
   contents, upgrade path, and CI/container artifacts.
+
+## Release preflight
+
+Before publishing a tag or GitHub Release, a maintainer must complete this
+checklist against the deliberate release commit:
+
+- [ ] Confirm the version, tag, release assets, and release notes agree.
+- [ ] Run `cargo fmt --all -- --check`.
+- [ ] Run `cargo check --workspace --locked`.
+- [ ] Run `cargo test --workspace --locked` and the isolated
+      `cargo test --locked -p wotoha-media` check.
+- [ ] Run `cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings`.
+- [ ] Run the deployment safety tests and verify the container workflow and
+      offline smoke test for the release commit.
+- [ ] Review image digest, checksums, provenance/attestation, and rollback
+      instructions before publishing.
+- [ ] Confirm that research-only reports and unverified benchmark claims are
+      not presented as production release features.

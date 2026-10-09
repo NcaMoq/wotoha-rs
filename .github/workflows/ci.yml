@@ -54,6 +54,8 @@ jobs:
         run: cargo check --workspace --locked
       - name: Test the workspace
         run: cargo test --workspace --locked
+      - name: Test media package in isolation
+        run: cargo test --locked -p wotoha-media
       - name: Lint the workspace
         run: cargo clippy --workspace --all-targets --locked --no-deps -- -D warnings
       - name: Offline deterministic quality regression
