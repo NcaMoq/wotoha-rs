@@ -4,8 +4,8 @@ use wotoha_analysis_lab::{
     AnalyzerMode, EvaluationOptions, ExternalObservationDocument, REPORT_SCHEMA_VERSION,
     TempoExperimentReportDocument, evaluate_exported_manifest, evaluate_manifest, export_blackbox,
     generate_default_manifest, load_manifest, package_blackbox, run_classical_tempo_research,
-    run_fixed_tempo_consensus_research, run_ground_truth_research,
-    run_independent_positive_corpus_research, run_real_song_research,
+    run_fixed_tempo_consensus_research, run_fixed_tempo_consensus_synthetic_research,
+    run_ground_truth_research, run_independent_positive_corpus_research, run_real_song_research,
     run_realistic_corpus_research, run_tempo_advisor_research, run_tempo_ambiguity_research,
     run_tempo_conservative_shadow_research, run_tempo_shadow_followup, verify_blackbox_package,
     write_json,
@@ -310,6 +310,20 @@ fn run() -> Result<(), Box<dyn Error + Send + Sync>> {
             println!(
                 "fixed-tempo consensus research complete: {} tracks, output={}",
                 report.summary.tracks,
+                output.display()
+            );
+        }
+        "research-fixed-tempo-consensus-synthetic" => {
+            let output = parse_output_dir(&mut args)?;
+            reject_unknown(args)?;
+            let source_commit = env::var("WOTOHA_SOURCE_COMMIT").map_err(
+                |_| "research-fixed-tempo-consensus-synthetic requires WOTOHA_SOURCE_COMMIT",
+            )?;
+            let report = run_fixed_tempo_consensus_synthetic_research(&output, source_commit)?;
+            println!(
+                "fixed-tempo synthetic E2E complete: {} fixtures, false_confident={}, output={}",
+                report.cases.len(),
+                report.false_confident_selections,
                 output.display()
             );
         }

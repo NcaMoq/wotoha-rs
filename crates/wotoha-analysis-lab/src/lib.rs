@@ -38,6 +38,7 @@ pub use fixed_tempo_grid_research::{StableTempoGrid, fit_stable_tempo_grid};
 mod fixed_tempo_consensus_research;
 pub use fixed_tempo_consensus_research::{
     FixedTempoConsensusReport, run_fixed_tempo_consensus_research,
+    run_fixed_tempo_consensus_synthetic_research,
 };
 use wotoha_core::{
     analysis::{AnalysisMethod, PhraseBoundarySource, TempoRelation, TrackAnalysisV2},

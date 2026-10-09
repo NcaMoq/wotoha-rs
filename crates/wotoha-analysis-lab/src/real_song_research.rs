@@ -95,6 +95,7 @@ pub struct RealSongAnalysisReport {
     pub raw_event_times_micros: Vec<u64>,
     pub raw_event_digest: String,
     pub raw_event_clock: RawEventClockReport,
+    #[serde(default)]
     pub grid_method_comparison: GridMethodComparisonReport,
     pub refined_grid: RefinedGridReport,
     pub integer_snap_audit: IntegerSnapAudit,
@@ -133,7 +134,7 @@ pub struct RawEventClockReport {
     pub confidence_max: Option<f32>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct GridMethodComparisonReport {
     pub adjacent_median_bpm: Option<f64>,
     pub trimmed_adjacent_median_bpm: Option<f64>,
@@ -147,6 +148,20 @@ pub struct GridMethodComparisonReport {
     pub classical_selected_bpm: Option<f32>,
     pub classical_candidate_bpms: Vec<f32>,
     pub selected_primary_relation: String,
+}
+
+impl GridMethodComparisonReport {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.adjacent_median_bpm.is_none()
+            && self.trimmed_adjacent_median_bpm.is_none()
+            && self.early_event_clock_bpm.is_none()
+            && self.middle_event_clock_bpm.is_none()
+            && self.late_event_clock_bpm.is_none()
+            && self.sequential_global_regression_bpm.is_none()
+            && self.missing_jump_global_regression_bpm.is_none()
+            && self.sequential_endpoint_bpm.is_none()
+            && self.missing_jump_endpoint_bpm.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -610,9 +625,6 @@ fn analysis_report(
         .iter()
         .map(|beat| beat.timing_confidence.get() as f64)
         .collect::<Vec<_>>();
-    let raw_event_clock = raw_event_clock(&raw_events, &confidence_values);
-    let refined_grid = refine_grid(&raw_events, legacy.duration.as_micros() as u64);
-    let integer = integer_snap_audit(raw_event_clock.event_clock_bpm);
     let tempo_hypotheses = v2
         .rhythm
         .tempo_hypotheses
@@ -628,32 +640,67 @@ fn analysis_report(
         .primary_tempo_hypothesis()
         .map(|hypothesis| format_relation(hypothesis.relation))
         .unwrap_or_else(|| "unknown".into());
+    let mut report = analysis_report_from_observed_events(
+        raw_events,
+        legacy.duration.as_micros() as u64,
+        legacy.bpm,
+        tempo_hypotheses
+            .iter()
+            .map(|hypothesis| hypothesis.bpm)
+            .collect(),
+        tempo_hypotheses,
+        relation,
+        if v2.has_native_rhythm_provenance() {
+            "neural_v2"
+        } else {
+            "classical_legacy_adapter"
+        },
+    );
+    report.raw_event_clock.confidence_min =
+        percentile(&confidence_values, 0.0).map(|value| value as f32);
+    report.raw_event_clock.confidence_median = median(&confidence_values).map(|value| value as f32);
+    report.raw_event_clock.confidence_max =
+        percentile(&confidence_values, 1.0).map(|value| value as f32);
+    Ok(report)
+}
+
+/// Build the same observation report used by real-song research from a blind
+/// event stream.  Synthetic validation uses this additive boundary, then
+/// enters the fixed-tempo consensus selector through the exact same
+/// `build_track` path as real-song reports.  No truth or fixture metadata is
+/// accepted by this function.
+pub(crate) fn analysis_report_from_observed_events(
+    raw_events: Vec<u64>,
+    duration_micros: u64,
+    classical_selected_bpm: Option<f32>,
+    classical_candidates_bpm: Vec<f32>,
+    tempo_hypotheses: Vec<TempoHypothesisReport>,
+    primary_relation: String,
+    analysis_backend: &str,
+) -> RealSongAnalysisReport {
+    let confidence_values = vec![1.0; raw_events.len()];
+    let raw_event_clock = raw_event_clock(&raw_events, &confidence_values);
+    let refined_grid = refine_grid(&raw_events, duration_micros);
+    let integer = integer_snap_audit(raw_event_clock.event_clock_bpm);
     let grid_method_comparison = grid_method_comparison(
         &raw_events,
         &raw_event_clock,
-        legacy.bpm,
+        classical_selected_bpm,
         &tempo_hypotheses,
-        &relation,
+        &primary_relation,
     );
-    Ok(RealSongAnalysisReport {
-        analysis_backend: if v2.has_native_rhythm_provenance() {
-            "neural_v2".into()
-        } else {
-            "classical_legacy_adapter".into()
-        },
-        classical_selected_bpm: legacy.bpm,
-        classical_candidates_bpm: tempo_hypotheses
-            .iter()
-            .map(|candidate| candidate.bpm)
-            .collect(),
+    RealSongAnalysisReport {
+        analysis_backend: analysis_backend.into(),
+        classical_selected_bpm,
+        classical_candidates_bpm,
         tempo_hypotheses,
-        conservative_decision: if legacy.bpm.is_some() {
+        conservative_decision: if classical_selected_bpm.is_some() {
             "selected"
         } else {
             "abstained"
         }
         .into(),
-        primary_relation: relation,
+        primary_relation,
         raw_event_digest: digest_u64s(&raw_events),
         raw_event_times_micros: raw_events,
         raw_event_clock: raw_event_clock.clone(),
@@ -661,7 +708,7 @@ fn analysis_report(
         refined_grid,
         integer_snap_audit: integer,
         stationarity: stationarity(&raw_event_clock),
-    })
+    }
 }
 
 fn grid_method_comparison(
@@ -673,7 +720,8 @@ fn grid_method_comparison(
 ) -> GridMethodComparisonReport {
     let intervals = events
         .windows(2)
-        .filter_map(|pair| (pair[1] > pair[0]).then_some((pair[1] - pair[0]) as f64))
+        .filter(|pair| pair[1] > pair[0])
+        .map(|pair| (pair[1] - pair[0]) as f64)
         .collect::<Vec<_>>();
     let mut sorted = intervals.clone();
     sorted.sort_by(f64::total_cmp);
@@ -766,13 +814,21 @@ fn endpoint_bpm(events: &[u64], indices: Option<&[i64]>) -> Option<f64> {
         .and_then(|values| values.last().copied())
         .unwrap_or(events.len().saturating_sub(1) as i64);
     let span = last_index - first_index;
-    (span > 0).then(|| 60_000_000.0 * span as f64 / (events[events.len() - 1] - events[0]) as f64)
+    (span > 0)
+        .then(|| {
+            events[events.len() - 1]
+                .checked_sub(events[0])
+                .filter(|span| *span > 0)
+                .map(|event_span| 60_000_000.0 * span as f64 / event_span as f64)
+        })
+        .flatten()
 }
 
 fn raw_event_clock(events: &[u64], confidence_values: &[f64]) -> RawEventClockReport {
     let intervals = events
         .windows(2)
-        .filter_map(|pair| (pair[1] > pair[0]).then_some((pair[1] - pair[0]) as f64))
+        .filter(|pair| pair[1] > pair[0])
+        .map(|pair| (pair[1] - pair[0]) as f64)
         .collect::<Vec<_>>();
     let median_interval = median(&intervals);
     let mad_interval = median_interval.map(|value| {
@@ -787,7 +843,8 @@ fn raw_event_clock(events: &[u64], confidence_values: &[f64]) -> RawEventClockRe
     let bpm_of = |slice: &[u64]| {
         let values = slice
             .windows(2)
-            .filter_map(|pair| (pair[1] > pair[0]).then_some((pair[1] - pair[0]) as f64))
+            .filter(|pair| pair[1] > pair[0])
+            .map(|pair| (pair[1] - pair[0]) as f64)
             .collect::<Vec<_>>();
         median(&values).map(|interval| 60_000_000.0 / interval)
     };

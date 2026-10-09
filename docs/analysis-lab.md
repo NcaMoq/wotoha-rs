@@ -270,9 +270,25 @@ The report exposes `SELECTED_STRONG`, `SELECTED_MODERATE`, `RETAIN_MULTIPLE`,
 and `ABSTAIN` confidence states, plus a deterministic synthetic hardening
 suite covering non-integer periods, missing/extra events, endpoint corruption,
 nearby false periods, correlated-channel duplication, metrical alternatives,
-and non-stationarity. The command is research-only, uses no external observer
-value as an inference feature, and does not change beat events, production
-tempo authority, or AutoMix behavior.
+and non-stationarity. The synthetic suite enters the same report construction,
+candidate scoring, channel aggregation, clustering, conflict detection,
+selection, confidence, and canonical-layer path as the real-song report. Truth
+is joined only afterward by an evaluator; `false_confident` is therefore
+derived from the actual selector result, not from a fixture label. Run it with:
+
+```bash
+WOTOHA_SOURCE_COMMIT=$(git rev-parse HEAD) \
+cargo run --release --locked -p wotoha-analysis-lab -- \
+  research-fixed-tempo-consensus-synthetic \
+  --output /tmp/wotoha-fixed-tempo-consensus-synthetic
+```
+
+The E2E report records `CORRECT_CONFIDENT`, `CORRECT_ACCEPTABLE`,
+`SAFE_RETAIN_MULTIPLE`, `SAFE_ABSTAIN`, `FALSE_CONFIDENT`, and
+`UNEXPECTED_FAILURE` per fixture. It also records a selector-level channel
+duplication invariance check. The command is research-only, uses no external
+observer value as an inference feature, and does not change beat events,
+production tempo authority, or AutoMix behavior.
 
 ### Conservative tempo shadow
 

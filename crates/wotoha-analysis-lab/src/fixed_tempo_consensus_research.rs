@@ -8,10 +8,14 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     LabError,
-    real_song_research::{RealSongAnalysisReport, RealSongResearchReport, RealSongTrackReport},
+    real_song_research::{
+        RealSongAnalysisReport, RealSongResearchReport, RealSongTrackReport,
+        SegmentConsistencyReport, TempoHypothesisReport, analysis_report_from_observed_events,
+    },
     write_json,
 };
 
@@ -44,18 +48,86 @@ pub struct FixedTempoConsensusReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyntheticHardeningSummary {
     pub suite: String,
+    pub phase: String,
+    pub source_commit: String,
     pub external_reference_used_for_inference: bool,
+    pub truth_used_for_inference: bool,
     pub cases: Vec<SyntheticHardeningCase>,
+    pub correct_confident: usize,
+    pub correct_acceptable: usize,
+    pub safe_retain_multiple: usize,
+    pub safe_abstain: usize,
     pub false_confident_selections: usize,
+    pub unexpected_failures: usize,
+    pub channel_duplication_invariance: bool,
     pub all_passed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SyntheticHardeningCase {
-    pub name: String,
+    pub fixture_id: String,
+    pub truth_bpm: Option<f64>,
+    pub valid_physical_bpms: Vec<f64>,
+    pub valid_canonical_bpms: Vec<f64>,
+    pub stationary_expected: bool,
+    pub allowed_period_status: Vec<String>,
+    pub period_status: String,
+    pub period_confidence: String,
+    pub selected_physical_bpm: Option<f64>,
+    pub relative_error: Option<f64>,
+    pub selected_error_relative: Option<f64>,
+    pub candidate_count: usize,
+    pub clusters: Vec<PeriodCluster>,
+    pub winning_channels: Vec<String>,
+    pub competing_channels: Vec<String>,
+    pub period_conflict: bool,
+    pub canonical_status: String,
+    pub truth_relation: String,
+    pub confidently_correct: bool,
+    pub safely_ambiguous: bool,
+    pub safely_abstained: bool,
+    pub evaluation_class: String,
+    pub false_confident: bool,
     pub passed: bool,
-    pub classification: String,
     pub detail: String,
+}
+
+#[derive(Clone, Debug)]
+struct SyntheticFixtureTruth {
+    truth_bpm: Option<f64>,
+    valid_physical_bpms: Vec<f64>,
+    valid_canonical_bpms: Vec<f64>,
+    stationary_expected: bool,
+    allowed_period_status: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SyntheticObservedEvidence {
+    events: Vec<u64>,
+    duration_micros: u64,
+    classical_candidates_bpm: Vec<f32>,
+    tempo_hypotheses: Vec<TempoHypothesisReport>,
+    primary_relation: String,
+}
+
+#[derive(Clone, Debug)]
+struct SyntheticFixture {
+    fixture_id: String,
+    observations: SyntheticObservedEvidence,
+    truth: SyntheticFixtureTruth,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PeriodSelectionEvaluation {
+    selected_error_relative: Option<f64>,
+    truth_relation: String,
+    confidently_correct: bool,
+    safely_ambiguous: bool,
+    safely_abstained: bool,
+    false_confident: bool,
+    evaluation_class: String,
+    passed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -240,6 +312,23 @@ pub fn run_fixed_tempo_consensus_research(
     Ok(output)
 }
 
+/// Run the end-to-end synthetic selector hardening suite.  The fixture truth
+/// is retained only by the evaluator; `synthetic_track_from_observations`
+/// receives observations without the truth object and enters `build_track`.
+pub fn run_fixed_tempo_consensus_synthetic_research(
+    output_dir: &Path,
+    source_commit: String,
+) -> Result<SyntheticHardeningSummary, LabError> {
+    let mut summary = synthetic_hardening_summary();
+    summary.source_commit = source_commit.clone();
+    write_json(&output_dir.join("synthetic-hardening-e2e.json"), &summary)?;
+    fs::write(
+        output_dir.join("synthetic-hardening-e2e.md"),
+        synthetic_markdown(&summary, &source_commit),
+    )?;
+    Ok(summary)
+}
+
 fn output_tracks_sorted(
     mut tracks: Vec<FixedTempoConsensusTrack>,
 ) -> Vec<FixedTempoConsensusTrack> {
@@ -249,7 +338,22 @@ fn output_tracks_sorted(
 
 fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
     let full = &track.full;
-    let grid = &full.grid_method_comparison;
+    let derived_grid;
+    let grid = if full.grid_method_comparison.is_empty() {
+        derived_grid = analysis_report_from_observed_events(
+            full.raw_event_times_micros.clone(),
+            track.duration_micros,
+            full.classical_selected_bpm,
+            full.classical_candidates_bpm.clone(),
+            full.tempo_hypotheses.clone(),
+            full.primary_relation.clone(),
+            &full.analysis_backend,
+        )
+        .grid_method_comparison;
+        &derived_grid
+    } else {
+        &full.grid_method_comparison
+    };
     let mut specs = Vec::new();
     add_spec(
         &mut specs,
@@ -353,7 +457,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
     }
     let mut candidates = specs
         .into_iter()
-        .map(|spec| score_candidate(spec, &full.raw_event_times_micros, full))
+        .map(|spec| score_candidate(spec, &full.raw_event_times_micros, full, grid))
         .collect::<Vec<_>>();
     let clusters = make_clusters(&mut candidates);
     let (period_status, physical_period_bpm, period_conflict) =
@@ -402,6 +506,7 @@ fn score_candidate(
     spec: CandidateSpec,
     events: &[u64],
     full: &RealSongAnalysisReport,
+    grid: &crate::real_song_research::GridMethodComparisonReport,
 ) -> FixedTempoPeriodCandidate {
     let period = 60_000_000.0 / spec.bpm;
     let support = events.len();
@@ -433,18 +538,9 @@ fn score_candidate(
         explained_event_fraction: explained,
         missing_beat_fraction: missing,
         extra_event_fraction: extra,
-        early_period_micros: full
-            .grid_method_comparison
-            .early_event_clock_bpm
-            .map(|bpm| 60_000_000.0 / bpm),
-        middle_period_micros: full
-            .grid_method_comparison
-            .middle_event_clock_bpm
-            .map(|bpm| 60_000_000.0 / bpm),
-        late_period_micros: full
-            .grid_method_comparison
-            .late_event_clock_bpm
-            .map(|bpm| 60_000_000.0 / bpm),
+        early_period_micros: grid.early_event_clock_bpm.map(|bpm| 60_000_000.0 / bpm),
+        middle_period_micros: grid.middle_event_clock_bpm.map(|bpm| 60_000_000.0 / bpm),
+        late_period_micros: grid.late_event_clock_bpm.map(|bpm| 60_000_000.0 / bpm),
         stationarity_error: full.stationarity.relative_period_drift,
         agreement_sources: Vec::new(),
         agreement_channels: vec![spec.channel.into()],
@@ -821,7 +917,7 @@ fn missing_fraction(indices: &[i64]) -> f64 {
     }
     let missing = indices
         .windows(2)
-        .map(|pair| (pair[1] - pair[0] - 1).max(0) as f64)
+        .map(|pair| (pair[1] - pair[0]).saturating_sub(1).max(0) as f64)
         .sum::<f64>();
     missing / (indices.last().copied().unwrap_or(0) - indices[0]).max(1) as f64
 }
@@ -832,7 +928,7 @@ fn extra_fraction(events: &[u64], period: f64) -> f64 {
     }
     events
         .windows(2)
-        .filter(|pair| ((pair[1] - pair[0]) as f64) < period * 0.5)
+        .filter(|pair| pair[1] > pair[0] && ((pair[1] - pair[0]) as f64) < period * 0.5)
         .count() as f64
         / (events.len() - 1) as f64
 }
@@ -860,18 +956,6 @@ fn synthetic_grid_events(period: f64, count: usize, phase: f64) -> Vec<u64> {
     (0..count)
         .map(|index| (phase + index as f64 * period).round() as u64)
         .collect()
-}
-
-fn synthetic_relative_interval_drift(events: &[u64]) -> Option<f64> {
-    let intervals = events
-        .windows(2)
-        .map(|pair| (pair[1] - pair[0]) as f64)
-        .collect::<Vec<_>>();
-    let early = intervals.get(..intervals.len() / 2)?.iter().sum::<f64>()
-        / (intervals.len() / 2).max(1) as f64;
-    let late = intervals.get(intervals.len() / 2..)?.iter().sum::<f64>()
-        / (intervals.len() - intervals.len() / 2).max(1) as f64;
-    Some((late / early - 1.0).abs())
 }
 
 fn synthetic_candidate(
@@ -905,276 +989,648 @@ fn synthetic_candidate(
     }
 }
 
-fn synthetic_case(
-    name: &str,
-    passed: bool,
-    classification: &str,
-    detail: impl Into<String>,
-) -> SyntheticHardeningCase {
-    SyntheticHardeningCase {
-        name: name.into(),
-        passed,
-        classification: classification.into(),
+fn patterned_events(period: f64, count: usize, phase: f64, pattern: &[f64]) -> Vec<u64> {
+    let mut events = vec![phase.round() as u64];
+    let mut time = phase;
+    for index in 0..count.saturating_sub(1) {
+        time += period * pattern[index % pattern.len()];
+        events.push(time.round() as u64);
+    }
+    events
+}
+
+fn offset_events(period: f64, count: usize, phase: f64, offsets: &[f64]) -> Vec<u64> {
+    (0..count)
+        .map(|index| {
+            (phase + index as f64 * period + offsets[index % offsets.len()]).round() as u64
+        })
+        .collect()
+}
+
+fn remove_events(events: &[u64], predicate: impl Fn(usize) -> bool) -> Vec<u64> {
+    events
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(index, event)| (!predicate(index)).then_some(event))
+        .collect()
+}
+
+fn synthetic_identity(events: &[u64]) -> String {
+    let mut digest = Sha256::new();
+    for event in events {
+        digest.update(event.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn synthetic_track_from_observations(
+    fixture_id: &str,
+    observations: &SyntheticObservedEvidence,
+) -> RealSongTrackReport {
+    // First derive candidate values from the blind observed event stream.  The
+    // truth object is intentionally not accepted by this function.
+    let derived = analysis_report_from_observed_events(
+        observations.events.clone(),
+        observations.duration_micros,
+        None,
+        Vec::new(),
+        observations.tempo_hypotheses.clone(),
+        observations.primary_relation.clone(),
+        "synthetic_observed_events",
+    );
+    let grid = &derived.grid_method_comparison;
+    let mut candidates = [
+        grid.adjacent_median_bpm,
+        grid.trimmed_adjacent_median_bpm,
+        grid.early_event_clock_bpm,
+        grid.middle_event_clock_bpm,
+        grid.late_event_clock_bpm,
+        grid.sequential_global_regression_bpm,
+        grid.missing_jump_global_regression_bpm,
+        grid.sequential_endpoint_bpm,
+        grid.missing_jump_endpoint_bpm,
+        derived.refined_grid.fit_bpm,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|bpm| bpm as f32)
+    .collect::<Vec<_>>();
+    candidates.extend(observations.classical_candidates_bpm.iter().copied());
+    candidates.sort_by(f32::total_cmp);
+    candidates.dedup_by(|left, right| (*left - *right).abs() <= 0.000_1);
+    let full = analysis_report_from_observed_events(
+        observations.events.clone(),
+        observations.duration_micros,
+        candidates.first().copied(),
+        candidates,
+        observations.tempo_hypotheses.clone(),
+        observations.primary_relation.clone(),
+        "synthetic_observed_events",
+    );
+    let source_sha256 = synthetic_identity(&observations.events);
+    RealSongTrackReport {
+        track_id: fixture_id.into(),
+        source_filename: format!("{fixture_id}.synthetic"),
+        source_sha256: source_sha256.clone(),
+        source_bytes: observations.events.len() * std::mem::size_of::<u64>(),
+        decoded_pcm_sha256: source_sha256,
+        container_extension: "synthetic".into(),
+        codec: "observed-event-clock".into(),
+        sample_rate: 1_000_000,
+        channels: 1,
+        decoded_frames: observations.duration_micros as usize,
+        duration_micros: observations.duration_micros,
+        full,
+        segments: Vec::new(),
+        segment_consistency: SegmentConsistencyReport {
+            segment_count: 0,
+            canonical_bpm_consistent: 0,
+            family_consistent: 0,
+            canonical_threshold_relative: 0.01,
+            family_threshold_relative: 0.01,
+            corpus_constant_tempo_assertion_used_only_after_inference: true,
+        },
+        failure_taxonomy: Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synthetic_fixture(
+    fixture_id: &str,
+    events: Vec<u64>,
+    truth_bpm: Option<f64>,
+    valid_physical_bpms: Vec<f64>,
+    valid_canonical_bpms: Vec<f64>,
+    stationary_expected: bool,
+    allowed_period_status: &[&str],
+    detail: &str,
+) -> SyntheticFixture {
+    let duration_micros = events
+        .last()
+        .copied()
+        .unwrap_or_default()
+        .saturating_add(1_000_000);
+    SyntheticFixture {
+        fixture_id: fixture_id.into(),
+        observations: SyntheticObservedEvidence {
+            events,
+            duration_micros,
+            classical_candidates_bpm: Vec::new(),
+            tempo_hypotheses: Vec::new(),
+            primary_relation: "unknown".into(),
+        },
+        truth: SyntheticFixtureTruth {
+            truth_bpm,
+            valid_physical_bpms,
+            valid_canonical_bpms,
+            stationary_expected,
+            allowed_period_status: allowed_period_status
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        },
         detail: detail.into(),
     }
 }
 
-fn synthetic_hardening_summary() -> SyntheticHardeningSummary {
-    let exact_period = 60_000_000.0 / 127.35;
-    let clean = synthetic_grid_events(exact_period, 48, 123_456.0);
-    let clean_fit = fit_period_phase(&clean, exact_period);
-    let mut bad_first = clean.clone();
-    bad_first[0] += 80_000;
-    let mut bad_last = clean.clone();
-    *bad_last.last_mut().expect("synthetic event") += 250_000;
-    let mut both_endpoints = bad_first.clone();
-    *both_endpoints.last_mut().expect("synthetic event") += 250_000;
-    let nearby_truth = synthetic_grid_events(60_000_000.0 / 174.0, 96, 91_000.0);
-    let nearby_truth_fit = fit_period_phase(&nearby_truth, 60_000_000.0 / 174.0);
-    let nearby_wrong_fit = fit_period_phase(&nearby_truth, 60_000_000.0 / 175.0);
-
-    let mut duplicate_candidates = vec![
-        synthetic_candidate("long-a", 129.0, CHANNEL_LONG_BASELINE, 3.0),
-        synthetic_candidate("long-b", 129.0, CHANNEL_LONG_BASELINE, 3.0),
-        synthetic_candidate("robust", 129.0, CHANNEL_ROBUST_GRID, 2.0),
-        synthetic_candidate("local", 129.0, CHANNEL_LOCAL_INTERVAL, 1.0),
-    ];
-    let duplicate_clusters = make_clusters(&mut duplicate_candidates);
-    let duplicate_score = duplicate_clusters[0].score;
-    let duplicate_selected = weighted_cluster_bpm(&duplicate_candidates, 0);
-    let mut single_candidates = duplicate_candidates
+fn with_observed_hypotheses(
+    mut fixture: SyntheticFixture,
+    hypotheses: &[(f32, &str, f32)],
+    primary_relation: &str,
+) -> SyntheticFixture {
+    fixture.observations.tempo_hypotheses = hypotheses
         .iter()
-        .filter(|candidate| candidate.source != "long-b")
-        .cloned()
-        .collect::<Vec<_>>();
-    let single_clusters = make_clusters(&mut single_candidates);
-
-    let mut conflict_candidates = vec![
-        synthetic_candidate("truth-long", 174.0, CHANNEL_LONG_BASELINE, 3.0),
-        synthetic_candidate("truth-robust", 174.0, CHANNEL_ROBUST_GRID, 2.0),
-        synthetic_candidate("wrong-long", 175.0, CHANNEL_LONG_BASELINE, 3.0),
-        synthetic_candidate("wrong-local", 175.0, CHANNEL_LOCAL_INTERVAL, 1.0),
-    ];
-    let conflict_clusters = make_clusters(&mut conflict_candidates);
-    let conflict_detected = conflict_clusters.len() == 2
-        && (conflict_clusters[0].score - conflict_clusters[1].score).abs() <= 2.0;
-
-    let mut missing = clean.clone();
-    missing.remove(17);
-    let periodic_missing: Vec<u64> = clean
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(index, time)| (index % 7 != 0).then_some(time))
+        .map(|(bpm, relation, relative_weight)| TempoHypothesisReport {
+            bpm: *bpm,
+            relation: (*relation).into(),
+            relative_weight: *relative_weight,
+        })
         .collect();
-    let mut subdivision = clean.clone();
-    subdivision.insert(12, subdivision[12] - (exact_period / 2.0).round() as u64);
-    let mut duplicate_event = clean.clone();
-    duplicate_event.insert(20, duplicate_event[20]);
-    let mut nonstationary = synthetic_grid_events(60_000_000.0 / 120.0, 48, 0.0);
-    for (index, time) in nonstationary.iter_mut().enumerate() {
-        *time += (index * index * 700) as u64;
-    }
-    let nonstationary_rejected =
-        synthetic_relative_interval_drift(&nonstationary).is_some_and(|drift| drift > 0.03);
+    fixture.observations.primary_relation = primary_relation.into();
+    fixture
+}
 
-    let mut cases = vec![
-        synthetic_case(
-            "clean_stationary",
-            clean_fit.residuals.iter().copied().fold(0.0, f64::max) <= 2.0,
-            "stationary_clock",
-            "exact non-integer period recovered with sub-microsecond rounded input",
-        ),
-        synthetic_case(
-            "noninteger_period",
-            clean_fit.residuals.iter().copied().fold(0.0, f64::max) <= 2.0,
-            "period_resolution",
-            format!("fit_period_micros={:.3}", exact_period),
-        ),
-        synthetic_case(
-            "bad_first_event_plus_80ms",
-            median(&fit_period_phase(&bad_first, exact_period).residuals).unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "first event is not the phase anchor",
-        ),
-        synthetic_case(
-            "bad_first_event_plus_150ms",
-            median(
-                &fit_period_phase(
-                    &{
-                        let mut events = clean.clone();
-                        events[0] += 150_000;
-                        events
-                    },
-                    exact_period,
-                )
-                .residuals,
-            )
-            .unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "first event corruption is isolated from the global phase",
-        ),
-        synthetic_case(
-            "bad_first_event_plus_250ms",
-            median(
-                &fit_period_phase(
-                    &{
-                        let mut events = clean.clone();
-                        events[0] += 250_000;
-                        events
-                    },
-                    exact_period,
-                )
-                .residuals,
-            )
-            .unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "large first event corruption does not move the majority phase",
-        ),
-        synthetic_case(
-            "bad_last_event_plus_80ms",
-            median(
-                &fit_period_phase(
-                    &{
-                        let mut events = clean.clone();
-                        *events.last_mut().expect("synthetic event") += 80_000;
-                        events
-                    },
-                    exact_period,
-                )
-                .residuals,
-            )
-            .unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "last event corruption is isolated from the global phase",
-        ),
-        synthetic_case(
-            "bad_last_event_plus_150ms",
-            median(
-                &fit_period_phase(
-                    &{
-                        let mut events = clean.clone();
-                        *events.last_mut().expect("synthetic event") += 150_000;
-                        events
-                    },
-                    exact_period,
-                )
-                .residuals,
-            )
-            .unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "last event corruption does not move the majority phase",
-        ),
-        synthetic_case(
-            "bad_last_event_plus_250ms",
-            median(&fit_period_phase(&bad_last, exact_period).residuals).unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "large last event corruption does not move the majority phase",
-        ),
-        synthetic_case(
-            "both_endpoints_corrupt",
-            median(&fit_period_phase(&both_endpoints, exact_period).residuals).unwrap_or(f64::MAX)
-                <= 2_000.0,
-            "endpoint_robustness",
-            "both endpoints are outliers while the interior remains stationary",
-        ),
-        synthetic_case(
-            "biased_adjacent_median",
-            nearby_truth_fit.residuals.len() == nearby_truth.len(),
-            "long_baseline_priority",
-            "global fit retains all event support instead of trusting one adjacent median",
-        ),
-        synthetic_case(
-            "random_missing_beats",
-            missing_fraction(&fit_period_phase(&missing, exact_period).indices) <= 1.0,
-            "missing_beat_diagnostics",
-            "missing support is represented as a bounded diagnostic",
-        ),
-        synthetic_case(
-            "periodic_missing_beats",
-            missing_fraction(&fit_period_phase(&periodic_missing, exact_period).indices) <= 1.0,
-            "missing_beat_diagnostics",
-            "periodic missing support does not create an unbounded score",
-        ),
-        synthetic_case(
-            "subdivision_event",
-            extra_fraction(&subdivision, exact_period) <= 1.0,
-            "extra_event_diagnostics",
-            "subdivision evidence is not silently treated as a new global clock",
-        ),
-        synthetic_case(
-            "duplicate_event",
-            extra_fraction(&duplicate_event, exact_period) <= 1.0,
-            "extra_event_diagnostics",
-            "duplicate events remain bounded and cannot add a channel vote",
-        ),
-        synthetic_case(
-            "nearby_false_period_174_vs_175",
-            robust_phase_objective(&nearby_truth_fit.residuals)
-                < robust_phase_objective(&nearby_wrong_fit.residuals),
-            "nearby_period_safety",
-            "long-duration residuals distinguish a nearby false period",
-        ),
-        synthetic_case(
-            "correlated_duplicate_channel",
-            (duplicate_score - single_clusters[0].score).abs() <= f64::EPSILON
-                && duplicate_selected == weighted_cluster_bpm(&single_candidates, 0),
-            "channel_independence",
-            "duplicating one evidence channel does not increase score or move the selected BPM",
-        ),
-        synthetic_case(
-            "conflicting_independent_channels",
-            conflict_detected,
-            "material_conflict",
-            "nearby independent alternatives remain visible instead of becoming confident consensus",
-        ),
-        synthetic_case(
-            "exact_half_double_layers",
-            {
-                let hypotheses = vec![
-                    crate::real_song_research::TempoHypothesisReport {
-                        bpm: 60.0,
-                        relation: "primary".into(),
-                        relative_weight: 0.55,
-                    },
-                    crate::real_song_research::TempoHypothesisReport {
-                        bpm: 120.0,
-                        relation: "double_time".into(),
-                        relative_weight: 0.45,
-                    },
-                ];
-                resolve_canonical_layer(Some(60.0), &hypotheses, "primary").status
-                    == "CANONICAL_RETAIN_MULTIPLE"
-            },
-            "metrical_ambiguity",
-            "exact half/double alternatives remain representable without forced canonical choice",
-        ),
-        synthetic_case(
-            "nonstationary_clock",
-            nonstationary_rejected,
-            "stationarity_safety",
-            "a visibly drifting clock is rejected by the stationary-input policy",
-        ),
-    ];
-    let false_confident = cases
+fn period_selection_evaluation(
+    result: &FixedTempoConsensusTrack,
+    truth: &SyntheticFixtureTruth,
+) -> PeriodSelectionEvaluation {
+    let selected = result.physical_period_bpm;
+    let selected_error_relative = selected.and_then(|bpm| {
+        truth
+            .valid_physical_bpms
+            .iter()
+            .map(|allowed| (bpm / allowed - 1.0).abs())
+            .min_by(f64::total_cmp)
+    });
+    let selected_confident = result.period_status == "SELECTED"
+        && matches!(
+            result.period_confidence.as_str(),
+            "SELECTED_STRONG" | "SELECTED_MODERATE"
+        );
+    let false_confident =
+        selected_confident && selected_error_relative.is_none_or(|error| error > 0.002);
+    let confidently_correct =
+        selected_confident && selected_error_relative.is_some_and(|error| error <= 0.0005);
+    let correct_acceptable =
+        selected_confident && selected_error_relative.is_some_and(|error| error <= 0.002);
+    let safely_ambiguous = result.period_status == "RETAIN_MULTIPLE";
+    let safely_abstained = result.period_status == "ABSTAIN";
+    let truth_relation = if selected_error_relative.is_some() {
+        if truth
+            .valid_canonical_bpms
+            .iter()
+            .any(|allowed| selected.is_some_and(|bpm| (bpm / allowed - 1.0).abs() <= 0.002))
+        {
+            "allowed_physical_or_canonical_layer"
+        } else {
+            "allowed_physical_layer"
+        }
+    } else {
+        "outside_allowed_physical_layer"
+    }
+    .into();
+    let evaluation_class = if false_confident {
+        "FALSE_CONFIDENT"
+    } else if confidently_correct {
+        "CORRECT_CONFIDENT"
+    } else if correct_acceptable {
+        "CORRECT_ACCEPTABLE"
+    } else if safely_ambiguous
+        && truth
+            .allowed_period_status
+            .iter()
+            .any(|status| status == "RETAIN_MULTIPLE")
+    {
+        "SAFE_RETAIN_MULTIPLE"
+    } else if safely_abstained
+        && truth
+            .allowed_period_status
+            .iter()
+            .any(|status| status == "ABSTAIN")
+    {
+        "SAFE_ABSTAIN"
+    } else {
+        "UNEXPECTED_FAILURE"
+    };
+    let passed = truth
+        .allowed_period_status
         .iter()
-        .filter(|case| case.classification == "false_confident")
+        .any(|status| status == &result.period_status)
+        && evaluation_class != "FALSE_CONFIDENT"
+        && evaluation_class != "UNEXPECTED_FAILURE";
+    PeriodSelectionEvaluation {
+        selected_error_relative,
+        truth_relation,
+        confidently_correct,
+        safely_ambiguous,
+        safely_abstained,
+        false_confident,
+        evaluation_class: evaluation_class.into(),
+        passed,
+    }
+}
+
+fn synthetic_case_from_result(
+    fixture: &SyntheticFixture,
+    result: &FixedTempoConsensusTrack,
+) -> SyntheticHardeningCase {
+    let evaluation = period_selection_evaluation(result, &fixture.truth);
+    let winning_cluster = result
+        .physical_period_bpm
+        .and_then(|bpm| {
+            result.period_clusters.iter().min_by(|left, right| {
+                ((left.representative_bpm / bpm - 1.0).abs())
+                    .total_cmp(&((right.representative_bpm / bpm - 1.0).abs()))
+            })
+        })
+        .or_else(|| result.period_clusters.first());
+    let winning_channels = winning_cluster
+        .map(|cluster| cluster.independent_channels.clone())
+        .unwrap_or_default();
+    let winning_id = winning_cluster.map(|cluster| cluster.cluster_id);
+    let competing_channels = result
+        .period_clusters
+        .iter()
+        .filter(|cluster| Some(cluster.cluster_id) != winning_id)
+        .flat_map(|cluster| cluster.independent_channels.iter().cloned())
+        .collect::<Vec<_>>();
+    SyntheticHardeningCase {
+        fixture_id: fixture.fixture_id.clone(),
+        truth_bpm: fixture.truth.truth_bpm,
+        valid_physical_bpms: fixture.truth.valid_physical_bpms.clone(),
+        valid_canonical_bpms: fixture.truth.valid_canonical_bpms.clone(),
+        stationary_expected: fixture.truth.stationary_expected,
+        allowed_period_status: fixture.truth.allowed_period_status.clone(),
+        period_status: result.period_status.clone(),
+        period_confidence: result.period_confidence.clone(),
+        selected_physical_bpm: result.physical_period_bpm,
+        relative_error: evaluation.selected_error_relative,
+        selected_error_relative: evaluation.selected_error_relative,
+        candidate_count: result.period_candidates.len(),
+        clusters: result.period_clusters.clone(),
+        winning_channels,
+        competing_channels,
+        period_conflict: result.period_conflict.is_some(),
+        canonical_status: result.canonical_layer.status.clone(),
+        truth_relation: evaluation.truth_relation,
+        confidently_correct: evaluation.confidently_correct,
+        safely_ambiguous: evaluation.safely_ambiguous,
+        safely_abstained: evaluation.safely_abstained,
+        evaluation_class: evaluation.evaluation_class.clone(),
+        false_confident: evaluation.false_confident,
+        passed: evaluation.passed,
+        detail: fixture.detail.clone(),
+    }
+}
+
+fn synthetic_hardening_fixtures() -> Vec<SyntheticFixture> {
+    let allow_selected = ["SELECTED"];
+    let allow_safe = ["SELECTED", "RETAIN_MULTIPLE", "ABSTAIN"];
+    let mut fixtures = Vec::new();
+    for bpm in [95.7, 119.8, 127.35, 129.7, 133.4, 174.2] {
+        fixtures.push(synthetic_fixture(
+            &format!("clean_stationary_{bpm}"),
+            synthetic_grid_events(60_000_000.0 / bpm, 64, 123_456.0),
+            Some(bpm),
+            vec![bpm],
+            vec![bpm],
+            true,
+            &allow_selected,
+            "clean stationary clock with an exact non-integer period",
+        ));
+    }
+    fixtures.push(synthetic_fixture(
+        "biased_adjacent_median",
+        patterned_events(500_000.0, 64, 10_000.0, &[0.97, 0.97, 1.06]),
+        Some(120.0),
+        vec![120.0],
+        vec![120.0],
+        true,
+        &allow_safe,
+        "adjacent median is biased while the repeating long-span clock is 500 ms",
+    ));
+    fixtures.push(synthetic_fixture(
+        "alternating_quantization_bias",
+        offset_events(60_000_000.0 / 119.8, 64, 20_000.0, &[8_000.0, -8_000.0]),
+        Some(119.8),
+        vec![119.8],
+        vec![119.8],
+        true,
+        &allow_safe,
+        "bounded alternating timing offsets",
+    ));
+    fixtures.push(synthetic_fixture(
+        "compensating_local_bias",
+        patterned_events(
+            60_000_000.0 / 127.35,
+            64,
+            30_000.0,
+            &[0.96, 0.96, 0.96, 1.12],
+        ),
+        Some(127.35),
+        vec![127.35],
+        vec![127.35],
+        true,
+        &allow_safe,
+        "short consecutive intervals are compensated by a longer interval",
+    ));
+    for offset in [80_000_u64, 150_000, 250_000] {
+        let mut first = synthetic_grid_events(60_000_000.0 / 129.7, 64, 40_000.0);
+        first[0] += offset;
+        fixtures.push(synthetic_fixture(
+            &format!("bad_first_endpoint_{offset}"),
+            first,
+            Some(129.7),
+            vec![129.7],
+            vec![129.7],
+            true,
+            &allow_safe,
+            "only the first observed event is corrupted",
+        ));
+        let mut last = synthetic_grid_events(60_000_000.0 / 129.7, 64, 40_000.0);
+        *last.last_mut().expect("synthetic endpoint") += offset;
+        fixtures.push(synthetic_fixture(
+            &format!("bad_last_endpoint_{offset}"),
+            last,
+            Some(129.7),
+            vec![129.7],
+            vec![129.7],
+            true,
+            &allow_safe,
+            "only the final observed event is corrupted",
+        ));
+    }
+    let random_base = synthetic_grid_events(60_000_000.0 / 133.4, 80, 50_000.0);
+    for (label, fraction) in [
+        ("random_missing_5pct", 20_usize),
+        ("random_missing_10pct", 10),
+        ("random_missing_20pct", 5),
+    ] {
+        fixtures.push(synthetic_fixture(
+            label,
+            remove_events(&random_base, |index| index > 0 && index % fraction == 0),
+            Some(133.4),
+            vec![133.4],
+            vec![133.4],
+            true,
+            &allow_safe,
+            "deterministic sparse missing-event pattern",
+        ));
+    }
+    let periodic_base = synthetic_grid_events(60_000_000.0 / 174.2, 96, 60_000.0);
+    for divisor in [4, 7, 8] {
+        fixtures.push(synthetic_fixture(
+            &format!("periodic_missing_every_{divisor}"),
+            remove_events(&periodic_base, |index| index > 0 && index % divisor == 0),
+            Some(174.2),
+            vec![174.2],
+            vec![174.2],
+            true,
+            &allow_safe,
+            "periodic missing events test alternate-period support",
+        ));
+    }
+    let subdivision_base = synthetic_grid_events(60_000_000.0 / 95.7, 64, 70_000.0);
+    let mut subdivision = subdivision_base.clone();
+    subdivision.insert(20, subdivision_base[20] - 300_000);
+    fixtures.push(synthetic_fixture(
+        "subdivision_contamination",
+        subdivision,
+        Some(95.7),
+        vec![95.7],
+        vec![95.7],
+        true,
+        &allow_safe,
+        "one half-beat subdivision is inserted into an otherwise stationary clock",
+    ));
+    let duplicate_base = synthetic_grid_events(60_000_000.0 / 119.8, 64, 80_000.0);
+    let mut duplicate = duplicate_base.clone();
+    duplicate.insert(24, duplicate_base[24] + 1_000);
+    fixtures.push(synthetic_fixture(
+        "near_duplicate_event",
+        duplicate,
+        Some(119.8),
+        vec![119.8],
+        vec![119.8],
+        true,
+        &allow_safe,
+        "one near-duplicate event is inserted without changing the physical clock",
+    ));
+    fixtures.push(synthetic_fixture(
+        "nearby_false_period_174_vs_175",
+        synthetic_grid_events(60_000_000.0 / 174.0, 96, 91_000.0),
+        Some(174.0),
+        vec![174.0],
+        vec![174.0],
+        true,
+        &allow_safe,
+        "long baseline must reject a plausible 175 BPM basin",
+    ));
+    for (id, bpm) in [
+        ("nearby_129_vs_130", 129.0),
+        ("nearby_95_7_vs_96", 95.7),
+        ("nearby_133_vs_134", 133.0),
+    ] {
+        fixtures.push(synthetic_fixture(
+            id,
+            synthetic_grid_events(60_000_000.0 / bpm, 80, 100_000.0),
+            Some(bpm),
+            vec![bpm],
+            vec![bpm],
+            true,
+            &allow_safe,
+            "nearby-period robustness without a BPM-specific inference rule",
+        ));
+    }
+    let alias = with_observed_hypotheses(
+        synthetic_fixture(
+            "half_double_60_120",
+            synthetic_grid_events(1_000_000.0, 64, 110_000.0),
+            Some(60.0),
+            vec![60.0],
+            vec![60.0, 120.0],
+            true,
+            &allow_selected,
+            "physical 60 BPM with an observed exact double-time metrical layer",
+        ),
+        &[(60.0, "primary", 0.55), (120.0, "double_time", 0.45)],
+        "primary",
+    );
+    fixtures.push(alias);
+    fixtures.push(with_observed_hypotheses(
+        synthetic_fixture(
+            "clear_primary_layer",
+            synthetic_grid_events(1_000_000.0, 64, 120_000.0),
+            Some(60.0),
+            vec![60.0],
+            vec![60.0],
+            true,
+            &allow_selected,
+            "one observed primary metrical layer has decisive weight",
+        ),
+        &[(60.0, "primary", 0.9)],
+        "primary",
+    ));
+    let mut nonstationary = synthetic_grid_events(500_000.0, 64, 130_000.0);
+    for (index, event) in nonstationary.iter_mut().enumerate() {
+        *event += (index * index * 2_500) as u64;
+    }
+    fixtures.push(synthetic_fixture(
+        "nonstationary_clock",
+        nonstationary,
+        Some(120.0),
+        Vec::new(),
+        Vec::new(),
+        false,
+        &["ABSTAIN"],
+        "tempo ramp is not eligible for fixed-period authority",
+    ));
+    fixtures
+}
+
+fn synthetic_hardening_summary() -> SyntheticHardeningSummary {
+    let cases = synthetic_hardening_fixtures()
+        .into_iter()
+        .map(|fixture| {
+            let observed =
+                synthetic_track_from_observations(&fixture.fixture_id, &fixture.observations);
+            let result = build_track(&observed);
+            synthetic_case_from_result(&fixture, &result)
+        })
+        .collect::<Vec<_>>();
+    let correct_confident = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "CORRECT_CONFIDENT")
         .count();
-    let all_passed = cases.iter().all(|case| case.passed) && false_confident == 0;
-    cases.shrink_to_fit();
+    let correct_acceptable = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "CORRECT_ACCEPTABLE")
+        .count();
+    let safe_retain_multiple = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_RETAIN_MULTIPLE")
+        .count();
+    let safe_abstain = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_ABSTAIN")
+        .count();
+    let false_confident = cases.iter().filter(|case| case.false_confident).count();
+    let unexpected_failures = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "UNEXPECTED_FAILURE")
+        .count();
+    let channel_duplication_invariance = synthetic_channel_duplication_invariance();
+    let all_passed = cases.iter().all(|case| case.passed)
+        && false_confident == 0
+        && channel_duplication_invariance;
     SyntheticHardeningSummary {
-        suite: "fixed_tempo_consensus_synthetic_hardening_v2".into(),
+        suite: "fixed_tempo_consensus_synthetic_hardening_e2e".into(),
+        phase: "PRE_HARDENING_E2E_BASELINE".into(),
+        source_commit: String::new(),
         external_reference_used_for_inference: false,
+        truth_used_for_inference: false,
         cases,
+        correct_confident,
+        correct_acceptable,
+        safe_retain_multiple,
+        safe_abstain,
         false_confident_selections: false_confident,
+        unexpected_failures,
+        channel_duplication_invariance,
         all_passed,
     }
+}
+
+fn synthetic_channel_duplication_invariance() -> bool {
+    let observed = synthetic_track_from_observations(
+        "channel_duplication_observation",
+        &SyntheticObservedEvidence {
+            events: synthetic_grid_events(60_000_000.0 / 129.0, 64, 0.0),
+            duration_micros: 32_000_000,
+            classical_candidates_bpm: Vec::new(),
+            tempo_hypotheses: Vec::new(),
+            primary_relation: "unknown".into(),
+        },
+    );
+    let mut with_duplicates = vec![
+        synthetic_candidate("local", 129.0, CHANNEL_LOCAL_INTERVAL, 1.0),
+        synthetic_candidate("long-a", 129.0, CHANNEL_LONG_BASELINE, 3.0),
+        synthetic_candidate("long-b", 129.0, CHANNEL_LONG_BASELINE, 3.0),
+        synthetic_candidate("long-c", 129.0, CHANNEL_LONG_BASELINE, 3.0),
+        synthetic_candidate("robust", 129.0, CHANNEL_ROBUST_GRID, 2.0),
+    ];
+    let duplicated_clusters = make_clusters(&mut with_duplicates);
+    let duplicated_score = duplicated_clusters[0].score;
+    let duplicated_bpm = weighted_cluster_bpm(&with_duplicates, 0);
+    let duplicated_channels = duplicated_clusters[0].independent_channels.clone();
+    let duplicated_selection = select_signature(&mut with_duplicates, &observed.full);
+    let mut single = with_duplicates
+        .into_iter()
+        .filter(|candidate| {
+            candidate.source == "local"
+                || candidate.source == "long-a"
+                || candidate.source == "robust"
+        })
+        .collect::<Vec<_>>();
+    let single_clusters = make_clusters(&mut single);
+    let single_selection = select_signature(&mut single, &observed.full);
+    duplicated_score == single_clusters[0].score
+        && duplicated_bpm == weighted_cluster_bpm(&single, 0)
+        && duplicated_channels == single_clusters[0].independent_channels
+        && duplicated_selection == single_selection
+}
+
+fn select_signature(
+    candidates: &mut [FixedTempoPeriodCandidate],
+    full: &RealSongAnalysisReport,
+) -> (String, Option<f64>, String) {
+    let clusters = make_clusters(candidates);
+    let (status, bpm, conflict) = select_period(candidates, &clusters, full);
+    let confidence = period_confidence(&status, &clusters, bpm);
+    (
+        status,
+        bpm,
+        confidence
+            + if conflict.is_some() {
+                ":CONFLICT"
+            } else {
+                ":CLEAR"
+            },
+    )
+}
+
+fn synthetic_markdown(summary: &SyntheticHardeningSummary, source_commit: &str) -> String {
+    format!(
+        "# Synthetic fixed-tempo consensus E2E validation\n\n\
+         - source commit: `{source_commit}`\n\
+         - phase: `{}`\n\
+         - truth used for inference: NO\n\
+         - external reference used for inference: NO\n\
+         - fixtures: {}\n\
+         - CORRECT_CONFIDENT: {}\n\
+         - CORRECT_ACCEPTABLE: {}\n\
+         - SAFE_RETAIN_MULTIPLE: {}\n\
+         - SAFE_ABSTAIN: {}\n\
+         - FALSE_CONFIDENT: {}\n\
+         - UNEXPECTED_FAILURE: {}\n\
+         - channel duplication invariance: {}\n\
+         - all passed: {}\n\n\
+         Each case entered the same candidate generation, channel aggregation,\
+         clustering, conflict detection, selection, confidence, and canonical\
+         decision path used by the blind real-song report. Truth is joined only\
+         after inference by the evaluator.\n",
+        summary.phase,
+        summary.cases.len(),
+        summary.correct_confident,
+        summary.correct_acceptable,
+        summary.safe_retain_multiple,
+        summary.safe_abstain,
+        summary.false_confident_selections,
+        summary.unexpected_failures,
+        summary.channel_duplication_invariance,
+        summary.all_passed,
+    )
 }
 
 fn markdown(report: &FixedTempoConsensusReport) -> String {
@@ -1354,9 +1810,39 @@ mod tests {
     #[test]
     fn synthetic_hardening_suite_has_no_false_confident_case() {
         let summary = synthetic_hardening_summary();
-        assert_eq!(summary.cases.len(), 19);
+        assert!(summary.cases.len() >= 19);
         assert_eq!(summary.false_confident_selections, 0);
+        assert_eq!(summary.unexpected_failures, 0);
+        assert!(summary.channel_duplication_invariance);
         assert!(summary.all_passed);
+        assert_eq!(
+            summary.cases.len(),
+            summary.correct_confident
+                + summary.correct_acceptable
+                + summary.safe_retain_multiple
+                + summary.safe_abstain
+                + summary.false_confident_selections
+                + summary.unexpected_failures
+        );
         assert!(!summary.external_reference_used_for_inference);
+        assert!(!summary.truth_used_for_inference);
+    }
+
+    #[test]
+    fn false_confidence_is_derived_from_selector_result() {
+        let fixture = synthetic_hardening_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "clean_stationary_119.8")
+            .expect("synthetic fixture");
+        let observed =
+            synthetic_track_from_observations(&fixture.fixture_id, &fixture.observations);
+        let mut selected = build_track(&observed);
+        selected.period_status = "SELECTED".into();
+        selected.period_confidence = "SELECTED_STRONG".into();
+        selected.physical_period_bpm = Some(121.0);
+        let evaluation = period_selection_evaluation(&selected, &fixture.truth);
+        assert!(evaluation.false_confident);
+        assert_eq!(evaluation.evaluation_class, "FALSE_CONFIDENT");
+        assert!(!evaluation.passed);
     }
 }
