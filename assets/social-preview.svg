@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Wotoha RS — Automatic DJ for Discord</title>
+  <desc id="desc">Rust audio processing, AutoMix, beat matching, and loudness normalization.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#312e81"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" rx="32" fill="url(#bg)"/>
+  <g fill="none" stroke="#818cf8" stroke-linecap="round" opacity="0.72">
+    <path stroke-width="8" d="M72 456h80l28-112 36 168 40-224 40 168 32-96 32 96h120"/>
+    <path stroke-width="4" d="M72 510h1090M72 548h920" opacity="0.45"/>
+  </g>
+  <text x="72" y="158" fill="#e0e7ff" font-family="Inter,Segoe UI,sans-serif" font-size="72" font-weight="700">Wotoha RS</text>
+  <text x="76" y="238" fill="#c7d2fe" font-family="Inter,Segoe UI,sans-serif" font-size="38">Automatic DJ for Discord</text>
+  <text x="76" y="312" fill="#a5b4fc" font-family="Inter,Segoe UI,sans-serif" font-size="28">AutoMix  •  Beat Matching  •  Rust Audio Processing</text>
+  <text x="76" y="590" fill="#94a3b8" font-family="Inter,Segoe UI,sans-serif" font-size="22">Open source · Self-hostable · Analysis-aware transitions</text>
+</svg>
