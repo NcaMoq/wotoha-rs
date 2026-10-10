@@ -19,7 +19,7 @@ use crate::{
     write_json,
 };
 
-const REPORT_SCHEMA: u32 = 1;
+const REPORT_SCHEMA: u32 = 2;
 const PERIOD_CONSENSUS_RELATIVE: f64 = 0.002;
 const STRONG_AGREEMENT_RELATIVE: f64 = 0.0005;
 const MODERATE_AGREEMENT_RELATIVE: f64 = 0.001;
@@ -33,6 +33,14 @@ const CHANNEL_SEGMENT_CLOCK: &str = "SEGMENT_CLOCK";
 const CHANNEL_CLASSICAL_METRICAL: &str = "CLASSICAL_METRICAL";
 const ORIGIN_BEAT_EVENTS: &str = "BEAT_EVENTS";
 const ORIGIN_INDEPENDENT_METRICAL: &str = "INDEPENDENT_METRICAL_OBSERVATION";
+const STATIONARITY_MIN_EVENTS: usize = 8;
+const STATIONARITY_WINDOW_COUNT: usize = 5;
+const STATIONARITY_CLOCK_CHANGE: f64 = 0.03;
+const STATIONARITY_CONTAMINATION_LOW: f64 = 0.75;
+const STATIONARITY_CONTAMINATION_HIGH: f64 = 1.25;
+const STATIONARITY_CONTAMINATION_MAD: f64 = 0.08;
+const CANONICAL_DECISIVE_WEIGHT: f32 = 0.65;
+const CANONICAL_DECISIVE_MARGIN: f32 = 0.25;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FixedTempoConsensusReport {
@@ -43,8 +51,97 @@ pub struct FixedTempoConsensusReport {
     pub input_report: String,
     pub configuration: ConsensusConfiguration,
     pub synthetic_hardening: SyntheticHardeningSummary,
+    pub stationarity_synthetic: StationaritySyntheticSummary,
+    pub canonical_synthetic: CanonicalSyntheticSummary,
     pub tracks: Vec<FixedTempoConsensusTrack>,
     pub summary: FixedTempoConsensusSummary,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationaritySyntheticSummary {
+    pub suite: String,
+    pub phase: String,
+    pub source_commit: String,
+    pub external_reference_used_for_inference: bool,
+    pub truth_used_for_inference: bool,
+    pub configuration: StationarityResearchConfiguration,
+    pub cases: Vec<StationaritySyntheticCase>,
+    pub correct_stationary: usize,
+    pub correct_nonstationary: usize,
+    pub safe_contaminated: usize,
+    pub safe_insufficient: usize,
+    pub false_nonstationary: usize,
+    pub false_stationary_authority: usize,
+    pub unexpected_failures: usize,
+    pub all_passed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationarityResearchConfiguration {
+    pub minimum_events: usize,
+    pub window_count: usize,
+    pub clock_change_relative_threshold: f64,
+    pub contamination_interval_ratio_low: f64,
+    pub contamination_interval_ratio_high: f64,
+    pub contamination_mad_threshold: f64,
+    pub inference_rule: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationaritySyntheticCase {
+    pub fixture_id: String,
+    pub truth_stationary: bool,
+    pub observed_event_count: usize,
+    pub stationarity_state: String,
+    pub clock_drift_score: f64,
+    pub window_period_spread: Option<f64>,
+    pub segment_consistency: f64,
+    pub contamination_score: f64,
+    pub support_fraction: f64,
+    pub reason_codes: Vec<String>,
+    pub evaluation_class: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanonicalSyntheticSummary {
+    pub suite: String,
+    pub phase: String,
+    pub source_commit: String,
+    pub external_reference_used_for_inference: bool,
+    pub truth_used_for_inference: bool,
+    pub cases: Vec<CanonicalSyntheticCase>,
+    pub correct_selected: usize,
+    pub safe_retain: usize,
+    pub safe_abstain: usize,
+    pub false_canonical_selection: usize,
+    pub unexpected_failures: usize,
+    pub all_passed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanonicalEvidenceProvenance {
+    pub evidence: String,
+    pub derived_from: String,
+    pub independence_origin: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CanonicalSyntheticCase {
+    pub fixture_id: String,
+    pub physical_period_bpm: f64,
+    pub truth_canonical_bpm: f64,
+    pub selected_canonical_bpm: Option<f64>,
+    pub retained_candidates_bpm: Vec<f64>,
+    pub status: String,
+    pub relation: String,
+    pub metrical_evidence: Vec<String>,
+    pub evidence_provenance: Vec<CanonicalEvidenceProvenance>,
+    pub canonical_confidence: String,
+    pub evaluation_class: String,
+    pub passed: bool,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,6 +260,7 @@ pub struct FixedTempoConsensusTrack {
     pub physical_period_bpm: Option<f64>,
     pub physical_period_micros: Option<f64>,
     pub period_conflict: Option<PeriodConflict>,
+    pub stationarity_research: StationarityResearchObservation,
     pub canonical_layer: CanonicalLayerDecision,
 }
 
@@ -222,7 +320,21 @@ pub struct CanonicalLayerDecision {
     pub retained_candidates_bpm: Vec<f64>,
     pub relation: String,
     pub metrical_evidence: Vec<String>,
+    pub evidence_provenance: Vec<CanonicalEvidenceProvenance>,
+    pub confidence: String,
     pub external_reference_used_for_inference: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StationarityResearchObservation {
+    pub state: String,
+    pub clock_drift_score: f64,
+    pub window_period_spread: Option<f64>,
+    pub segment_consistency: f64,
+    pub contamination_score: f64,
+    pub support_fraction: f64,
+    pub reason_codes: Vec<String>,
+    pub inference_truth_free: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -302,10 +414,12 @@ pub fn run_fixed_tempo_consensus_research(
             channel_aggregation_rule: "within each fixed representative cluster, each evidence channel contributes only its highest-scoring candidate; correlated estimators share one bounded vote and cannot inflate the cluster score".into(),
             phase_estimation_rule: "candidate phase is selected from bounded event remainders and fixed phase buckets using a trimmed residual objective; it is never anchored to the first BeatEvent".into(),
             confidence_rule: "SELECTED_STRONG requires two or more genuine evidence origins; SELECTED_MODERATE is reserved for a selected cluster supported only by one origin; algorithmic channels derived from the same BeatEvent stream do not create a second origin; unresolved conflict is RETAIN_MULTIPLE and non-stationary or insufficient evidence is ABSTAIN".into(),
-            canonical_layer_rule: "physical period is resolved first; a metrical alternative is retained only when a runtime tempo hypothesis is an exact half/double layer with substantial weight and no decisive separation".into(),
+            canonical_layer_rule: "physical period is resolved first; exact half/double layers are selected only when generic runtime metrical evidence has a pre-registered decisive weight and margin, otherwise both layers are retained".into(),
             external_reference_used_for_inference: false,
         },
         synthetic_hardening: synthetic_hardening_summary(),
+        stationarity_synthetic: stationarity_synthetic_summary(),
+        canonical_synthetic: canonical_synthetic_summary(),
         tracks: output_tracks_sorted(tracks),
         summary,
     };
@@ -317,6 +431,14 @@ pub fn run_fixed_tempo_consensus_research(
     write_json(
         &output_dir.join("synthetic-hardening.json"),
         &output.synthetic_hardening,
+    )?;
+    write_json(
+        &output_dir.join("stationarity-synthetic.json"),
+        &output.stationarity_synthetic,
+    )?;
+    write_json(
+        &output_dir.join("canonical-synthetic.json"),
+        &output.canonical_synthetic,
     )?;
     Ok(output)
 }
@@ -335,6 +457,13 @@ pub fn run_fixed_tempo_consensus_synthetic_research(
         output_dir.join("synthetic-hardening-e2e.md"),
         synthetic_markdown(&summary, &source_commit),
     )?;
+    let stationarity = stationarity_synthetic_summary_with_source(&source_commit);
+    let canonical = canonical_synthetic_summary_with_source(&source_commit);
+    write_json(
+        &output_dir.join("stationarity-synthetic-e2e.json"),
+        &stationarity,
+    )?;
+    write_json(&output_dir.join("canonical-synthetic-e2e.json"), &canonical)?;
     Ok(summary)
 }
 
@@ -489,6 +618,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         &full.tempo_hypotheses,
         &full.primary_relation,
     );
+    let stationarity_research = research_stationarity(&full.raw_event_times_micros);
     FixedTempoConsensusTrack {
         track_id: track.track_id.clone(),
         source_filename: track.source_filename.clone(),
@@ -500,6 +630,7 @@ fn build_track(track: &RealSongTrackReport) -> FixedTempoConsensusTrack {
         physical_period_bpm,
         physical_period_micros: physical_period_bpm.map(|bpm| 60_000_000.0 / bpm),
         period_conflict,
+        stationarity_research,
         canonical_layer,
     }
 }
@@ -893,6 +1024,8 @@ fn resolve_canonical_layer(
             retained_candidates_bpm: Vec::new(),
             relation: "unknown".into(),
             metrical_evidence: vec!["physical period was not selected".into()],
+            evidence_provenance: Vec::new(),
+            confidence: "ABSTAIN".into(),
             external_reference_used_for_inference: false,
         };
     };
@@ -916,6 +1049,12 @@ fn resolve_canonical_layer(
             retained.push(f64::from(alternative.bpm));
         }
         retained.sort_by(f64::total_cmp);
+        let evidence_provenance = match (primary, alternative) {
+            (Some(primary), Some(alternative)) => {
+                canonical_evidence_provenance(primary, alternative)
+            }
+            _ => Vec::new(),
+        };
         return CanonicalLayerDecision {
             status: "CANONICAL_RETAIN_MULTIPLE".into(),
             physical_period_bpm: Some(physical),
@@ -926,8 +1065,31 @@ fn resolve_canonical_layer(
                 "primary and half/double hypothesis are both runtime-supported".into(),
                 format!("input primary relation: {primary_relation}"),
             ],
+            evidence_provenance,
+            confidence: "RETAIN_MULTIPLE".into(),
             external_reference_used_for_inference: false,
         };
+    }
+    if let (Some(primary), Some(alternative)) = (primary, alternative) {
+        let alternative_is_decisive = alternative.relative_weight >= CANONICAL_DECISIVE_WEIGHT
+            && alternative.relative_weight - primary.relative_weight >= CANONICAL_DECISIVE_MARGIN;
+        if alternative_is_decisive {
+            let alternative_bpm = f64::from(alternative.bpm);
+            return CanonicalLayerDecision {
+                status: "CANONICAL_SELECTED".into(),
+                physical_period_bpm: Some(physical),
+                canonical_bpm: Some(alternative_bpm),
+                retained_candidates_bpm: vec![alternative_bpm],
+                relation: relation_for_layer(alternative_bpm, physical),
+                metrical_evidence: vec![
+                    "a runtime half/double hypothesis has decisive generic metrical weight".into(),
+                    format!("input primary relation: {primary_relation}"),
+                ],
+                evidence_provenance: canonical_evidence_provenance(primary, alternative),
+                confidence: "SELECTED_STRONG".into(),
+                external_reference_used_for_inference: false,
+            };
+        }
     }
     CanonicalLayerDecision {
         status: "CANONICAL_SELECTED".into(),
@@ -936,7 +1098,42 @@ fn resolve_canonical_layer(
         retained_candidates_bpm: vec![physical],
         relation: "primary".into(),
         metrical_evidence: vec!["no decisive exact half/double alternative was supported".into()],
+        evidence_provenance: primary
+            .map(|hypothesis| vec![canonical_evidence_for_hypothesis(hypothesis)])
+            .unwrap_or_default(),
+        confidence: "SELECTED_STRONG".into(),
         external_reference_used_for_inference: false,
+    }
+}
+
+fn canonical_evidence_for_hypothesis(
+    hypothesis: &crate::real_song_research::TempoHypothesisReport,
+) -> CanonicalEvidenceProvenance {
+    CanonicalEvidenceProvenance {
+        evidence: format!("{}:{:.3}", hypothesis.relation, hypothesis.relative_weight),
+        derived_from: "RUNTIME_TEMPO_HYPOTHESIS".into(),
+        independence_origin: ORIGIN_INDEPENDENT_METRICAL.into(),
+    }
+}
+
+fn canonical_evidence_provenance(
+    primary: &crate::real_song_research::TempoHypothesisReport,
+    alternative: &crate::real_song_research::TempoHypothesisReport,
+) -> Vec<CanonicalEvidenceProvenance> {
+    vec![
+        canonical_evidence_for_hypothesis(primary),
+        canonical_evidence_for_hypothesis(alternative),
+    ]
+}
+
+fn relation_for_layer(layer_bpm: f64, physical_bpm: f64) -> String {
+    let ratio = layer_bpm / physical_bpm.max(f64::EPSILON);
+    if (ratio - 2.0).abs() <= STRONG_AGREEMENT_RELATIVE {
+        "double_time".into()
+    } else if (ratio - 0.5).abs() <= STRONG_AGREEMENT_RELATIVE {
+        "half_time".into()
+    } else {
+        "primary".into()
     }
 }
 
@@ -1669,6 +1866,866 @@ fn synthetic_markdown(summary: &SyntheticHardeningSummary, source_commit: &str) 
     )
 }
 
+fn stationarity_configuration() -> StationarityResearchConfiguration {
+    StationarityResearchConfiguration {
+        minimum_events: STATIONARITY_MIN_EVENTS,
+        window_count: STATIONARITY_WINDOW_COUNT,
+        clock_change_relative_threshold: STATIONARITY_CLOCK_CHANGE,
+        contamination_interval_ratio_low: STATIONARITY_CONTAMINATION_LOW,
+        contamination_interval_ratio_high: STATIONARITY_CONTAMINATION_HIGH,
+        contamination_mad_threshold: STATIONARITY_CONTAMINATION_MAD,
+        inference_rule: "window-local period estimates establish clock change only when at least two stable views support a coherent trend or step; otherwise irregular intervals are classified as event-sequence contamination or insufficient evidence".into(),
+    }
+}
+
+fn research_stationarity(events: &[u64]) -> StationarityResearchObservation {
+    let intervals = events
+        .windows(2)
+        .filter_map(|pair| {
+            if pair[1] > pair[0] {
+                Some((pair[1] - pair[0]) as f64)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let support_fraction = if events.len() < 2 {
+        0.0
+    } else {
+        intervals.len() as f64 / (events.len() - 1) as f64
+    };
+    let unavailable = |state: &str, reasons: Vec<String>| StationarityResearchObservation {
+        state: state.into(),
+        clock_drift_score: 1.0,
+        window_period_spread: None,
+        segment_consistency: 0.0,
+        contamination_score: 0.0,
+        support_fraction,
+        reason_codes: reasons,
+        inference_truth_free: true,
+    };
+    if events.len() < STATIONARITY_MIN_EVENTS || intervals.len() < STATIONARITY_MIN_EVENTS - 1 {
+        return unavailable(
+            "INSUFFICIENT_EVIDENCE",
+            vec!["minimum_event_support_not_met".into()],
+        );
+    }
+    let global_period = median(&intervals).unwrap_or(0.0).max(1.0);
+    let windows = period_windows(&intervals);
+    if windows.len() < 3 {
+        return unavailable(
+            "INSUFFICIENT_EVIDENCE",
+            vec!["fewer_than_three_period_views".into()],
+        );
+    }
+    let window_periods = windows
+        .iter()
+        .filter_map(|window| median(window))
+        .collect::<Vec<_>>();
+    let window_mads = windows
+        .iter()
+        .map(|window| {
+            let center = median(window).unwrap_or(global_period);
+            median(
+                &window
+                    .iter()
+                    .map(|value| (value - center).abs())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or(f64::INFINITY)
+                / center.max(1.0)
+        })
+        .collect::<Vec<_>>();
+    let window_period_spread = window_periods
+        .iter()
+        .min_by(|left, right| f64::total_cmp(left, right))
+        .zip(
+            window_periods
+                .iter()
+                .max_by(|left, right| f64::total_cmp(left, right)),
+        )
+        .map(|(minimum, maximum)| (maximum - minimum) / global_period);
+    let clock_drift_score = window_periods
+        .first()
+        .zip(window_periods.last())
+        .map(|(first, last)| (last - first).abs() / global_period)
+        .unwrap_or(1.0);
+    let stable_windows = window_mads
+        .iter()
+        .filter(|mad| **mad <= STATIONARITY_CONTAMINATION_MAD)
+        .count();
+    let segment_consistency = stable_windows as f64 / window_mads.len().max(1) as f64;
+    let contamination_count = intervals
+        .iter()
+        .filter(|interval| {
+            let ratio = **interval / global_period;
+            ratio < STATIONARITY_CONTAMINATION_LOW || ratio > STATIONARITY_CONTAMINATION_HIGH
+        })
+        .count();
+    let contamination_score = contamination_count as f64 / intervals.len() as f64;
+    let contaminated_window_count = windows
+        .iter()
+        .filter(|window| {
+            let contaminated = window
+                .iter()
+                .filter(|interval| {
+                    let ratio = **interval / global_period;
+                    ratio < STATIONARITY_CONTAMINATION_LOW
+                        || ratio > STATIONARITY_CONTAMINATION_HIGH
+                })
+                .count();
+            contaminated as f64 / window.len().max(1) as f64 >= 0.10
+        })
+        .count();
+    let contamination_is_distributed = contaminated_window_count >= 3;
+    let monotonic_steps = window_periods
+        .windows(2)
+        .filter(|window| {
+            (window[1] - window[0]).abs() / global_period >= STATIONARITY_CLOCK_CHANGE / 3.0
+        })
+        .count();
+    let low_windows = window_periods
+        .iter()
+        .filter(|period| {
+            window_periods
+                .iter()
+                .min_by(|left, right| f64::total_cmp(left, right))
+                .is_some_and(|minimum| (**period - *minimum).abs() / global_period < 0.01)
+        })
+        .count();
+    let high_windows = window_periods
+        .iter()
+        .filter(|period| {
+            window_periods
+                .iter()
+                .max_by(|left, right| f64::total_cmp(left, right))
+                .is_some_and(|maximum| (**period - *maximum).abs() / global_period < 0.01)
+        })
+        .count();
+    let coherent_clock_change = window_period_spread.is_some_and(|spread| {
+        spread >= STATIONARITY_CLOCK_CHANGE
+            && stable_windows >= 3
+            && (monotonic_steps >= 2 || (low_windows >= 2 && high_windows >= 2))
+            && (contamination_score <= 0.05 || contamination_is_distributed)
+    });
+    let mut reason_codes = Vec::new();
+    if coherent_clock_change {
+        reason_codes.push("multiple_stable_windows_support_clock_change".into());
+        reason_codes.push("period_views_are_not_explained_by_event_contamination_alone".into());
+    }
+    if contamination_score > 0.0 {
+        reason_codes.push("outlier_or_multiple_intervals_present".into());
+    }
+    if contamination_score > 0.05 && !contamination_is_distributed {
+        reason_codes.push("contamination_is_localized_to_period_views".into());
+    }
+    if segment_consistency < 1.0 {
+        reason_codes.push("window_local_dispersion_present".into());
+    }
+    let state = if coherent_clock_change {
+        "NONSTATIONARY"
+    } else if contamination_score > 0.0 || segment_consistency < 1.0 {
+        "EVENT_SEQUENCE_CONTAMINATED"
+    } else {
+        "STATIONARY"
+    };
+    StationarityResearchObservation {
+        state: state.into(),
+        clock_drift_score,
+        window_period_spread,
+        segment_consistency,
+        contamination_score,
+        support_fraction,
+        reason_codes,
+        inference_truth_free: true,
+    }
+}
+
+fn period_windows(intervals: &[f64]) -> Vec<Vec<f64>> {
+    if intervals.len() < 3 {
+        return Vec::new();
+    }
+    let window_len = (intervals.len() / STATIONARITY_WINDOW_COUNT.max(1)).max(4);
+    let last_start = intervals.len().saturating_sub(window_len);
+    (0..STATIONARITY_WINDOW_COUNT)
+        .map(|index| {
+            let start = if STATIONARITY_WINDOW_COUNT <= 1 {
+                0
+            } else {
+                index * last_start / (STATIONARITY_WINDOW_COUNT - 1)
+            };
+            intervals[start..(start + window_len).min(intervals.len())].to_vec()
+        })
+        .filter(|window| window.len() >= 4)
+        .collect()
+}
+
+fn stationarity_synthetic_summary() -> StationaritySyntheticSummary {
+    stationarity_synthetic_summary_with_source("")
+}
+
+fn stationarity_synthetic_summary_with_source(source_commit: &str) -> StationaritySyntheticSummary {
+    let cases = stationarity_synthetic_fixtures()
+        .into_iter()
+        .map(|fixture| {
+            let inferred = research_stationarity(&fixture.events);
+            stationarity_case_from_inference(&fixture, inferred)
+        })
+        .collect::<Vec<_>>();
+    let correct_stationary = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "CORRECT_STATIONARY")
+        .count();
+    let correct_nonstationary = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "CORRECT_NONSTATIONARY")
+        .count();
+    let safe_contaminated = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_CONTAMINATED")
+        .count();
+    let safe_insufficient = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_INSUFFICIENT")
+        .count();
+    let false_nonstationary = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "FALSE_NONSTATIONARY")
+        .count();
+    let false_stationary_authority = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "FALSE_STATIONARY_AUTHORITY")
+        .count();
+    let unexpected_failures = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "UNEXPECTED_FAILURE")
+        .count();
+    StationaritySyntheticSummary {
+        suite: "fixed_tempo_stationarity_contamination_e2e".into(),
+        phase: "GENERIC_SYNTHETIC_FROZEN_BEFORE_OPEN_REGRESSION".into(),
+        source_commit: source_commit.into(),
+        external_reference_used_for_inference: false,
+        truth_used_for_inference: false,
+        configuration: stationarity_configuration(),
+        cases,
+        correct_stationary,
+        correct_nonstationary,
+        safe_contaminated,
+        safe_insufficient,
+        false_nonstationary,
+        false_stationary_authority,
+        unexpected_failures,
+        all_passed: false_nonstationary == 0
+            && false_stationary_authority == 0
+            && unexpected_failures == 0,
+    }
+}
+
+#[derive(Clone)]
+struct StationarityFixture {
+    fixture_id: String,
+    events: Vec<u64>,
+    truth_stationary: bool,
+    detail: String,
+}
+
+fn stationarity_case_from_inference(
+    fixture: &StationarityFixture,
+    inferred: StationarityResearchObservation,
+) -> StationaritySyntheticCase {
+    let evaluation_class = if fixture.truth_stationary {
+        match inferred.state.as_str() {
+            "STATIONARY" => "CORRECT_STATIONARY",
+            "EVENT_SEQUENCE_CONTAMINATED" => "SAFE_CONTAMINATED",
+            "INSUFFICIENT_EVIDENCE" => "SAFE_INSUFFICIENT",
+            "NONSTATIONARY" => "FALSE_NONSTATIONARY",
+            _ => "UNEXPECTED_FAILURE",
+        }
+    } else {
+        match inferred.state.as_str() {
+            "NONSTATIONARY" => "CORRECT_NONSTATIONARY",
+            "EVENT_SEQUENCE_CONTAMINATED" => "SAFE_CONTAMINATED",
+            "INSUFFICIENT_EVIDENCE" => "SAFE_INSUFFICIENT",
+            "STATIONARY" => "FALSE_STATIONARY_AUTHORITY",
+            _ => "UNEXPECTED_FAILURE",
+        }
+    };
+    let passed = !matches!(
+        evaluation_class,
+        "FALSE_NONSTATIONARY" | "FALSE_STATIONARY_AUTHORITY" | "UNEXPECTED_FAILURE"
+    );
+    StationaritySyntheticCase {
+        fixture_id: fixture.fixture_id.clone(),
+        truth_stationary: fixture.truth_stationary,
+        observed_event_count: fixture.events.len(),
+        stationarity_state: inferred.state,
+        clock_drift_score: inferred.clock_drift_score,
+        window_period_spread: inferred.window_period_spread,
+        segment_consistency: inferred.segment_consistency,
+        contamination_score: inferred.contamination_score,
+        support_fraction: inferred.support_fraction,
+        reason_codes: inferred.reason_codes,
+        evaluation_class: evaluation_class.into(),
+        passed,
+        detail: fixture.detail.clone(),
+    }
+}
+
+fn stationary_events(period: f64, count: usize, phase: f64) -> Vec<u64> {
+    synthetic_grid_events(period, count, phase)
+}
+
+fn variable_events(periods: &[f64], phase: f64) -> Vec<u64> {
+    let mut events = vec![phase.round() as u64];
+    let mut time = phase;
+    for period in periods {
+        time += *period;
+        events.push(time.round() as u64);
+    }
+    events
+}
+
+fn stationarity_synthetic_fixtures() -> Vec<StationarityFixture> {
+    let base_period = 500_000.0;
+    let base = stationary_events(base_period, 120, 100_000.0);
+    let mut fixtures = Vec::new();
+    let add = |fixtures: &mut Vec<StationarityFixture>,
+               id: &str,
+               events: Vec<u64>,
+               stationary: bool,
+               detail: &str| {
+        fixtures.push(StationarityFixture {
+            fixture_id: id.into(),
+            events,
+            truth_stationary: stationary,
+            detail: detail.into(),
+        });
+    };
+    add(
+        &mut fixtures,
+        "clean_stationary",
+        base.clone(),
+        true,
+        "exact stationary event clock",
+    );
+    for (id, divisor) in [
+        ("stationary_missing_5pct", 20),
+        ("stationary_missing_10pct", 10),
+        ("stationary_missing_20pct", 5),
+    ] {
+        add(
+            &mut fixtures,
+            id,
+            remove_events(&base, |index| index > 0 && index % divisor == 0),
+            true,
+            "stationary clock with deterministic missing events",
+        );
+    }
+    for divisor in [4, 7] {
+        add(
+            &mut fixtures,
+            &format!("stationary_missing_every_{divisor}"),
+            remove_events(&base, |index| index > 0 && index % divisor == 0),
+            true,
+            "stationary clock with periodic missing events",
+        );
+    }
+    let mut duplicate = base.clone();
+    duplicate.insert(30, base[30]);
+    duplicate.insert(70, base[70] + 1_000);
+    add(
+        &mut fixtures,
+        "stationary_duplicate_events",
+        duplicate,
+        true,
+        "exact and near duplicate observations",
+    );
+    for (id, fraction) in [
+        ("stationary_half_subdivision", 0.5),
+        ("stationary_quarter_subdivision", 0.25),
+    ] {
+        let mut events = base.clone();
+        events.insert(
+            35,
+            (base[35] as f64 - base_period * fraction).round() as u64,
+        );
+        add(
+            &mut fixtures,
+            id,
+            events,
+            true,
+            "stationary physical clock with subdivision contamination",
+        );
+    }
+    for (id, first, last) in [
+        ("stationary_bad_first_endpoint", 80_000_i64, 0_i64),
+        ("stationary_bad_last_endpoint", 0, 150_000),
+        ("stationary_bad_both_endpoints", 150_000, 250_000),
+    ] {
+        let mut events = base.clone();
+        events[0] = (events[0] as i64 + first) as u64;
+        let last_index = events.len() - 1;
+        events[last_index] = (events[last_index] as i64 + last) as u64;
+        add(
+            &mut fixtures,
+            id,
+            events,
+            true,
+            "stationary clock with bounded endpoint corruption",
+        );
+    }
+    let mut noisy = base.clone();
+    for index in 48..61 {
+        noisy[index] = (noisy[index] as i64 + ((index % 5) as i64 - 2) * 65_000) as u64;
+    }
+    add(
+        &mut fixtures,
+        "stationary_one_noisy_section",
+        noisy,
+        true,
+        "one noisy section without physical clock change",
+    );
+    let sparse = remove_events(&base, |index| (45..=65).contains(&index));
+    add(
+        &mut fixtures,
+        "stationary_long_sparse_breakdown",
+        sparse,
+        true,
+        "long sparse breakdown with unchanged clock",
+    );
+    let mut phase_jump = base.clone();
+    for event in phase_jump.iter_mut().skip(60) {
+        *event += 100_000;
+    }
+    add(
+        &mut fixtures,
+        "stationary_phase_discontinuity",
+        phase_jump,
+        true,
+        "phase discontinuity with unchanged period",
+    );
+    let local_collapse = remove_events(&base, |index| (48..=70).contains(&index) && index % 2 == 1);
+    add(
+        &mut fixtures,
+        "stationary_local_event_density_collapse",
+        local_collapse,
+        true,
+        "local event-density collapse without clock change",
+    );
+    add(
+        &mut fixtures,
+        "stationary_non_integer_tempo",
+        stationary_events(60_000_000.0 / 127.35, 120, 100_000.0),
+        true,
+        "stationary non-integer tempo",
+    );
+    let mut half_time = stationary_events(1_000_000.0, 90, 100_000.0);
+    let physical = half_time.clone();
+    for index in (1..physical.len()).step_by(2).rev() {
+        half_time.insert(
+            index,
+            (physical[index - 1] as f64 + 500_000.0).round() as u64,
+        );
+    }
+    add(
+        &mut fixtures,
+        "stationary_half_time_with_subdivisions",
+        half_time,
+        true,
+        "stable physical half-time pulse with regular subdivisions",
+    );
+    let ramp = |start: f64, end: f64, count: usize| {
+        (0..count)
+            .map(|index| {
+                let fraction = index as f64 / (count.saturating_sub(1).max(1)) as f64;
+                60_000_000.0 / (start + (end - start) * fraction)
+            })
+            .collect::<Vec<_>>()
+    };
+    add(
+        &mut fixtures,
+        "slow_linear_accelerando",
+        variable_events(&ramp(120.0, 115.0, 100), 100_000.0),
+        false,
+        "slow coherent accelerando",
+    );
+    add(
+        &mut fixtures,
+        "slow_linear_ritardando",
+        variable_events(&ramp(115.0, 120.0, 100), 100_000.0),
+        false,
+        "slow coherent ritardando",
+    );
+    add(
+        &mut fixtures,
+        "faster_linear_ramp",
+        variable_events(&ramp(130.0, 100.0, 100), 100_000.0),
+        false,
+        "faster coherent tempo ramp",
+    );
+    let mut step = vec![60_000_000.0 / 120.0; 50];
+    step.extend([60_000_000.0 / 105.0; 50]);
+    add(
+        &mut fixtures,
+        "abrupt_tempo_step",
+        variable_events(&step, 100_000.0),
+        false,
+        "abrupt tempo step",
+    );
+    let mut two_sections = vec![60_000_000.0 / 100.0; 50];
+    two_sections.extend([60_000_000.0 / 130.0; 50]);
+    add(
+        &mut fixtures,
+        "two_stable_sections",
+        variable_events(&two_sections, 100_000.0),
+        false,
+        "two stable sections with different clocks",
+    );
+    let mut multiple_steps = vec![60_000_000.0 / 120.0; 34];
+    multiple_steps.extend([60_000_000.0 / 110.0; 33]);
+    multiple_steps.extend([60_000_000.0 / 130.0; 33]);
+    add(
+        &mut fixtures,
+        "multiple_tempo_steps",
+        variable_events(&multiple_steps, 100_000.0),
+        false,
+        "multiple tempo steps",
+    );
+    let mut return_clock = ramp(120.0, 110.0, 50);
+    return_clock.extend(ramp(110.0, 120.0, 50));
+    add(
+        &mut fixtures,
+        "accelerando_then_return",
+        variable_events(&return_clock, 100_000.0),
+        false,
+        "accelerando followed by a return",
+    );
+    let sinusoidal = (0..100)
+        .map(|index| {
+            60_000_000.0 / (120.0 + 12.0 * (index as f64 / 100.0 * std::f64::consts::TAU).sin())
+        })
+        .collect::<Vec<_>>();
+    add(
+        &mut fixtures,
+        "sinusoidal_tempo_drift",
+        variable_events(&sinusoidal, 100_000.0),
+        false,
+        "bounded sinusoidal tempo drift",
+    );
+    let mut excursion = vec![60_000_000.0 / 120.0; 40];
+    excursion.extend([60_000_000.0 / 100.0; 25]);
+    excursion.extend([60_000_000.0 / 120.0; 35]);
+    add(
+        &mut fixtures,
+        "local_temporary_tempo_excursion",
+        variable_events(&excursion, 100_000.0),
+        false,
+        "local temporary tempo excursion",
+    );
+    let mut drift_missing = remove_events(
+        &variable_events(&ramp(120.0, 108.0, 100), 100_000.0),
+        |index| index > 0 && index % 7 == 0,
+    );
+    drift_missing.dedup();
+    add(
+        &mut fixtures,
+        "tempo_drift_plus_missing_events",
+        drift_missing,
+        false,
+        "tempo drift with missing observations",
+    );
+    let mut step_subdivision = variable_events(&step, 100_000.0);
+    let insertion = step_subdivision[65] - 300_000;
+    step_subdivision.insert(65, insertion);
+    add(
+        &mut fixtures,
+        "tempo_step_plus_subdivision",
+        step_subdivision,
+        false,
+        "tempo step with subdivision contamination",
+    );
+    fixtures
+}
+
+fn canonical_synthetic_summary() -> CanonicalSyntheticSummary {
+    canonical_synthetic_summary_with_source("")
+}
+
+fn canonical_synthetic_summary_with_source(source_commit: &str) -> CanonicalSyntheticSummary {
+    let cases = canonical_synthetic_fixtures()
+        .into_iter()
+        .map(|fixture| {
+            let observed = synthetic_track_from_observations(
+                &fixture.fixture_id,
+                &fixture.fixture.observations,
+            );
+            let result = build_track(&observed);
+            canonical_case_from_result(&fixture, &result.canonical_layer)
+        })
+        .collect::<Vec<_>>();
+    let correct_selected = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "CORRECT_CANONICAL_SELECTED")
+        .count();
+    let safe_retain = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_CANONICAL_RETAIN")
+        .count();
+    let safe_abstain = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "SAFE_CANONICAL_ABSTAIN")
+        .count();
+    let false_canonical_selection = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "FALSE_CANONICAL_SELECTION")
+        .count();
+    let unexpected_failures = cases
+        .iter()
+        .filter(|case| case.evaluation_class == "UNEXPECTED_FAILURE")
+        .count();
+    CanonicalSyntheticSummary {
+        suite: "fixed_tempo_canonical_metrical_layer_e2e".into(),
+        phase: "GENERIC_SYNTHETIC_FROZEN_BEFORE_OPEN_REGRESSION".into(),
+        source_commit: source_commit.into(),
+        external_reference_used_for_inference: false,
+        truth_used_for_inference: false,
+        cases,
+        correct_selected,
+        safe_retain,
+        safe_abstain,
+        false_canonical_selection,
+        unexpected_failures,
+        all_passed: false_canonical_selection == 0 && unexpected_failures == 0,
+    }
+}
+
+#[derive(Clone)]
+struct CanonicalFixture {
+    fixture_id: String,
+    fixture: SyntheticFixture,
+    physical_period_bpm: f64,
+    truth_canonical_bpm: f64,
+    detail: String,
+}
+
+fn canonical_case_from_result(
+    fixture: &CanonicalFixture,
+    decision: &CanonicalLayerDecision,
+) -> CanonicalSyntheticCase {
+    let selected_correct = decision
+        .canonical_bpm
+        .is_some_and(|bpm| (bpm / fixture.truth_canonical_bpm - 1.0).abs() <= 0.002);
+    let retained_truth = decision
+        .retained_candidates_bpm
+        .iter()
+        .any(|bpm| (bpm / fixture.truth_canonical_bpm - 1.0).abs() <= 0.002);
+    let evaluation_class = if decision.status == "CANONICAL_SELECTED" && selected_correct {
+        "CORRECT_CANONICAL_SELECTED"
+    } else if decision.status == "CANONICAL_RETAIN_MULTIPLE" && retained_truth {
+        "SAFE_CANONICAL_RETAIN"
+    } else if decision.status == "CANONICAL_ABSTAIN" {
+        "SAFE_CANONICAL_ABSTAIN"
+    } else if decision.status == "CANONICAL_SELECTED" {
+        "FALSE_CANONICAL_SELECTION"
+    } else {
+        "UNEXPECTED_FAILURE"
+    };
+    CanonicalSyntheticCase {
+        fixture_id: fixture.fixture_id.clone(),
+        physical_period_bpm: fixture.physical_period_bpm,
+        truth_canonical_bpm: fixture.truth_canonical_bpm,
+        selected_canonical_bpm: decision.canonical_bpm,
+        retained_candidates_bpm: decision.retained_candidates_bpm.clone(),
+        status: decision.status.clone(),
+        relation: decision.relation.clone(),
+        metrical_evidence: decision.metrical_evidence.clone(),
+        evidence_provenance: decision.evidence_provenance.clone(),
+        canonical_confidence: decision.confidence.clone(),
+        passed: matches!(
+            evaluation_class,
+            "CORRECT_CANONICAL_SELECTED" | "SAFE_CANONICAL_RETAIN" | "SAFE_CANONICAL_ABSTAIN"
+        ),
+        evaluation_class: evaluation_class.into(),
+        detail: fixture.detail.clone(),
+    }
+}
+
+fn canonical_synthetic_fixtures() -> Vec<CanonicalFixture> {
+    let mut fixtures = Vec::new();
+    let mut add =
+        |id: &str, physical: f64, truth: f64, hypotheses: &[(f32, &str, f32)], detail: &str| {
+            let fixture = with_observed_hypotheses(
+                synthetic_fixture(
+                    id,
+                    synthetic_grid_events(60_000_000.0 / physical, 64, 120_000.0),
+                    Some(physical),
+                    vec![physical],
+                    vec![truth],
+                    true,
+                    &["SELECTED"],
+                    detail,
+                ),
+                hypotheses,
+                "primary",
+            );
+            fixtures.push(CanonicalFixture {
+                fixture_id: id.into(),
+                fixture,
+                physical_period_bpm: physical,
+                truth_canonical_bpm: truth,
+                detail: detail.into(),
+            });
+        };
+    add(
+        "physical_75_canonical_75",
+        75.0,
+        75.0,
+        &[(75.0, "primary", 0.85)],
+        "physical period is the canonical layer",
+    );
+    add(
+        "physical_75_canonical_150",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.45), (150.0, "double_time", 0.55)],
+        "ambiguous double-time layer is retained",
+    );
+    add(
+        "physical_80_canonical_160",
+        80.0,
+        160.0,
+        &[(80.0, "primary", 0.45), (160.0, "double_time", 0.55)],
+        "ambiguous double-time layer is retained",
+    );
+    add(
+        "physical_90_canonical_180",
+        90.0,
+        180.0,
+        &[(90.0, "primary", 0.45), (180.0, "double_time", 0.55)],
+        "ambiguous double-time layer is retained",
+    );
+    add(
+        "physical_100_canonical_100",
+        100.0,
+        100.0,
+        &[(100.0, "primary", 0.85)],
+        "clear primary layer",
+    );
+    add(
+        "physical_120_canonical_120",
+        120.0,
+        120.0,
+        &[(120.0, "primary", 0.85)],
+        "clear primary layer",
+    );
+    add(
+        "physical_130_canonical_130",
+        130.0,
+        130.0,
+        &[(130.0, "primary", 0.85)],
+        "clear primary layer",
+    );
+    add(
+        "physical_150_canonical_150",
+        150.0,
+        150.0,
+        &[(150.0, "primary", 0.85)],
+        "clear primary layer",
+    );
+    add(
+        "physical_150_canonical_75",
+        150.0,
+        75.0,
+        &[(150.0, "primary", 0.45), (75.0, "half_time", 0.55)],
+        "ambiguous half-time layer is retained",
+    );
+    add(
+        "physical_180_canonical_90",
+        180.0,
+        90.0,
+        &[(180.0, "primary", 0.45), (90.0, "half_time", 0.55)],
+        "ambiguous half-time layer is retained",
+    );
+    add(
+        "clear_intermediate_pulse",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.15), (150.0, "double_time", 0.85)],
+        "clear intermediate pulse",
+    );
+    add(
+        "weak_intermediate_pulse",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.55), (150.0, "double_time", 0.45)],
+        "weak intermediate pulse",
+    );
+    add(
+        "no_intermediate_pulse",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.50), (150.0, "double_time", 0.50)],
+        "no decisive intermediate pulse",
+    );
+    add(
+        "equal_energy_subdivision",
+        80.0,
+        160.0,
+        &[(80.0, "primary", 0.50), (160.0, "double_time", 0.50)],
+        "equal-energy subdivision",
+    );
+    add(
+        "alternating_strong_weak_physical",
+        75.0,
+        75.0,
+        &[(75.0, "primary", 0.80), (150.0, "double_time", 0.20)],
+        "alternating strong and weak physical pulses",
+    );
+    add(
+        "kick_every_physical_pulse",
+        100.0,
+        100.0,
+        &[(100.0, "primary", 0.80), (200.0, "double_time", 0.20)],
+        "kick on every physical pulse",
+    );
+    add(
+        "kick_every_second_pulse",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.20), (150.0, "double_time", 0.80)],
+        "kick on every second physical pulse",
+    );
+    add(
+        "snare_backbeat_structure",
+        90.0,
+        90.0,
+        &[(90.0, "primary", 0.80), (180.0, "double_time", 0.20)],
+        "snare backbeat supports primary layer",
+    );
+    add(
+        "dense_electronic_subdivisions",
+        130.0,
+        130.0,
+        &[(130.0, "primary", 0.80), (260.0, "double_time", 0.20)],
+        "dense subdivisions do not override clear primary",
+    );
+    add(
+        "intro_ambiguous_chorus_clear",
+        75.0,
+        150.0,
+        &[(75.0, "primary", 0.18), (150.0, "double_time", 0.82)],
+        "ambiguous intro and clear chorus",
+    );
+    add(
+        "half_time_drum_feel",
+        150.0,
+        75.0,
+        &[(150.0, "primary", 0.18), (75.0, "half_time", 0.82)],
+        "half-time drum feel",
+    );
+    fixtures
+}
+
 fn markdown(report: &FixedTempoConsensusReport) -> String {
     let summary = &report.summary;
     format!(
@@ -1683,6 +2740,8 @@ fn markdown(report: &FixedTempoConsensusReport) -> String {
          - canonical RETAIN_MULTIPLE: {}\n\
          - period conflicts: {}\n\
          - synthetic hardening: {}/{} passed\n\
+         - stationarity synthetic: {}/{} passed; false nonstationary={}; false stationary authority={}\n\
+         - canonical synthetic: {}/{} passed; false canonical selection={}\n\
          - external reference used for inference: NO\n\n\
          This is a research-only candidate competition. Physical period selection\
          and canonical metrical-layer selection are intentionally separate.\n",
@@ -1702,6 +2761,23 @@ fn markdown(report: &FixedTempoConsensusReport) -> String {
             .filter(|case| case.passed)
             .count(),
         report.synthetic_hardening.cases.len(),
+        report
+            .stationarity_synthetic
+            .cases
+            .iter()
+            .filter(|case| case.passed)
+            .count(),
+        report.stationarity_synthetic.cases.len(),
+        report.stationarity_synthetic.false_nonstationary,
+        report.stationarity_synthetic.false_stationary_authority,
+        report
+            .canonical_synthetic
+            .cases
+            .iter()
+            .filter(|case| case.passed)
+            .count(),
+        report.canonical_synthetic.cases.len(),
+        report.canonical_synthetic.false_canonical_selection,
     )
 }
 
@@ -1868,6 +2944,59 @@ mod tests {
         );
         assert!(!summary.external_reference_used_for_inference);
         assert!(!summary.truth_used_for_inference);
+    }
+
+    #[test]
+    fn stationarity_suite_separates_contamination_from_clock_change() {
+        let summary = stationarity_synthetic_summary();
+        assert!(summary.cases.len() >= 28);
+        assert_eq!(summary.false_nonstationary, 0);
+        assert_eq!(summary.false_stationary_authority, 0);
+        assert_eq!(summary.unexpected_failures, 0);
+        assert!(
+            summary
+                .cases
+                .iter()
+                .any(|case| case.evaluation_class == "SAFE_CONTAMINATED")
+        );
+        assert!(
+            summary
+                .cases
+                .iter()
+                .any(|case| case.evaluation_class == "CORRECT_NONSTATIONARY")
+        );
+        assert!(summary.all_passed);
+    }
+
+    #[test]
+    fn canonical_suite_keeps_ambiguous_layers_safe() {
+        let summary = canonical_synthetic_summary();
+        assert!(summary.cases.len() >= 20);
+        assert_eq!(summary.false_canonical_selection, 0);
+        assert_eq!(summary.unexpected_failures, 0);
+        assert!(
+            summary
+                .cases
+                .iter()
+                .any(|case| case.evaluation_class == "SAFE_CANONICAL_RETAIN")
+        );
+        assert!(
+            summary
+                .cases
+                .iter()
+                .any(|case| case.evaluation_class == "CORRECT_CANONICAL_SELECTED")
+        );
+        assert!(summary.all_passed);
+    }
+
+    #[test]
+    fn localized_missing_events_are_not_called_a_tempo_change() {
+        let fixture = stationarity_synthetic_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.fixture_id == "stationary_local_event_density_collapse")
+            .expect("localized contamination fixture");
+        let inferred = research_stationarity(&fixture.events);
+        assert_eq!(inferred.state, "EVENT_SEQUENCE_CONTAMINATED");
     }
 
     #[test]
