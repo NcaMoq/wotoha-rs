@@ -1959,7 +1959,7 @@ fn research_stationarity(events: &[u64]) -> StationarityResearchObservation {
         .iter()
         .filter(|interval| {
             let ratio = **interval / global_period;
-            ratio < STATIONARITY_CONTAMINATION_LOW || ratio > STATIONARITY_CONTAMINATION_HIGH
+            !(STATIONARITY_CONTAMINATION_LOW..=STATIONARITY_CONTAMINATION_HIGH).contains(&ratio)
         })
         .count();
     let contamination_score = contamination_count as f64 / intervals.len() as f64;
@@ -1970,8 +1970,8 @@ fn research_stationarity(events: &[u64]) -> StationarityResearchObservation {
                 .iter()
                 .filter(|interval| {
                     let ratio = **interval / global_period;
-                    ratio < STATIONARITY_CONTAMINATION_LOW
-                        || ratio > STATIONARITY_CONTAMINATION_HIGH
+                    !(STATIONARITY_CONTAMINATION_LOW..=STATIONARITY_CONTAMINATION_HIGH)
+                        .contains(&ratio)
                 })
                 .count();
             contaminated as f64 / window.len().max(1) as f64 >= 0.10
@@ -2275,8 +2275,8 @@ fn stationarity_synthetic_fixtures() -> Vec<StationarityFixture> {
         );
     }
     let mut noisy = base.clone();
-    for index in 48..61 {
-        noisy[index] = (noisy[index] as i64 + ((index % 5) as i64 - 2) * 65_000) as u64;
+    for (index, event) in noisy.iter_mut().enumerate().take(61).skip(48) {
+        *event = (*event as i64 + ((index % 5) as i64 - 2) * 65_000) as u64;
     }
     add(
         &mut fixtures,
