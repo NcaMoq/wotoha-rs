@@ -135,6 +135,23 @@ mod tests {
     }
 
     #[test]
+    fn default_bidirectional_policy_handles_reference_loudness_levels() {
+        let cases = [(-10.0, -6.0), (-16.0, 0.0), (-20.0, 4.0), (-24.0, 6.0)];
+
+        for (integrated_lufs, expected_gain_db) in cases {
+            let gain = loudness_normalization_gain(
+                &config(),
+                Some(&analysis(Some(integrated_lufs), Some(-8.0))),
+            );
+            assert!(
+                (gain_db(gain) - expected_gain_db).abs() < 0.0001,
+                "integrated_lufs={integrated_lufs}, gain_db={}",
+                gain_db(gain)
+            );
+        }
+    }
+
+    #[test]
     fn attenuation_only_policy_does_not_boost_quiet_tracks() {
         let gain = loudness_normalization_gain(
             &attenuation_only_config(),

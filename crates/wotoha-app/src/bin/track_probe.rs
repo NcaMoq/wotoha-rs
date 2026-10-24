@@ -146,7 +146,7 @@ impl ProbeOptions {
         let mut warmup = false;
         let mut automix_plan = false;
         let mut automix_preview = None;
-        let mut loudness_max_boost_db = 0.0;
+        let mut loudness_max_boost_db = LoudnessConfig::production_default().max_boost_db;
         let mut urls = Vec::new();
         let mut args = args.into_iter();
 
@@ -456,7 +456,7 @@ mod tests {
         assert!(options.warmup);
         assert!(!options.strict);
         assert!(options.automix_plan);
-        assert_eq!(options.loudness_max_boost_db, 0.0);
+        assert_eq!(options.loudness_max_boost_db, 6.0);
         assert_eq!(options.automix_preview, None);
         assert_eq!(options.urls, ["one", "two"]);
     }
@@ -492,7 +492,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_loudness_boost_is_opt_in() {
+    fn production_loudness_boost_is_the_cli_default() {
+        let options = ProbeOptions::parse(["one".to_owned()]).unwrap();
+
+        assert_eq!(options.loudness_max_boost_db, 6.0);
+    }
+
+    #[test]
+    fn explicit_loudness_boost_override_is_preserved() {
         let options = ProbeOptions::parse([
             "--loudness-max-boost-db".to_owned(),
             "6".to_owned(),

@@ -22,9 +22,10 @@ should be cut and tested from a deliberate release commit rather than treating
   dropped capabilities, and offline self-check coverage.
 - Runtime delivery, reconnect state, bounded persistence, and managed media
   helper handling have additional safety and provenance checks.
-- Loudness normalization defaults to attenuation-only behavior; positive gain
-  remains an explicit configuration choice and true-peak limits remain part of
-  the safety boundary.
+- Loudness normalization defaults to a `-16 LUFS` target with up to `+6 dB`
+  of positive gain when a valid true-peak measurement permits it; setting
+  `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` retains attenuation-only behavior.
+  True-peak limits remain part of the safety boundary.
 - AutoMix planning has a documented V2 timeline/cue analysis surface and
   research shadow controls. The compatibility planner remains the default
   production authority until a separate promotion decision is made.
@@ -41,8 +42,9 @@ should be cut and tested from a deliberate release commit rather than treating
 - Existing native Linux installations are supported only through the documented
   migration path. Do not treat the legacy archive workflow as the preferred
   deployment model for a new host.
-- If `WOTOHA_LOUDNESS_MAX_BOOST_DB` is omitted, the current default is `0.0`.
-  Deployments that explicitly set another value retain that configured value.
+- If `WOTOHA_LOUDNESS_MAX_BOOST_DB` is omitted, the current default is `6.0`.
+  Existing deployments with an explicit value retain that configured value;
+  update an existing `runtime.env` explicitly if it still contains `0.0`.
 - Review the release asset manifest, checksum, provenance, and container smoke
   results before publishing a future tag.
 

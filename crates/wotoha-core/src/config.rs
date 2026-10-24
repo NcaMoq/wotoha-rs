@@ -8,10 +8,10 @@ const DEFAULT_LOG_DIR: &str = "/wotoha/logs";
 const DEFAULT_LOG_FILE: &str = "wotoha-app.runtime.log";
 const DEFAULT_RUST_LOG: &str = "info,wotoha_debug=info";
 const DEFAULT_LOG_ANSI: bool = false;
-const DEFAULT_PLAYBACK_VOLUME: f32 = 0.10;
+const DEFAULT_PLAYBACK_VOLUME: f32 = 0.20;
 const DEFAULT_LOUDNESS_NORMALIZATION_ENABLED: bool = true;
 const DEFAULT_LOUDNESS_TARGET_LUFS: f32 = -16.0;
-const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 0.0;
+const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 6.0;
 const DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP: f32 = -2.0;
 const DEFAULT_MAX_QUEUE_LEN: usize = 512;
 const DEFAULT_MAX_PENDING_ENQUEUES: usize = 64;
@@ -469,7 +469,7 @@ fn validate_log_file_name(value: String) -> Result<String, ConfigError> {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{AutoMixPlannerMode, BeatmatchBlendConfig, BotConfig, ConfigError};
+    use super::{AutoMixPlannerMode, BeatmatchBlendConfig, BotConfig, ConfigError, LoudnessConfig};
 
     fn load_from(vars: &[(&str, &str)]) -> Result<BotConfig, ConfigError> {
         let vars = vars.iter().copied().collect::<HashMap<_, _>>();
@@ -489,10 +489,10 @@ mod tests {
         assert!(config.logging.file_enabled);
         assert_eq!(config.logging.rust_log, "info,wotoha_debug=info");
         assert!(!config.logging.ansi);
-        assert_eq!(config.playback.default_volume, 0.10);
+        assert_eq!(config.playback.default_volume, 0.20);
         assert!(config.playback.loudness.enabled);
         assert_eq!(config.playback.loudness.target_lufs, -16.0);
-        assert_eq!(config.playback.loudness.max_boost_db, 0.0);
+        assert_eq!(config.playback.loudness.max_boost_db, 6.0);
         assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -2.0);
         assert_eq!(config.playback.max_queue_len, 512);
         assert_eq!(config.playback.max_pending_enqueues, 64);
@@ -518,10 +518,10 @@ mod tests {
             ("WOTOHA_LOG_FILE_ENABLED", "false"),
             ("RUST_LOG", "warn,wotoha=debug"),
             ("WOTOHA_LOG_ANSI", "true"),
-            ("WOTOHA_DEFAULT_VOLUME", "0.25"),
+            ("WOTOHA_DEFAULT_VOLUME", "0.10"),
             ("WOTOHA_LOUDNESS_NORMALIZATION_ENABLED", "false"),
             ("WOTOHA_LOUDNESS_TARGET_LUFS", "-18.5"),
-            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "4.5"),
+            ("WOTOHA_LOUDNESS_MAX_BOOST_DB", "3.0"),
             ("WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP", "-1.5"),
             ("WOTOHA_MAX_QUEUE_LEN", "256"),
             ("WOTOHA_MAX_PENDING_ENQUEUES", "32"),
@@ -546,10 +546,10 @@ mod tests {
         assert!(!config.logging.file_enabled);
         assert_eq!(config.logging.rust_log, "warn,wotoha=debug");
         assert!(config.logging.ansi);
-        assert_eq!(config.playback.default_volume, 0.25);
+        assert_eq!(config.playback.default_volume, 0.10);
         assert!(!config.playback.loudness.enabled);
         assert_eq!(config.playback.loudness.target_lufs, -18.5);
-        assert_eq!(config.playback.loudness.max_boost_db, 4.5);
+        assert_eq!(config.playback.loudness.max_boost_db, 3.0);
         assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -1.5);
         assert_eq!(config.playback.max_queue_len, 256);
         assert_eq!(config.playback.max_pending_enqueues, 32);
@@ -561,6 +561,16 @@ mod tests {
         assert_eq!(config.playback.automix_planner_mode, AutoMixPlannerMode::V2);
         assert_eq!(config.playback.automix_beatmatch.min_beats, 8);
         assert_eq!(config.playback.automix_beatmatch.preferred_beats, 16);
+    }
+
+    #[test]
+    fn production_loudness_default_matches_runtime_defaults() {
+        let config = LoudnessConfig::production_default();
+
+        assert!(config.enabled);
+        assert_eq!(config.target_lufs, -16.0);
+        assert_eq!(config.max_boost_db, 6.0);
+        assert_eq!(config.true_peak_ceiling_dbtp, -2.0);
     }
 
     #[test]

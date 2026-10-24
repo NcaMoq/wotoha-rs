@@ -193,7 +193,7 @@ impl Options {
             .join("automix-corpus.json");
         let mut report = None;
         let mut keep_artifacts = false;
-        let mut loudness_max_boost_db = 0.0;
+        let mut loudness_max_boost_db = LoudnessConfig::production_default().max_boost_db;
         let mut args = args.into_iter();
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -2535,16 +2535,16 @@ mod tests {
     };
 
     #[test]
-    fn research_loudness_defaults_match_production_attenuation_only_policy() {
-        let config = loudness_config(0.0);
+    fn research_loudness_defaults_match_production_policy() {
+        let config = loudness_config(LoudnessConfig::production_default().max_boost_db);
         assert!(config.enabled);
         assert_eq!(config.target_lufs, -16.0);
-        assert_eq!(config.max_boost_db, 0.0);
+        assert_eq!(config.max_boost_db, 6.0);
         assert_eq!(config.true_peak_ceiling_dbtp, -2.0);
     }
 
     #[test]
-    fn explicit_research_boost_remains_opt_in() {
+    fn explicit_research_boost_override_is_preserved() {
         let config = loudness_config(6.0);
         assert_eq!(config.max_boost_db, 6.0);
     }

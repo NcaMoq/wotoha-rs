@@ -102,10 +102,12 @@ non-BeatMatched plan rather than assuming that a candidate is executable.
 
 Track loudness uses the integrated loudness field represented in LUFS, with the
 EBU R128 / ITU-R BS.1770 convention used by the core loudness implementation.
-The default target is `-16.0 LUFS`, the default maximum positive gain is `0.0
+The default target is `-16.0 LUFS`, the default maximum positive gain is `+6.0
 dB`, and the normalization-stage true-peak ceiling is `-2.0 dBTP`. Quieter
-tracks are therefore not automatically boosted unless an operator explicitly
-opts into positive gain.
+tracks may therefore be boosted by up to `+6.0 dB` when a valid true-peak
+measurement leaves sufficient headroom. A missing or invalid true-peak
+measurement never authorizes an unconditional boost. Set
+`WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` to retain attenuation-only behavior.
 
 Normalization is applied once per track. The true-peak ceiling at this stage
 is not a substitute for validating a deployment's separately configured master
