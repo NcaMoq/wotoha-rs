@@ -13,7 +13,7 @@ use dashmap::{DashMap, mapref::entry::Entry};
 use reqwest::{Client, redirect::Policy};
 use thiserror::Error;
 use tokio::sync::{Mutex, Semaphore};
-use wotoha_contracts::MediaBackend;
+use wotoha_contracts::{MediaBackend, PlaybackFailureKind};
 use wotoha_core::{
     PreparedSource, TrackRequest,
     url::{
@@ -292,6 +292,7 @@ impl MediaResolver {
             request.canonical_key.to_string(),
         );
         let _guard = lease.gate.lock.clone().lock_owned().await;
+        self.invalidate_cached_playback(request);
         let _permit = self.acquire_probe_slot().await?;
 
         match self.refresh_with_deadline(request).await {
@@ -304,6 +305,22 @@ impl MediaResolver {
                 Err(error) => Err(error),
             },
             Err(error) => Err(error),
+        }
+    }
+
+    fn invalidate_cached_playback(&self, request: &TrackRequest) {
+        let canonical_key = request.canonical_key.as_ref();
+        self.inner.metadata_cache.remove(canonical_key);
+        self.inner.prepared_cache.remove(canonical_key);
+        let aliases: Vec<String> = self
+            .inner
+            .url_aliases
+            .iter()
+            .filter(|entry| entry.value().canonical_key.as_ref() == canonical_key)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for alias in aliases {
+            self.inner.url_aliases.remove(&alias);
         }
     }
 
@@ -575,6 +592,20 @@ impl MediaBackend for MediaResolver {
     async fn prepare_playback(&self, request: &TrackRequest) -> Result<TrackRequest, Self::Error> {
         Self::prepare_playback(self, request).await
     }
+
+    async fn prepare_playback_fresh(
+        &self,
+        request: &TrackRequest,
+    ) -> Result<TrackRequest, Self::Error> {
+        Self::prepare_playback_fresh(self, request).await
+    }
+
+    fn playback_failure_kind(&self, error: &Self::Error) -> Option<PlaybackFailureKind> {
+        match error {
+            ResolveError::YouTube(error) => error.playback_failure_kind(),
+            _ => None,
+        }
+    }
 }
 
 fn validate_prepared_request(request: &TrackRequest) -> Result<(), ResolveError> {
@@ -709,6 +740,23 @@ mod tests {
             cached.prepared.expires_at_unix(),
             fresh_request.prepared.expires_at_unix()
         );
+    }
+
+    #[test]
+    fn failed_playback_source_is_removed_before_fresh_acquisition() {
+        let resolver = MediaResolver::new().expect("resolver");
+        let request = sample_request(Some(unix_now_secs().saturating_add(600)));
+        resolver.store_request(request.requested_url.as_ref(), &request);
+        resolver.store_prepared_request(&request);
+
+        resolver.invalidate_cached_playback(&request);
+
+        assert!(
+            resolver
+                .lookup_cached_request(request.requested_url.as_ref())
+                .is_none()
+        );
+        assert!(resolver.lookup_prepared_request(&request).is_none());
     }
 
     #[test]

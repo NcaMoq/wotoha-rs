@@ -19,10 +19,10 @@ use tokio::sync::{
 use tracing::{debug, info, warn};
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
-    PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent, PlaybackService,
-    RuntimeEventReceiver, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
-    TransitionArmFailureKind, TransitionArmResult, UserKey, VoiceActionAccess, VoicePeerSnapshot,
-    VoiceRuntime, VoiceUpdateDecision,
+    PlaybackFailureKind, PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent,
+    PlaybackService, RuntimeEventReceiver, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason,
+    TrackStartOptions, TransitionArmFailureKind, TransitionArmResult, UserKey, VoiceActionAccess,
+    VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
@@ -36,7 +36,7 @@ use wotoha_core::{
         transition_score_breakdown,
     },
     config::{AutoMixPlannerMode, BeatmatchBlendConfig, LoudnessConfig},
-    debug::append_debug_log,
+    debug::{append_debug_log, sanitize_log_message},
     loudness::loudness_normalization_gain,
     operational_metrics,
 };
@@ -1727,7 +1727,7 @@ where
             )
         };
 
-        let prepared = match self.inner.media.prepare_playback(&next).await {
+        let mut prepared = match self.inner.media.prepare_playback(&next).await {
             Ok(prepared) => prepared,
             Err(error) => {
                 warn!(guild_id = guild_id.get(), error = %error, "AutoMix failed to prefetch next track");
@@ -1776,6 +1776,7 @@ where
             loudness_normalization_gain(&self.inner.loudness, outgoing_analysis.as_ref());
         let mut outgoing_equalizer_transition = None;
         let mut options = track_start_options(&self.inner.automix, prepared.metadata.duration, 0.0);
+        let mut playback_refresh_attempted = false;
         let mut guarded_plan = outgoing_analysis
             .as_ref()
             .zip(incoming_analysis.as_ref())
@@ -2200,15 +2201,13 @@ where
             compensate_trimmed_source_events(&mut options);
         }
         let mut incoming_result = self
-            .inner
-            .runtime
-            .prepare_track_with_options(
+            .prepare_incoming_with_retry(
                 guild_id,
                 session_id,
                 incoming_id,
-                &prepared,
-                self.inner.events.clone(),
+                &mut prepared,
                 options,
+                &mut playback_refresh_attempted,
             )
             .await;
         if beatmatched_plan && frame_schedule_supported {
@@ -2249,15 +2248,13 @@ where
                 }
                 compensate_trimmed_source_events(&mut options);
                 incoming_result = self
-                    .inner
-                    .runtime
-                    .prepare_track_with_options(
+                    .prepare_incoming_with_retry(
                         guild_id,
                         session_id,
                         incoming_id,
-                        &prepared,
-                        self.inner.events.clone(),
+                        &mut prepared,
                         options,
+                        &mut playback_refresh_attempted,
                     )
                     .await;
             }
@@ -2272,15 +2269,13 @@ where
             outgoing_equalizer_transition = None;
             compensate_trimmed_source_events(&mut options);
             incoming_result = self
-                .inner
-                .runtime
-                .prepare_track_with_options(
+                .prepare_incoming_with_retry(
                     guild_id,
                     session_id,
                     incoming_id,
-                    &prepared,
-                    self.inner.events.clone(),
+                    &mut prepared,
                     options,
+                    &mut playback_refresh_attempted,
                 )
                 .await;
             false
@@ -2357,15 +2352,13 @@ where
                 compensate_trimmed_source_events(&mut options);
                 incoming.handle.stop();
                 let fallback = self
-                    .inner
-                    .runtime
-                    .prepare_track_with_options(
+                    .prepare_incoming_with_retry(
                         guild_id,
                         session_id,
                         incoming_id,
-                        &prepared,
-                        self.inner.events.clone(),
+                        &mut prepared,
                         options,
+                        &mut playback_refresh_attempted,
                     )
                     .await;
                 incoming.handle = match fallback {
@@ -2964,7 +2957,7 @@ where
         let playback_started = Instant::now();
         let playback_id = self.next_playback_id();
         let media_started = Instant::now();
-        let prepared = self
+        let mut prepared = self
             .inner
             .media
             .prepare_playback(request)
@@ -2983,7 +2976,74 @@ where
             return Err(PlaybackError::SessionExpired);
         }
 
-        let analysis_key = track_analysis_key(&prepared);
+        for refresh_attempt in 0..=1 {
+            match self
+                .play_prepared_request(
+                    guild_id,
+                    session_id,
+                    playback_id,
+                    &prepared,
+                    initial_gain,
+                    playback_started,
+                )
+                .await
+            {
+                Ok(started) => return Ok(started),
+                Err(PlaybackError::Runtime(error))
+                    if refresh_attempt == 0
+                        && self.inner.runtime.is_retryable_playback_error(&error) =>
+                {
+                    info!(
+                        guild_id = guild_id.get(),
+                        session_id,
+                        playback_id = playback_id.get(),
+                        provider_id = prepared.provider_id.as_ref(),
+                        canonical_key = prepared.canonical_key.as_ref(),
+                        "playback source rejected; requesting one fresh prepared source"
+                    );
+                    match self.inner.media.prepare_playback_fresh(&prepared).await {
+                        Ok(refreshed) if refreshed.prepared != prepared.prepared => {
+                            prepared = refreshed;
+                            continue;
+                        }
+                        Ok(_) => {
+                            warn!(
+                                guild_id = guild_id.get(),
+                                session_id,
+                                playback_id = playback_id.get(),
+                                "fresh playback source was identical; refusing retry loop"
+                            );
+                            return Err(PlaybackError::Runtime(error));
+                        }
+                        Err(refresh_error) => {
+                            let safe_error = sanitize_log_message(&refresh_error.to_string());
+                            warn!(
+                                guild_id = guild_id.get(),
+                                session_id,
+                                playback_id = playback_id.get(),
+                                error = safe_error.as_str(),
+                                "fresh playback source acquisition failed"
+                            );
+                            return Err(PlaybackError::Resolve(refresh_error));
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded playback refresh loop returned without a result")
+    }
+
+    async fn play_prepared_request(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        playback_id: PlaybackId,
+        prepared: &TrackRequest,
+        initial_gain: f32,
+        playback_started: Instant,
+    ) -> Result<StartedTrack, PlaybackError<M::Error, R::Error>> {
+        let analysis_key = track_analysis_key(prepared);
         let analysis_enabled = self
             .get_session(guild_id)
             .filter(|session| session.id == session_id)
@@ -3007,7 +3067,7 @@ where
                 None => {
                     self.inner
                         .runtime
-                        .cached_track_analysis_async(&prepared)
+                        .cached_track_analysis_async(prepared)
                         .await
                 }
             }
@@ -3044,7 +3104,7 @@ where
                 guild_id,
                 session_id,
                 playback_id,
-                &prepared,
+                prepared,
                 self.inner.events.clone(),
                 track_start_options(
                     &self.inner.automix,
@@ -3088,6 +3148,72 @@ where
             analysis: cached_analysis,
             base_gain: effective_initial_gain,
         })
+    }
+
+    async fn prepare_incoming_with_retry(
+        &self,
+        guild_id: GuildKey,
+        session_id: u64,
+        incoming_id: PlaybackId,
+        prepared: &mut TrackRequest,
+        options: TrackStartOptions,
+        refresh_attempted: &mut bool,
+    ) -> Result<Arc<dyn RuntimeTrackHandle>, R::Error> {
+        let first = self
+            .inner
+            .runtime
+            .prepare_track_with_options(
+                guild_id,
+                session_id,
+                incoming_id,
+                prepared,
+                self.inner.events.clone(),
+                options,
+            )
+            .await;
+        let Err(error) = first else {
+            return first;
+        };
+        if *refresh_attempted || !self.inner.runtime.is_retryable_playback_error(&error) {
+            return Err(error);
+        }
+        *refresh_attempted = true;
+
+        let refreshed = match self.inner.media.prepare_playback_fresh(prepared).await {
+            Ok(refreshed) if refreshed.prepared != prepared.prepared => refreshed,
+            Ok(_) => {
+                warn!(
+                    guild_id = guild_id.get(),
+                    session_id,
+                    incoming_playback_id = incoming_id.get(),
+                    "fresh AutoMix source was identical; refusing retry loop"
+                );
+                return Err(error);
+            }
+            Err(refresh_error) => {
+                let safe_error = sanitize_log_message(&refresh_error.to_string());
+                warn!(
+                    guild_id = guild_id.get(),
+                    session_id,
+                    incoming_playback_id = incoming_id.get(),
+                    error = safe_error.as_str(),
+                    "fresh AutoMix source acquisition failed"
+                );
+                return Err(error);
+            }
+        };
+        *prepared = refreshed;
+        self.inner
+            .runtime
+            .prepare_track_with_options(
+                guild_id,
+                session_id,
+                incoming_id,
+                prepared,
+                self.inner.events.clone(),
+                options,
+            )
+            .await
     }
 }
 
@@ -3258,6 +3384,14 @@ where
         source_url: &str,
     ) -> Result<EnqueueOutcome, Self::Error> {
         self.enqueue_impl(guild_id, source_url).await
+    }
+
+    fn playback_failure_kind(&self, error: &Self::Error) -> Option<PlaybackFailureKind> {
+        match error {
+            PlaybackError::Resolve(error) => self.inner.media.playback_failure_kind(error),
+            PlaybackError::Runtime(error) => self.inner.runtime.playback_failure_kind(error),
+            PlaybackError::SessionExpired | PlaybackError::QueueFull => None,
+        }
     }
 
     fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview> {
@@ -3766,11 +3900,15 @@ mod tests {
     impl std::error::Error for TestMediaError {}
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct TestRuntimeError(Arc<str>);
+    struct TestRuntimeError(Arc<str>, bool);
 
     impl TestRuntimeError {
         fn new(message: impl Into<Arc<str>>) -> Self {
-            Self(message.into())
+            Self(message.into(), false)
+        }
+
+        fn retryable(message: impl Into<Arc<str>>) -> Self {
+            Self(message.into(), true)
         }
     }
 
@@ -3797,9 +3935,11 @@ mod tests {
         scripts: Mutex<HashMap<String, ResolveScript>>,
         prepare_scripts:
             Mutex<HashMap<String, oneshot::Receiver<Result<TrackRequest, TestMediaError>>>>,
+        fresh_results: Mutex<HashMap<String, Result<TrackRequest, TestMediaError>>>,
         prepared_keys: Mutex<Vec<String>>,
         resolve_calls: AtomicUsize,
         prepare_calls: AtomicUsize,
+        fresh_calls: AtomicUsize,
         resolve_notify: Notify,
         prepare_notify: Notify,
     }
@@ -3840,6 +3980,15 @@ mod tests {
             sender
         }
 
+        fn fresh_with(&self, canonical_key: &str, result: Result<TrackRequest, TestMediaError>) {
+            let previous = self
+                .state
+                .fresh_results
+                .lock()
+                .insert(canonical_key.to_owned(), result);
+            assert!(previous.is_none());
+        }
+
         async fn wait_for_resolve_count(&self, expected: usize) {
             timeout(Duration::from_secs(3), async {
                 while self.state.resolve_calls.load(Ordering::SeqCst) < expected {
@@ -3866,6 +4015,10 @@ mod tests {
 
         fn prepared_keys(&self) -> Vec<String> {
             self.state.prepared_keys.lock().clone()
+        }
+
+        fn fresh_call_count(&self) -> usize {
+            self.state.fresh_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -3911,6 +4064,18 @@ mod tests {
                 None => Ok(request.clone()),
             }
         }
+
+        async fn prepare_playback_fresh(
+            &self,
+            request: &TrackRequest,
+        ) -> Result<TrackRequest, Self::Error> {
+            self.state.fresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.state
+                .fresh_results
+                .lock()
+                .remove(request.canonical_key.as_ref())
+                .unwrap_or_else(|| Ok(request.clone()))
+        }
     }
 
     #[derive(Clone, Default)]
@@ -3921,7 +4086,7 @@ mod tests {
     #[derive(Default)]
     struct MockRuntimeState {
         played: Mutex<Vec<PlayedTrack>>,
-        play_failures: Mutex<HashMap<String, TestRuntimeError>>,
+        play_failures: Mutex<HashMap<String, VecDeque<TestRuntimeError>>>,
         analyses: Mutex<HashMap<String, TrackAnalysis>>,
         cached_analyses: Mutex<HashMap<String, TrackAnalysis>>,
         analysis_blockers: Mutex<HashMap<String, oneshot::Receiver<()>>>,
@@ -3952,12 +4117,12 @@ mod tests {
 
     impl MockRuntime {
         fn fail_play_for(&self, key: &str, error: TestRuntimeError) {
-            let previous = self
-                .state
+            self.state
                 .play_failures
                 .lock()
-                .insert(key.to_owned(), error);
-            assert!(previous.is_none());
+                .entry(key.to_owned())
+                .or_default()
+                .push_back(error);
         }
 
         fn analyze_with(&self, key: &str, analysis: TrackAnalysis) {
@@ -4117,12 +4282,13 @@ mod tests {
             request: &TrackRequest,
             events: RuntimeEventSink,
         ) -> Result<Arc<dyn RuntimeTrackHandle>, Self::Error> {
-            if let Some(error) = self
+            let error = self
                 .state
                 .play_failures
                 .lock()
-                .remove(request.canonical_key.as_ref())
-            {
+                .get_mut(request.canonical_key.as_ref())
+                .and_then(VecDeque::pop_front);
+            if let Some(error) = error {
                 return Err(error);
             }
 
@@ -4139,6 +4305,10 @@ mod tests {
             });
             self.state.play_notify.notify_waiters();
             Ok(handle)
+        }
+
+        fn is_retryable_playback_error(&self, error: &Self::Error) -> bool {
+            error.1
         }
 
         async fn play_track_with_options(
@@ -5291,6 +5461,86 @@ mod tests {
             "good"
         );
         assert!(preview.upcoming().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retryable_stream_failure_refreshes_source_once_without_duplicate_playback() {
+        let guild_id = GuildKey::new(60);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new(media.clone(), runtime.clone());
+
+        let initial = track_request("refreshable");
+        let mut refreshed = initial.clone();
+        refreshed.prepared = PreparedSource::http(
+            "https://stream.example.invalid/refreshable-fresh.opus",
+            Vec::new(),
+            None,
+            None,
+        );
+        media.resolve_with("refreshable", Ok(initial));
+        media.fresh_with("refreshable", Ok(refreshed));
+        runtime.fail_play_for("refreshable", TestRuntimeError::retryable("403"));
+
+        let outcome = playback
+            .enqueue_impl(guild_id, "refreshable")
+            .await
+            .expect("fresh source should recover playback");
+        runtime.wait_for_play_count(1).await;
+
+        assert!(outcome.now_playing);
+        assert_eq!(runtime.played().len(), 1);
+        assert_eq!(media.fresh_call_count(), 1);
+        assert_eq!(runtime.played()[0].playback_id, PlaybackId::new(1));
+    }
+
+    #[tokio::test]
+    async fn retryable_stream_failure_has_one_fresh_attempt_when_refreshed_source_also_fails() {
+        let guild_id = GuildKey::new(61);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new(media.clone(), runtime.clone());
+
+        let initial = track_request("retry-once");
+        let mut refreshed = initial.clone();
+        refreshed.prepared = PreparedSource::http(
+            "https://stream.example.invalid/retry-once-fresh.opus",
+            Vec::new(),
+            None,
+            None,
+        );
+        media.resolve_with("retry-once", Ok(initial));
+        media.fresh_with("retry-once", Ok(refreshed));
+        runtime.fail_play_for("retry-once", TestRuntimeError::retryable("403"));
+        runtime.fail_play_for("retry-once", TestRuntimeError::retryable("403 again"));
+
+        let result = playback.enqueue_impl(guild_id, "retry-once").await;
+
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Runtime(error))
+                if error == TestRuntimeError::retryable("403 again")
+        ));
+        assert!(runtime.played().is_empty());
+        assert_eq!(media.fresh_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_stream_failure_does_not_refresh_source() {
+        let guild_id = GuildKey::new(62);
+        let media = MockMedia::default();
+        let runtime = MockRuntime::default();
+        let playback = PlaybackCoordinator::new(media.clone(), runtime.clone());
+        media.resolve_with("not-found", Ok(track_request("not-found")));
+        runtime.fail_play_for("not-found", TestRuntimeError::new("404"));
+
+        let result = playback.enqueue_impl(guild_id, "not-found").await;
+
+        assert!(matches!(
+            result,
+            Err(PlaybackError::Runtime(error)) if error == TestRuntimeError::new("404")
+        ));
+        assert_eq!(media.fresh_call_count(), 0);
     }
 
     #[tokio::test]

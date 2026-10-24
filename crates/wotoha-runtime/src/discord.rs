@@ -26,9 +26,9 @@ use serenity::{
 use songbird::{SerenityInit, Songbird};
 use tracing::{error, info};
 use wotoha_contracts::{
-    ChannelKey, GuildKey, PlaybackService, UserKey, VoiceActionAccess, VoiceGatewayEvent,
-    VoiceGatewayRuntime, VoiceGatewayServerUpdate, VoiceGatewayStateUpdate, VoicePeerSnapshot,
-    VoiceUpdateDecision,
+    ChannelKey, GuildKey, PlaybackFailureKind, PlaybackService, UserKey, VoiceActionAccess,
+    VoiceGatewayEvent, VoiceGatewayRuntime, VoiceGatewayServerUpdate, VoiceGatewayStateUpdate,
+    VoicePeerSnapshot, VoiceUpdateDecision,
 };
 use wotoha_control::{ComponentAction, ComponentOutcome, ControlService};
 use wotoha_core::{
@@ -55,6 +55,8 @@ const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_RESTART_SNAPSHOTS: usize = 128;
 const EMBED_FIELD_LIMIT: usize = 1024;
 const EMBED_TITLE_LIMIT: usize = 180;
+const WOTOHA_INVITE_URL: &str =
+    "https://discord.com/oauth2/authorize?client_id=1238488423208063107";
 const UPDATE_NOTICE_TITLE: &str = "アップデートのお知らせ";
 const UPDATE_NOTICE_DESCRIPTION: &str =
     "最新版へのアップデートのため、まもなく再起動します。再生中の音声は一時的に停止します。";
@@ -400,9 +402,9 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                         &ctx.http,
                         CreateInteractionResponseFollowup::new()
                             .flags(MessageFlags::EPHEMERAL)
-                            .embed(error_embed(
-                                "読み込みに失敗しました。しばらくしてから再試行してください。",
-                            )),
+                            .embed(error_embed(playback_failure_message(
+                                self.control.playback_failure_kind(&error),
+                            ))),
                     )
                     .await?;
             }
@@ -796,6 +798,21 @@ fn update_restart_embed() -> CreateEmbed {
         .color(Colour::new(COLOR_INFO))
 }
 
+fn playback_failure_message(kind: Option<PlaybackFailureKind>) -> &'static str {
+    match kind {
+        Some(PlaybackFailureKind::AgeVerificationRequired) => {
+            "この動画はYouTubeで年齢確認が必要なため、現在の設定では再生できません。"
+        }
+        Some(PlaybackFailureKind::AuthenticationRequired) => {
+            "この動画は認証が必要なため、現在の設定では再生できません。"
+        }
+        Some(PlaybackFailureKind::AccessRestricted) => "この動画は現在の環境から再生できません。",
+        Some(PlaybackFailureKind::TemporarySource) | None => {
+            "音声の取得に失敗しました。しばらくしてから再試行してください。"
+        }
+    }
+}
+
 fn track_embed(
     metadata: &TrackMetadata,
     requested_by: &str,
@@ -809,6 +826,11 @@ fn track_embed(
         .author(CreateEmbedAuthor::new(author))
         .title(title)
         .field("Time", ui::format_duration(metadata.duration), true)
+        .field(
+            "Wotoha",
+            format!("[自分のサーバーに招待 ↗]({WOTOHA_INVITE_URL})"),
+            true,
+        )
         .footer(match avatar_url {
             Some(icon_url) => CreateEmbedFooter::new(format!("Requested by {requested_by}"))
                 .icon_url(icon_url.to_owned()),
@@ -985,8 +1007,9 @@ fn button_fallback_emoji(custom_id: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_VERSION, EMBED_FIELD_LIMIT, matches_play_option, play_command, public_display_url,
-        queue_lines, safe_thumbnail_url, truncate_embed_text, version_activity,
+        BUILD_VERSION, EMBED_FIELD_LIMIT, matches_play_option, play_command, player_action_row,
+        public_display_url, queue_lines, safe_thumbnail_url, track_embed, truncate_embed_text,
+        version_activity,
     };
     use serenity::all::ActivityType;
     use wotoha_core::{GuildPlayerState, PreparedSource, TrackMetadata, TrackRequest};
@@ -1044,6 +1067,35 @@ mod tests {
             public_display_url("https://rr1---sn.example.googlevideo.com/videoplayback?id=abc"),
             None
         );
+    }
+
+    #[test]
+    fn track_embed_includes_invite_link_next_to_time() {
+        let metadata = TrackMetadata::new(
+            "title",
+            "artist",
+            "https://example.com/track",
+            None,
+            Some(std::time::Duration::from_secs(90)),
+        );
+        let payload = serde_json::to_value(track_embed(&metadata, "listener", None))
+            .expect("embed serializes");
+        let fields = payload["fields"].as_array().expect("embed fields");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["name"], "Time");
+        assert_eq!(fields[1]["name"], "Wotoha");
+        assert_eq!(
+            fields[1]["value"],
+            "[自分のサーバーに招待 ↗](https://discord.com/oauth2/authorize?client_id=1238488423208063107)"
+        );
+        assert_eq!(fields[0]["inline"], true);
+        assert_eq!(fields[1]["inline"], true);
+    }
+
+    #[test]
+    fn player_action_row_keeps_the_five_existing_buttons() {
+        let payload = serde_json::to_value(player_action_row()).expect("buttons serialize");
+        assert_eq!(payload["components"].as_array().map(Vec::len), Some(5));
     }
 
     #[test]

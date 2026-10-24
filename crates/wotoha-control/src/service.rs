@@ -1,6 +1,6 @@
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, PlaybackRestartSnapshot, PlaybackService, UserKey,
-    VoiceActionAccess, VoicePeerSnapshot, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, GuildKey, PlaybackFailureKind, PlaybackRestartSnapshot,
+    PlaybackService, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceUpdateDecision,
 };
 use wotoha_core::QueuePreview;
 
@@ -42,6 +42,10 @@ impl<P: PlaybackService> ControlService<P> {
         source_url: &str,
     ) -> Result<EnqueueOutcome, P::Error> {
         self.playback.enqueue(guild_id, source_url).await
+    }
+
+    pub fn playback_failure_kind(&self, error: &P::Error) -> Option<PlaybackFailureKind> {
+        self.playback.playback_failure_kind(error)
     }
 
     pub fn voice_action_access(

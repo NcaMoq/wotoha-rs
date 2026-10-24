@@ -19,6 +19,8 @@ use tokio_util::{
     sync::{CancellationToken, WaitForCancellationFutureOwned},
 };
 
+use crate::stream_error::HttpStreamError;
+
 /// A direct HTTP input whose response body can be interrupted when its owner
 /// is cancelled. Songbird's built-in `HttpRequest` has no cancellation hook;
 /// this keeps the same lazy/async adapter behavior while adding one.
@@ -70,9 +72,9 @@ impl CancellableHttpRequest {
                 .map_err(|error| AudioStreamError::Fail(Box::new(error)))?
         };
         if !response.status().is_success() {
-            return Err(AudioStreamError::Fail(
-                format!("failed with http status code: {}", response.status()).into(),
-            ));
+            return Err(AudioStreamError::Fail(Box::new(HttpStreamError::new(
+                response.status().as_u16(),
+            ))));
         }
 
         let length = response

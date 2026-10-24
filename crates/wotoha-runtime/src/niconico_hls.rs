@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncSeek, AsyncWriteExt, DuplexStream, ReadBuf, dupl
 use tokio_util::sync::CancellationToken;
 
 use crate::hls_security::{filtered_headers, validate_provider_url};
+use crate::stream_error::HttpStreamError;
 
 const NICONICO_HLS_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const NICONICO_HLS_MAX_PLAYLIST_BYTES: usize = 8 * 1024 * 1024;
@@ -510,7 +511,10 @@ impl StreamFailure {
 }
 
 fn reqwest_error(error: reqwest::Error) -> AudioStreamError {
-    AudioStreamError::Fail(Box::new(error))
+    match error.status() {
+        Some(status) => AudioStreamError::Fail(Box::new(HttpStreamError::new(status.as_u16()))),
+        None => AudioStreamError::Fail(Box::new(error)),
+    }
 }
 
 #[derive(Clone, Debug)]

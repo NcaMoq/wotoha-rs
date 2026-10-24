@@ -21,18 +21,18 @@ use songbird::{
     error::JoinError,
     events::{Event, EventContext, EventData, EventHandler as VoiceEventHandler, TrackEvent},
     input::{
-        MakePlayableError,
+        AudioStreamError, MakePlayableError,
         codecs::{get_codec_registry, get_probe},
     },
-    tracks::{PlayMode, ReadyState, Track, TrackHandle},
+    tracks::{ControlError, PlayError, PlayMode, ReadyState, Track, TrackHandle},
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use wotoha_contracts::{
-    ChannelKey, FrameScheduledTransitionSupport, GuildKey, PlaybackId, PlaybackRuntimeEvent,
-    RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
+    ChannelKey, FrameScheduledTransitionSupport, GuildKey, PlaybackFailureKind, PlaybackId,
+    PlaybackRuntimeEvent, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason, TrackStartOptions,
     TransitionArmFailureKind, TransitionArmResult, VoiceGatewayEvent, VoiceGatewayRuntime,
     VoiceRuntime,
 };
@@ -64,6 +64,7 @@ use crate::{
     cancellable_http::CancellableHttpRequest,
     niconico_hls::NiconicoHlsRequest,
     ranged_http::RangedHttpRequest,
+    stream_error::HttpStreamError,
     tempo_stretch::{
         StretchTimeline, build_stretched_input_with_equalizer, build_trimmed_input_with_equalizer,
     },
@@ -197,6 +198,8 @@ pub enum SongbirdRuntimeError {
     TrackReady(String),
     #[error("resolved source is not playable: {0}")]
     MakePlayable(String),
+    #[error("playback source returned HTTP status {status}")]
+    HttpStatus { status: u16 },
     #[error("failed to initialize tempo-matched playback: {0}")]
     TempoStretch(String),
     #[error("failed to remove voice call: {0}")]
@@ -613,7 +616,7 @@ impl SongbirdRuntime {
         // active, so BeatMatched is never claimed for an unready deck.
         if let Err(error) = handle.make_playable_async().await {
             let _ = handle.stop();
-            return Err(SongbirdRuntimeError::TrackReady(error.to_string()));
+            return Err(track_ready_error(error));
         }
         append_debug_log(format!(
             "runtime: play_track handle registered guild_id={} session_id={} playback_id={} paused={} ready=true",
@@ -673,6 +676,23 @@ fn build_stream_client(provider_id: &'static str) -> Result<Client, SongbirdRunt
 #[async_trait]
 impl VoiceRuntime for SongbirdRuntime {
     type Error = SongbirdRuntimeError;
+
+    fn is_retryable_playback_error(&self, error: &Self::Error) -> bool {
+        matches!(
+            error,
+            SongbirdRuntimeError::HttpStatus { status }
+                if matches!(*status, 401 | 403 | 408 | 410 | 425 | 429 | 500..=599)
+        )
+    }
+
+    fn playback_failure_kind(&self, error: &Self::Error) -> Option<PlaybackFailureKind> {
+        match error {
+            SongbirdRuntimeError::HttpStatus {
+                status: 401 | 403 | 410,
+            } => Some(PlaybackFailureKind::TemporarySource),
+            _ => None,
+        }
+    }
 
     async fn play_track(
         &self,
@@ -1366,7 +1386,26 @@ fn should_use_ranged_request(content_length: Option<u64>, range_chunk_size: Opti
 }
 
 fn make_playable_error(error: MakePlayableError) -> SongbirdRuntimeError {
+    if let MakePlayableError::Create(AudioStreamError::Fail(cause)) = &error
+        && let Some(http_error) = cause.downcast_ref::<HttpStreamError>()
+    {
+        return SongbirdRuntimeError::HttpStatus {
+            status: http_error.status(),
+        };
+    }
     SongbirdRuntimeError::MakePlayable(error.to_string())
+}
+
+fn track_ready_error(error: ControlError) -> SongbirdRuntimeError {
+    if let ControlError::Play(PlayError::Create(cause)) = &error
+        && let AudioStreamError::Fail(inner) = cause.as_ref()
+        && let Some(http_error) = inner.downcast_ref::<HttpStreamError>()
+    {
+        return SongbirdRuntimeError::HttpStatus {
+            status: http_error.status(),
+        };
+    }
+    SongbirdRuntimeError::TrackReady(error.to_string())
 }
 
 fn validate_prepared_source_url(
@@ -2181,7 +2220,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use reqwest::Client;
-    use songbird::Songbird;
+    use songbird::{
+        Songbird,
+        input::{AudioStreamError, MakePlayableError},
+    };
     use wotoha_contracts::VoiceRuntime;
     use wotoha_core::{
         PreparedHeader, PreparedSource, TrackMetadata, TrackRequest, analysis::RhythmAnalysis,
@@ -2194,6 +2236,7 @@ mod tests {
         SongbirdRuntimeError, TrackEndReason, TrackLifecycle, analysis_outcome_to_v2,
         analysis_source_supported, build_input, should_use_ranged_request,
     };
+    use crate::stream_error::HttpStreamError;
 
     fn request_with_source(prepared: PreparedSource) -> TrackRequest {
         request_with_source_and_duration(prepared, None)
@@ -2380,6 +2423,19 @@ mod tests {
             error,
             SongbirdRuntimeError::DisallowedPreparedUrl { .. }
         ));
+    }
+
+    #[test]
+    fn preserves_http_status_as_typed_retry_signal() {
+        let error = super::make_playable_error(MakePlayableError::Create(AudioStreamError::Fail(
+            Box::new(HttpStreamError::new(403)),
+        )));
+        assert!(matches!(
+            error,
+            SongbirdRuntimeError::HttpStatus { status: 403 }
+        ));
+        let runtime = SongbirdRuntime::new(Songbird::serenity()).unwrap();
+        assert!(runtime.is_retryable_playback_error(&error));
     }
 
     #[test]

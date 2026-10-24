@@ -23,6 +23,8 @@ use tokio_util::{
 };
 use wotoha_core::{PreparedRangeMode, debug::append_debug_log};
 
+use crate::stream_error::HttpStreamError;
+
 fn cancelled_stream_error() -> AudioStreamError {
     AudioStreamError::Fail(Box::new(IoError::new(
         IoErrorKind::Interrupted,
@@ -208,14 +210,14 @@ impl RangedHttpRequest {
                     .map(|token| Box::pin(token.cancelled_owned())),
             });
         }
-        let message: Box<dyn std::error::Error + Send + Sync + 'static> = format!(
-            "failed with http status code: {}",
-            last_status
-                .map(|status| status.to_string())
-                .unwrap_or_else(|| "unknown".to_owned())
-        )
-        .into();
-        Err(AudioStreamError::Fail(message))
+        match last_status {
+            Some(status) => Err(AudioStreamError::Fail(Box::new(HttpStreamError::new(
+                status.as_u16(),
+            )))),
+            None => Err(AudioStreamError::Fail(
+                "HTTP stream returned no response".into(),
+            )),
+        }
     }
 }
 
@@ -425,14 +427,62 @@ mod tests {
         header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue},
     };
     use songbird::input::{
-        Input, LiveInput,
+        AudioStreamError, Input, LiveInput,
         codecs::{get_codec_registry, get_probe},
     };
     use symphonia::core::audio::SampleBuffer;
     use tokio::io::AsyncReadExt;
     use wotoha_core::PreparedRangeMode;
 
+    use crate::stream_error::HttpStreamError;
     use crate::tempo_stretch::build_trimmed_input;
+
+    #[tokio::test]
+    async fn preserves_http_status_for_retry_classification() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/audio", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut request = Vec::new();
+            let mut read_buf = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut read_buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => request.extend_from_slice(&read_buf[..read]),
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let mut request = RangedHttpRequest::new_with_headers(
+            reqwest::Client::new(),
+            url,
+            HeaderMap::new(),
+            Some(10),
+            10,
+            PreparedRangeMode::Header,
+        );
+        let error = match request.create_stream(0).await {
+            Ok(_) => panic!("403 should fail"),
+            Err(error) => error,
+        };
+        let AudioStreamError::Fail(cause) = error else {
+            panic!("expected typed stream failure");
+        };
+        assert_eq!(
+            cause
+                .downcast_ref::<HttpStreamError>()
+                .map(|error| error.status()),
+            Some(403)
+        );
+    }
 
     #[test]
     fn validates_partial_content_start_offset() {

@@ -15,6 +15,7 @@ use tokio::{
     sync::Semaphore,
     time::timeout,
 };
+use wotoha_contracts::PlaybackFailureKind;
 use wotoha_core::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(25);
@@ -57,6 +58,15 @@ pub enum YtDlpError {
     UnsafeHeaders,
     #[error("invalid yt-dlp cookies file: {0}")]
     CookiesFile(String),
+}
+
+impl YtDlpError {
+    pub fn playback_failure_kind(&self) -> Option<PlaybackFailureKind> {
+        let YtDlpError::Failed { message, .. } = self else {
+            return None;
+        };
+        Some(classify_failure_message(message))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -474,6 +484,34 @@ fn concise_stderr(stderr: &[u8]) -> String {
         format!("{}…", compact.chars().take(500).collect::<String>())
     }
 }
+
+fn classify_failure_message(message: &str) -> PlaybackFailureKind {
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("confirm your age")
+        || normalized.contains("age-restricted")
+        || normalized.contains("age restricted")
+    {
+        return PlaybackFailureKind::AgeVerificationRequired;
+    }
+    if normalized.contains("sign in")
+        || normalized.contains("authentication required")
+        || normalized.contains("login required")
+        || normalized.contains("members-only")
+        || normalized.contains("members only")
+    {
+        return PlaybackFailureKind::AuthenticationRequired;
+    }
+    if normalized.contains("private video")
+        || normalized.contains("video is private")
+        || normalized.contains("video unavailable")
+        || normalized.contains("not available in your country")
+        || normalized.contains("geo-restricted")
+        || normalized.contains("geoblocked")
+    {
+        return PlaybackFailureKind::AccessRestricted;
+    }
+    PlaybackFailureKind::TemporarySource
+}
 fn url_query_u64(raw_url: &str, key: &str) -> Option<u64> {
     reqwest::Url::parse(raw_url)
         .ok()?
@@ -501,6 +539,27 @@ mod tests {
         assert!(args.contains(&"--no-playlist".to_owned()));
         assert_eq!(args[args.len() - 2], "--");
         assert_eq!(args.last().unwrap(), "https://www.youtube.com/watch?v=x");
+    }
+
+    #[test]
+    fn classifies_yt_dlp_access_failures_without_exposing_stderr_to_ui() {
+        let age = YtDlpError::Failed {
+            status: "1".into(),
+            message: "ERROR: Sign in to confirm your age".into(),
+        };
+        assert_eq!(
+            age.playback_failure_kind(),
+            Some(PlaybackFailureKind::AgeVerificationRequired)
+        );
+
+        let private = YtDlpError::Failed {
+            status: "1".into(),
+            message: "ERROR: This video is private".into(),
+        };
+        assert_eq!(
+            private.playback_failure_kind(),
+            Some(PlaybackFailureKind::AccessRestricted)
+        );
     }
     #[test]
     fn drops_secret_headers_and_rejects_injected_retained_headers() {

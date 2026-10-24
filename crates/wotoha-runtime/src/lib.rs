@@ -11,6 +11,7 @@ mod niconico_hls;
 mod ranged_http;
 mod reconnect;
 mod songbird;
+mod stream_error;
 mod tempo_stretch;
 mod transition_dsp;
 mod validated_hls;

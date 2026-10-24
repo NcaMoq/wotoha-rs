@@ -80,6 +80,18 @@ pub enum TrackEndReason {
     Stopped,
 }
 
+/// A coarse, secret-safe category for user-facing playback failures.
+///
+/// Providers and runtimes keep their detailed diagnostics private; the
+/// Discord layer only needs this small set of actionable messages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackFailureKind {
+    TemporarySource,
+    AgeVerificationRequired,
+    AuthenticationRequired,
+    AccessRestricted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlaybackRuntimeEvent {
     TrackStarted {
@@ -546,11 +558,38 @@ pub trait MediaBackend: Clone + Send + Sync + 'static {
 
     async fn resolve(&self, source_url: &str) -> Result<TrackRequest, Self::Error>;
     async fn prepare_playback(&self, request: &TrackRequest) -> Result<TrackRequest, Self::Error>;
+
+    /// Bypass ordinary prepared-source caches after a source acquisition
+    /// failure.  Implementations should invalidate the failed source before
+    /// refreshing it.  The default preserves compatibility for lightweight
+    /// backends that do not have a provider-specific refresh path.
+    async fn prepare_playback_fresh(
+        &self,
+        request: &TrackRequest,
+    ) -> Result<TrackRequest, Self::Error> {
+        self.prepare_playback(request).await
+    }
+
+    /// Converts provider-specific failures into a secret-safe UI category.
+    fn playback_failure_kind(&self, _error: &Self::Error) -> Option<PlaybackFailureKind> {
+        None
+    }
 }
 
 #[async_trait]
 pub trait VoiceRuntime: Clone + Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
+
+    /// Returns true only when a failed lazy stream may become playable after
+    /// obtaining a fresh provider source.  The playback layer enforces the
+    /// one-refresh limit; runtimes must not perform retries themselves.
+    fn is_retryable_playback_error(&self, _error: &Self::Error) -> bool {
+        false
+    }
+
+    fn playback_failure_kind(&self, _error: &Self::Error) -> Option<PlaybackFailureKind> {
+        None
+    }
 
     async fn play_track(
         &self,
@@ -663,6 +702,10 @@ pub trait PlaybackService: Clone + Send + Sync + 'static {
         guild_id: GuildKey,
         source_url: &str,
     ) -> Result<EnqueueOutcome, Self::Error>;
+
+    fn playback_failure_kind(&self, _error: &Self::Error) -> Option<PlaybackFailureKind> {
+        None
+    }
 
     fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview>;
     async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool>;

@@ -18,8 +18,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, PlaybackId,
-    PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink, RuntimeTrackHandle,
+    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, PlaybackFailureKind,
+    PlaybackId, PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink, RuntimeTrackHandle,
     TrackStartOptions, TransitionArmResult, UserKey, VoiceActionAccess, VoiceGatewayEvent,
     VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
@@ -374,6 +374,14 @@ where
 {
     type Error = R::Error;
 
+    fn is_retryable_playback_error(&self, error: &Self::Error) -> bool {
+        self.inner.is_retryable_playback_error(error)
+    }
+
+    fn playback_failure_kind(&self, error: &Self::Error) -> Option<PlaybackFailureKind> {
+        self.inner.playback_failure_kind(error)
+    }
+
     async fn play_track(
         &self,
         guild_id: GuildKey,
@@ -709,6 +717,13 @@ where
             .enqueue(guild_id, source_url)
             .await
             .map_err(ConfiguredPlaybackError::Inner)
+    }
+
+    fn playback_failure_kind(&self, error: &Self::Error) -> Option<PlaybackFailureKind> {
+        match error {
+            ConfiguredPlaybackError::Inner(error) => self.inner.playback_failure_kind(error),
+            ConfiguredPlaybackError::QueueFull { .. } => None,
+        }
     }
 
     fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview> {
