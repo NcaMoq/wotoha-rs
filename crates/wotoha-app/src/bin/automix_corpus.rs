@@ -2537,7 +2537,7 @@ mod tests {
     #[test]
     fn research_loudness_defaults_match_production_policy() {
         let config = loudness_config(LoudnessConfig::production_default().max_boost_db);
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert_eq!(config.target_lufs, -16.0);
         assert_eq!(config.max_boost_db, 6.0);
         assert_eq!(config.true_peak_ceiling_dbtp, -2.0);

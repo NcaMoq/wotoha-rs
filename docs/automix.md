@@ -102,12 +102,20 @@ non-BeatMatched plan rather than assuming that a candidate is executable.
 
 Track loudness uses the integrated loudness field represented in LUFS, with the
 EBU R128 / ITU-R BS.1770 convention used by the core loudness implementation.
-The default target is `-16.0 LUFS`, the default maximum positive gain is `+6.0
-dB`, and the normalization-stage true-peak ceiling is `-2.0 dBTP`. Quieter
-tracks may therefore be boosted by up to `+6.0 dB` when a valid true-peak
-measurement leaves sufficient headroom. A missing or invalid true-peak
-measurement never authorizes an unconditional boost. Set
-`WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` to retain attenuation-only behavior.
+The target is `-16.0 LUFS`, the maximum positive gain is `+6.0 dB`, and the
+normalization-stage true-peak ceiling is `-2.0 dBTP`. Normalization is disabled
+by default to keep the first audible response fast; set
+`WOTOHA_LOUDNESS_NORMALIZATION_ENABLED=true` to opt in. Quieter tracks may
+then be boosted by up to `+6.0 dB` when a valid cached true-peak measurement
+leaves sufficient headroom. A missing or invalid true-peak measurement never
+authorizes an unconditional boost. Set `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` to
+retain attenuation-only behavior.
+
+Playback does not wait for either a loudness-only pass or detailed AutoMix
+analysis. If a full analysis is already cached, its loudness fields may be
+used for the initial gain; otherwise an unanalysed track starts at the
+requested base volume. Detailed rhythm, structure, and transition analysis
+continues independently for AutoMix.
 
 Normalization is applied once per track. The true-peak ceiling at this stage
 is not a substitute for validating a deployment's separately configured master

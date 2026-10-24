@@ -67,8 +67,8 @@ The following work still needs to happen:
 - `WOTOHA_LOG_FILE`: file name created under `WOTOHA_LOG_DIR`. Directory separators are rejected.
 - `WOTOHA_LOG_FILE_ENABLED`: enables the optional secondary file writer; Docker defaults this to `false` so stdout/stderr remain the primary bounded log stream.
 - `WOTOHA_LOG_ANSI`: `true` enables ANSI color sequences in stdout and the file writer; keep `false` for systemd logs.
-- `WOTOHA_DEFAULT_VOLUME`: playback volume value, accepted range `0.0..=2.0`; defaults to `0.20`.
-- `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED`: enables per-track loudness normalization; defaults to `true`.
+- `WOTOHA_DEFAULT_VOLUME`: playback volume value, accepted range `0.0..=2.0`; defaults to `0.10`.
+- `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED`: enables per-track loudness normalization; defaults to `false` so playback is not delayed by analysis. Set it to `true` to opt in; normalization is applied only when a cached analysis is already available at playback/transition start.
 - `WOTOHA_LOUDNESS_TARGET_LUFS`: integrated loudness target, accepted range `-24.0..=-8.0` LUFS; defaults to `-16.0`.
 - `WOTOHA_LOUDNESS_MAX_BOOST_DB`: maximum normalization boost, accepted range `0.0..=12.0` dB; defaults to `6.0`. By default, loudness normalization attenuates tracks above the target and may boost quieter tracks when a valid true-peak measurement permits it. Set this to `0.0` for attenuation-only behavior.
 - `WOTOHA_LOUDNESS_TRUE_PEAK_CEILING_DBTP`: true-peak ceiling, accepted range `-6.0..=0.0` dBTP; defaults to `-2.0`.

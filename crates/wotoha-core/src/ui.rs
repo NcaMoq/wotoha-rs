@@ -21,11 +21,14 @@ pub const SKIP_EMOJI_NAME: &str = "skip";
 pub const LOOP_EMOJI_NAME: &str = "loop";
 pub const SHUFFLE_EMOJI_NAME: &str = "shuffle";
 pub const AUTOMIX_EMOJI_NAME: &str = "AutoMix";
+pub const QUEUE_EMOJI_NAME: &str = "list";
+pub const INVITE_BUTTON_LABEL: &str = "招待";
 
 pub const SKIP_EMOJI_ID: u64 = 1450137384359559332;
 pub const LOOP_EMOJI_ID: u64 = 1450137411278475416;
 pub const SHUFFLE_EMOJI_ID: u64 = 1450135594746511393;
 pub const AUTOMIX_EMOJI_ID: u64 = 1523220885522223185;
+pub const QUEUE_EMOJI_ID: u64 = 1450138747084738751;
 
 pub const COLOR_INFO: u32 = 0x49B0E4;
 pub const COLOR_ERROR: u32 = 0xE74C3C;

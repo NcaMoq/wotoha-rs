@@ -8,8 +8,8 @@ const DEFAULT_LOG_DIR: &str = "/wotoha/logs";
 const DEFAULT_LOG_FILE: &str = "wotoha-app.runtime.log";
 const DEFAULT_RUST_LOG: &str = "info,wotoha_debug=info";
 const DEFAULT_LOG_ANSI: bool = false;
-const DEFAULT_PLAYBACK_VOLUME: f32 = 0.20;
-const DEFAULT_LOUDNESS_NORMALIZATION_ENABLED: bool = true;
+const DEFAULT_PLAYBACK_VOLUME: f32 = 0.10;
+const DEFAULT_LOUDNESS_NORMALIZATION_ENABLED: bool = false;
 const DEFAULT_LOUDNESS_TARGET_LUFS: f32 = -16.0;
 const DEFAULT_LOUDNESS_MAX_BOOST_DB: f32 = 6.0;
 const DEFAULT_LOUDNESS_TRUE_PEAK_CEILING_DBTP: f32 = -2.0;
@@ -489,8 +489,8 @@ mod tests {
         assert!(config.logging.file_enabled);
         assert_eq!(config.logging.rust_log, "info,wotoha_debug=info");
         assert!(!config.logging.ansi);
-        assert_eq!(config.playback.default_volume, 0.20);
-        assert!(config.playback.loudness.enabled);
+        assert_eq!(config.playback.default_volume, 0.10);
+        assert!(!config.playback.loudness.enabled);
         assert_eq!(config.playback.loudness.target_lufs, -16.0);
         assert_eq!(config.playback.loudness.max_boost_db, 6.0);
         assert_eq!(config.playback.loudness.true_peak_ceiling_dbtp, -2.0);
@@ -567,10 +567,21 @@ mod tests {
     fn production_loudness_default_matches_runtime_defaults() {
         let config = LoudnessConfig::production_default();
 
-        assert!(config.enabled);
+        assert!(!config.enabled);
         assert_eq!(config.target_lufs, -16.0);
         assert_eq!(config.max_boost_db, 6.0);
         assert_eq!(config.true_peak_ceiling_dbtp, -2.0);
+    }
+
+    #[test]
+    fn loudness_normalization_can_be_explicitly_enabled() {
+        let config = load_from(&[
+            ("DISCORD_TOKEN", "token"),
+            ("WOTOHA_LOUDNESS_NORMALIZATION_ENABLED", "true"),
+        ])
+        .unwrap();
+
+        assert!(config.playback.loudness.enabled);
     }
 
     #[test]

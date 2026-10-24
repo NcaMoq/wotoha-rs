@@ -16,7 +16,7 @@ use tokio::sync::{
     mpsc::{self, error::TrySendError},
     oneshot,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
     PlaybackFailureKind, PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent,
@@ -691,7 +691,7 @@ where
         let analysis_key = track_analysis_key(&request);
         {
             let mut playback = session.playback.lock();
-            if !playback.automix_enabled && !self.inner.loudness.enabled {
+            if !playback.automix_enabled {
                 return;
             }
             if let Some(analysis) = playback.analysis_by_key.get(&analysis_key).cloned() {
@@ -726,7 +726,6 @@ where
                 && session.id == session_id
             {
                 let mut rearm_current = false;
-                let mut late_analysis_for_current = false;
                 let mut playback = session.playback.lock();
                 playback.analysis_in_flight.remove(&task_key);
                 playback.analysis_tasks.remove(&task_key);
@@ -740,7 +739,7 @@ where
                     .iter()
                     .take(AUTOMIX_ANALYSIS_LOOKAHEAD)
                     .any(|queued| track_analysis_key(queued) == task_key);
-                if (playback.automix_enabled || coordinator.inner.loudness.enabled)
+                if playback.automix_enabled
                     && (request_is_current || request_is_queued_candidate)
                     && let Some(analysis) = analysis
                 {
@@ -748,27 +747,16 @@ where
                     if request_is_current {
                         playback.current_analysis = Some(analysis);
                         rearm_current = playback.automix_enabled;
-                        late_analysis_for_current = coordinator.inner.loudness.enabled;
                     }
                 }
                 drop(playback);
-                if late_analysis_for_current {
-                    operational_metrics().record_late_analysis_for_future();
-                    debug!(
-                        guild_id = guild_id.get(),
-                        session_id,
-                        "late loudness analysis stored for future playback; active track gain remains fixed"
-                    );
-                }
                 if rearm_current {
                     coordinator.spawn_current_automix_rearm(guild_id, session_id);
                 }
             }
         });
         let mut playback = session.playback.lock();
-        if (playback.automix_enabled || self.inner.loudness.enabled)
-            && playback.analysis_in_flight.contains(&analysis_key)
-        {
+        if playback.automix_enabled && playback.analysis_in_flight.contains(&analysis_key) {
             playback.analysis_tasks.insert(analysis_key, task);
             let _ = start_tx.send(());
         } else {
@@ -785,7 +773,7 @@ where
         }
         let requests = {
             let mut playback = session.playback.lock();
-            if !playback.automix_enabled && !self.inner.loudness.enabled {
+            if !playback.automix_enabled {
                 return;
             }
             let requests = playback
@@ -938,9 +926,7 @@ where
             let mut playback = session.playback.lock();
             if playback.automix_enabled {
                 playback.automix_enabled = false;
-                if !self.inner.loudness.enabled {
-                    abort_analysis_tasks(&mut playback);
-                }
+                abort_analysis_tasks(&mut playback);
                 playback.logical.disable_loop();
             }
             let prepared = invalidate_prepared_transition(&mut playback);
@@ -1023,7 +1009,7 @@ where
             playback.automix_enabled = !playback.automix_enabled;
             if playback.automix_enabled {
                 playback.logical.disable_loop();
-            } else if !self.inner.loudness.enabled {
+            } else {
                 abort_analysis_tasks(&mut playback);
             }
             let prepared = invalidate_prepared_transition(&mut playback);
@@ -1216,7 +1202,7 @@ where
             {
                 let mut playback = session.playback.lock();
                 playback.automix_enabled = snapshot.automix_enabled;
-                if !snapshot.automix_enabled && !self.inner.loudness.enabled {
+                if !snapshot.automix_enabled {
                     abort_analysis_tasks(&mut playback);
                 }
                 playback.logical.disable_loop();
@@ -1224,7 +1210,7 @@ where
                     playback.logical.toggle_loop();
                 }
             }
-            if snapshot.automix_enabled || self.inner.loudness.enabled {
+            if snapshot.automix_enabled {
                 self.spawn_relevant_analyses(guild_id, session.id);
             }
         }
@@ -1754,6 +1740,15 @@ where
                     .cloned(),
             )
         };
+        let incoming_cached_analysis = match incoming_cached_analysis {
+            Some(analysis) => Some(analysis),
+            None => {
+                self.inner
+                    .runtime
+                    .cached_track_analysis_async(&prepared)
+                    .await
+            }
+        };
         let incoming_id = self.next_playback_id();
         let outgoing_frame_support = {
             let playback = session.playback.lock();
@@ -1763,15 +1758,18 @@ where
                 .map(|handle| handle.frame_scheduled_transition_support())
         };
         let incoming_analysis = if incoming_cached_analysis.is_some() {
-            incoming_cached_analysis
+            incoming_cached_analysis.clone()
         } else {
             self.inner.runtime.analyze_track(&prepared).await
         };
         let mut timing = timing;
         let mut transition_after = timing.transition_after;
         let mut transition_kind = TransitionKind::Crossfade;
+        // A transition may use analysis that was already cached before this
+        // handoff was prepared.  It must not turn the detailed AutoMix
+        // analysis just performed above into a new blocking loudness path.
         let incoming_gain =
-            loudness_normalization_gain(&self.inner.loudness, incoming_analysis.as_ref());
+            loudness_normalization_gain(&self.inner.loudness, incoming_cached_analysis.as_ref());
         let outgoing_gain =
             loudness_normalization_gain(&self.inner.loudness, outgoing_analysis.as_ref());
         let mut outgoing_equalizer_transition = None;
@@ -3044,13 +3042,12 @@ where
         playback_started: Instant,
     ) -> Result<StartedTrack, PlaybackError<M::Error, R::Error>> {
         let analysis_key = track_analysis_key(prepared);
-        let analysis_enabled = self
+        let automix_analysis_enabled = self
             .get_session(guild_id)
             .filter(|session| session.id == session_id)
-            .is_some_and(|session| {
-                session.playback.lock().automix_enabled || self.inner.loudness.enabled
-            });
-        let cached_analysis = if analysis_enabled {
+            .is_some_and(|session| session.playback.lock().automix_enabled);
+        let cache_lookup_enabled = automix_analysis_enabled || self.inner.loudness.enabled;
+        let cached_analysis = if cache_lookup_enabled {
             let in_memory = self
                 .get_session(guild_id)
                 .filter(|session| session.id == session_id)
@@ -3074,8 +3071,13 @@ where
         } else {
             None
         };
-        let analysis_available_at_start = cached_analysis.is_some();
-        if self.inner.loudness.enabled && analysis_available_at_start {
+        // Only an analysis already held by the AutoMix cache may affect the
+        // initial gain.  Never decode or await a new loudness measurement on
+        // the user-facing play path: an unanalysed source starts immediately
+        // at its requested base volume.
+        let normalization_analysis_available_at_start =
+            self.inner.loudness.enabled && cached_analysis.is_some();
+        if self.inner.loudness.enabled && normalization_analysis_available_at_start {
             operational_metrics().record_loudness_cache_hit();
         } else if self.inner.loudness.enabled {
             operational_metrics().record_loudness_cache_miss();
@@ -3083,7 +3085,7 @@ where
         let normalization_gain =
             loudness_normalization_gain(&self.inner.loudness, cached_analysis.as_ref());
         let effective_initial_gain = initial_gain * normalization_gain;
-        if self.inner.loudness.enabled && analysis_available_at_start {
+        if self.inner.loudness.enabled && normalization_analysis_available_at_start {
             operational_metrics().record_normalized_at_start();
         }
 
@@ -3093,7 +3095,9 @@ where
             provider_id = prepared.provider_id.as_ref(),
             canonical_key = prepared.canonical_key.as_ref(),
             title = prepared.metadata.title.as_ref(),
-            analysis_available_at_start,
+            detailed_analysis_available_at_start =
+                automix_analysis_enabled && cached_analysis.is_some(),
+            normalization_analysis_available_at_start,
             normalization_gain_selected_at_start = normalization_gain,
             "prepared track for runtime playback"
         );
@@ -4530,27 +4534,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    async fn wait_for_analysis_cache(playback: &TestPlayback, guild_id: GuildKey, key: &str) {
-        let expected_key = super::track_analysis_key(&track_request(key));
-        timeout(Duration::from_secs(3), async {
-            loop {
-                let cached = playback.get_session(guild_id).is_some_and(|session| {
-                    session
-                        .playback
-                        .lock()
-                        .analysis_by_key
-                        .contains_key(&expected_key)
-                });
-                if cached {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("analysis cache wait timed out for {key}"));
-    }
-
     async fn wait_for_current_analysis(playback: &TestPlayback, guild_id: GuildKey) {
         timeout(Duration::from_secs(3), async {
             loop {
@@ -4602,7 +4585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loudness_starts_analysis_when_automix_is_disabled() {
+    async fn unanalysed_playback_does_not_wait_for_loudness_or_automix_analysis() {
         let guild_id = GuildKey::new(201);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
@@ -4619,9 +4602,9 @@ mod tests {
         media.resolve_with("track", Ok(track_request("track")));
 
         playback.enqueue_impl(guild_id, "track").await.unwrap();
-        runtime.wait_for_analysis_count(1).await;
 
-        assert_eq!(runtime.analysis_calls(), vec!["track"]);
+        assert_eq!(runtime.analysis_calls(), Vec::<String>::new());
+        assert_eq!(runtime.start_options()[0].1.initial_gain, 1.0);
         assert!(!playback.automix_enabled(guild_id));
     }
 
@@ -4659,15 +4642,13 @@ mod tests {
         assert!(runtime.analysis_calls().is_empty());
     }
 
-    async fn assert_late_loudness_analysis_does_not_change_current_gain(
-        guild_id: GuildKey,
-        integrated_lufs: f32,
-    ) {
+    async fn unanalysed_track_starts_at_requested_gain() {
+        let guild_id = GuildKey::new(203);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
         runtime.analyze_with(
             "track",
-            loudness_analysis(Duration::from_secs(30), integrated_lufs, None),
+            loudness_analysis(Duration::from_secs(30), -10.0, None),
         );
         let playback = PlaybackCoordinator::new_with_automix_and_loudness(
             media.clone(),
@@ -4678,11 +4659,7 @@ mod tests {
         media.resolve_with("track", Ok(track_request("track")));
 
         playback.enqueue_impl(guild_id, "track").await.unwrap();
-        runtime.wait_for_analysis_count(1).await;
         let playback_id = runtime.played()[0].playback_id;
-        wait_for_analysis_cache(&playback, guild_id, "track").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
         let gains = runtime
             .volumes()
             .into_iter()
@@ -4692,19 +4669,13 @@ mod tests {
         let state = playback.get_session(guild_id).unwrap();
         let playback = state.playback.lock();
         assert_eq!(playback.current_gain, 1.0);
-        assert!(playback.current_analysis.is_some());
-        let analysis_key = super::track_analysis_key(&track_request("track"));
-        assert!(playback.analysis_by_key.contains_key(&analysis_key));
+        assert!(playback.current_analysis.is_none());
+        assert!(runtime.analysis_calls().is_empty());
     }
 
     #[tokio::test]
-    async fn late_loudness_analysis_does_not_retarget_current_track() {
-        assert_late_loudness_analysis_does_not_change_current_gain(GuildKey::new(203), -10.0).await;
-    }
-
-    #[tokio::test]
-    async fn late_loudness_analysis_does_not_apply_boost_to_current_track() {
-        assert_late_loudness_analysis_does_not_change_current_gain(GuildKey::new(209), -20.0).await;
+    async fn missing_true_peak_does_not_block_playback() {
+        unanalysed_track_starts_at_requested_gain().await;
     }
 
     #[tokio::test]
@@ -4731,8 +4702,6 @@ mod tests {
             playback.enqueue_impl(guild_id, key).await.unwrap();
         }
 
-        runtime.wait_for_analysis_count(2).await;
-        wait_for_analysis_cache(&playback, guild_id, "second").await;
         let first = runtime.played()[0].clone();
         playback
             .advance(
@@ -4743,10 +4712,8 @@ mod tests {
             )
             .await;
         runtime.wait_for_play_count(2).await;
-
-        let expected = 10.0_f32.powf(-6.0 / 20.0);
         let options = runtime.start_options();
-        assert!((options[1].1.initial_gain - expected).abs() < 0.0001);
+        assert_eq!(options[1].1.initial_gain, 1.0);
         let second = runtime.played()[1].playback_id;
         assert_eq!(
             runtime
@@ -4754,16 +4721,15 @@ mod tests {
                 .into_iter()
                 .filter(|(id, _)| *id == second)
                 .collect::<Vec<_>>(),
-            vec![(second, expected)]
+            vec![(second, 1.0)]
         );
     }
 
     #[tokio::test]
-    async fn queued_track_with_late_loudness_analysis_keeps_start_gain_fixed() {
+    async fn queued_track_preplay_loudness_is_not_blocked_by_detailed_analysis() {
         let guild_id = GuildKey::new(211);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
-        let release = runtime.block_analysis("second");
         runtime.analyze_with(
             "first",
             loudness_analysis(Duration::from_secs(30), -16.0, None),
@@ -4783,7 +4749,6 @@ mod tests {
             playback.enqueue_impl(guild_id, key).await.unwrap();
         }
 
-        runtime.wait_for_analysis_count(2).await;
         let first = runtime.played()[0].clone();
         playback
             .advance(
@@ -4803,18 +4768,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(second, 1.0)]
         );
-
-        release.send(()).unwrap();
-        wait_for_analysis_cache(&playback, guild_id, "second").await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(
-            runtime
-                .volumes()
-                .into_iter()
-                .filter(|(id, _)| *id == second)
-                .collect::<Vec<_>>(),
-            vec![(second, 1.0)]
-        );
         assert_eq!(
             playback
                 .get_session(guild_id)
@@ -4824,14 +4777,14 @@ mod tests {
                 .current_gain,
             1.0
         );
+        assert!(runtime.analysis_calls().is_empty());
     }
 
     #[tokio::test]
-    async fn late_loudness_analysis_does_not_retarget_during_transition() {
+    async fn preplay_loudness_does_not_retarget_during_transition() {
         let guild_id = GuildKey::new(204);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
-        let release = runtime.block_analysis("track");
         runtime.analyze_with(
             "track",
             loudness_analysis(Duration::from_secs(30), -10.0, None),
@@ -4845,13 +4798,11 @@ mod tests {
         media.resolve_with("track", Ok(track_request("track")));
 
         playback.enqueue_impl(guild_id, "track").await.unwrap();
-        runtime.wait_for_analysis_count(1).await;
         let played = runtime.played()[0].clone();
         {
             let session = playback.get_session(guild_id).unwrap();
             session.playback.lock().transition_due = Some(played.playback_id);
         }
-        release.send(()).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         let gains = runtime
@@ -4860,10 +4811,11 @@ mod tests {
             .filter(|(id, _)| *id == played.playback_id)
             .collect::<Vec<_>>();
         assert_eq!(gains, vec![(played.playback_id, 1.0)]);
+        assert!(runtime.analysis_calls().is_empty());
     }
 
     #[tokio::test]
-    async fn late_loudness_analysis_remains_fixed_without_prepared_transition() {
+    async fn preplay_loudness_remains_fixed_without_prepared_transition() {
         let guild_id = GuildKey::new(207);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
@@ -4973,7 +4925,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_loudness_analysis_cannot_change_the_next_track() {
+    async fn preplay_loudness_cannot_change_the_next_track_later() {
         let guild_id = GuildKey::new(205);
         let media = MockMedia::default();
         let runtime = MockRuntime::default();
@@ -4991,7 +4943,6 @@ mod tests {
             media.resolve_with(key, Ok(track_request(key)));
             playback.enqueue_impl(guild_id, key).await.unwrap();
         }
-        runtime.wait_for_analysis_count(2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         let first = runtime.played()[0].clone();
 
@@ -5015,6 +4966,7 @@ mod tests {
         assert_eq!(second_gains, vec![1.0]);
         let session = playback.get_session(guild_id).unwrap();
         assert_eq!(session.playback.lock().current_gain, 1.0);
+        assert!(runtime.analysis_calls().is_empty());
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ The [latest release](https://github.com/NcaMoq/wotoha-rs/releases/latest) is the
 
 - **Analysis-driven AutoMix** — transition candidates use tempo, beat timing, structure, cues, energy, vocal activity, and optional tonal compatibility rather than a single global fade setting.
 - **Conservative handoffs** — BeatMatched is used only when the timing, overlap, and quality checks support it; otherwise the planner falls back to Crossfade or Gapless.
-- **Loudness-aware playback** — track normalization targets `-16 LUFS` by default, with an attenuation-first policy and a `-2 dBTP` true-peak ceiling at the normalization stage.
+- **Optional loudness-aware playback** — when enabled, track normalization targets `-16 LUFS` with an attenuation-first policy and a `-2 dBTP` true-peak ceiling at the normalization stage. It is disabled by default so playback does not wait for analysis.
 - **Rust audio stack** — a modular Cargo workspace built around Tokio, Serenity, Songbird, and Symphonia.
 - **Self-hostable** — the production container runs on Linux/amd64 with a non-root user, a read-only root filesystem, dropped capabilities, and an offline self-check.
 

@@ -22,8 +22,10 @@ should be cut and tested from a deliberate release commit rather than treating
   dropped capabilities, and offline self-check coverage.
 - Runtime delivery, reconnect state, bounded persistence, and managed media
   helper handling have additional safety and provenance checks.
-- Loudness normalization defaults to a `-16 LUFS` target with up to `+6 dB`
-  of positive gain when a valid true-peak measurement permits it; setting
+- Optional loudness normalization targets `-16 LUFS` with up to `+6 dB` of
+  positive gain when a valid cached true-peak measurement permits it. It is
+  disabled by default so playback does not wait for analysis; setting
+  `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED=true` opts in, while
   `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` retains attenuation-only behavior.
   True-peak limits remain part of the safety boundary.
 - AutoMix planning has a documented V2 timeline/cue analysis surface and

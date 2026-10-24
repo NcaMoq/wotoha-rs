@@ -35,20 +35,24 @@ contains the application settings and secret; it is never committed.
 
 ## Loudness normalization policy
 
-Loudness normalization remains enabled by default and targets `-16.0` LUFS with
-a `-2.0` dBTP ceiling. The default maximum positive gain is `+6.0` dB:
-tracks louder than the target are attenuated, while quieter tracks may be
-boosted when a valid true-peak measurement leaves sufficient headroom. Set
-`WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` in `runtime.env` to retain attenuation-only
+Loudness normalization is disabled by default so a new play request is not
+held behind an analysis pass. Set
+`WOTOHA_LOUDNESS_NORMALIZATION_ENABLED=true` in `runtime.env` to opt in. When
+enabled, normalization targets `-16.0` LUFS with a `-2.0` dBTP ceiling and a
+maximum positive gain of `+6.0` dB: tracks louder than the target are
+attenuated, while quieter tracks may be boosted when a valid cached true-peak
+measurement leaves sufficient headroom. An unanalysed track still starts
+immediately; only analysis already available in cache can affect its initial
+gain. Set `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` to retain attenuation-only
 behavior. The true-peak ceiling applies at the track-normalization stage. It
 is not a final-output limiter after the separately configured master volume,
 so deployments that raise the master volume above `1.0` must validate the
 resulting output chain separately.
 
-This default applies only when the variable is omitted. Existing deployments
-with an explicit value retain their configured behavior; an existing
-`runtime.env` containing `0.0` will continue to disable positive gain until it
-is changed explicitly.
+The disabled default applies only when the enable variable is omitted.
+Existing deployments with an explicit enable value retain their configured
+behavior. An existing `runtime.env` containing an explicit loudness setting
+continues to override the application default until it is changed explicitly.
 
 The Compose file intentionally has no published ports or fake healthcheck.
 Discord voice and gateway traffic are outbound connections. The service runs

@@ -47,9 +47,11 @@ planner's evidence and fallbacks easier to operate.
 
 ## Safety and reliability
 
-- Loudness normalization remains enabled by default at `-16 LUFS`, with up to
-  `+6 dB` of positive gain when a valid true-peak measurement permits it, and
-  a `-2 dBTP` normalization-stage true-peak ceiling. Set
+- Loudness normalization is opt-in and targets `-16 LUFS`, with up to `+6 dB`
+  of positive gain when a valid cached true-peak measurement permits it, and a
+  `-2 dBTP` normalization-stage true-peak ceiling. Playback does not wait for
+  analysis when the source is not already cached. Set
+  `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED=true` to enable it, or
   `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0` for attenuation-only behavior.
 - BeatMatched remains bounded by timing, overlap, phase, gain, structure, and
   renderer-compatibility checks.

@@ -14,8 +14,8 @@ use serenity::{
         CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateButton,
         CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
-        CreateInteractionResponseMessage, Guild, Interaction, MessageFlags, ReactionType, Ready,
-        UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
+        CreateInteractionResponseMessage, EmojiId, Guild, Interaction, MessageFlags, ReactionType,
+        Ready, UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
     },
     async_trait,
     builder::CreateMessage,
@@ -24,7 +24,7 @@ use serenity::{
     http::Http,
 };
 use songbird::{SerenityInit, Songbird};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use wotoha_contracts::{
     ChannelKey, GuildKey, PlaybackFailureKind, PlaybackService, UserKey, VoiceActionAccess,
     VoiceGatewayEvent, VoiceGatewayRuntime, VoiceGatewayServerUpdate, VoiceGatewayStateUpdate,
@@ -36,12 +36,13 @@ use wotoha_core::{
     debug::{append_debug_log, sanitize_log_message},
     operational_metrics,
     ui::{
-        self, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, BUTTON_LOOP, BUTTON_LOOP_LABEL, BUTTON_QUEUE,
-        BUTTON_QUEUE_LABEL, BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, BUTTON_SKIP, BUTTON_SKIP_LABEL,
-        COLOR_ERROR, COLOR_INFO, MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST,
-        MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE, MSG_PLAYING_IN_ANOTHER_VOICE,
-        MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME,
-        PLAY_COMMAND_URL_MAX_LENGTH, PLAY_COMMAND_URL_OPTION,
+        self, AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL,
+        BUTTON_LOOP, BUTTON_QUEUE, BUTTON_SHUFFLE, BUTTON_SKIP, COLOR_ERROR, COLOR_INFO,
+        INVITE_BUTTON_LABEL, LOOP_EMOJI_ID, LOOP_EMOJI_NAME, MSG_ALLOWED_URL_ONLY,
+        MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE,
+        MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION,
+        PLAY_COMMAND_NAME, PLAY_COMMAND_URL_MAX_LENGTH, PLAY_COMMAND_URL_OPTION, SHUFFLE_EMOJI_ID,
+        SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
     },
     url::summarize_url_for_logs,
 };
@@ -60,6 +61,10 @@ const WOTOHA_INVITE_URL: &str =
 const UPDATE_NOTICE_TITLE: &str = "アップデートのお知らせ";
 const UPDATE_NOTICE_DESCRIPTION: &str =
     "最新版へのアップデートのため、まもなく再起動します。再生中の音声は一時的に停止します。";
+const MODE_NICKNAME_LOOP: &str = "🔁";
+const MODE_NICKNAME_SHUFFLE: &str = "🔀";
+const MODE_NICKNAME_AUTOMIX: &str = "🎧";
+const DISCORD_NICKNAME_MAX_CHARS: usize = 32;
 const BUILD_VERSION: &str = match option_env!("WOTOHA_BUILD_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
@@ -89,7 +94,15 @@ pub struct DiscordGateway<P: PlaybackService, R: VoiceGatewayRuntime> {
     startup: Arc<StartupState>,
     notification_channels: Arc<DashMap<GuildKey, ChannelId>>,
     active_voice_channels: Arc<DashMap<GuildKey, ChannelKey>>,
+    mode_nickname_states: Arc<DashMap<GuildKey, ModeNicknameState>>,
     reconnect_store: ReconnectStore,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ModeNicknameState {
+    looping: bool,
+    shuffle: bool,
+    automix: bool,
 }
 
 #[derive(Default)]
@@ -105,6 +118,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             startup: Arc::default(),
             notification_channels: Arc::default(),
             active_voice_channels: Arc::default(),
+            mode_nickname_states: Arc::default(),
             reconnect_store: ReconnectStore::from_env(),
         }
     }
@@ -113,6 +127,82 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         let count = self.active_voice_channels.len();
         operational_metrics().set_active_guilds(count);
         operational_metrics().set_active_voice_sessions(count);
+    }
+
+    async fn refresh_mode_nickname(
+        &self,
+        ctx: &Context,
+        guild_id: serenity::all::GuildId,
+        guild_key: GuildKey,
+        shuffle_action: bool,
+        looping_override: Option<bool>,
+        automix_override: Option<bool>,
+    ) {
+        let previous = self
+            .mode_nickname_states
+            .get(&guild_key)
+            .map(|state| *state)
+            .unwrap_or_default();
+        let state = match self.control.restart_snapshot(guild_key).await {
+            Some(snapshot) => ModeNicknameState {
+                looping: snapshot.looping,
+                shuffle: previous.shuffle,
+                automix: snapshot.automix_enabled,
+            },
+            None => ModeNicknameState {
+                shuffle: previous.shuffle,
+                automix: self.control.automix_enabled(guild_key),
+                ..ModeNicknameState::default()
+            },
+        };
+        let mut state = ModeNicknameState {
+            shuffle: state.shuffle || shuffle_action,
+            ..state
+        };
+        if let Some(looping) = looping_override {
+            state.looping = looping;
+        }
+        if let Some(automix) = automix_override {
+            state.automix = automix;
+        }
+        self.mode_nickname_states.insert(guild_key, state);
+        self.apply_mode_nickname(ctx, guild_id, state).await;
+    }
+
+    async fn apply_mode_nickname(
+        &self,
+        ctx: &Context,
+        guild_id: serenity::all::GuildId,
+        state: ModeNicknameState,
+    ) {
+        // `current_user_member` targets Discord's current-user endpoint.  Bot
+        // tokens cannot use that endpoint for guild-member nickname updates;
+        // fetch the bot's member record by its user id instead.
+        let bot_user_id = ctx.cache.current_user().id;
+        let member = match guild_id.member(&ctx.http, bot_user_id).await {
+            Ok(member) => member,
+            Err(error) => {
+                warn!(
+                    guild_id = guild_id.get(),
+                    error = %error,
+                    "failed to read bot member before updating mode nickname"
+                );
+                return;
+            }
+        };
+        let base = member.nick.as_deref().unwrap_or(member.user.name.as_str());
+        let nickname = render_mode_nickname(base, state);
+        if member.nick.as_deref() == Some(nickname.as_str()) {
+            return;
+        }
+
+        if let Err(error) = guild_id.edit_nickname(&ctx.http, Some(&nickname)).await {
+            warn!(
+                guild_id = guild_id.get(),
+                error = %error,
+                "failed to update bot mode nickname"
+            );
+        }
     }
 
     pub async fn notify_restart(&self, http: &Http) {
@@ -190,6 +280,11 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                         self.guild_voice_snapshot(ctx, serenity_guild_id, bot_user_id),
                     );
                     if let Some(snapshot) = playback {
+                        let mode_state = ModeNicknameState {
+                            looping: snapshot.looping,
+                            automix: snapshot.automix_enabled,
+                            ..ModeNicknameState::default()
+                        };
                         let restored = self
                             .control
                             .restore_restart_snapshot(guild_id, snapshot)
@@ -199,6 +294,10 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                                 guild_id = guild_id.get(),
                                 "failed to restore playback after restart"
                             );
+                        } else {
+                            self.mode_nickname_states.insert(guild_id, mode_state);
+                            self.apply_mode_nickname(ctx, serenity_guild_id, mode_state)
+                                .await;
                         }
                     }
                     info!(
@@ -373,6 +472,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     now_playing = outcome.now_playing,
                     "play command resolved successfully"
                 );
+                self.refresh_mode_nickname(ctx, guild_id, guild_key, false, None, None)
+                    .await;
                 let response = CreateInteractionResponseFollowup::new()
                     .embed(track_embed(
                         &outcome.request.metadata,
@@ -444,11 +545,31 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         component.defer(&ctx.http).await?;
         operational_metrics().observe_interaction_ack(interaction_started.elapsed());
 
-        match self
+        let outcome = self
             .control
             .handle_component(guild_key, actor_channel, action)
-            .await
-        {
+            .await;
+
+        let mode_update = match &outcome {
+            ComponentOutcome::Skip { .. } => Some((false, Some(false), None)),
+            ComponentOutcome::Loop { enabled } => Some((false, Some(*enabled), None)),
+            ComponentOutcome::Shuffle => Some((true, None, None)),
+            ComponentOutcome::AutoMix { enabled } => Some((false, None, Some(*enabled))),
+            _ => None,
+        };
+        if let Some((shuffle_action, looping_override, automix_override)) = mode_update {
+            self.refresh_mode_nickname(
+                ctx,
+                guild_id,
+                guild_key,
+                shuffle_action,
+                looping_override,
+                automix_override,
+            )
+            .await;
+        }
+
+        match outcome {
             ComponentOutcome::Skip { .. } => {}
             ComponentOutcome::Loop { .. } => {}
             ComponentOutcome::Shuffle => {
@@ -553,6 +674,36 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             })
             .collect()
     }
+}
+
+fn render_mode_nickname(base: &str, state: ModeNicknameState) -> String {
+    let clean_base = base
+        .replace(MODE_NICKNAME_LOOP, "")
+        .replace(MODE_NICKNAME_SHUFFLE, "")
+        .replace(MODE_NICKNAME_AUTOMIX, "")
+        .trim()
+        .to_owned();
+    let mut indicators = Vec::with_capacity(3);
+    if state.looping {
+        indicators.push(MODE_NICKNAME_LOOP);
+    }
+    if state.shuffle {
+        indicators.push(MODE_NICKNAME_SHUFFLE);
+    }
+    if state.automix {
+        indicators.push(MODE_NICKNAME_AUTOMIX);
+    }
+    if indicators.is_empty() {
+        return clean_base
+            .chars()
+            .take(DISCORD_NICKNAME_MAX_CHARS)
+            .collect();
+    }
+
+    let suffix = indicators.join("");
+    let base_limit = DISCORD_NICKNAME_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let truncated_base = clean_base.chars().take(base_limit).collect::<String>();
+    format!("{truncated_base}{suffix}")
 }
 
 impl<P> DiscordGateway<P, SongbirdRuntime>
@@ -826,11 +977,6 @@ fn track_embed(
         .author(CreateEmbedAuthor::new(author))
         .title(title)
         .field("Time", ui::format_duration(metadata.duration), true)
-        .field(
-            "Wotoha",
-            format!("[自分のサーバーに招待 ↗]({WOTOHA_INVITE_URL})"),
-            true,
-        )
         .footer(match avatar_url {
             Some(icon_url) => CreateEmbedFooter::new(format!("Requested by {requested_by}"))
                 .icon_url(icon_url.to_owned()),
@@ -976,42 +1122,86 @@ fn is_tracking_query_key(key: &str) -> bool {
 
 fn player_action_row() -> CreateActionRow {
     CreateActionRow::Buttons(vec![
-        player_button(BUTTON_SKIP, BUTTON_SKIP_LABEL, ButtonStyle::Secondary),
-        player_button(BUTTON_LOOP, BUTTON_LOOP_LABEL, ButtonStyle::Secondary),
-        player_button(BUTTON_SHUFFLE, BUTTON_SHUFFLE_LABEL, ButtonStyle::Secondary),
-        player_button(BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL, ButtonStyle::Secondary),
-        player_button(BUTTON_QUEUE, BUTTON_QUEUE_LABEL, ButtonStyle::Primary),
+        player_icon_button(
+            BUTTON_SKIP,
+            ButtonStyle::Secondary,
+            SKIP_EMOJI_NAME,
+            SKIP_EMOJI_ID,
+        ),
+        player_icon_button(
+            BUTTON_LOOP,
+            ButtonStyle::Secondary,
+            LOOP_EMOJI_NAME,
+            LOOP_EMOJI_ID,
+        ),
+        player_icon_button(
+            BUTTON_SHUFFLE,
+            ButtonStyle::Secondary,
+            SHUFFLE_EMOJI_NAME,
+            SHUFFLE_EMOJI_ID,
+        ),
+        player_button(
+            BUTTON_AUTOMIX,
+            BUTTON_AUTOMIX_LABEL,
+            ButtonStyle::Secondary,
+            AUTOMIX_EMOJI_NAME,
+            AUTOMIX_EMOJI_ID,
+        ),
+        player_link_button(WOTOHA_INVITE_URL, INVITE_BUTTON_LABEL),
     ])
 }
 
-fn player_button(custom_id: &str, label: &str, style: ButtonStyle) -> CreateButton {
-    CreateButton::new(custom_id)
-        .label(label)
-        .style(style)
-        .emoji(ReactionType::Unicode(
-            button_fallback_emoji(custom_id).to_owned(),
-        ))
+fn player_link_button(url: &str, label: &str) -> CreateButton {
+    CreateButton::new_link(url).label(label)
 }
 
-fn button_fallback_emoji(custom_id: &str) -> &'static str {
-    match custom_id {
-        BUTTON_SKIP => "⏭️",
-        BUTTON_LOOP => "🔁",
-        BUTTON_SHUFFLE => "🔀",
-        BUTTON_AUTOMIX => "🎚️",
-        BUTTON_QUEUE => "📜",
-        _ => "🎵",
-    }
+fn player_button(
+    custom_id: &str,
+    label: &str,
+    style: ButtonStyle,
+    emoji_name: &str,
+    emoji_id: u64,
+) -> CreateButton {
+    player_button_base(custom_id, style, emoji_name, emoji_id).label(label)
+}
+
+fn player_icon_button(
+    custom_id: &str,
+    style: ButtonStyle,
+    emoji_name: &str,
+    emoji_id: u64,
+) -> CreateButton {
+    player_button_base(custom_id, style, emoji_name, emoji_id)
+}
+
+fn player_button_base(
+    custom_id: &str,
+    style: ButtonStyle,
+    emoji_name: &str,
+    emoji_id: u64,
+) -> CreateButton {
+    CreateButton::new(custom_id)
+        .style(style)
+        .emoji(ReactionType::Custom {
+            animated: false,
+            id: EmojiId::new(emoji_id),
+            name: Some(emoji_name.to_owned()),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BUILD_VERSION, EMBED_FIELD_LIMIT, matches_play_option, play_command, player_action_row,
-        public_display_url, queue_lines, safe_thumbnail_url, track_embed, truncate_embed_text,
-        version_activity,
+        BUILD_VERSION, BUTTON_AUTOMIX_LABEL, DISCORD_NICKNAME_MAX_CHARS, EMBED_FIELD_LIMIT,
+        INVITE_BUTTON_LABEL, ModeNicknameState, WOTOHA_INVITE_URL, matches_play_option,
+        play_command, player_action_row, public_display_url, queue_lines, render_mode_nickname,
+        safe_thumbnail_url, track_embed, truncate_embed_text, version_activity,
     };
     use serenity::all::ActivityType;
+    use wotoha_core::ui::{
+        LOOP_EMOJI_ID, LOOP_EMOJI_NAME, SHUFFLE_EMOJI_ID, SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID,
+        SKIP_EMOJI_NAME,
+    };
     use wotoha_core::{GuildPlayerState, PreparedSource, TrackMetadata, TrackRequest};
 
     #[test]
@@ -1070,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn track_embed_includes_invite_link_next_to_time() {
+    fn track_embed_keeps_only_the_time_field() {
         let metadata = TrackMetadata::new(
             "title",
             "artist",
@@ -1081,21 +1271,66 @@ mod tests {
         let payload = serde_json::to_value(track_embed(&metadata, "listener", None))
             .expect("embed serializes");
         let fields = payload["fields"].as_array().expect("embed fields");
-        assert_eq!(fields.len(), 2);
+        assert_eq!(fields.len(), 1);
         assert_eq!(fields[0]["name"], "Time");
-        assert_eq!(fields[1]["name"], "Wotoha");
-        assert_eq!(
-            fields[1]["value"],
-            "[自分のサーバーに招待 ↗](https://discord.com/oauth2/authorize?client_id=1238488423208063107)"
-        );
         assert_eq!(fields[0]["inline"], true);
-        assert_eq!(fields[1]["inline"], true);
+        assert!(!payload.to_string().contains(WOTOHA_INVITE_URL));
     }
 
     #[test]
     fn player_action_row_keeps_the_five_existing_buttons() {
         let payload = serde_json::to_value(player_action_row()).expect("buttons serialize");
         assert_eq!(payload["components"].as_array().map(Vec::len), Some(5));
+    }
+
+    #[test]
+    fn player_action_row_keeps_existing_controls_and_uses_invite_link() {
+        let payload = serde_json::to_value(player_action_row()).expect("buttons serialize");
+        let expected = [
+            (SKIP_EMOJI_NAME, SKIP_EMOJI_ID),
+            (LOOP_EMOJI_NAME, LOOP_EMOJI_ID),
+            (SHUFFLE_EMOJI_NAME, SHUFFLE_EMOJI_ID),
+        ];
+
+        for (index, (name, id)) in expected.into_iter().enumerate() {
+            let emoji = &payload["components"][index]["emoji"];
+            let label = payload["components"][index].get("label");
+            assert!(label.is_none() || label.is_some_and(serde_json::Value::is_null));
+            assert_eq!(emoji["name"], name);
+            assert_eq!(emoji["id"], id.to_string());
+            assert_eq!(emoji["animated"], false);
+        }
+
+        assert_eq!(payload["components"][3]["label"], BUTTON_AUTOMIX_LABEL);
+        let invite = &payload["components"][4];
+        assert_eq!(invite["label"], INVITE_BUTTON_LABEL);
+        assert_eq!(
+            invite["url"],
+            "https://discord.com/oauth2/authorize?client_id=1238488423208063107"
+        );
+        assert!(invite.get("emoji").is_none() || invite["emoji"].is_null());
+    }
+
+    #[test]
+    fn mode_nickname_renders_all_active_indicators() {
+        let nickname = render_mode_nickname(
+            "音葉",
+            ModeNicknameState {
+                looping: true,
+                shuffle: true,
+                automix: true,
+            },
+        );
+
+        assert_eq!(nickname, "音葉🔁🔀🎧");
+    }
+
+    #[test]
+    fn mode_nickname_removes_stale_indicators_and_respects_limit() {
+        let base = format!("{} 🔁 🔀 🎧", "音".repeat(DISCORD_NICKNAME_MAX_CHARS));
+        let nickname = render_mode_nickname(&base, ModeNicknameState::default());
+
+        assert_eq!(nickname, "音".repeat(DISCORD_NICKNAME_MAX_CHARS));
     }
 
     #[test]

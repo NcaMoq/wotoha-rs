@@ -20,13 +20,15 @@ for the container. Move any analysis cache, reconnect state, or operational
 logs that must be retained into that directory; the application binary and its
 container filesystem are immutable.
 
-The default loudness maximum boost is `+6.0` dB for deployments that omit
-`WOTOHA_LOUDNESS_MAX_BOOST_DB`. Normalization attenuates tracks above the
-target and may boost quieter tracks when a valid true-peak measurement leaves
-headroom. The normalization-stage true-peak ceiling remains in force. To
-retain attenuation-only behavior, set `WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0`.
-Existing runtime files with an explicit value, including `0.0`, keep that
-value until the operator changes it.
+Loudness normalization is disabled by default so playback is not held behind
+analysis. Set `WOTOHA_LOUDNESS_NORMALIZATION_ENABLED=true` to opt in. When
+enabled, the maximum normalization boost is `+6.0` dB unless
+`WOTOHA_LOUDNESS_MAX_BOOST_DB` is explicitly set. Normalization attenuates
+tracks above the target and may boost quieter tracks when a valid cached
+true-peak measurement leaves headroom. The normalization-stage true-peak
+ceiling remains in force. To retain attenuation-only behavior, set
+`WOTOHA_LOUDNESS_MAX_BOOST_DB=0.0`. Existing runtime files with explicit
+values keep those values until the operator changes them.
 
 ## Legacy updater boundary
 
