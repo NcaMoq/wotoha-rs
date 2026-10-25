@@ -49,7 +49,7 @@ const SOUNDCLOUD_TRACK_POLICY: HostPolicy = HostPolicy {
 
 const SOUNDCLOUD_PLAYBACK_POLICY: HostPolicy = HostPolicy {
     exact: &["sndcdn.com"],
-    suffixes: &[".sndcdn.com"],
+    suffixes: &[".sndcdn.com", ".media-streaming.soundcloud.cloud"],
 };
 
 const X_TRACK_POLICY: HostPolicy = HostPolicy {
@@ -334,9 +334,25 @@ mod tests {
             "vimeo",
             "https://vod-progressive.akamaized.net/exp=1/video.mp4",
         ));
+        assert!(is_allowed_prepared_url(
+            "soundcloud",
+            "https://playback.media-streaming.soundcloud.cloud/audio/playlist.m3u8",
+        ));
+        assert!(is_allowed_prepared_url(
+            "soundcloud",
+            "https://cf-media.sndcdn.com/audio/segment.m4s",
+        ));
         assert!(!is_allowed_prepared_url(
             "youtube",
             "https://example.com/videoplayback",
+        ));
+        assert!(!is_allowed_prepared_url(
+            "soundcloud",
+            "https://soundcloud.cloud/audio/segment.m4s",
+        ));
+        assert!(!is_allowed_prepared_url(
+            "soundcloud",
+            "https://unrelated.soundcloud.cloud/audio/segment.m4s",
         ));
     }
 
@@ -344,6 +360,9 @@ mod tests {
     fn runtime_redirect_allowlist_covers_known_media_hosts() {
         assert!(is_allowed_runtime_redirect_url(
             "https://cf-hls-media.sndcdn.com/media/playlist.m3u8",
+        ));
+        assert!(is_allowed_runtime_redirect_url(
+            "https://playback.media-streaming.soundcloud.cloud/audio/playlist.m3u8",
         ));
         assert!(is_allowed_runtime_redirect_url(
             "https://video-weaver.tyo01.hls.ttvnw.net/v1/playlist.m3u8",

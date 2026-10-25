@@ -1491,13 +1491,13 @@ fn player_panel_components(
 ) -> Vec<CreateComponentV2> {
     let title = escape_markdown(&single_line(&metadata.title, 256));
     let artist = escape_markdown(&single_line(&metadata.author, 256));
-    let provider = provider_display_name(provider_id, metadata.uri.as_ref());
+    let provider = provider_display_line(provider_id, metadata.uri.as_ref());
     let title_text = match public_display_url(metadata.uri.as_ref()) {
         Some(uri) => format!("**[{title}]({uri})**"),
         None => format!("**{title}**"),
     };
     let track_text = vec![
-        CreateComponentV2::text_display(format!("**{provider}**")),
+        CreateComponentV2::text_display(provider.clone()),
         CreateComponentV2::text_display(title_text),
         CreateComponentV2::text_display(artist),
     ];
@@ -1512,7 +1512,7 @@ fn player_panel_components(
         )
     } else {
         CreateComponentV2::text_display(format!(
-            "**{provider}**\n{}\n{}",
+            "{provider}\n{}\n{}",
             match public_display_url(metadata.uri.as_ref()) {
                 Some(uri) => format!("**[{title}]({uri})**"),
                 None => format!("**{title}**"),
@@ -1583,9 +1583,12 @@ fn player_action_row() -> CreateComponentV2 {
 
 fn provider_display_name(provider_id: &str, track_uri: &str) -> &'static str {
     match provider_id.to_ascii_lowercase().as_str() {
+        "bandcamp" => "Bandcamp",
+        "niconico" => "Niconico",
         "youtube" => "YouTube",
         "soundcloud" => "SoundCloud",
-        "niconico" => "Niconico",
+        "twitch" => "Twitch",
+        "vimeo" => "Vimeo",
         "x" => "X",
         _ => {
             let host = url::Url::parse(track_uri)
@@ -1597,10 +1600,33 @@ fn provider_display_name(provider_id: &str, track_uri: &str) -> &'static str {
                 Some("open.spotify.com") => "Spotify",
                 Some("nicovideo.jp" | "www.nicovideo.jp") => "Niconico",
                 Some("x.com" | "www.x.com") => "X",
+                Some("twitch.tv" | "www.twitch.tv" | "clips.twitch.tv") => "Twitch",
+                Some("vimeo.com" | "www.vimeo.com" | "player.vimeo.com") => "Vimeo",
+                Some("bandcamp.com") => "Bandcamp",
+                Some(host) if host.ends_with(".bandcamp.com") => "Bandcamp",
                 _ => "Audio source",
             }
         }
     }
+}
+
+fn provider_display_line(provider_id: &str, track_uri: &str) -> String {
+    let provider = provider_display_name(provider_id, track_uri);
+    let emoji = match provider {
+        "Bandcamp" => Some(("bandcamp", "1563933089778892817")),
+        "Niconico" => Some(("niconico", "1563933110478053548")),
+        "SoundCloud" => Some(("soundcloud", "1563933135475843182")),
+        "Twitch" => Some(("twitch", "1563933156657070191")),
+        "Vimeo" => Some(("vimeo", "1563933178136109156")),
+        "X" => Some(("x", "1563933199787360496")),
+        "YouTube" => Some(("youtube", "1563933220041523251")),
+        _ => None,
+    };
+
+    emoji.map_or_else(
+        || format!("**{provider}**"),
+        |(name, id)| format!("<:{name}:{id}> **{provider}**"),
+    )
 }
 
 const PLAYER_PROGRESS_BAR_WIDTH: usize = 19;
@@ -1837,9 +1863,9 @@ mod tests {
         format_player_progress, is_skipped_playback_snapshot, is_stale_player_panel_snapshot,
         matches_play_option, play_command, player_action_row, player_panel_components,
         player_panel_followup, player_panel_for_request, player_panel_no_playback_grace_expired,
-        public_display_url, queue_lines, queued_track_panel_components, register_player_panel,
-        render_mode_nickname, retain_live_player_panels, safe_thumbnail_url, truncate_embed_text,
-        version_activity,
+        provider_display_line, public_display_url, queue_lines, queued_track_panel_components,
+        register_player_panel, render_mode_nickname, retain_live_player_panels, safe_thumbnail_url,
+        truncate_embed_text, version_activity,
     };
     use serenity::all::{
         ActivityType, ChannelId, CreateAllowedMentions, EditMessage, MessageFlags, MessageId,
@@ -1956,7 +1982,10 @@ mod tests {
             track_section["components"].as_array().map(Vec::len),
             Some(3)
         );
-        assert_eq!(track_section["components"][0]["content"], "**YouTube**");
+        assert_eq!(
+            track_section["components"][0]["content"],
+            "<:youtube:1563933220041523251> **YouTube**"
+        );
         assert_eq!(track_section["accessory"]["type"], 11);
         assert_eq!(
             track_section["accessory"]["media"]["url"],
@@ -1972,6 +2001,27 @@ mod tests {
                 .to_string()
                 .contains("Requested by <@123456789012345678>")
         );
+    }
+
+    #[test]
+    fn provider_source_titles_use_the_configured_custom_emoji() {
+        for (provider_id, expected_line) in [
+            ("bandcamp", "<:bandcamp:1563933089778892817> **Bandcamp**"),
+            ("niconico", "<:niconico:1563933110478053548> **Niconico**"),
+            (
+                "soundcloud",
+                "<:soundcloud:1563933135475843182> **SoundCloud**",
+            ),
+            ("twitch", "<:twitch:1563933156657070191> **Twitch**"),
+            ("vimeo", "<:vimeo:1563933178136109156> **Vimeo**"),
+            ("x", "<:x:1563933199787360496> **X**"),
+            ("youtube", "<:youtube:1563933220041523251> **YouTube**"),
+        ] {
+            assert_eq!(
+                provider_display_line(provider_id, "https://example.test/track"),
+                expected_line
+            );
+        }
     }
 
     #[test]

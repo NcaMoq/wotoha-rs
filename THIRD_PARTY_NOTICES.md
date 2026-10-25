@@ -11,9 +11,11 @@ advice or a substitute for a downstream distributor's license review.
 The supported production artifact is the lower-case GHCR image
 `ghcr.io/ncamoq/wotoha-rs`, built for `linux/amd64`. The final image contains
 the Wotoha executable, embedded Beat This!/RTen model assets, and pinned
-yt-dlp and Deno runtime executables. The image keeps this notice and the
-project license under `/app/licenses/`; `/wotoha` is the only persistent
-writable application area.
+yt-dlp and Deno runtime executables. It also contains a version- and
+wheel-hash-pinned Python environment for the opt-in yt-dlp API worker. The
+worker is not selected by default; CLI extraction remains the default. The
+image keeps this notice and the project license under `/app/licenses/`;
+`/wotoha` is the only persistent writable application area.
 
 The bundled yt-dlp executable is distributed under the GNU General Public
 License version 3 or later by the upstream
@@ -24,6 +26,15 @@ available from that official repository. Deno is distributed under the MIT
 License by [Deno Land](https://github.com/denoland/deno), from the pinned
 release recorded in the same file. These upstream programs remain separate
 from Wotoha's MIT-licensed code and are not linked into the Rust executable.
+
+The optional Python worker uses the yt-dlp Python distribution and Requests,
+plus their pinned runtime dependencies. Exact package versions, wheel SHA-256
+hashes, package metadata, and the corresponding license texts are included
+under `/app/licenses/python-worker/` in the OCI image. The pinned yt-dlp
+Python wheel declares Unlicense; Requests declares Apache-2.0, certifi
+MPL-2.0, charset-normalizer MIT, idna BSD-3-Clause, and urllib3 MIT. These
+packages are separate runtime dependencies and are loaded only when an
+administrator explicitly selects the Python worker backend.
 
 The native Linux archives and their legacy bootstrap material are retained for
 migration and redistribution compliance only. The native Wotoha application

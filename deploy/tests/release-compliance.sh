@@ -36,7 +36,8 @@ bash "$MODEL_COMPLIANCE"
 
 # shellcheck source=/dev/null
 source "$VERSIONS"
-for variable in YTDLP_REPOSITORY YTDLP_VERSION DENO_VERSION DENO_X86_64_LINUX_GNU_SHA256; do
+for variable in YTDLP_REPOSITORY YTDLP_VERSION PYTHON_YTDLP_VERSION PYTHON_YTDLP_MODULE_VERSION \
+  REQUESTS_VERSION DENO_VERSION DENO_X86_64_LINUX_GNU_SHA256; do
   [[ -n "${!variable:-}" ]] || fail "missing $variable"
 done
 
@@ -46,10 +47,38 @@ case "$YTDLP_REPOSITORY" in
 esac
 [[ "$YTDLP_VERSION" =~ ^[0-9]{4}[.][0-9]{2}[.][0-9]{2}([.][0-9]{6})?$ ]] \
   || fail 'YTDLP_VERSION is not a release tag'
+# PEP 440 normalizes zero-padded numeric release segments in package metadata
+# (for example, 07 becomes 7) while yt-dlp's module version keeps the tag form.
+normalize_numeric_release() {
+  local version="$1" normalized="" part
+  local -a parts
+  IFS='.' read -r -a parts <<< "$version"
+  for part in "${parts[@]}"; do
+    [[ "$part" =~ ^[0-9]+$ ]] || return 1
+    normalized+="${normalized:+.}$((10#$part))"
+  done
+  printf '%s' "$normalized"
+}
+expected_python_ytdlp_distribution="$(normalize_numeric_release "$PYTHON_YTDLP_MODULE_VERSION").dev0"
+[[ "$PYTHON_YTDLP_VERSION" == "$expected_python_ytdlp_distribution" ]] \
+  || fail 'Python yt-dlp distribution and module pins are inconsistent'
+[[ "$REQUESTS_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] \
+  || fail 'REQUESTS_VERSION is not a release version'
 [[ "$DENO_VERSION" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] \
   || fail 'DENO_VERSION is not a release version'
 [[ "$DENO_X86_64_LINUX_GNU_SHA256" =~ ^[0-9a-f]{64}$ ]] \
   || fail 'Deno digest is not lowercase SHA-256'
+
+PYTHON_REQUIREMENTS="$ROOT/deploy/python-worker-requirements.txt"
+[[ -s "$PYTHON_REQUIREMENTS" ]] || fail 'hash-pinned Python worker requirements are required'
+grep -Fqx -- '--require-hashes' "$PYTHON_REQUIREMENTS" \
+  || fail 'Python worker requirements do not enforce wheel hashes'
+for python_pin in \
+  'certifi==2026.10.23' 'charset-normalizer==3.5.2' 'idna==3.20' \
+  "requests==$REQUESTS_VERSION" 'urllib3==2.8.0' "yt-dlp==$PYTHON_YTDLP_VERSION"; do
+  grep -Fq -- "$python_pin" "$PYTHON_REQUIREMENTS" \
+    || fail "Python worker requirement is missing exact pin: $python_pin"
+done
 
 grep -Fq 'wotoha-linux-x86_64-musl.tar.gz' "$NOTICES" \
   || fail 'notices do not identify the app-only release artifact'

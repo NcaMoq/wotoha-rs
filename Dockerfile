@@ -70,6 +70,97 @@ RUN set -eux; \
     /out/deno --version | awk -v expected="$DENO_VERSION" '$1 == "deno" && $2 == expected {found=1} END {exit !found}'; \
     rm -rf /tmp/gnupg /tmp/deno /tmp/yt-dlp /tmp/deno.zip /tmp/SHA2-256SUMS /tmp/SHA2-256SUMS.sig /tmp/verify-status
 
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS python-worker
+
+COPY deploy/third-party-versions.env /tmp/third-party-versions.env
+COPY deploy/python-worker-requirements.txt /tmp/python-worker-requirements.txt
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /out/python \
+    && /out/python/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-compile \
+        --requirement /tmp/python-worker-requirements.txt
+
+RUN /out/python/bin/python -I -B - <<'PY'
+import hashlib
+import os
+import shutil
+import tempfile
+from importlib.metadata import distribution
+from pathlib import Path
+
+versions = {}
+for line in Path("/tmp/third-party-versions.env").read_text().splitlines():
+    if "=" in line and not line.lstrip().startswith("#"):
+        key, value = line.split("=", 1)
+        versions[key] = value
+
+python = Path("/out/python/bin/python")
+check = (
+    "import os, tempfile, requests; from yt_dlp import YoutubeDL; "
+    "from yt_dlp.networking import Request; from yt_dlp.version import __version__; "
+    "ydl = YoutubeDL({'ignoreconfig': True, 'quiet': True}); "
+    "handlers = ydl._request_director._get_handlers(Request('https://www.youtube.com/')); "
+    "assert handlers and handlers[0].RH_NAME == 'requests'; "
+    "print(__version__); print(requests.__version__); ydl.close(); "
+    "fixture = tempfile.NamedTemporaryFile(mode='w', delete=False); "
+    "fixture.write('# Netscape HTTP Cookie File\\n.youtube.com\\tTRUE\\t/\\tTRUE\\t1893456000\\tSID\\tfixture-value\\n'); "
+    "fixture.close(); os.chmod(fixture.name, 0o600); "
+    "cookie_ydl = YoutubeDL({'ignoreconfig': True, 'quiet': True, 'cookiefile': fixture.name}); "
+    "assert len(list(cookie_ydl.cookiejar)) == 1; cookie_ydl.close(); os.unlink(fixture.name)"
+)
+import subprocess
+module_version, requests_version = subprocess.check_output(
+    [str(python), "-I", "-B", "-c", check], text=True
+).splitlines()
+assert module_version == versions["PYTHON_YTDLP_MODULE_VERSION"]
+assert requests_version == versions["REQUESTS_VERSION"]
+assert distribution("yt-dlp").version == versions["PYTHON_YTDLP_VERSION"]
+
+license_root = Path("/out/licenses/python")
+packages = ("yt-dlp", "requests", "certifi", "charset-normalizer", "idna", "urllib3")
+lines = [
+    f"python_runtime={os.popen('/usr/bin/python3 --version').read().strip().split()[-1]}",
+    f"python_ytdlp_distribution={distribution('yt-dlp').version}",
+    f"python_ytdlp_module={module_version}",
+    f"requests={requests_version}",
+]
+for package in packages:
+    dist = distribution(package)
+    output = license_root / dist.metadata["Name"].lower().replace("_", "-")
+    copied = 0
+    for item in dist.files or ():
+        normalized = str(item).replace("\\", "/")
+        if "/licenses/" not in normalized.lower():
+            continue
+        source = Path(dist.locate_file(item))
+        if not source.is_file():
+            continue
+        relative = normalized.split("/licenses/", 1)[1]
+        destination = output / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        copied += 1
+    assert copied > 0, f"license text missing for {package}"
+    lines.append(f"package={dist.metadata['Name']}=={dist.version}")
+    lines.append(f"license={dist.metadata.get('License-Expression') or dist.metadata.get('License')}")
+
+license_root.mkdir(parents=True, exist_ok=True)
+(Path("/out/licenses/python-worker-requirements.txt")).write_bytes(
+    Path("/tmp/python-worker-requirements.txt").read_bytes()
+)
+(license_root / "PROVENANCE.txt").write_text(
+    "Python runtime dependencies are installed in an isolated venv from exact, "
+    "SHA-256-verified wheel pins in deploy/python-worker-requirements.txt.\n"
+    "Packages are sourced from PyPI; included license texts are copied from "
+    "the corresponding wheel metadata.\n" + "\n".join(lines) + "\n"
+)
+requirements_hash = hashlib.sha256(Path("/tmp/python-worker-requirements.txt").read_bytes()).hexdigest()
+with (license_root / "PROVENANCE.txt").open("a") as provenance:
+    provenance.write(f"requirements_sha256={requirements_hash}\n")
+PY
+
 FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
 
 WORKDIR /src
@@ -109,16 +200,17 @@ ARG SOURCE_COMMIT=unknown
 ARG IMAGE_VERSION=development
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates \
+    && apt-get install --no-install-recommends --yes ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system --gid 10001 wotoha \
     && useradd --system --uid 10001 --gid 10001 --home-dir /wotoha --shell /usr/sbin/nologin wotoha \
-    && install -d -o 10001 -g 10001 -m 0755 /app /app/tools /app/licenses /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno /wotoha /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp
+    && install -d -o 10001 -g 10001 -m 0755 /app /app/tools /app/licenses /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno /app/licenses/python-worker /wotoha /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp
 
 COPY --from=builder /src/target/release/wotoha-app /app/wotoha-app
 COPY --from=tools /out/yt-dlp-fallback /app/tools/yt-dlp-fallback
 COPY --from=tools /out/deno /app/tools/deno
+COPY --from=python-worker /out/python /app/python
 COPY LICENSE THIRD_PARTY_NOTICES.md Cargo.lock /app/licenses/
 COPY crates/wotoha-runtime/models/LICENSE.beat-this-original.txt \
      crates/wotoha-runtime/models/LICENSE.beat-this-rs.txt \
@@ -132,10 +224,13 @@ COPY --from=tools /out/licenses/yt-dlp/LICENSE /app/licenses/yt-dlp/LICENSE
 COPY --from=tools /out/licenses/yt-dlp/PROVENANCE.txt /app/licenses/yt-dlp/PROVENANCE.txt
 COPY --from=tools /out/licenses/deno/LICENSE.md /app/licenses/deno/LICENSE.md
 COPY --from=tools /out/licenses/deno/PROVENANCE.txt /app/licenses/deno/PROVENANCE.txt
+COPY --from=python-worker /out/licenses/python /app/licenses/python-worker/packages
+COPY --from=python-worker /out/licenses/python-worker-requirements.txt /app/licenses/python-worker/requirements.txt
 
-RUN chmod 0555 /app /app/wotoha-app /app/tools /app/tools/yt-dlp-fallback /app/tools/deno /app/licenses \
+RUN chmod -R a-w /app/python \
+    && chmod 0555 /app /app/wotoha-app /app/tools /app/tools/yt-dlp-fallback /app/tools/deno /app/licenses \
     && chmod 0555 /app/licenses/models \
-    && chmod 0555 /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno \
+    && chmod 0555 /app/licenses/rust /app/licenses/yt-dlp /app/licenses/deno /app/licenses/python-worker \
     && chmod 0755 /wotoha /wotoha/cache /wotoha/cache/analysis /wotoha/logs /wotoha/tools /tmp \
     && chown -R 10001:10001 /wotoha
 
@@ -147,6 +242,8 @@ ENV WOTOHA_SOURCE_COMMIT=$SOURCE_COMMIT \
     WOTOHA_LOG_DIR=/wotoha/logs \
     WOTOHA_LOG_FILE_ENABLED=false \
     WOTOHA_DENO_PATH=/app/tools/deno \
+    WOTOHA_YTDLP_PYTHON_PATH=/app/python/bin/python \
+    WOTOHA_YTDLP_PYTHON_EXPECTED_VERSION=2026.07.23.234303 \
     RUST_LOG=info,wotoha_debug=info
 
 LABEL org.opencontainers.image.title="wotoha-rs" \

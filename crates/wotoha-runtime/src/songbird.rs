@@ -24,7 +24,7 @@ use songbird::{
         AudioStreamError, MakePlayableError,
         codecs::{get_codec_registry, get_probe},
     },
-    tracks::{ControlError, PlayError, PlayMode, ReadyState, Track, TrackHandle},
+    tracks::{ControlError, PlayError, PlayMode, ReadyState, Track, TrackHandle, TrackState},
 };
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -633,6 +633,7 @@ impl SongbirdRuntime {
             stretch_timeline,
             equalizer,
             identity,
+            position_diagnostic_state: AtomicU8::new(u8::MAX),
             frame_slot,
             registry: Arc::downgrade(&self.tracks),
         });
@@ -1492,6 +1493,7 @@ struct SongbirdTrackHandle {
     stretch_timeline: Option<StretchTimeline>,
     equalizer: EqualizerControl,
     identity: TrackIdentity,
+    position_diagnostic_state: AtomicU8,
     frame_slot: Arc<Mutex<Option<ArmedFrameTransition>>>,
     registry: Weak<Mutex<HashMap<TrackIdentity, Weak<SongbirdTrackHandle>>>>,
 }
@@ -1543,12 +1545,40 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
     }
 
     async fn position(&self) -> Option<Duration> {
-        self.handle.get_info().await.ok().map(|state| {
-            self.stretch_timeline
-                .map_or(self.source_start + state.position, |timeline| {
-                    timeline.source_start + timeline.envelope.source_elapsed(state.position)
-                })
-        })
+        let state = match self.handle.get_info().await {
+            Ok(state) => state,
+            Err(_) => {
+                if self.position_diagnostic_state.swap(0, Ordering::Relaxed) != 0 {
+                    append_debug_log(format!(
+                        "runtime: player position unavailable playback_id={} reason=track_state_unavailable",
+                        self.identity.playback_id.get()
+                    ));
+                }
+                return None;
+            }
+        };
+        let position =
+            runtime_track_position(&state, self.source_start, self.stretch_timeline.as_ref());
+        let diagnostic_state = match state.ready {
+            ReadyState::Uninitialised => 1,
+            ReadyState::Preparing => 2,
+            ReadyState::Playable => 3,
+        };
+        if self
+            .position_diagnostic_state
+            .swap(diagnostic_state, Ordering::Relaxed)
+            != diagnostic_state
+        {
+            append_debug_log(format!(
+                "runtime: player position state playback_id={} ready={:?} playing={:?} source_position_ms={} mapped_position_ms={:?}",
+                self.identity.playback_id.get(),
+                state.ready,
+                state.playing,
+                state.position.as_millis(),
+                position.map(|value| value.as_millis())
+            ));
+        }
+        position
     }
 
     async fn seek(&self, position: Duration) -> bool {
@@ -1567,6 +1597,21 @@ impl RuntimeTrackHandle for SongbirdTrackHandle {
     fn cancel_equalizer_transition(&self, id: u64) {
         self.equalizer.cancel(id);
     }
+}
+
+fn runtime_track_position(
+    state: &TrackState,
+    source_start: Duration,
+    stretch_timeline: Option<&StretchTimeline>,
+) -> Option<Duration> {
+    if state.ready != ReadyState::Playable {
+        return None;
+    }
+
+    Some(stretch_timeline.map_or_else(
+        || source_start + state.position,
+        |timeline| timeline.source_start + timeline.envelope.source_elapsed(state.position),
+    ))
 }
 
 impl SongbirdTrackHandle {
@@ -2223,6 +2268,7 @@ mod tests {
     use songbird::{
         Songbird,
         input::{AudioStreamError, MakePlayableError},
+        tracks::{PlayMode, ReadyState, TrackState},
     };
     use wotoha_contracts::VoiceRuntime;
     use wotoha_core::{
@@ -2234,9 +2280,35 @@ mod tests {
         AnalysisBackend, AnalysisCacheKey, AnalysisOutcome, CLASSICAL_FALLBACK_RETRY_TTL,
         ClassicalFallback, MAX_ANALYSIS_DURATION, MAX_V2_SHADOW_CACHE_ENTRIES, SongbirdRuntime,
         SongbirdRuntimeError, TrackEndReason, TrackLifecycle, analysis_outcome_to_v2,
-        analysis_source_supported, build_input, should_use_ranged_request,
+        analysis_source_supported, build_input, runtime_track_position, should_use_ranged_request,
     };
     use crate::stream_error::HttpStreamError;
+
+    #[test]
+    fn runtime_position_waits_until_playable_and_stays_available_while_paused() {
+        let mut state = TrackState {
+            position: Duration::from_secs(12),
+            ..TrackState::default()
+        };
+        assert_eq!(
+            runtime_track_position(&state, Duration::ZERO, None),
+            None,
+            "pre-playback position must not be presented as elapsed audio"
+        );
+
+        state.ready = ReadyState::Playable;
+        assert_eq!(
+            runtime_track_position(&state, Duration::ZERO, None),
+            Some(Duration::from_secs(12))
+        );
+
+        state.playing = PlayMode::Pause;
+        assert_eq!(
+            runtime_track_position(&state, Duration::ZERO, None),
+            Some(Duration::from_secs(12)),
+            "a paused track keeps its last actual source position"
+        );
+    }
 
     fn request_with_source(prepared: PreparedSource) -> TrackRequest {
         request_with_source_and_duration(prepared, None)

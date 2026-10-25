@@ -7,7 +7,7 @@
 
 use std::{
     sync::{
-        OnceLock,
+        Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -49,6 +49,73 @@ pub struct LatencySnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+pub struct YtDlpWorkerProfile {
+    pub extraction_count: u64,
+    pub requests_handler_workers: u64,
+    pub urllib_handler_workers: u64,
+    pub http_requests: u64,
+    pub http_open_micros: u64,
+    pub http_body_read_micros: u64,
+    pub dns_calls: u64,
+    pub dns_micros: u64,
+    pub tcp_connect_calls: u64,
+    pub tcp_connect_micros: u64,
+    pub tls_handshakes: u64,
+    pub tls_micros: u64,
+    pub js_solver_calls: u64,
+    pub js_solver_micros: u64,
+    pub js_runtime_calls: u64,
+    pub js_runtime_micros: u64,
+    pub cpu_user_micros: u64,
+    pub cpu_system_micros: u64,
+    pub child_cpu_user_micros: u64,
+    pub child_cpu_system_micros: u64,
+    pub rss_highwater_kb: u64,
+    pub child_rss_highwater_kb: u64,
+    pub youtube_requests: u64,
+    pub media_cdn_requests: u64,
+    pub other_requests: u64,
+    pub http_request_detail_count: u8,
+    pub http_request_details: [YtDlpHttpRequestDetail; MAX_YTDLP_HTTP_REQUEST_DETAILS],
+}
+
+pub const MAX_YTDLP_HTTP_REQUEST_DETAILS: usize = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YtDlpHttpRequestDetail {
+    pub kind: YtDlpHttpRequestKind,
+    pub status_code: u16,
+    pub open_micros: u64,
+    pub body_read_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum YtDlpHttpRequestKind {
+    #[default]
+    Other,
+    YouTubePlayerApi,
+    YouTubeClientConfig,
+    YouTubeWebpage,
+    YouTubeInitialData,
+    YouTubePlayerScript,
+    MediaCdn,
+}
+
+impl YtDlpHttpRequestKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::YouTubePlayerApi => "youtube_player_api",
+            Self::YouTubeClientConfig => "youtube_client_config",
+            Self::YouTubeWebpage => "youtube_webpage",
+            Self::YouTubeInitialData => "youtube_initial_data",
+            Self::YouTubePlayerScript => "youtube_player_script",
+            Self::MediaCdn => "media_cdn",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct OperationalMetricsSnapshot {
     pub gateway_ready: u64,
     pub gateway_disconnected: u64,
@@ -69,6 +136,14 @@ pub struct OperationalMetricsSnapshot {
     pub interaction_ack_latency: LatencySnapshot,
     pub enqueue_latency: LatencySnapshot,
     pub media_resolve_latency: LatencySnapshot,
+    pub yt_dlp_process_latency: LatencySnapshot,
+    pub yt_dlp_worker_startup_latency: LatencySnapshot,
+    pub yt_dlp_worker_ipc_latency: LatencySnapshot,
+    pub yt_dlp_worker_api_latency: LatencySnapshot,
+    pub yt_dlp_worker_import_latency: LatencySnapshot,
+    pub yt_dlp_worker_profile: YtDlpWorkerProfile,
+    pub yt_dlp_worker_cli_fallbacks: u64,
+    pub yt_dlp_format_fallbacks: u64,
     pub playback_start_latency: LatencySnapshot,
     pub analysis_duration: LatencySnapshot,
 }
@@ -94,6 +169,14 @@ pub struct OperationalMetrics {
     interaction_ack_latency: LatencyAccumulator,
     enqueue_latency: LatencyAccumulator,
     media_resolve_latency: LatencyAccumulator,
+    yt_dlp_process_latency: LatencyAccumulator,
+    yt_dlp_worker_startup_latency: LatencyAccumulator,
+    yt_dlp_worker_ipc_latency: LatencyAccumulator,
+    yt_dlp_worker_api_latency: LatencyAccumulator,
+    yt_dlp_worker_import_latency: LatencyAccumulator,
+    yt_dlp_worker_profile: Mutex<YtDlpWorkerProfile>,
+    yt_dlp_worker_cli_fallbacks: AtomicU64,
+    yt_dlp_format_fallbacks: AtomicU64,
     playback_start_latency: LatencyAccumulator,
     analysis_duration: LatencyAccumulator,
 }
@@ -160,6 +243,79 @@ impl OperationalMetrics {
     pub fn observe_media_resolve(&self, elapsed: Duration) {
         self.media_resolve_latency.observe(elapsed);
     }
+    pub fn observe_yt_dlp_process(&self, elapsed: Duration) {
+        self.yt_dlp_process_latency.observe(elapsed);
+    }
+    pub fn observe_yt_dlp_worker_startup(&self, elapsed: Duration) {
+        self.yt_dlp_worker_startup_latency.observe(elapsed);
+    }
+    pub fn observe_yt_dlp_worker_ipc(&self, elapsed: Duration) {
+        self.yt_dlp_worker_ipc_latency.observe(elapsed);
+    }
+    pub fn observe_yt_dlp_worker_api(&self, elapsed: Duration) {
+        self.yt_dlp_worker_api_latency.observe(elapsed);
+    }
+    pub fn observe_yt_dlp_worker_import(&self, elapsed: Duration) {
+        self.yt_dlp_worker_import_latency.observe(elapsed);
+    }
+    pub fn record_yt_dlp_worker_handler(&self, name: &str) {
+        let mut profile = self
+            .yt_dlp_worker_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match name {
+            "requests" => profile.requests_handler_workers += 1,
+            "urllib" => profile.urllib_handler_workers += 1,
+            _ => {}
+        }
+    }
+    pub fn record_yt_dlp_worker_profile(&self, observed: YtDlpWorkerProfile) {
+        let mut profile = self
+            .yt_dlp_worker_profile
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        macro_rules! add {
+            ($($field:ident),+ $(,)?) => { $(profile.$field = profile.$field.saturating_add(observed.$field);)+ };
+        }
+        add!(
+            extraction_count,
+            http_requests,
+            http_open_micros,
+            http_body_read_micros,
+            dns_calls,
+            dns_micros,
+            tcp_connect_calls,
+            tcp_connect_micros,
+            tls_handshakes,
+            tls_micros,
+            js_solver_calls,
+            js_solver_micros,
+            js_runtime_calls,
+            js_runtime_micros,
+            cpu_user_micros,
+            cpu_system_micros,
+            child_cpu_user_micros,
+            child_cpu_system_micros,
+            youtube_requests,
+            media_cdn_requests,
+            other_requests,
+        );
+        if observed.http_request_detail_count > 0 {
+            profile.http_request_detail_count = observed.http_request_detail_count;
+            profile.http_request_details = observed.http_request_details;
+        }
+        profile.rss_highwater_kb = profile.rss_highwater_kb.max(observed.rss_highwater_kb);
+        profile.child_rss_highwater_kb = profile
+            .child_rss_highwater_kb
+            .max(observed.child_rss_highwater_kb);
+    }
+    pub fn record_yt_dlp_format_fallback(&self) {
+        self.yt_dlp_format_fallbacks.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_yt_dlp_worker_cli_fallback(&self) {
+        self.yt_dlp_worker_cli_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
     pub fn observe_playback_start(&self, elapsed: Duration) {
         self.playback_start_latency.observe(elapsed);
     }
@@ -185,6 +341,17 @@ impl OperationalMetrics {
             interaction_ack_latency: self.interaction_ack_latency.snapshot(),
             enqueue_latency: self.enqueue_latency.snapshot(),
             media_resolve_latency: self.media_resolve_latency.snapshot(),
+            yt_dlp_process_latency: self.yt_dlp_process_latency.snapshot(),
+            yt_dlp_worker_startup_latency: self.yt_dlp_worker_startup_latency.snapshot(),
+            yt_dlp_worker_ipc_latency: self.yt_dlp_worker_ipc_latency.snapshot(),
+            yt_dlp_worker_api_latency: self.yt_dlp_worker_api_latency.snapshot(),
+            yt_dlp_worker_import_latency: self.yt_dlp_worker_import_latency.snapshot(),
+            yt_dlp_worker_profile: *self
+                .yt_dlp_worker_profile
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            yt_dlp_worker_cli_fallbacks: self.yt_dlp_worker_cli_fallbacks.load(Ordering::Relaxed),
+            yt_dlp_format_fallbacks: self.yt_dlp_format_fallbacks.load(Ordering::Relaxed),
             playback_start_latency: self.playback_start_latency.snapshot(),
             analysis_duration: self.analysis_duration.snapshot(),
         }
@@ -210,5 +377,38 @@ mod tests {
         assert_eq!(snapshot.enqueue_latency.count, 2);
         assert_eq!(snapshot.enqueue_latency.sum_micros, 7_000);
         assert_eq!(snapshot.enqueue_latency.max_micros, 5_000);
+    }
+
+    #[test]
+    fn yt_dlp_worker_profile_keeps_only_aggregate_counts_timings_and_peak_memory() {
+        let metrics = OperationalMetrics::default();
+        metrics.record_yt_dlp_worker_profile(YtDlpWorkerProfile {
+            extraction_count: 1,
+            http_requests: 3,
+            http_open_micros: 900,
+            tls_handshakes: 2,
+            tls_micros: 700,
+            cpu_user_micros: 1_200,
+            rss_highwater_kb: 32_000,
+            ..YtDlpWorkerProfile::default()
+        });
+        metrics.record_yt_dlp_worker_profile(YtDlpWorkerProfile {
+            extraction_count: 1,
+            http_requests: 2,
+            http_open_micros: 500,
+            tls_handshakes: 1,
+            tls_micros: 300,
+            cpu_user_micros: 600,
+            rss_highwater_kb: 28_000,
+            ..YtDlpWorkerProfile::default()
+        });
+        let snapshot = metrics.snapshot().yt_dlp_worker_profile;
+        assert_eq!(snapshot.extraction_count, 2);
+        assert_eq!(snapshot.http_requests, 5);
+        assert_eq!(snapshot.http_open_micros, 1_400);
+        assert_eq!(snapshot.tls_handshakes, 3);
+        assert_eq!(snapshot.tls_micros, 1_000);
+        assert_eq!(snapshot.cpu_user_micros, 1_800);
+        assert_eq!(snapshot.rss_highwater_kb, 32_000);
     }
 }

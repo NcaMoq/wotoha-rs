@@ -1,5 +1,6 @@
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -13,9 +14,10 @@ use wotoha_core::{
     },
     config::LoudnessConfig,
     loudness::loudness_normalization_gain,
+    operational_metrics::{YtDlpWorkerProfile, operational_metrics},
 };
 use wotoha_media::MediaResolver;
-use wotoha_runtime::SongbirdRuntime;
+use wotoha_runtime::{SongbirdRuntime, SongbirdRuntimeError};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -38,32 +40,171 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         std::process::exit(2);
     }
 
+    if options.parallelism > 1 && automix_requested {
+        eprintln!("--parallelism cannot be combined with AutoMix preview options");
+        std::process::exit(2);
+    }
+
     let resolver = MediaResolver::new()?;
     if options.warmup {
         resolver.warmup_providers().await;
     }
     let runtime = SongbirdRuntime::new(Songbird::serenity())?;
+    if options.parallelism > 1 {
+        return run_parallel_probe(
+            Arc::new(resolver),
+            Arc::new(runtime),
+            options.parallelism,
+            options.strict,
+            options.urls,
+        )
+        .await;
+    }
     let mut prepared_tracks = Vec::new();
     let mut probe_failed = false;
 
     for (index, url) in options.urls.into_iter().enumerate() {
         let started_at = Instant::now();
         println!("SOURCE\t{index}\t{url}");
-        match resolver.resolve(&url).await {
+        let metrics_before = operational_metrics().snapshot();
+        let resolve_started_at = Instant::now();
+        let resolved = resolver.resolve(&url).await;
+        let youtube_extract = resolve_started_at.elapsed();
+        let metrics_after = operational_metrics().snapshot();
+        let mut timings = TrackProbeTimings {
+            youtube_extract: Some(youtube_extract),
+            yt_dlp_process: latency_delta(
+                metrics_before.yt_dlp_process_latency,
+                metrics_after.yt_dlp_process_latency,
+            ),
+            yt_dlp_process_count: process_count_delta(
+                metrics_before.yt_dlp_process_latency,
+                metrics_after.yt_dlp_process_latency,
+            ),
+            worker_startup: latency_delta(
+                metrics_before.yt_dlp_worker_startup_latency,
+                metrics_after.yt_dlp_worker_startup_latency,
+            ),
+            worker_ipc: latency_delta(
+                metrics_before.yt_dlp_worker_ipc_latency,
+                metrics_after.yt_dlp_worker_ipc_latency,
+            ),
+            worker_api_extract: latency_delta(
+                metrics_before.yt_dlp_worker_api_latency,
+                metrics_after.yt_dlp_worker_api_latency,
+            ),
+            worker_import: latency_delta(
+                metrics_before.yt_dlp_worker_import_latency,
+                metrics_after.yt_dlp_worker_import_latency,
+            ),
+            worker_startup_count: process_count_delta(
+                metrics_before.yt_dlp_worker_startup_latency,
+                metrics_after.yt_dlp_worker_startup_latency,
+            ),
+            worker_ipc_count: process_count_delta(
+                metrics_before.yt_dlp_worker_ipc_latency,
+                metrics_after.yt_dlp_worker_ipc_latency,
+            ),
+            worker_api_count: process_count_delta(
+                metrics_before.yt_dlp_worker_api_latency,
+                metrics_after.yt_dlp_worker_api_latency,
+            ),
+            format_fallback_count: metrics_after
+                .yt_dlp_format_fallbacks
+                .saturating_sub(metrics_before.yt_dlp_format_fallbacks),
+            cli_fallback_count: metrics_after
+                .yt_dlp_worker_cli_fallbacks
+                .saturating_sub(metrics_before.yt_dlp_worker_cli_fallbacks),
+            worker_profile: difference_worker_profile(
+                metrics_before.yt_dlp_worker_profile,
+                metrics_after.yt_dlp_worker_profile,
+            ),
+            ..TrackProbeTimings::default()
+        };
+        match resolved {
             Ok(request) => {
-                let prepared = match resolver.prepare_playback(&request).await {
-                    Ok(prepared) => prepared,
+                let prepare_started_at = Instant::now();
+                let metrics_before_prepare = operational_metrics().snapshot();
+                let prepared_result = resolver.prepare_playback(&request).await;
+                let metrics_after_prepare = operational_metrics().snapshot();
+                timings.yt_dlp_process = add_durations(
+                    timings.yt_dlp_process,
+                    latency_delta(
+                        metrics_before_prepare.yt_dlp_process_latency,
+                        metrics_after_prepare.yt_dlp_process_latency,
+                    ),
+                );
+                timings.yt_dlp_process_count += process_count_delta(
+                    metrics_before_prepare.yt_dlp_process_latency,
+                    metrics_after_prepare.yt_dlp_process_latency,
+                );
+                timings.worker_startup = add_durations(
+                    timings.worker_startup,
+                    latency_delta(
+                        metrics_before_prepare.yt_dlp_worker_startup_latency,
+                        metrics_after_prepare.yt_dlp_worker_startup_latency,
+                    ),
+                );
+                timings.worker_ipc = add_durations(
+                    timings.worker_ipc,
+                    latency_delta(
+                        metrics_before_prepare.yt_dlp_worker_ipc_latency,
+                        metrics_after_prepare.yt_dlp_worker_ipc_latency,
+                    ),
+                );
+                timings.worker_api_extract = add_durations(
+                    timings.worker_api_extract,
+                    latency_delta(
+                        metrics_before_prepare.yt_dlp_worker_api_latency,
+                        metrics_after_prepare.yt_dlp_worker_api_latency,
+                    ),
+                );
+                timings.worker_import = add_durations(
+                    timings.worker_import,
+                    latency_delta(
+                        metrics_before_prepare.yt_dlp_worker_import_latency,
+                        metrics_after_prepare.yt_dlp_worker_import_latency,
+                    ),
+                );
+                timings.worker_startup_count += process_count_delta(
+                    metrics_before_prepare.yt_dlp_worker_startup_latency,
+                    metrics_after_prepare.yt_dlp_worker_startup_latency,
+                );
+                timings.worker_ipc_count += process_count_delta(
+                    metrics_before_prepare.yt_dlp_worker_ipc_latency,
+                    metrics_after_prepare.yt_dlp_worker_ipc_latency,
+                );
+                timings.worker_api_count += process_count_delta(
+                    metrics_before_prepare.yt_dlp_worker_api_latency,
+                    metrics_after_prepare.yt_dlp_worker_api_latency,
+                );
+                timings.format_fallback_count += metrics_after_prepare
+                    .yt_dlp_format_fallbacks
+                    .saturating_sub(metrics_before_prepare.yt_dlp_format_fallbacks);
+                timings.cli_fallback_count += metrics_after_prepare
+                    .yt_dlp_worker_cli_fallbacks
+                    .saturating_sub(metrics_before_prepare.yt_dlp_worker_cli_fallbacks);
+                timings.worker_profile = add_worker_profiles(
+                    timings.worker_profile,
+                    difference_worker_profile(
+                        metrics_before_prepare.yt_dlp_worker_profile,
+                        metrics_after_prepare.yt_dlp_worker_profile,
+                    ),
+                );
+                let prepared = match prepared_result {
+                    Ok(prepared) => {
+                        timings.prepare_playback = Some(prepare_started_at.elapsed());
+                        prepared
+                    }
                     Err(error) => {
-                        eprintln!("PROVIDER_ERROR\t{index}\tprepare_playback\t{error}");
-                        println!("RESOLVED\t{index}\terror\t{error}");
+                        timings.prepare_playback = Some(prepare_started_at.elapsed());
+                        eprintln!("PROVIDER_ERROR\t{index}\tprepare_playback\tfailed");
+                        println!("RESOLVED\t{index}\terror");
+                        probe_failed = true;
+                        print_timings(index, timings, started_at.elapsed());
                         if !options.strict {
                             return Err(Box::new(error).into());
                         }
-                        probe_failed = true;
-                        println!(
-                            "ELAPSED_MS\t{index}\t{:.2}",
-                            started_at.elapsed().as_secs_f64() * 1000.0
-                        );
                         continue;
                     }
                 };
@@ -71,14 +212,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "RESOLVED\t{index}\t{}\t{}\t{}",
                     prepared.provider_id, prepared.canonical_key, prepared.metadata.title
                 );
+                let playable_started_at = Instant::now();
                 match runtime.verify_track(&prepared).await {
                     Ok(()) => println!("PLAYABLE\t{index}\tok"),
                     Err(error) => {
-                        eprintln!("PROVIDER_ERROR\t{index}\tverify_track\t{error}");
-                        println!("PLAYABLE\t{index}\terror\t{error}");
+                        let failure = safe_playable_failure(&error);
+                        eprintln!("PROVIDER_ERROR\t{index}\tverify_track\t{failure}");
+                        println!("PLAYABLE\t{index}\terror\t{failure}");
                         probe_failed = true;
                     }
                 }
+                timings.songbird_make_playable = Some(playable_started_at.elapsed());
+                print_timings(index, timings, started_at.elapsed());
                 let analysis = if automix_requested {
                     let analysis = runtime.analyze_track(&prepared).await;
                     print_analysis(index, analysis.as_ref());
@@ -92,9 +237,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     analysis,
                 });
             }
-            Err(error) => {
-                eprintln!("PROVIDER_ERROR\t{index}\tresolve\t{error}");
-                println!("RESOLVED\t{index}\terror\t{error}");
+            Err(_) => {
+                eprintln!("PROVIDER_ERROR\t{index}\tresolve\tfailed");
+                println!("RESOLVED\t{index}\terror");
                 probe_failed = true;
                 if automix_requested {
                     prepared_tracks.push(PreparedProbe {
@@ -103,12 +248,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         analysis: None,
                     });
                 }
+                print_timings(index, timings, started_at.elapsed());
             }
         }
-        println!(
-            "ELAPSED_MS\t{index}\t{:.2}",
-            started_at.elapsed().as_secs_f64() * 1000.0
-        );
     }
 
     if automix_requested {
@@ -125,6 +267,399 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+fn safe_playable_failure(error: &SongbirdRuntimeError) -> String {
+    match error {
+        SongbirdRuntimeError::HttpStatus { status } => format!("http_status_{status}"),
+        SongbirdRuntimeError::MakePlayable(_) => "make_playable_failed".to_owned(),
+        SongbirdRuntimeError::TrackReady(_) => "track_not_ready".to_owned(),
+        _ => "playback_unavailable".to_owned(),
+    }
+}
+
+struct ParallelProbeResult {
+    index: usize,
+    youtube_extract: Duration,
+    prepare_playback: Duration,
+    songbird_make_playable: Duration,
+    total: Duration,
+    failure: Option<&'static str>,
+}
+
+async fn run_parallel_probe(
+    resolver: Arc<MediaResolver>,
+    runtime: Arc<SongbirdRuntime>,
+    parallelism: usize,
+    strict: bool,
+    urls: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let metrics_before = operational_metrics().snapshot();
+    let mut pending = urls.into_iter().enumerate();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut outcomes = Vec::new();
+
+    for _ in 0..parallelism {
+        let Some((index, url)) = pending.next() else {
+            break;
+        };
+        let resolver = Arc::clone(&resolver);
+        let runtime = Arc::clone(&runtime);
+        tasks.spawn(async move { probe_one_parallel(index, url, resolver, runtime).await });
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(_) => return Err(probe_error("parallel probe task failed")),
+        }
+        if let Some((index, url)) = pending.next() {
+            let resolver = Arc::clone(&resolver);
+            let runtime = Arc::clone(&runtime);
+            tasks.spawn(async move { probe_one_parallel(index, url, resolver, runtime).await });
+        }
+    }
+
+    outcomes.sort_by_key(|outcome| outcome.index);
+    let mut failed = false;
+    for outcome in outcomes {
+        if let Some(reason) = outcome.failure {
+            failed = true;
+            println!("RESOLVED\t{}\terror\t{reason}", outcome.index);
+        } else {
+            println!("PLAYABLE\t{}\tok", outcome.index);
+        }
+        println!(
+            "TIMING_MS\t{}\tyoutube_extract_ms={:.2}\tprepare_playback_ms={:.2}\tsongbird_make_playable_ms={:.2}\ttotal_ms={:.2}",
+            outcome.index,
+            outcome.youtube_extract.as_secs_f64() * 1000.0,
+            outcome.prepare_playback.as_secs_f64() * 1000.0,
+            outcome.songbird_make_playable.as_secs_f64() * 1000.0,
+            outcome.total.as_secs_f64() * 1000.0,
+        );
+    }
+
+    let metrics_after = operational_metrics().snapshot();
+    print_worker_profile(
+        "all",
+        difference_worker_profile(
+            metrics_before.yt_dlp_worker_profile,
+            metrics_after.yt_dlp_worker_profile,
+        ),
+    );
+    println!(
+        "RUN_SUMMARY\tparallelism={parallelism}\tworker_cli_fallbacks={}",
+        metrics_after
+            .yt_dlp_worker_cli_fallbacks
+            .saturating_sub(metrics_before.yt_dlp_worker_cli_fallbacks),
+    );
+    if strict && failed {
+        return Err(probe_error("strict parallel media probe failed"));
+    }
+    Ok(())
+}
+
+async fn probe_one_parallel(
+    index: usize,
+    url: String,
+    resolver: Arc<MediaResolver>,
+    runtime: Arc<SongbirdRuntime>,
+) -> ParallelProbeResult {
+    let started = Instant::now();
+    let resolve_started = Instant::now();
+    let resolved = resolver.resolve(&url).await;
+    let youtube_extract = resolve_started.elapsed();
+    let mut prepare_playback = Duration::ZERO;
+    let mut songbird_make_playable = Duration::ZERO;
+    let failure = match resolved {
+        Ok(request) => {
+            let prepare_started = Instant::now();
+            let prepared = resolver.prepare_playback(&request).await;
+            prepare_playback = prepare_started.elapsed();
+            match prepared {
+                Ok(prepared) => {
+                    let playable_started = Instant::now();
+                    let result = runtime.verify_track(&prepared).await;
+                    songbird_make_playable = playable_started.elapsed();
+                    result
+                        .err()
+                        .as_ref()
+                        .map(|error| match safe_playable_failure(error).as_str() {
+                            "http_status_403" => "http_status_403",
+                            "http_status_404" => "http_status_404",
+                            "http_status_410" => "http_status_410",
+                            _ => "make_playable_failed",
+                        })
+                }
+                Err(_) => Some("prepare_failed"),
+            }
+        }
+        Err(_) => Some("resolve_failed"),
+    };
+    ParallelProbeResult {
+        index,
+        youtube_extract,
+        prepare_playback,
+        songbird_make_playable,
+        total: started.elapsed(),
+        failure,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TrackProbeTimings {
+    youtube_extract: Option<Duration>,
+    yt_dlp_process: Option<Duration>,
+    yt_dlp_process_count: u64,
+    worker_startup: Option<Duration>,
+    worker_ipc: Option<Duration>,
+    worker_api_extract: Option<Duration>,
+    worker_import: Option<Duration>,
+    worker_startup_count: u64,
+    worker_ipc_count: u64,
+    worker_api_count: u64,
+    format_fallback_count: u64,
+    cli_fallback_count: u64,
+    worker_profile: YtDlpWorkerProfile,
+    prepare_playback: Option<Duration>,
+    songbird_make_playable: Option<Duration>,
+}
+
+fn process_count_delta(
+    before: wotoha_core::operational_metrics::LatencySnapshot,
+    after: wotoha_core::operational_metrics::LatencySnapshot,
+) -> u64 {
+    after.count.saturating_sub(before.count)
+}
+
+fn latency_delta(
+    before: wotoha_core::operational_metrics::LatencySnapshot,
+    after: wotoha_core::operational_metrics::LatencySnapshot,
+) -> Option<Duration> {
+    let count = after.count.saturating_sub(before.count);
+    (count > 0).then(|| Duration::from_micros(after.sum_micros.saturating_sub(before.sum_micros)))
+}
+
+fn add_durations(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        (Some(duration), None) | (None, Some(duration)) => Some(duration),
+        (None, None) => None,
+    }
+}
+
+fn print_timings(index: usize, timings: TrackProbeTimings, total: Duration) {
+    fn format_ms(duration: Option<Duration>) -> String {
+        duration.map_or_else(
+            || "n/a".to_owned(),
+            |duration| format!("{:.2}", duration.as_secs_f64() * 1000.0),
+        )
+    }
+
+    println!(
+        "TIMING_MS\t{index}\tyoutube_extract_ms={}\tyt_dlp_process_ms={}\tyt_dlp_process_count={}\tpython_worker_startup_ms={}\tpython_worker_startup_count={}\tpython_worker_import_ms={}\tpython_worker_ipc_ms={}\tpython_worker_ipc_count={}\tpython_api_extract_ms={}\tpython_api_extract_count={}\tformat_fallback_count={}\tcli_fallback_count={}\tprepare_playback_ms={}\tsongbird_make_playable_ms={}\ttotal_ms={:.2}",
+        format_ms(timings.youtube_extract),
+        format_ms(timings.yt_dlp_process),
+        timings.yt_dlp_process_count,
+        format_ms(timings.worker_startup),
+        timings.worker_startup_count,
+        format_ms(timings.worker_import),
+        format_ms(timings.worker_ipc),
+        timings.worker_ipc_count,
+        format_ms(timings.worker_api_extract),
+        timings.worker_api_count,
+        timings.format_fallback_count,
+        timings.cli_fallback_count,
+        format_ms(timings.prepare_playback),
+        format_ms(timings.songbird_make_playable),
+        total.as_secs_f64() * 1000.0,
+    );
+    print_worker_profile(index, timings.worker_profile);
+    // Keep the pre-existing probe field available to scripts that consume it.
+    println!("ELAPSED_MS\t{index}\t{:.2}", total.as_secs_f64() * 1000.0);
+}
+
+fn difference_worker_profile(
+    before: YtDlpWorkerProfile,
+    after: YtDlpWorkerProfile,
+) -> YtDlpWorkerProfile {
+    macro_rules! difference {
+        ($($field:ident),+ $(,)?) => { $(let $field = after.$field.saturating_sub(before.$field);)+ };
+    }
+    difference!(
+        extraction_count,
+        requests_handler_workers,
+        urllib_handler_workers,
+        http_requests,
+        http_open_micros,
+        http_body_read_micros,
+        dns_calls,
+        dns_micros,
+        tcp_connect_calls,
+        tcp_connect_micros,
+        tls_handshakes,
+        tls_micros,
+        js_solver_calls,
+        js_solver_micros,
+        js_runtime_calls,
+        js_runtime_micros,
+        cpu_user_micros,
+        cpu_system_micros,
+        child_cpu_user_micros,
+        child_cpu_system_micros,
+        youtube_requests,
+        media_cdn_requests,
+        other_requests,
+    );
+    YtDlpWorkerProfile {
+        extraction_count,
+        requests_handler_workers,
+        urllib_handler_workers,
+        http_requests,
+        http_open_micros,
+        http_body_read_micros,
+        dns_calls,
+        dns_micros,
+        tcp_connect_calls,
+        tcp_connect_micros,
+        tls_handshakes,
+        tls_micros,
+        js_solver_calls,
+        js_solver_micros,
+        js_runtime_calls,
+        js_runtime_micros,
+        cpu_user_micros,
+        cpu_system_micros,
+        child_cpu_user_micros,
+        child_cpu_system_micros,
+        rss_highwater_kb: after.rss_highwater_kb,
+        child_rss_highwater_kb: after.child_rss_highwater_kb,
+        youtube_requests,
+        media_cdn_requests,
+        other_requests,
+        http_request_detail_count: after.http_request_detail_count,
+        http_request_details: after.http_request_details,
+    }
+}
+
+fn add_worker_profiles(left: YtDlpWorkerProfile, right: YtDlpWorkerProfile) -> YtDlpWorkerProfile {
+    macro_rules! add {
+        ($($field:ident),+ $(,)?) => { $(let $field = left.$field.saturating_add(right.$field);)+ };
+    }
+    add!(
+        extraction_count,
+        requests_handler_workers,
+        urllib_handler_workers,
+        http_requests,
+        http_open_micros,
+        http_body_read_micros,
+        dns_calls,
+        dns_micros,
+        tcp_connect_calls,
+        tcp_connect_micros,
+        tls_handshakes,
+        tls_micros,
+        js_solver_calls,
+        js_solver_micros,
+        js_runtime_calls,
+        js_runtime_micros,
+        cpu_user_micros,
+        cpu_system_micros,
+        child_cpu_user_micros,
+        child_cpu_system_micros,
+        youtube_requests,
+        media_cdn_requests,
+        other_requests,
+    );
+    YtDlpWorkerProfile {
+        extraction_count,
+        requests_handler_workers,
+        urllib_handler_workers,
+        http_requests,
+        http_open_micros,
+        http_body_read_micros,
+        dns_calls,
+        dns_micros,
+        tcp_connect_calls,
+        tcp_connect_micros,
+        tls_handshakes,
+        tls_micros,
+        js_solver_calls,
+        js_solver_micros,
+        js_runtime_calls,
+        js_runtime_micros,
+        cpu_user_micros,
+        cpu_system_micros,
+        child_cpu_user_micros,
+        child_cpu_system_micros,
+        rss_highwater_kb: left.rss_highwater_kb.max(right.rss_highwater_kb),
+        child_rss_highwater_kb: left
+            .child_rss_highwater_kb
+            .max(right.child_rss_highwater_kb),
+        youtube_requests,
+        media_cdn_requests,
+        other_requests,
+        http_request_detail_count: if right.http_request_detail_count > 0 {
+            right.http_request_detail_count
+        } else {
+            left.http_request_detail_count
+        },
+        http_request_details: if right.http_request_detail_count > 0 {
+            right.http_request_details
+        } else {
+            left.http_request_details
+        },
+    }
+}
+
+fn print_worker_profile(index: impl std::fmt::Display, profile: YtDlpWorkerProfile) {
+    if profile.extraction_count == 0 {
+        return;
+    }
+    let ms = |micros: u64| micros as f64 / 1000.0;
+    println!(
+        "YTDLP_PROFILE\t{index}\textractions={}\trequests_workers={}\turllib_workers={}\thttp_requests={}\thttp_open_ms={:.2}\thttp_body_ms={:.2}\tdns_calls={}\tdns_ms={:.2}\ttcp_connect_calls={}\ttcp_connect_ms={:.2}\ttls_handshakes={}\ttls_ms={:.2}\tjs_solver_calls={}\tjs_solver_ms={:.2}\tjs_runtime_calls={}\tjs_runtime_ms={:.2}\tcpu_user_ms={:.2}\tcpu_system_ms={:.2}\tchild_cpu_user_ms={:.2}\tchild_cpu_system_ms={:.2}\trss_highwater_kb={}\tchild_rss_highwater_kb={}\tyoutube_requests={}\tmedia_cdn_requests={}\tother_requests={}",
+        profile.extraction_count,
+        profile.requests_handler_workers,
+        profile.urllib_handler_workers,
+        profile.http_requests,
+        ms(profile.http_open_micros),
+        ms(profile.http_body_read_micros),
+        profile.dns_calls,
+        ms(profile.dns_micros),
+        profile.tcp_connect_calls,
+        ms(profile.tcp_connect_micros),
+        profile.tls_handshakes,
+        ms(profile.tls_micros),
+        profile.js_solver_calls,
+        ms(profile.js_solver_micros),
+        profile.js_runtime_calls,
+        ms(profile.js_runtime_micros),
+        ms(profile.cpu_user_micros),
+        ms(profile.cpu_system_micros),
+        ms(profile.child_cpu_user_micros),
+        ms(profile.child_cpu_system_micros),
+        profile.rss_highwater_kb,
+        profile.child_rss_highwater_kb,
+        profile.youtube_requests,
+        profile.media_cdn_requests,
+        profile.other_requests,
+    );
+    for (ordinal, detail) in profile
+        .http_request_details
+        .iter()
+        .take(profile.http_request_detail_count as usize)
+        .enumerate()
+    {
+        println!(
+            "YTDLP_HTTP_REQUEST\t{index}\tordinal={}\tkind={}\tstatus={}\topen_ms={:.3}\tbody_ms={:.3}",
+            ordinal + 1,
+            detail.kind.as_str(),
+            detail.status_code,
+            ms(detail.open_micros),
+            ms(detail.body_read_micros),
+        );
+    }
+}
+
 struct PreparedProbe {
     index: usize,
     request: Option<TrackRequest>,
@@ -137,7 +672,53 @@ struct ProbeOptions {
     automix_plan: bool,
     automix_preview: Option<PathBuf>,
     loudness_max_boost_db: f32,
+    parallelism: usize,
     urls: Vec<String>,
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use wotoha_core::operational_metrics::LatencySnapshot;
+
+    #[test]
+    fn process_latency_delta_is_per_probe_and_uses_microseconds() {
+        let before = LatencySnapshot {
+            count: 4,
+            sum_micros: 10_000,
+            max_micros: 5_000,
+        };
+        let after = LatencySnapshot {
+            count: 5,
+            sum_micros: 2_010_000,
+            max_micros: 2_000_000,
+        };
+        assert_eq!(latency_delta(before, after), Some(Duration::from_secs(2)));
+        assert_eq!(process_count_delta(before, after), 1);
+    }
+
+    #[test]
+    fn process_latency_delta_is_unavailable_when_no_process_was_spawned() {
+        let snapshot = LatencySnapshot::default();
+        assert_eq!(latency_delta(snapshot, snapshot), None);
+        assert_eq!(process_count_delta(snapshot, snapshot), 0);
+    }
+
+    #[test]
+    fn process_durations_can_be_combined_across_resolve_and_prepare() {
+        assert_eq!(
+            add_durations(
+                Some(Duration::from_millis(20)),
+                Some(Duration::from_millis(5))
+            ),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            add_durations(None, Some(Duration::from_millis(5))),
+            Some(Duration::from_millis(5))
+        );
+        assert_eq!(add_durations(None, None), None);
+    }
 }
 
 impl ProbeOptions {
@@ -147,6 +728,7 @@ impl ProbeOptions {
         let mut automix_plan = false;
         let mut automix_preview = None;
         let mut loudness_max_boost_db = LoudnessConfig::production_default().max_boost_db;
+        let mut parallelism = 1usize;
         let mut urls = Vec::new();
         let mut args = args.into_iter();
 
@@ -154,6 +736,17 @@ impl ProbeOptions {
             match arg.as_str() {
                 "--strict" => strict = true,
                 "--warmup" => warmup = true,
+                "--parallelism" => {
+                    let Some(value) = args.next() else {
+                        return Err("--parallelism requires a value".to_owned());
+                    };
+                    parallelism = value
+                        .parse::<usize>()
+                        .map_err(|_| "--parallelism must be between 1 and 8".to_owned())?;
+                    if !(1..=8).contains(&parallelism) {
+                        return Err("--parallelism must be between 1 and 8".to_owned());
+                    }
+                }
                 "--automix-plan" => automix_plan = true,
                 "--automix-preview" => {
                     let Some(path) = args.next() else {
@@ -189,6 +782,7 @@ impl ProbeOptions {
             automix_plan,
             automix_preview,
             loudness_max_boost_db,
+            parallelism,
             urls,
         })
     }

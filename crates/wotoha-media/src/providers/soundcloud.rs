@@ -455,7 +455,12 @@ fn score_transcoding(transcoding: &SoundTranscoding) -> (u8, u8, u8) {
 fn is_supported_transcoding(transcoding: &SoundTranscoding) -> bool {
     let is_mp3 = transcoding.format.mime_type.contains("audio/mpeg");
     match transcoding.format.protocol.as_str() {
-        "progressive" | "hls" => is_mp3,
+        "progressive" => is_mp3,
+        // SoundCloud commonly exposes AAC as fragmented MP4 HLS. The runtime
+        // HLS reader emits its EXT-X-MAP initialization section before media
+        // fragments, so these streams can be decoded without bypassing URL
+        // validation or introducing a separate playback path.
+        "hls" => is_mp3 || transcoding.format.mime_type.contains("audio/mp4"),
         _ => false,
     }
 }
@@ -534,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn excludes_fragmented_mp4_hls_without_initialization_map_support() {
+    fn supports_aac_fragmented_mp4_hls_with_initialization_map_support() {
         let transcoding = SoundTranscoding {
             url: "https://api-v2.soundcloud.com/media/aac-hls".to_owned(),
             preset: Some("aac_160k".to_owned()),
@@ -545,7 +550,7 @@ mod tests {
             },
         };
 
-        assert!(!is_supported_transcoding(&transcoding));
+        assert!(is_supported_transcoding(&transcoding));
     }
 
     #[tokio::test]
@@ -604,6 +609,58 @@ mod tests {
                     == "https://cf-hls-media.sndcdn.com/full-track/playlist.m3u8"
         ));
         assert_eq!(server.join().unwrap(), vec!["/progressive", "/hls"]);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_aac_hls_when_mp3_hls_resolution_fails() {
+        let (base_url, server) = spawn_stream_api([
+            ("/hls", 404, ""),
+            (
+                "/aac-hls",
+                200,
+                r#"{"url":"https://cf-hls-media.sndcdn.com/full-track/playlist.m3u8"}"#,
+            ),
+        ]);
+        let provider = provider_with_cached_client_id().await;
+        let mut track = sample_track(&base_url);
+        track
+            .media
+            .as_mut()
+            .unwrap()
+            .transcodings
+            .retain(|transcoding| transcoding.url.ends_with("/hls"));
+        track
+            .media
+            .as_mut()
+            .unwrap()
+            .transcodings
+            .push(SoundTranscoding {
+                url: format!("{base_url}/aac-hls"),
+                preset: Some("aac_160k".to_owned()),
+                quality: Some("hq".to_owned()),
+                format: SoundFormat {
+                    protocol: "hls".to_owned(),
+                    mime_type: "audio/mp4; codecs=\"mp4a.40.2\"".to_owned(),
+                },
+            });
+
+        let request = provider
+            .track_request_from_track(
+                "https://soundcloud.com/forss/flickermood",
+                "https://soundcloud.com/forss/flickermood",
+                &track,
+                &Client::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            request.prepared,
+            PreparedSource::Hls { ref playlist_url, .. }
+                if playlist_url.as_ref()
+                    == "https://cf-hls-media.sndcdn.com/full-track/playlist.m3u8"
+        ));
+        assert_eq!(server.join().unwrap(), vec!["/hls", "/aac-hls"]);
     }
 
     fn sample_track(media_base_url: &str) -> SoundHydration {

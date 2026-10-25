@@ -2,9 +2,12 @@ use std::{collections::VecDeque, time::Duration};
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use hls_m3u8::{MasterPlaylist, MediaPlaylist, tags::VariantStream};
+use hls_m3u8::{
+    Decryptable, MasterPlaylist, MediaPlaylist,
+    tags::{ExtXMap, VariantStream},
+};
 use patricia_tree::PatriciaSet;
-use reqwest::{Client, Request, Url, header::HeaderMap};
+use reqwest::{Client, Url, header::HeaderMap};
 use songbird::input::{
     AsyncAdapterStream, AsyncMediaSource, AudioStream, AudioStreamError, Compose, Input,
     core::io::MediaSource,
@@ -26,10 +29,13 @@ const PLAYLIST_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const HLS_MIN_PLAYLIST_RELOAD: Duration = Duration::from_millis(500);
 const HLS_MAX_PLAYLIST_RELOAD: Duration = Duration::from_secs(15);
+const HLS_SEGMENT_RETRY_DELAY: Duration = Duration::from_millis(150);
+const HLS_SEGMENT_DOWNLOAD_ATTEMPTS: usize = 2;
 const SEGMENT_QUEUE_CAPACITY: usize = 16;
 const SEGMENT_LINK_CAPACITY: usize = 512;
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PLAYLIST_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HLS_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ValidatedHlsRequest {
@@ -92,8 +98,11 @@ impl ValidatedHlsRequest {
         let downloader_client = self.client.clone();
         let watcher_tx = segment_tx.clone();
         let watcher_stop_rx = stop_rx.clone();
+        let watcher_stop_check = stop_rx.clone();
         tokio::spawn(async move {
-            if let Err(error) = watcher.run(watcher_tx.clone(), watcher_stop_rx).await {
+            if let Err(error) = watcher.run(watcher_tx.clone(), watcher_stop_rx).await
+                && !stop_requested(&watcher_stop_check)
+            {
                 tracing::warn!("validated hls watcher failed: {error}");
                 let _ = watcher_tx.send(SegmentQueue::StreamOver).await;
             }
@@ -148,24 +157,21 @@ async fn bytes_forwarder(
 
         match item {
             SegmentQueue::Url(segment) => {
-                let request = match client
-                    .get(segment.url.clone())
-                    .headers(segment.headers)
-                    .timeout(DOWNLOAD_TIMEOUT)
-                    .build()
+                match download_segment_with_retry(
+                    client.clone(),
+                    segment,
+                    &mut writer,
+                    &mut stop_rx,
+                )
+                .await
                 {
-                    Ok(request) => request,
-                    Err(error) => {
-                        tracing::warn!("validated hls request build failed: {error}");
-                        continue;
-                    }
-                };
-
-                match download_segment(client.clone(), request, &mut writer, &mut stop_rx).await {
                     Ok(SegmentDownload::Completed) => {}
                     Ok(SegmentDownload::Stopped) => break,
                     Err(error) => {
-                        tracing::warn!("validated hls segment download failed: {error}");
+                        tracing::warn!(
+                            reason = error.reason(),
+                            "validated hls segment download failed after retry"
+                        );
                         break;
                     }
                 }
@@ -185,30 +191,117 @@ enum SegmentDownload {
     Stopped,
 }
 
-async fn download_segment(
+enum SegmentDownloadFailure {
+    Request(reqwest::Error),
+    HttpStatus(reqwest::StatusCode),
+    Body(reqwest::Error),
+    BodyTimeout,
+    TooLarge,
+    Writer,
+}
+
+impl SegmentDownloadFailure {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Request(error) | Self::Body(error) => {
+                error.is_timeout() || error.is_connect() || error.is_body() || error.is_decode()
+            }
+            Self::HttpStatus(status) => status.as_u16() == 429 || status.is_server_error(),
+            Self::BodyTimeout => true,
+            Self::TooLarge | Self::Writer => false,
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Request(error) if error.is_timeout() => "request_timeout",
+            Self::Request(error) if error.is_connect() => "connect_error",
+            Self::Request(_) => "request_error",
+            Self::HttpStatus(status) if status.as_u16() == 429 => "http_429",
+            Self::HttpStatus(status) if status.is_server_error() => "http_5xx",
+            Self::HttpStatus(_) => "http_status",
+            Self::Body(error) if error.is_decode() => "body_decode_error",
+            Self::Body(error) if error.is_timeout() => "body_timeout",
+            Self::Body(_) => "body_error",
+            Self::BodyTimeout => "body_timeout",
+            Self::TooLarge => "segment_too_large",
+            Self::Writer => "audio_pipe_write_error",
+        }
+    }
+}
+
+async fn download_segment_with_retry(
     client: Client,
-    request: Request,
+    segment: SegmentRequest,
     writer: &mut DuplexStream,
     stop_rx: &mut watch::Receiver<bool>,
-) -> Result<SegmentDownload, String> {
+) -> Result<SegmentDownload, SegmentDownloadFailure> {
+    for attempt in 1..=HLS_SEGMENT_DOWNLOAD_ATTEMPTS {
+        match download_segment(client.clone(), &segment, writer, stop_rx).await {
+            Ok(result) => return Ok(result),
+            Err(error) if attempt < HLS_SEGMENT_DOWNLOAD_ATTEMPTS && error.retryable() => {
+                tracing::warn!(
+                    attempt,
+                    reason = error.reason(),
+                    "retrying transient hls segment failure"
+                );
+                if sleep_or_stop(HLS_SEGMENT_RETRY_DELAY, stop_rx).await {
+                    return Ok(SegmentDownload::Stopped);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("the segment download attempt count is nonzero")
+}
+
+async fn download_segment(
+    client: Client,
+    segment: &SegmentRequest,
+    writer: &mut DuplexStream,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> Result<SegmentDownload, SegmentDownloadFailure> {
     if stop_requested(stop_rx) {
         return Ok(SegmentDownload::Stopped);
     }
 
+    let request = client
+        .get(segment.url.clone())
+        .headers(segment.headers.clone())
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()
+        .map_err(SegmentDownloadFailure::Request)?;
+
     let response = tokio::select! {
-        response = client.execute(request) => response.map_err(|error| error.to_string())?,
+        response = client.execute(request) => response.map_err(SegmentDownloadFailure::Request)?,
         changed = stop_rx.changed() => {
             if changed.is_err() || stop_requested(stop_rx) {
                 return Ok(SegmentDownload::Stopped);
             }
-            return Err("HLS segment download stop signal changed unexpectedly".to_owned());
+            return Err(SegmentDownloadFailure::BodyTimeout);
         }
     };
 
-    let mut stream = response
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .bytes_stream();
+    let status = response.status();
+    if !status.is_success() {
+        return Err(SegmentDownloadFailure::HttpStatus(status));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_HLS_SEGMENT_BYTES as u64)
+    {
+        return Err(SegmentDownloadFailure::TooLarge);
+    }
+
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_HLS_SEGMENT_BYTES as u64) as usize,
+    );
+    let mut stream = response.bytes_stream();
 
     loop {
         if stop_requested(stop_rx) {
@@ -216,7 +309,9 @@ async fn download_segment(
         }
 
         let next = tokio::select! {
-            next = tokio::time::timeout(DOWNLOAD_TIMEOUT, stream.next()) => next,
+            next = tokio::time::timeout(DOWNLOAD_TIMEOUT, stream.next()) => {
+                next.map_err(|_| SegmentDownloadFailure::BodyTimeout)?
+            },
             changed = stop_rx.changed() => {
                 if changed.is_err() || stop_requested(stop_rx) {
                     return Ok(SegmentDownload::Stopped);
@@ -226,23 +321,30 @@ async fn download_segment(
         };
 
         match next {
-            Ok(Some(Ok(bytes))) => {
-                let write_result = tokio::select! {
-                    result = writer.write_all(&bytes) => result,
-                    changed = stop_rx.changed() => {
-                        if changed.is_err() || stop_requested(stop_rx) {
-                            return Ok(SegmentDownload::Stopped);
-                        }
-                        continue;
-                    }
-                };
-                write_result.map_err(|error| error.to_string())?;
+            Some(Ok(bytes)) => {
+                if body.len().saturating_add(bytes.len()) > MAX_HLS_SEGMENT_BYTES {
+                    return Err(SegmentDownloadFailure::TooLarge);
+                }
+                body.extend_from_slice(&bytes);
             }
-            Ok(Some(Err(error))) => return Err(error.to_string()),
-            Ok(None) => return Ok(SegmentDownload::Completed),
-            Err(_) => return Err("HLS segment download timed out".to_owned()),
+            Some(Err(error)) => return Err(SegmentDownloadFailure::Body(error)),
+            None => break,
         }
     }
+
+    let write_result = loop {
+        tokio::select! {
+            result = writer.write_all(&body) => break result,
+            changed = stop_rx.changed() => {
+                if changed.is_err() || stop_requested(stop_rx) {
+                    return Ok(SegmentDownload::Stopped);
+                }
+            }
+        }
+    };
+    write_result.map_err(|_| SegmentDownloadFailure::Writer)?;
+
+    Ok(SegmentDownload::Completed)
 }
 
 struct HlsWatcher {
@@ -251,6 +353,7 @@ struct HlsWatcher {
     playlist_url: Url,
     headers: HeaderMap,
     links: RecentSegmentLinks,
+    active_init_map: Option<String>,
     timeout: Duration,
     fail_counter: usize,
 }
@@ -270,6 +373,7 @@ impl HlsWatcher {
             playlist_url,
             headers,
             links: RecentSegmentLinks::new(SEGMENT_LINK_CAPACITY),
+            active_init_map: None,
             timeout: PLAYLIST_TIMEOUT,
             fail_counter: 0,
         })
@@ -333,6 +437,26 @@ impl HlsWatcher {
 
             let mut saw_new_segment = false;
             for (_, segment) in media_playlist.segments.iter() {
+                if let Some(initialization_map) = initialization_map_request(
+                    &self.provider_id,
+                    &self.playlist_url,
+                    &media_url,
+                    &self.headers,
+                    segment.map.as_ref(),
+                    &mut self.active_init_map,
+                )? {
+                    if !send_queue_item(
+                        &queue_tx,
+                        SegmentQueue::Url(initialization_map),
+                        &mut stop_rx,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    saw_new_segment = true;
+                }
+
                 let resolved = resolve_child_url(&media_url, segment.uri().trim())
                     .map_err(|error| error.to_string())?;
                 validate_provider_url(&self.provider_id, resolved.as_str())
@@ -477,6 +601,42 @@ fn parse_media_playlist(raw: &str) -> Result<MediaPlaylist<'_>, String> {
     let mut builder = MediaPlaylist::builder();
     builder.allowable_excess_duration(Duration::from_secs(10));
     builder.parse(raw).map_err(|error| error.to_string())
+}
+
+fn initialization_map_request(
+    provider_id: &str,
+    playlist_url: &Url,
+    media_url: &Url,
+    headers: &HeaderMap,
+    map: Option<&ExtXMap<'_>>,
+    active_map: &mut Option<String>,
+) -> Result<Option<SegmentRequest>, String> {
+    // EXT-X-MAP applies to following segments, but the parsed playlist may
+    // expose it only on the segment where the tag appeared. Absence here must
+    // therefore preserve the active map until a later map tag replaces it.
+    let Some(map) = map else {
+        return Ok(None);
+    };
+
+    if map.range().is_some() {
+        return Err("HLS initialization map byte ranges are unsupported".to_owned());
+    }
+    if !map.keys().is_empty() {
+        return Err("encrypted HLS initialization maps are unsupported".to_owned());
+    }
+
+    let resolved =
+        resolve_child_url(media_url, map.uri().trim()).map_err(|error| error.to_string())?;
+    validate_provider_url(provider_id, resolved.as_str()).map_err(|error| error.to_string())?;
+    if active_map.as_deref() == Some(resolved.as_str()) {
+        return Ok(None);
+    }
+
+    *active_map = Some(resolved.as_str().to_owned());
+    Ok(Some(SegmentRequest {
+        headers: filtered_headers(playlist_url.as_str(), resolved.as_str(), headers),
+        url: resolved,
+    }))
 }
 
 async fn send_queue_item(
@@ -726,9 +886,10 @@ mod tests {
 
     use super::{
         HLS_MAX_PLAYLIST_RELOAD, HLS_MIN_PLAYLIST_RELOAD, HlsWatcher, RecentSegmentLinks,
-        SEGMENT_QUEUE_CAPACITY, STREAM_BUFFER_BYTES, SegmentQueue, SegmentRequest,
-        ValidatedHlsAsyncSource, bounded_playlist_reload, bytes_forwarder, parse_media_playlist,
-        request_stop, resolve_child_url, select_master_variant, send_queue_item, sleep_or_stop,
+        SEGMENT_QUEUE_CAPACITY, STREAM_BUFFER_BYTES, SegmentDownloadFailure, SegmentQueue,
+        SegmentRequest, ValidatedHlsAsyncSource, bounded_playlist_reload, bytes_forwarder,
+        initialization_map_request, parse_media_playlist, request_stop, resolve_child_url,
+        select_master_variant, send_queue_item, sleep_or_stop,
     };
     use hls_m3u8::MasterPlaylist;
     use reqwest::{Client, Url, header::HeaderMap};
@@ -755,6 +916,66 @@ mod tests {
         let parsed = parse_media_playlist(playlist).unwrap();
         assert_eq!(parsed.segments.iter().count(), 1);
         assert!(parsed.has_end_list);
+    }
+
+    #[test]
+    fn media_playlist_initialization_map_is_resolved_and_queued_once_per_map() {
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\nsegment-1.m4s\n#EXTINF:4.0,\nsegment-2.m4s\n#EXT-X-ENDLIST\n";
+        let parsed = parse_media_playlist(playlist).unwrap();
+        let base = Url::parse("https://cf-media.sndcdn.com/audio/index.m3u8").unwrap();
+        let mut active_map = None;
+        let first = parsed.segments.iter().next().unwrap().1;
+        let first_map = initialization_map_request(
+            "soundcloud",
+            &base,
+            &base,
+            &HeaderMap::new(),
+            first.map.as_ref(),
+            &mut active_map,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first_map.url.as_str(),
+            "https://cf-media.sndcdn.com/audio/init.mp4"
+        );
+
+        let second = parsed.segments.iter().nth(1).unwrap().1;
+        assert!(
+            initialization_map_request(
+                "soundcloud",
+                &base,
+                &base,
+                &HeaderMap::new(),
+                second.map.as_ref(),
+                &mut active_map,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            active_map.as_deref(),
+            Some("https://cf-media.sndcdn.com/audio/init.mp4")
+        );
+    }
+
+    #[test]
+    fn initialization_map_must_pass_provider_host_validation() {
+        let playlist = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"https://untrusted.invalid/init.mp4\"\n#EXTINF:4.0,\nsegment-1.m4s\n#EXT-X-ENDLIST\n";
+        let parsed = parse_media_playlist(playlist).unwrap();
+        let base = Url::parse("https://cf-media.sndcdn.com/audio/index.m3u8").unwrap();
+        let segment = parsed.segments.iter().next().unwrap().1;
+        assert!(
+            initialization_map_request(
+                "soundcloud",
+                &base,
+                &base,
+                &HeaderMap::new(),
+                segment.map.as_ref(),
+                &mut None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -790,6 +1011,17 @@ mod tests {
             bounded_playlist_reload(Duration::from_secs(60)),
             HLS_MAX_PLAYLIST_RELOAD
         );
+    }
+
+    #[test]
+    fn segment_retry_policy_is_limited_to_transient_failures() {
+        assert!(
+            SegmentDownloadFailure::HttpStatus(reqwest::StatusCode::TOO_MANY_REQUESTS).retryable()
+        );
+        assert!(SegmentDownloadFailure::HttpStatus(reqwest::StatusCode::BAD_GATEWAY).retryable());
+        assert!(!SegmentDownloadFailure::HttpStatus(reqwest::StatusCode::FORBIDDEN).retryable());
+        assert!(!SegmentDownloadFailure::HttpStatus(reqwest::StatusCode::NOT_FOUND).retryable());
+        assert!(!SegmentDownloadFailure::TooLarge.retryable());
     }
 
     #[test]
@@ -850,6 +1082,47 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transient_segment_body_failure_retries_without_duplicating_audio() {
+        let expected = (0..4096)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let (segment_url, server) = spawn_truncated_then_complete_response(expected.clone());
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let (segment_tx, segment_rx) = channel(SEGMENT_QUEUE_CAPACITY);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (writer, mut reader) = duplex(STREAM_BUFFER_BYTES);
+        let forwarder = tokio::spawn(bytes_forwarder(
+            client, segment_rx, writer, stop_tx, stop_rx,
+        ));
+
+        segment_tx
+            .send(SegmentQueue::Url(SegmentRequest {
+                url: Url::parse(&segment_url).unwrap(),
+                headers: HeaderMap::new(),
+            }))
+            .await
+            .unwrap();
+        segment_tx.send(SegmentQueue::StreamOver).await.unwrap();
+        drop(segment_tx);
+
+        let mut actual = Vec::new();
+        timeout(Duration::from_secs(3), reader.read_to_end(&mut actual))
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(3), forwarder)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(server.join().unwrap(), 2);
     }
 
     #[tokio::test]
@@ -985,6 +1258,50 @@ mod tests {
             }
         });
         url
+    }
+
+    fn spawn_truncated_then_complete_response(
+        body: Vec<u8>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/segment.ts", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            for attempt in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                accepted += 1;
+                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+
+                let mut request = Vec::new();
+                let mut read_buf = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut read_buf) {
+                        Ok(0) => break,
+                        Ok(read) => request.extend_from_slice(&read_buf[..read]),
+                        Err(_) => break,
+                    }
+                }
+
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/mp4\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(header.as_bytes()).is_err() {
+                    continue;
+                }
+                if attempt == 0 {
+                    let partial_len = body.len() / 2;
+                    let _ = stream.write_all(&body[..partial_len]);
+                } else {
+                    let _ = stream.write_all(&body);
+                }
+            }
+            accepted
+        });
+        (url, server)
     }
 
     fn spawn_tls_blackhole() -> SocketAddr {

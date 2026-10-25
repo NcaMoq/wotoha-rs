@@ -153,8 +153,11 @@ The Dockerfile is a multi-stage build. The builder compiles the locked
 wotoha-app binary; the tools stage downloads the pinned yt-dlp and Deno
 artifacts, verifies the yt-dlp signed checksum and signing-key fingerprint,
 verifies the pinned Deno SHA-256, and checks reported versions. The final
-Debian slim stage contains only the application, licenses, runtime tools, and
-data directories.
+Debian slim stage contains the application, licenses, pinned CLI/Deno tools,
+and a read-only Python environment with pinned yt-dlp/Requests wheels for the
+optional resident worker. Python worker selection remains off by default; the
+CLI stays the default backend. `/wotoha` remains the only persistent writable
+application area.
 
 ~~~bash
 docker buildx build --platform linux/amd64 --load \

@@ -117,6 +117,12 @@ jobs:
             --security-opt=no-new-privileges:true \
             "$image" --self-check
           docker run --rm "$image" --version | grep -F "commit $GITHUB_SHA"
+          python_ytdlp_module_version="$(awk -F= '$1 == "PYTHON_YTDLP_MODULE_VERSION" {print $2}' deploy/third-party-versions.env)"
+          requests_version="$(awk -F= '$1 == "REQUESTS_VERSION" {print $2}' deploy/third-party-versions.env)"
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,exec,mode=1777 \
+            --cap-drop=ALL --security-opt=no-new-privileges:true \
+            --entrypoint /app/python/bin/python "$image" -I -B -c 'import sys, requests; from yt_dlp import YoutubeDL; from yt_dlp.version import __version__; from yt_dlp.networking import Request; expected_module, expected_requests = sys.argv[1:]; ydl = YoutubeDL({"ignoreconfig": True, "quiet": True}); handlers = ydl._request_director._get_handlers(Request("https://www.youtube.com/")); assert __version__ == expected_module; assert requests.__version__ == expected_requests; assert handlers and handlers[0].RH_NAME == "requests"; print("opt-in Python worker runtime and Requests handler: OK")' "$python_ytdlp_module_version" "$requests_version"
           docker run --rm --entrypoint /bin/sh "$image" -c '
             set -eu
             test ! -e /usr/local/cargo
@@ -125,6 +131,7 @@ jobs:
             test -x /app/wotoha-app
             test -x /app/tools/yt-dlp-fallback
             test -x /app/tools/deno
+            test -x /app/python/bin/python
             test -s /app/licenses/license-inventory.json
             test -s /app/licenses/rust/THIRD_PARTY_LICENSES.html
             test -s /app/licenses/rust/THIRD_PARTY_ATTRIBUTIONS.txt
@@ -132,6 +139,14 @@ jobs:
             test -s /app/licenses/yt-dlp/PROVENANCE.txt
             test -s /app/licenses/deno/LICENSE.md
             test -s /app/licenses/deno/PROVENANCE.txt
+            test -s /app/licenses/python-worker/requirements.txt
+            test -s /app/licenses/python-worker/packages/PROVENANCE.txt
+            test -s /app/licenses/python-worker/packages/yt-dlp/LICENSE
+            test -s /app/licenses/python-worker/packages/requests/LICENSE
+            test -s /app/licenses/python-worker/packages/certifi/LICENSE
+            test -s /app/licenses/python-worker/packages/charset-normalizer/LICENSE
+            test -s /app/licenses/python-worker/packages/idna/LICENSE.md
+            test -s /app/licenses/python-worker/packages/urllib3/LICENSE.txt
             test -s /app/licenses/Cargo.lock
             test -s /app/licenses/models/NOTICE.txt
             test -s /app/licenses/third-party-versions.env
@@ -217,6 +232,9 @@ jobs:
           set -euo pipefail
           tag="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1 | sed 's#^.*/##')"
           ytdlp_version="$(awk -F= '$1 == "YTDLP_VERSION" {print $2}' deploy/third-party-versions.env)"
+          python_ytdlp_version="$(awk -F= '$1 == "PYTHON_YTDLP_VERSION" {print $2}' deploy/third-party-versions.env)"
+          python_ytdlp_module_version="$(awk -F= '$1 == "PYTHON_YTDLP_MODULE_VERSION" {print $2}' deploy/third-party-versions.env)"
+          requests_version="$(awk -F= '$1 == "REQUESTS_VERSION" {print $2}' deploy/third-party-versions.env)"
           deno_version="$(awk -F= '$1 == "DENO_VERSION" {print $2}' deploy/third-party-versions.env)"
           jq -n \
             --arg source_commit "$GITHUB_SHA" \
@@ -225,10 +243,16 @@ jobs:
             --arg digest "$PUBLISHED_DIGEST" \
             --arg version "$GITHUB_REF_NAME" \
             --arg yt_dlp_version "$ytdlp_version" \
+            --arg python_ytdlp_version "$python_ytdlp_version" \
+            --arg python_ytdlp_module_version "$python_ytdlp_module_version" \
+            --arg requests_version "$requests_version" \
             --arg deno_version "$deno_version" \
             '{schema_version: 1, source_commit: $source_commit, image: $image,
               tag: $tag, digest: $digest, version: $version,
-              yt_dlp_version: $yt_dlp_version, deno_version: $deno_version}' \
+              yt_dlp_version: $yt_dlp_version,
+              python_ytdlp_version: $python_ytdlp_version,
+              python_ytdlp_module_version: $python_ytdlp_module_version,
+              requests_version: $requests_version, deno_version: $deno_version}' \
             > deployment-metadata.json
           jq -e '.source_commit == $ENV.GITHUB_SHA and (.digest | startswith("sha256:"))' deployment-metadata.json >/dev/null
           cat deployment-metadata.json >> "$GITHUB_STEP_SUMMARY"
