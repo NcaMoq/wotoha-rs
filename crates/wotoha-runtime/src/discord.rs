@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -11,11 +12,12 @@ use futures::future::join_all;
 use serenity::{
     all::{
         ActivityData, ButtonStyle, ChannelId, Colour, Command, CommandInteraction,
-        CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateButton,
-        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
+        CommandOptionType, ComponentInteraction, Context, CreateActionRow, CreateAllowedMentions,
+        CreateButton, CreateCommand, CreateCommandOption, CreateComponentV2, CreateEmbed,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
-        CreateInteractionResponseMessage, EmojiId, Guild, Interaction, MessageFlags, ReactionType,
-        Ready, UnavailableGuild, VoiceServerUpdateEvent, VoiceState,
+        CreateInteractionResponseMessage, CreateSectionAccessory, EditMessage, EmojiId, Guild,
+        Interaction, MessageFlags, MessageId, ReactionType, Ready, UnavailableGuild,
+        VoiceServerUpdateEvent, VoiceState,
     },
     async_trait,
     builder::CreateMessage,
@@ -26,23 +28,23 @@ use serenity::{
 use songbird::{SerenityInit, Songbird};
 use tracing::{error, info, warn};
 use wotoha_contracts::{
-    ChannelKey, GuildKey, PlaybackFailureKind, PlaybackService, UserKey, VoiceActionAccess,
-    VoiceGatewayEvent, VoiceGatewayRuntime, VoiceGatewayServerUpdate, VoiceGatewayStateUpdate,
-    VoicePeerSnapshot, VoiceUpdateDecision,
+    ChannelKey, GuildKey, PlaybackFailureKind, PlaybackId, PlaybackService, UserKey,
+    VoiceActionAccess, VoiceGatewayEvent, VoiceGatewayRuntime, VoiceGatewayServerUpdate,
+    VoiceGatewayStateUpdate, VoicePeerSnapshot, VoiceUpdateDecision,
 };
 use wotoha_control::{ComponentAction, ComponentOutcome, ControlService};
 use wotoha_core::{
-    QueuePreview, TrackMetadata,
+    QueuePreview, TrackMetadata, TrackRequest, TrackRequestId,
     debug::{append_debug_log, sanitize_log_message},
     operational_metrics,
     ui::{
-        self, AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, BUTTON_AUTOMIX, BUTTON_AUTOMIX_LABEL,
-        BUTTON_LOOP, BUTTON_QUEUE, BUTTON_SHUFFLE, BUTTON_SKIP, COLOR_ERROR, COLOR_INFO,
-        INVITE_BUTTON_LABEL, LOOP_EMOJI_ID, LOOP_EMOJI_NAME, MSG_ALLOWED_URL_ONLY,
-        MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST, MSG_NO_TRACK_PLAYING, MSG_NOTHING_TO_SHUFFLE,
-        MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY, MSG_SHUFFLED, PLAY_COMMAND_DESCRIPTION,
-        PLAY_COMMAND_NAME, PLAY_COMMAND_URL_MAX_LENGTH, PLAY_COMMAND_URL_OPTION, SHUFFLE_EMOJI_ID,
-        SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
+        AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, BUTTON_AUTOMIX, BUTTON_LOOP, BUTTON_QUEUE,
+        BUTTON_SHUFFLE, BUTTON_SKIP, COLOR_ERROR, COLOR_INFO, INVITE_BUTTON_LABEL, LOOP_EMOJI_ID,
+        LOOP_EMOJI_NAME, MSG_ALLOWED_URL_ONLY, MSG_JOIN_ACTIVE_VOICE, MSG_JOIN_VOICE_FIRST,
+        MSG_NO_TRACK_PLAYING, MSG_PLAYING_IN_ANOTHER_VOICE, MSG_QUEUE_EMPTY,
+        PLAY_COMMAND_DESCRIPTION, PLAY_COMMAND_NAME, PLAY_COMMAND_URL_MAX_LENGTH,
+        PLAY_COMMAND_URL_OPTION, SHUFFLE_EMOJI_ID, SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID,
+        SKIP_EMOJI_NAME,
     },
     url::summarize_url_for_logs,
 };
@@ -54,6 +56,8 @@ const QUEUE_PREVIEW_LIMIT: usize = 10;
 const MAX_RESTART_NOTIFICATIONS: usize = 64;
 const RESTART_NOTIFICATION_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_RESTART_SNAPSHOTS: usize = 128;
+const PLAYER_PANEL_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYER_PANEL_NO_PLAYBACK_GRACE: Duration = Duration::from_secs(30);
 const EMBED_FIELD_LIMIT: usize = 1024;
 const EMBED_TITLE_LIMIT: usize = 180;
 const WOTOHA_INVITE_URL: &str =
@@ -64,6 +68,7 @@ const UPDATE_NOTICE_DESCRIPTION: &str =
 const MODE_NICKNAME_LOOP: &str = "🔁";
 const MODE_NICKNAME_SHUFFLE: &str = "🔀";
 const MODE_NICKNAME_AUTOMIX: &str = "🎧";
+const BOT_BASE_NICKNAME: &str = "音葉";
 const DISCORD_NICKNAME_MAX_CHARS: usize = 32;
 const BUILD_VERSION: &str = match option_env!("WOTOHA_BUILD_VERSION") {
     Some(version) => version,
@@ -93,6 +98,9 @@ pub struct DiscordGateway<P: PlaybackService, R: VoiceGatewayRuntime> {
     runtime: R,
     startup: Arc<StartupState>,
     notification_channels: Arc<DashMap<GuildKey, ChannelId>>,
+    player_panels: Arc<DashMap<GuildKey, GuildPlayerPanels>>,
+    player_panel_locks: Arc<DashMap<GuildKey, Arc<tokio::sync::Mutex<()>>>>,
+    player_panel_skip_pending: Arc<DashMap<GuildKey, PlaybackId>>,
     active_voice_channels: Arc<DashMap<GuildKey, ChannelKey>>,
     mode_nickname_states: Arc<DashMap<GuildKey, ModeNicknameState>>,
     reconnect_store: ReconnectStore,
@@ -103,6 +111,78 @@ struct ModeNicknameState {
     looping: bool,
     shuffle: bool,
     automix: bool,
+}
+
+#[derive(Clone)]
+struct PlayerPanelState {
+    channel_id: ChannelId,
+    message_id: MessageId,
+    request_id: TrackRequestId,
+    playback_id: Option<PlaybackId>,
+    requester: UserKey,
+    last_payload: Arc<tokio::sync::Mutex<String>>,
+}
+
+#[derive(Clone)]
+struct GuildPlayerPanels {
+    by_request_id: HashMap<TrackRequestId, PlayerPanelState>,
+    update_generation: Arc<()>,
+}
+
+impl GuildPlayerPanels {
+    fn new() -> Self {
+        Self {
+            by_request_id: HashMap::new(),
+            update_generation: Arc::new(()),
+        }
+    }
+}
+
+fn player_panel_no_playback_grace_expired(since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(since) >= PLAYER_PANEL_NO_PLAYBACK_GRACE
+}
+
+fn is_stale_player_panel_snapshot(
+    panel_playback_id: Option<PlaybackId>,
+    snapshot_playback_id: PlaybackId,
+) -> bool {
+    panel_playback_id.is_some_and(|panel_id| snapshot_playback_id < panel_id)
+}
+
+fn is_skipped_playback_snapshot(
+    skipped_playback_id: Option<PlaybackId>,
+    snapshot_playback_id: PlaybackId,
+) -> bool {
+    skipped_playback_id == Some(snapshot_playback_id)
+}
+
+fn player_panel_for_request(
+    panels: &GuildPlayerPanels,
+    request_id: TrackRequestId,
+) -> Option<PlayerPanelState> {
+    panels.by_request_id.get(&request_id).cloned()
+}
+
+fn register_player_panel(panels: &mut GuildPlayerPanels, panel: PlayerPanelState) {
+    panels.by_request_id.insert(panel.request_id, panel);
+}
+
+fn retain_live_player_panels(
+    panels: &mut GuildPlayerPanels,
+    live_request_ids: &HashSet<TrackRequestId>,
+) {
+    panels
+        .by_request_id
+        .retain(|request_id, _| live_request_ids.contains(request_id));
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlayerPanelUpdateResult {
+    Updated,
+    Unchanged,
+    NoPlayback,
+    RetryableFailure,
+    PermanentFailure(TrackRequestId),
 }
 
 #[derive(Default)]
@@ -117,6 +197,9 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             runtime,
             startup: Arc::default(),
             notification_channels: Arc::default(),
+            player_panels: Arc::default(),
+            player_panel_locks: Arc::default(),
+            player_panel_skip_pending: Arc::default(),
             active_voice_channels: Arc::default(),
             mode_nickname_states: Arc::default(),
             reconnect_store: ReconnectStore::from_env(),
@@ -134,7 +217,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         ctx: &Context,
         guild_id: serenity::all::GuildId,
         guild_key: GuildKey,
-        shuffle_action: bool,
+        shuffle_override: Option<bool>,
         looping_override: Option<bool>,
         automix_override: Option<bool>,
     ) {
@@ -146,19 +229,19 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         let state = match self.control.restart_snapshot(guild_key).await {
             Some(snapshot) => ModeNicknameState {
                 looping: snapshot.looping,
-                shuffle: previous.shuffle,
+                shuffle: self.control.shuffle_enabled(guild_key),
                 automix: snapshot.automix_enabled,
             },
             None => ModeNicknameState {
-                shuffle: previous.shuffle,
+                shuffle: self.control.shuffle_enabled(guild_key),
                 automix: self.control.automix_enabled(guild_key),
-                ..ModeNicknameState::default()
+                looping: previous.looping,
             },
         };
-        let mut state = ModeNicknameState {
-            shuffle: state.shuffle || shuffle_action,
-            ..state
-        };
+        let mut state = state;
+        if let Some(shuffle) = shuffle_override {
+            state.shuffle = shuffle;
+        }
         if let Some(looping) = looping_override {
             state.looping = looping;
         }
@@ -190,8 +273,7 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 return;
             }
         };
-        let base = member.nick.as_deref().unwrap_or(member.user.name.as_str());
-        let nickname = render_mode_nickname(base, state);
+        let nickname = render_mode_nickname(BOT_BASE_NICKNAME, state);
         if member.nick.as_deref() == Some(nickname.as_str()) {
             return;
         }
@@ -202,6 +284,388 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 error = %error,
                 "failed to update bot mode nickname"
             );
+        }
+    }
+
+    async fn reset_disconnected_guild(
+        &self,
+        ctx: &Context,
+        guild_id: serenity::all::GuildId,
+        guild_key: GuildKey,
+    ) {
+        self.mode_nickname_states.remove(&guild_key);
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        self.player_panels.remove(&guild_key);
+        self.player_panel_skip_pending.remove(&guild_key);
+        drop(_panel_guard);
+        self.control.disconnect_guild(guild_key).await;
+        self.apply_mode_nickname(ctx, guild_id, ModeNicknameState::default())
+            .await;
+    }
+
+    fn player_panel_lock(&self, guild_key: GuildKey) -> Arc<tokio::sync::Mutex<()>> {
+        self.player_panel_locks
+            .entry(guild_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn publish_player_panel(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        guild_key: GuildKey,
+        request: &TrackRequest,
+        requested_by: UserKey,
+    ) -> serenity::Result<()> {
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        let existing_panels = self
+            .player_panels
+            .get(&guild_key)
+            .map(|panel| panel.value().clone());
+        let should_start_updates = existing_panels.is_none();
+        let mut panels = existing_panels.unwrap_or_else(GuildPlayerPanels::new);
+        let snapshot = self
+            .control
+            .now_playing_snapshot(guild_key)
+            .await
+            .filter(|snapshot| snapshot.request_id == request.request_id);
+        let position = snapshot.as_ref().and_then(|snapshot| snapshot.position);
+        let playback_id = snapshot.as_ref().map(|snapshot| snapshot.playback_id);
+        let components = player_panel_components(
+            &request.metadata,
+            request.provider_id.as_ref(),
+            position,
+            Some(requested_by),
+        );
+        let last_payload = serde_json::to_string(&components).unwrap_or_default();
+        let message = command
+            .create_followup(&ctx.http, player_panel_followup(components))
+            .await?;
+        let request_panel = PlayerPanelState {
+            channel_id: message.channel_id,
+            message_id: message.id,
+            request_id: request.request_id,
+            playback_id,
+            requester: requested_by,
+            last_payload: Arc::new(tokio::sync::Mutex::new(last_payload)),
+        };
+        register_player_panel(&mut panels, request_panel);
+        let update_generation = panels.update_generation.clone();
+        self.player_panels.insert(guild_key, panels);
+        if should_start_updates {
+            self.start_player_panel_updates(ctx.clone(), guild_key, update_generation);
+        }
+        Ok(())
+    }
+
+    async fn publish_queued_track_response(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        guild_key: GuildKey,
+        request: &TrackRequest,
+        requested_by: UserKey,
+    ) -> serenity::Result<()> {
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        let existing_panels = self
+            .player_panels
+            .get(&guild_key)
+            .map(|panels| panels.value().clone());
+        let should_start_updates = existing_panels.is_none();
+        let mut panels = existing_panels.unwrap_or_else(GuildPlayerPanels::new);
+        let snapshot = self
+            .control
+            .now_playing_snapshot(guild_key)
+            .await
+            .filter(|snapshot| snapshot.request_id == request.request_id);
+        let components = player_panel_components(
+            &request.metadata,
+            request.provider_id.as_ref(),
+            snapshot.as_ref().and_then(|snapshot| snapshot.position),
+            Some(requested_by),
+        );
+        let last_payload = serde_json::to_string(&components).unwrap_or_default();
+        let message = command
+            .create_followup(&ctx.http, player_panel_followup(components))
+            .await?;
+        register_player_panel(
+            &mut panels,
+            PlayerPanelState {
+                channel_id: message.channel_id,
+                message_id: message.id,
+                request_id: request.request_id,
+                playback_id: snapshot.as_ref().map(|snapshot| snapshot.playback_id),
+                requester: requested_by,
+                last_payload: Arc::new(tokio::sync::Mutex::new(last_payload)),
+            },
+        );
+        let update_generation = panels.update_generation.clone();
+        self.player_panels.insert(guild_key, panels);
+        if should_start_updates {
+            self.start_player_panel_updates(ctx.clone(), guild_key, update_generation);
+        }
+        Ok(())
+    }
+
+    fn start_player_panel_updates(
+        &self,
+        ctx: Context,
+        guild_key: GuildKey,
+        update_generation: Arc<()>,
+    ) {
+        let gateway = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + PLAYER_PANEL_UPDATE_INTERVAL,
+                PLAYER_PANEL_UPDATE_INTERVAL,
+            );
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut no_playback_since = None;
+            let mut retry_backoff = Duration::from_secs(1);
+            let mut first_refresh = true;
+            loop {
+                ticker.tick().await;
+                if !gateway.has_player_panel_generation(guild_key, &update_generation) {
+                    return;
+                }
+                let result = gateway.refresh_player_panel(&ctx, guild_key).await;
+                if first_refresh {
+                    append_debug_log(format!(
+                        "discord: player panel updater first refresh guild_id={} result={result:?}",
+                        guild_key.get()
+                    ));
+                    first_refresh = false;
+                }
+                match result {
+                    PlayerPanelUpdateResult::Updated | PlayerPanelUpdateResult::Unchanged => {
+                        no_playback_since = None;
+                        retry_backoff = Duration::from_secs(1);
+                    }
+                    PlayerPanelUpdateResult::NoPlayback => {
+                        let pending_track = gateway.control.has_current_track(guild_key)
+                            || gateway
+                                .control
+                                .queue_preview(guild_key, 0)
+                                .is_some_and(|queue| queue.total_queued() > 0);
+                        if pending_track {
+                            no_playback_since = None;
+                            continue;
+                        }
+                        let since = no_playback_since.get_or_insert_with(Instant::now);
+                        if player_panel_no_playback_grace_expired(*since, Instant::now()) {
+                            gateway
+                                .remove_player_panel_generation(guild_key, &update_generation)
+                                .await;
+                            return;
+                        }
+                    }
+                    PlayerPanelUpdateResult::PermanentFailure(request_id) => {
+                        if gateway
+                            .remove_player_panel(guild_key, &update_generation, request_id)
+                            .await
+                        {
+                            return;
+                        }
+                    }
+                    PlayerPanelUpdateResult::RetryableFailure => {
+                        tokio::time::sleep(retry_backoff).await;
+                        retry_backoff =
+                            retry_backoff.saturating_mul(2).min(Duration::from_secs(30));
+                        ticker.reset();
+                    }
+                }
+            }
+        });
+    }
+
+    fn has_player_panel_generation(&self, guild_key: GuildKey, generation: &Arc<()>) -> bool {
+        self.player_panels
+            .get(&guild_key)
+            .is_some_and(|panels| Arc::ptr_eq(&panels.update_generation, generation))
+    }
+
+    async fn remove_player_panel_generation(&self, guild_key: GuildKey, generation: &Arc<()>) {
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        if self.has_player_panel_generation(guild_key, generation) {
+            self.player_panels.remove(&guild_key);
+        }
+    }
+
+    async fn remove_player_panel(
+        &self,
+        guild_key: GuildKey,
+        generation: &Arc<()>,
+        request_id: TrackRequestId,
+    ) -> bool {
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        let mut empty = false;
+        if let Some(mut panels) = self.player_panels.get_mut(&guild_key)
+            && Arc::ptr_eq(&panels.update_generation, generation)
+        {
+            panels.by_request_id.remove(&request_id);
+            empty = panels.by_request_id.is_empty();
+        }
+        if empty {
+            self.player_panels.remove(&guild_key);
+        }
+        empty
+    }
+
+    async fn refresh_player_panel(
+        &self,
+        ctx: &Context,
+        guild_key: GuildKey,
+    ) -> PlayerPanelUpdateResult {
+        self.refresh_player_panel_to(ctx, guild_key).await
+    }
+
+    async fn refresh_player_panel_to(
+        &self,
+        ctx: &Context,
+        guild_key: GuildKey,
+    ) -> PlayerPanelUpdateResult {
+        let panel_lock = self.player_panel_lock(guild_key);
+        let _panel_guard = panel_lock.lock().await;
+        let panels = self
+            .player_panels
+            .get(&guild_key)
+            .map(|panel| panel.value().clone());
+        let Some(snapshot) = self.control.now_playing_snapshot(guild_key).await else {
+            self.player_panel_skip_pending.remove(&guild_key);
+            return PlayerPanelUpdateResult::NoPlayback;
+        };
+        let skipped_playback_id = self
+            .player_panel_skip_pending
+            .get(&guild_key)
+            .map(|pending| *pending.value());
+        if is_skipped_playback_snapshot(skipped_playback_id, snapshot.playback_id) {
+            return PlayerPanelUpdateResult::Unchanged;
+        }
+        if skipped_playback_id.is_some() {
+            self.player_panel_skip_pending.remove(&guild_key);
+        }
+        let Some(panels) = panels else {
+            return PlayerPanelUpdateResult::Unchanged;
+        };
+
+        // Panel registrations can arrive out of order relative to playback
+        // transitions. Keep only the current and queued request identities;
+        // never let whichever Discord response completed last decide which
+        // song owns the update target.
+        let mut live_request_ids = HashSet::from([snapshot.request_id]);
+        if let Some(queue) = self.control.queue_preview(guild_key, usize::MAX) {
+            if let Some(current) = queue.current() {
+                live_request_ids.insert(current.request_id);
+            }
+            live_request_ids.extend(queue.upcoming().iter().map(|track| track.request_id));
+        }
+        if let Some(mut current) = self.player_panels.get_mut(&guild_key)
+            && Arc::ptr_eq(&current.update_generation, &panels.update_generation)
+        {
+            retain_live_player_panels(&mut current, &live_request_ids);
+        }
+
+        let Some(panel) = player_panel_for_request(&panels, snapshot.request_id) else {
+            return PlayerPanelUpdateResult::Unchanged;
+        };
+        if panel.request_id != snapshot.request_id {
+            return PlayerPanelUpdateResult::Unchanged;
+        }
+        if is_stale_player_panel_snapshot(panel.playback_id, snapshot.playback_id) {
+            return PlayerPanelUpdateResult::Unchanged;
+        }
+
+        // A skip or automatic transition may complete while the first
+        // snapshot is being rendered. Recheck immediately before editing so
+        // an outgoing card is not advanced using the next track's state.
+        let Some(latest_snapshot) = self.control.now_playing_snapshot(guild_key).await else {
+            return PlayerPanelUpdateResult::NoPlayback;
+        };
+        if latest_snapshot.playback_id != snapshot.playback_id
+            || latest_snapshot.request_id != snapshot.request_id
+        {
+            return PlayerPanelUpdateResult::Unchanged;
+        }
+        let components = player_panel_components(
+            &snapshot.metadata,
+            snapshot.provider_id.as_ref(),
+            snapshot.position,
+            Some(panel.requester),
+        );
+        let result = self
+            .edit_player_panel(ctx, guild_key, &panel, components)
+            .await;
+        if matches!(
+            result,
+            PlayerPanelUpdateResult::PermanentFailure(_)
+                | PlayerPanelUpdateResult::RetryableFailure
+        ) {
+            return result;
+        }
+
+        if let Some(mut current) = self.player_panels.get_mut(&guild_key)
+            && Arc::ptr_eq(&current.update_generation, &panels.update_generation)
+            && let Some(current_panel) = current.by_request_id.get_mut(&snapshot.request_id)
+        {
+            current_panel.playback_id = Some(snapshot.playback_id);
+        }
+        result
+    }
+
+    async fn edit_player_panel(
+        &self,
+        ctx: &Context,
+        guild_key: GuildKey,
+        panel: &PlayerPanelState,
+        components: Vec<CreateComponentV2>,
+    ) -> PlayerPanelUpdateResult {
+        let serialized = serde_json::to_string(&components).unwrap_or_default();
+        let mut last_payload = panel.last_payload.lock().await;
+        if *last_payload == serialized {
+            return PlayerPanelUpdateResult::Unchanged;
+        }
+        match panel
+            .channel_id
+            .edit_message(
+                &ctx.http,
+                panel.message_id,
+                EditMessage::new()
+                    .allowed_mentions(CreateAllowedMentions::new())
+                    .components_v2(components),
+            )
+            .await
+        {
+            Ok(_) => {
+                *last_payload = serialized;
+                PlayerPanelUpdateResult::Updated
+            }
+            Err(error) => {
+                let permanent = matches!(
+                    &error,
+                    serenity::Error::Http(http_error)
+                        if http_error.status_code().is_some_and(|status| {
+                            (400..500).contains(&status.as_u16()) && status.as_u16() != 429
+                        })
+                );
+                let safe_error = sanitize_log_message(&error.to_string());
+                warn!(
+                    guild_id = guild_key.get(),
+                    message_id = panel.message_id.get(),
+                    error = safe_error.as_str(),
+                    "failed to refresh Components V2 player panel"
+                );
+                if permanent {
+                    PlayerPanelUpdateResult::PermanentFailure(panel.request_id)
+                } else {
+                    PlayerPanelUpdateResult::RetryableFailure
+                }
+            }
         }
     }
 
@@ -282,8 +746,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     if let Some(snapshot) = playback {
                         let mode_state = ModeNicknameState {
                             looping: snapshot.looping,
+                            shuffle: snapshot.shuffle_enabled,
                             automix: snapshot.automix_enabled,
-                            ..ModeNicknameState::default()
                         };
                         let restored = self
                             .control
@@ -299,6 +763,15 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                             self.apply_mode_nickname(ctx, serenity_guild_id, mode_state)
                                 .await;
                         }
+                    } else {
+                        self.mode_nickname_states
+                            .insert(guild_id, ModeNicknameState::default());
+                        self.apply_mode_nickname(
+                            ctx,
+                            serenity_guild_id,
+                            ModeNicknameState::default(),
+                        )
+                        .await;
                     }
                     info!(
                         guild_id = guild_id.get(),
@@ -416,7 +889,9 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
             }
         }
 
-        command.defer(&ctx.http).await?;
+        command
+            .create_response(&ctx.http, deferred_play_response())
+            .await?;
         operational_metrics().observe_interaction_ack(interaction_started.elapsed());
         let joined_now = match self
             .runtime
@@ -472,16 +947,28 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                     now_playing = outcome.now_playing,
                     "play command resolved successfully"
                 );
-                self.refresh_mode_nickname(ctx, guild_id, guild_key, false, None, None)
+                self.refresh_mode_nickname(ctx, guild_id, guild_key, None, None, None)
                     .await;
-                let response = CreateInteractionResponseFollowup::new()
-                    .embed(track_embed(
-                        &outcome.request.metadata,
-                        command.user.name.as_str(),
-                        command.user.avatar_url().as_deref(),
-                    ))
-                    .components(vec![player_action_row()]);
-                command.create_followup(&ctx.http, response).await?;
+                let requested_by = UserKey::new(command.user.id.get());
+                if outcome.now_playing {
+                    self.publish_player_panel(
+                        ctx,
+                        command,
+                        guild_key,
+                        &outcome.request,
+                        requested_by,
+                    )
+                    .await?;
+                } else {
+                    self.publish_queued_track_response(
+                        ctx,
+                        command,
+                        guild_key,
+                        &outcome.request,
+                        requested_by,
+                    )
+                    .await?;
+                }
             }
             Err(error) => {
                 let safe_error = sanitize_log_message(&error.to_string());
@@ -496,7 +983,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
                 if joined_now && !self.control.has_current_track(guild_key) {
                     self.active_voice_channels.remove(&guild_key);
                     self.record_active_voice_counts();
-                    self.control.disconnect_guild(guild_key).await;
+                    self.reset_disconnected_guild(ctx, guild_id, guild_key)
+                        .await;
                 }
                 command
                     .create_followup(
@@ -525,15 +1013,8 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         };
         let guild_key = GuildKey::new(guild_id.get());
 
-        let action = match component.data.custom_id.as_str() {
-            BUTTON_SKIP => ComponentAction::Skip,
-            BUTTON_LOOP => ComponentAction::Loop,
-            BUTTON_SHUFFLE => ComponentAction::Shuffle,
-            BUTTON_AUTOMIX => ComponentAction::AutoMix,
-            BUTTON_QUEUE => ComponentAction::Queue {
-                limit: QUEUE_PREVIEW_LIMIT,
-            },
-            _ => return Ok(()),
+        let Some(action) = component_action(&component.data.custom_id) else {
+            return Ok(());
         };
         let actor_channel = self
             .user_voice_channel(ctx, guild_id, component.user.id)
@@ -545,53 +1026,69 @@ impl<P: PlaybackService, R: VoiceGatewayRuntime> DiscordGateway<P, R> {
         component.defer(&ctx.http).await?;
         operational_metrics().observe_interaction_ack(interaction_started.elapsed());
 
+        let skip_action = matches!(action, ComponentAction::Skip);
+        let panel_lock = skip_action.then(|| self.player_panel_lock(guild_key));
+        let _panel_guard = if let Some(panel_lock) = panel_lock.as_ref() {
+            Some(panel_lock.lock().await)
+        } else {
+            None
+        };
+        let skipped_playback_id = if skip_action {
+            self.control
+                .now_playing_snapshot(guild_key)
+                .await
+                .map(|snapshot| snapshot.playback_id)
+        } else {
+            None
+        };
         let outcome = self
             .control
             .handle_component(guild_key, actor_channel, action)
             .await;
+        if matches!(&outcome, ComponentOutcome::Skip { .. })
+            && let Some(playback_id) = skipped_playback_id
+        {
+            self.player_panel_skip_pending
+                .insert(guild_key, playback_id);
+        }
+        drop(_panel_guard);
 
         let mode_update = match &outcome {
-            ComponentOutcome::Skip { .. } => Some((false, Some(false), None)),
-            ComponentOutcome::Loop { enabled } => Some((false, Some(*enabled), None)),
-            ComponentOutcome::Shuffle => Some((true, None, None)),
-            ComponentOutcome::AutoMix { enabled } => Some((false, None, Some(*enabled))),
+            ComponentOutcome::Skip { .. } => Some((None, Some(false), None)),
+            ComponentOutcome::Loop { enabled } => Some((None, Some(*enabled), None)),
+            ComponentOutcome::Shuffle { enabled } => Some((Some(*enabled), None, None)),
+            ComponentOutcome::AutoMix { enabled } => Some((None, None, Some(*enabled))),
             _ => None,
         };
-        if let Some((shuffle_action, looping_override, automix_override)) = mode_update {
+        if let Some((shuffle_override, looping_override, automix_override)) = mode_update {
             self.refresh_mode_nickname(
                 ctx,
                 guild_id,
                 guild_key,
-                shuffle_action,
+                shuffle_override,
                 looping_override,
                 automix_override,
             )
             .await;
         }
 
+        if matches!(
+            &outcome,
+            ComponentOutcome::Loop { .. }
+                | ComponentOutcome::Shuffle { .. }
+                | ComponentOutcome::AutoMix { .. }
+        ) {
+            let result = self.refresh_player_panel(ctx, guild_key).await;
+            append_debug_log(format!(
+                "discord: player panel interaction refresh guild_id={} result={result:?}",
+                guild_key.get()
+            ));
+        }
+
         match outcome {
             ComponentOutcome::Skip { .. } => {}
             ComponentOutcome::Loop { .. } => {}
-            ComponentOutcome::Shuffle => {
-                component
-                    .create_followup(
-                        &ctx.http,
-                        CreateInteractionResponseFollowup::new()
-                            .flags(MessageFlags::EPHEMERAL)
-                            .embed(info_embed(MSG_SHUFFLED)),
-                    )
-                    .await?;
-            }
-            ComponentOutcome::NothingToShuffle => {
-                component
-                    .create_followup(
-                        &ctx.http,
-                        CreateInteractionResponseFollowup::new()
-                            .flags(MessageFlags::EPHEMERAL)
-                            .embed(error_embed(MSG_NOTHING_TO_SHUFFLE)),
-                    )
-                    .await?;
-            }
+            ComponentOutcome::Shuffle { .. } => {}
             ComponentOutcome::AutoMix { .. } => {}
             ComponentOutcome::QueuePreview(preview) => {
                 component
@@ -687,7 +1184,7 @@ fn render_mode_nickname(base: &str, state: ModeNicknameState) -> String {
     if state.looping {
         indicators.push(MODE_NICKNAME_LOOP);
     }
-    if state.shuffle {
+    if state.shuffle && !state.looping {
         indicators.push(MODE_NICKNAME_SHUFFLE);
     }
     if state.automix {
@@ -828,6 +1325,8 @@ where
                     self.active_voice_channels.remove(&guild_key);
                     self.record_active_voice_counts();
                     self.notification_channels.remove(&guild_key);
+                    self.reset_disconnected_guild(&ctx, guild_id, guild_key)
+                        .await;
                 }
             }
             return;
@@ -846,7 +1345,9 @@ where
 
         self.active_voice_channels.remove(&guild_key);
         self.record_active_voice_counts();
-        self.control.disconnect_guild(guild_key).await;
+        self.notification_channels.remove(&guild_key);
+        self.reset_disconnected_guild(&ctx, guild_id, guild_key)
+            .await;
     }
 
     async fn voice_server_update(&self, _ctx: Context, event: VoiceServerUpdateEvent) {
@@ -936,10 +1437,28 @@ fn error_embed(message: &str) -> CreateEmbed {
         .color(Colour::new(COLOR_ERROR))
 }
 
-fn info_embed(message: &str) -> CreateEmbed {
-    CreateEmbed::new()
-        .description(message)
-        .color(Colour::new(COLOR_INFO))
+fn component_action(custom_id: &str) -> Option<ComponentAction> {
+    match custom_id {
+        BUTTON_SKIP => Some(ComponentAction::Skip),
+        BUTTON_LOOP => Some(ComponentAction::Loop),
+        BUTTON_SHUFFLE => Some(ComponentAction::Shuffle),
+        BUTTON_AUTOMIX => Some(ComponentAction::AutoMix),
+        BUTTON_QUEUE => Some(ComponentAction::Queue {
+            limit: QUEUE_PREVIEW_LIMIT,
+        }),
+        _ => None,
+    }
+}
+
+fn deferred_play_response() -> CreateInteractionResponse {
+    CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new())
+}
+
+fn player_panel_followup(components: Vec<CreateComponentV2>) -> CreateInteractionResponseFollowup {
+    CreateInteractionResponseFollowup::new()
+        .flags(MessageFlags::IS_COMPONENTS_V2)
+        .allowed_mentions(CreateAllowedMentions::new())
+        .components_v2(components)
 }
 
 fn update_restart_embed() -> CreateEmbed {
@@ -964,35 +1483,194 @@ fn playback_failure_message(kind: Option<PlaybackFailureKind>) -> &'static str {
     }
 }
 
-fn track_embed(
+fn player_panel_components(
     metadata: &TrackMetadata,
-    requested_by: &str,
-    avatar_url: Option<&str>,
-) -> CreateEmbed {
-    let title = truncate_embed_text(&sanitize_display_text(metadata.title.as_ref()), 256);
-    let author = truncate_embed_text(&sanitize_display_text(metadata.author.as_ref()), 256);
-    let uri = public_display_url(metadata.uri.as_ref());
-    let mut embed = CreateEmbed::new()
-        .color(Colour::new(COLOR_INFO))
-        .author(CreateEmbedAuthor::new(author))
-        .title(title)
-        .field("Time", ui::format_duration(metadata.duration), true)
-        .footer(match avatar_url {
-            Some(icon_url) => CreateEmbedFooter::new(format!("Requested by {requested_by}"))
-                .icon_url(icon_url.to_owned()),
-            None => CreateEmbedFooter::new(format!("Requested by {requested_by}")),
-        });
-
-    if let Some(uri) = uri {
-        embed = embed.url(uri);
-    }
-    if let Some(thumbnail_url) = &metadata.thumbnail_url
-        && let Some(uri) = safe_thumbnail_url(thumbnail_url.as_ref())
+    provider_id: &str,
+    position: Option<Duration>,
+    requested_by: Option<UserKey>,
+) -> Vec<CreateComponentV2> {
+    let title = escape_markdown(&single_line(&metadata.title, 256));
+    let artist = escape_markdown(&single_line(&metadata.author, 256));
+    let provider = provider_display_name(provider_id, metadata.uri.as_ref());
+    let title_text = match public_display_url(metadata.uri.as_ref()) {
+        Some(uri) => format!("**[{title}]({uri})**"),
+        None => format!("**{title}**"),
+    };
+    let track_text = vec![
+        CreateComponentV2::text_display(format!("**{provider}**")),
+        CreateComponentV2::text_display(title_text),
+        CreateComponentV2::text_display(artist),
+    ];
+    let track_section = if let Some(thumbnail_url) = metadata
+        .thumbnail_url
+        .as_deref()
+        .and_then(safe_thumbnail_url)
     {
-        embed = embed.thumbnail(uri);
-    }
+        CreateComponentV2::section(
+            track_text,
+            CreateSectionAccessory::thumbnail(thumbnail_url, Some(title)),
+        )
+    } else {
+        CreateComponentV2::text_display(format!(
+            "**{provider}**\n{}\n{}",
+            match public_display_url(metadata.uri.as_ref()) {
+                Some(uri) => format!("**[{title}]({uri})**"),
+                None => format!("**{title}**"),
+            },
+            escape_markdown(&single_line(&metadata.author, 256)),
+        ))
+    };
 
-    embed
+    let components = vec![
+        track_section,
+        CreateComponentV2::text_display(format_player_progress(position, metadata.duration)),
+        CreateComponentV2::text_display(format!(
+            "Requested by {}",
+            requested_by.map_or_else(|| "不明".to_owned(), |user| format!("<@{}>", user.get())),
+        )),
+        CreateComponentV2::separator(true, 1),
+        player_action_row(),
+    ];
+
+    vec![CreateComponentV2::container_with_accent(
+        components, COLOR_INFO,
+    )]
+}
+
+#[cfg(test)]
+fn queued_track_panel_components(
+    request: &TrackRequest,
+    requested_by: UserKey,
+) -> Vec<CreateComponentV2> {
+    player_panel_components(
+        &request.metadata,
+        request.provider_id.as_ref(),
+        None,
+        Some(requested_by),
+    )
+}
+
+fn player_action_row() -> CreateComponentV2 {
+    CreateComponentV2::action_row(CreateActionRow::Buttons(vec![
+        player_icon_button(
+            BUTTON_SKIP,
+            ButtonStyle::Secondary,
+            SKIP_EMOJI_NAME,
+            SKIP_EMOJI_ID,
+        ),
+        player_icon_button(
+            BUTTON_LOOP,
+            ButtonStyle::Secondary,
+            LOOP_EMOJI_NAME,
+            LOOP_EMOJI_ID,
+        ),
+        player_icon_button(
+            BUTTON_SHUFFLE,
+            ButtonStyle::Secondary,
+            SHUFFLE_EMOJI_NAME,
+            SHUFFLE_EMOJI_ID,
+        ),
+        player_icon_button(
+            BUTTON_AUTOMIX,
+            ButtonStyle::Secondary,
+            AUTOMIX_EMOJI_NAME,
+            AUTOMIX_EMOJI_ID,
+        )
+        .label("AutoMix"),
+        player_link_button(WOTOHA_INVITE_URL, INVITE_BUTTON_LABEL),
+    ]))
+}
+
+fn provider_display_name(provider_id: &str, track_uri: &str) -> &'static str {
+    match provider_id.to_ascii_lowercase().as_str() {
+        "youtube" => "YouTube",
+        "soundcloud" => "SoundCloud",
+        "niconico" => "Niconico",
+        "x" => "X",
+        _ => {
+            let host = url::Url::parse(track_uri)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+            match host.as_deref() {
+                Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be") => "YouTube",
+                Some("soundcloud.com" | "www.soundcloud.com") => "SoundCloud",
+                Some("open.spotify.com") => "Spotify",
+                Some("nicovideo.jp" | "www.nicovideo.jp") => "Niconico",
+                Some("x.com" | "www.x.com") => "X",
+                _ => "Audio source",
+            }
+        }
+    }
+}
+
+const PLAYER_PROGRESS_BAR_WIDTH: usize = 19;
+
+fn format_player_progress(position: Option<Duration>, duration: Option<Duration>) -> String {
+    let Some(duration) = duration else {
+        return position.map_or_else(
+            || "再生時間不明".to_owned(),
+            |position| format!("`{}` · 時間不明", format_player_clock(position)),
+        );
+    };
+    if duration.is_zero() {
+        return position.map_or_else(
+            || "再生時間不明".to_owned(),
+            |position| format!("`{}` · 時間不明", format_player_clock(position)),
+        );
+    }
+    let position = position.map(|position| position.min(duration));
+    let bar = match position {
+        Some(position) => {
+            let ratio = (position.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+            let cursor = (ratio * (PLAYER_PROGRESS_BAR_WIDTH - 1) as f64).round() as usize;
+            (0..PLAYER_PROGRESS_BAR_WIDTH)
+                .map(|index| {
+                    if index == cursor {
+                        '●'
+                    } else if index < cursor {
+                        '━'
+                    } else {
+                        '─'
+                    }
+                })
+                .collect::<String>()
+        }
+        None => "─".repeat(PLAYER_PROGRESS_BAR_WIDTH),
+    };
+    let elapsed = position.map_or_else(|| "--:--".to_owned(), format_player_clock);
+    format!("`{elapsed}` {bar} `{}`", format_player_clock(duration))
+}
+
+fn format_player_clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    if minutes >= 60 {
+        format!("{}:{:02}:{remainder:02}", minutes / 60, minutes % 60)
+    } else {
+        format!("{minutes}:{remainder:02}")
+    }
+}
+
+fn single_line(text: &str, max_len: usize) -> String {
+    truncate_embed_text(
+        &sanitize_display_text(text).replace(['\n', '\r'], " "),
+        max_len,
+    )
+}
+
+fn escape_markdown(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(
+            character,
+            '\\' | '*' | '_' | '~' | '`' | '|' | '>' | '[' | ']'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn queue_embed(preview: &QueuePreview) -> CreateEmbed {
@@ -1120,49 +1798,8 @@ fn is_tracking_query_key(key: &str) -> bool {
     key == "fbclid" || key == "gclid" || key == "si" || key == "feature" || key.starts_with("utm_")
 }
 
-fn player_action_row() -> CreateActionRow {
-    CreateActionRow::Buttons(vec![
-        player_icon_button(
-            BUTTON_SKIP,
-            ButtonStyle::Secondary,
-            SKIP_EMOJI_NAME,
-            SKIP_EMOJI_ID,
-        ),
-        player_icon_button(
-            BUTTON_LOOP,
-            ButtonStyle::Secondary,
-            LOOP_EMOJI_NAME,
-            LOOP_EMOJI_ID,
-        ),
-        player_icon_button(
-            BUTTON_SHUFFLE,
-            ButtonStyle::Secondary,
-            SHUFFLE_EMOJI_NAME,
-            SHUFFLE_EMOJI_ID,
-        ),
-        player_button(
-            BUTTON_AUTOMIX,
-            BUTTON_AUTOMIX_LABEL,
-            ButtonStyle::Secondary,
-            AUTOMIX_EMOJI_NAME,
-            AUTOMIX_EMOJI_ID,
-        ),
-        player_link_button(WOTOHA_INVITE_URL, INVITE_BUTTON_LABEL),
-    ])
-}
-
 fn player_link_button(url: &str, label: &str) -> CreateButton {
     CreateButton::new_link(url).label(label)
-}
-
-fn player_button(
-    custom_id: &str,
-    label: &str,
-    style: ButtonStyle,
-    emoji_name: &str,
-    emoji_id: u64,
-) -> CreateButton {
-    player_button_base(custom_id, style, emoji_name, emoji_id).label(label)
 }
 
 fn player_icon_button(
@@ -1191,16 +1828,28 @@ fn player_button_base(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashSet, sync::Arc, time::Instant};
+
     use super::{
-        BUILD_VERSION, BUTTON_AUTOMIX_LABEL, DISCORD_NICKNAME_MAX_CHARS, EMBED_FIELD_LIMIT,
-        INVITE_BUTTON_LABEL, ModeNicknameState, WOTOHA_INVITE_URL, matches_play_option,
-        play_command, player_action_row, public_display_url, queue_lines, render_mode_nickname,
-        safe_thumbnail_url, track_embed, truncate_embed_text, version_activity,
+        BOT_BASE_NICKNAME, BUILD_VERSION, DISCORD_NICKNAME_MAX_CHARS, EMBED_FIELD_LIMIT,
+        GuildPlayerPanels, INVITE_BUTTON_LABEL, ModeNicknameState, PLAYER_PROGRESS_BAR_WIDTH,
+        PlayerPanelState, component_action, deferred_play_response, escape_markdown,
+        format_player_progress, is_skipped_playback_snapshot, is_stale_player_panel_snapshot,
+        matches_play_option, play_command, player_action_row, player_panel_components,
+        player_panel_followup, player_panel_for_request, player_panel_no_playback_grace_expired,
+        public_display_url, queue_lines, queued_track_panel_components, register_player_panel,
+        render_mode_nickname, retain_live_player_panels, safe_thumbnail_url, truncate_embed_text,
+        version_activity,
     };
-    use serenity::all::ActivityType;
+    use serenity::all::{
+        ActivityType, ChannelId, CreateAllowedMentions, EditMessage, MessageFlags, MessageId,
+    };
+    use wotoha_contracts::{PlaybackId, UserKey};
+    use wotoha_control::ComponentAction;
     use wotoha_core::ui::{
-        LOOP_EMOJI_ID, LOOP_EMOJI_NAME, SHUFFLE_EMOJI_ID, SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID,
-        SKIP_EMOJI_NAME,
+        AUTOMIX_EMOJI_ID, AUTOMIX_EMOJI_NAME, BUTTON_AUTOMIX, BUTTON_LOOP, BUTTON_QUEUE,
+        BUTTON_SHUFFLE, BUTTON_SKIP, LOOP_EMOJI_ID, LOOP_EMOJI_NAME, SHUFFLE_EMOJI_ID,
+        SHUFFLE_EMOJI_NAME, SKIP_EMOJI_ID, SKIP_EMOJI_NAME,
     };
     use wotoha_core::{GuildPlayerState, PreparedSource, TrackMetadata, TrackRequest};
 
@@ -1260,69 +1909,446 @@ mod tests {
     }
 
     #[test]
-    fn track_embed_keeps_only_the_time_field() {
+    fn player_message_uses_components_v2_without_embeds_or_legacy_content() {
         let metadata = TrackMetadata::new(
             "title",
             "artist",
-            "https://example.com/track",
-            None,
-            Some(std::time::Duration::from_secs(90)),
+            "https://www.youtube.com/watch?v=abc",
+            Some("https://cdn.example.test/thumb.jpg".into()),
+            Some(std::time::Duration::from_secs(198)),
         );
-        let payload = serde_json::to_value(track_embed(&metadata, "listener", None))
-            .expect("embed serializes");
-        let fields = payload["fields"].as_array().expect("embed fields");
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0]["name"], "Time");
-        assert_eq!(fields[0]["inline"], true);
-        assert!(!payload.to_string().contains(WOTOHA_INVITE_URL));
+        let components = player_panel_components(
+            &metadata,
+            "youtube",
+            Some(std::time::Duration::from_secs(55)),
+            Some(UserKey::new(123_456_789_012_345_678)),
+        );
+        let payload = serde_json::to_value(player_panel_followup(components))
+            .expect("Components V2 followup serializes");
+
+        assert_eq!(payload["flags"], MessageFlags::IS_COMPONENTS_V2.bits());
+        assert_eq!(
+            payload["flags"].as_u64().unwrap() & MessageFlags::EPHEMERAL.bits(),
+            0
+        );
+        assert!(payload.get("content").is_none());
+        assert!(payload.get("embeds").is_none());
+        assert!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            payload["allowed_mentions"]["users"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            payload["allowed_mentions"]["roles"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        let container = &payload["components"][0];
+        assert_eq!(container["type"], 17);
+        let track_section = &container["components"][0];
+        assert_eq!(track_section["type"], 9);
+        assert_eq!(
+            track_section["components"].as_array().map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(track_section["components"][0]["content"], "**YouTube**");
+        assert_eq!(track_section["accessory"]["type"], 11);
+        assert_eq!(
+            track_section["accessory"]["media"]["url"],
+            "https://cdn.example.test/thumb.jpg"
+        );
+        assert!(
+            payload
+                .to_string()
+                .contains("`0:55` ━━━━━●───────────── `3:18`")
+        );
+        assert!(
+            payload
+                .to_string()
+                .contains("Requested by <@123456789012345678>")
+        );
     }
 
     #[test]
-    fn player_action_row_keeps_the_five_existing_buttons() {
-        let payload = serde_json::to_value(player_action_row()).expect("buttons serialize");
-        assert_eq!(payload["components"].as_array().map(Vec::len), Some(5));
+    fn queued_track_response_renders_the_queued_item_as_a_static_panel() {
+        let request = track("queued song".to_owned(), 0);
+        let payload = serde_json::to_string(&queued_track_panel_components(
+            &request,
+            UserKey::new(123_456_789_012_345_678),
+        ))
+        .expect("queued player components serialize");
+
+        assert!(payload.contains("**queued song**"));
+        assert!(payload.contains("Requested by <@123456789012345678>"));
+        assert!(!payload.contains("AutoMix **"));
+        assert!(payload.contains("再生時間不明"));
     }
 
     #[test]
-    fn player_action_row_keeps_existing_controls_and_uses_invite_link() {
-        let payload = serde_json::to_value(player_action_row()).expect("buttons serialize");
-        let expected = [
-            (SKIP_EMOJI_NAME, SKIP_EMOJI_ID),
-            (LOOP_EMOJI_NAME, LOOP_EMOJI_ID),
-            (SHUFFLE_EMOJI_NAME, SHUFFLE_EMOJI_ID),
-        ];
+    fn player_panel_survives_the_track_change_snapshot_gap() {
+        let now = Instant::now();
+        assert!(!player_panel_no_playback_grace_expired(
+            now,
+            now + std::time::Duration::from_secs(29)
+        ));
+        assert!(player_panel_no_playback_grace_expired(
+            now,
+            now + std::time::Duration::from_secs(30)
+        ));
+    }
 
-        for (index, (name, id)) in expected.into_iter().enumerate() {
-            let emoji = &payload["components"][index]["emoji"];
-            let label = payload["components"][index].get("label");
-            assert!(label.is_none() || label.is_some_and(serde_json::Value::is_null));
-            assert_eq!(emoji["name"], name);
-            assert_eq!(emoji["id"], id.to_string());
-            assert_eq!(emoji["animated"], false);
+    #[test]
+    fn older_playback_snapshot_cannot_rewrite_the_active_panel() {
+        assert!(is_stale_player_panel_snapshot(
+            Some(PlaybackId::new(12)),
+            PlaybackId::new(11),
+        ));
+        assert!(!is_stale_player_panel_snapshot(
+            Some(PlaybackId::new(12)),
+            PlaybackId::new(12),
+        ));
+        assert!(!is_stale_player_panel_snapshot(
+            Some(PlaybackId::new(12)),
+            PlaybackId::new(13),
+        ));
+    }
+
+    #[test]
+    fn skipped_track_panel_freezes_until_playback_identity_changes() {
+        let skipped = PlaybackId::new(21);
+        assert!(is_skipped_playback_snapshot(Some(skipped), skipped));
+        assert!(!is_skipped_playback_snapshot(
+            Some(skipped),
+            PlaybackId::new(22)
+        ));
+        assert!(!is_skipped_playback_snapshot(None, skipped));
+    }
+
+    #[test]
+    fn each_track_request_routes_updates_to_its_own_panel() {
+        let first = track("first song".to_owned(), 1);
+        let second = track("second song".to_owned(), 2);
+        let mut panels = GuildPlayerPanels::new();
+        // Simulate Discord follow-up responses completing in reverse order.
+        for (request, message_id) in [(&second, 202), (&first, 101)] {
+            register_player_panel(
+                &mut panels,
+                PlayerPanelState {
+                    channel_id: ChannelId::new(10),
+                    message_id: MessageId::new(message_id),
+                    request_id: request.request_id,
+                    playback_id: None,
+                    requester: UserKey::new(123),
+                    last_payload: Arc::new(tokio::sync::Mutex::new(String::new())),
+                },
+            );
         }
 
-        assert_eq!(payload["components"][3]["label"], BUTTON_AUTOMIX_LABEL);
-        let invite = &payload["components"][4];
-        assert_eq!(invite["label"], INVITE_BUTTON_LABEL);
+        let selected = player_panel_for_request(&panels, second.request_id)
+            .expect("the second track has its own panel");
+
+        assert_eq!(selected.message_id, MessageId::new(202));
+        assert!(panels.by_request_id.contains_key(&first.request_id));
+        assert_eq!(panels.by_request_id.len(), 2);
+    }
+
+    #[test]
+    fn stale_song_panels_are_pruned_without_reassigning_live_panels() {
+        let first = track("first song".to_owned(), 1);
+        let second = track("second song".to_owned(), 2);
+        let queued = track("queued song".to_owned(), 3);
+        let mut panels = GuildPlayerPanels::new();
+        for (request, message_id) in [(&first, 101), (&second, 202), (&queued, 303)] {
+            register_player_panel(
+                &mut panels,
+                PlayerPanelState {
+                    channel_id: ChannelId::new(10),
+                    message_id: MessageId::new(message_id),
+                    request_id: request.request_id,
+                    playback_id: None,
+                    requester: UserKey::new(123),
+                    last_payload: Arc::new(tokio::sync::Mutex::new(String::new())),
+                },
+            );
+        }
+
+        retain_live_player_panels(
+            &mut panels,
+            &HashSet::from([second.request_id, queued.request_id]),
+        );
+
+        assert!(player_panel_for_request(&panels, second.request_id).is_some());
+        assert!(player_panel_for_request(&panels, queued.request_id).is_some());
+        assert!(player_panel_for_request(&panels, first.request_id).is_none());
+        assert_eq!(panels.by_request_id.len(), 2);
+    }
+
+    #[test]
+    fn player_panel_omits_automix_status_text() {
+        let metadata = TrackMetadata::new("title", "artist", "https://example.com/a", None, None);
+        let payload = serde_json::to_string(&player_panel_components(
+            &metadata,
+            "direct",
+            None,
+            Some(UserKey::new(123_456_789_012_345_678)),
+        ))
+        .expect("panel serializes");
+
+        assert!(payload.contains("Requested by <@123456789012345678>"));
+        assert!(!payload.contains("AutoMix **"));
+    }
+
+    #[test]
+    fn player_action_row_has_four_controls_and_invite_next_to_automix() {
+        let payload = serde_json::to_value(player_action_row()).expect("controls serialize");
+        assert_eq!(payload["type"], 1);
+        let buttons = payload["components"].as_array().expect("button array");
+        assert_eq!(buttons.len(), 5);
+        let expected = [
+            (BUTTON_SKIP, SKIP_EMOJI_NAME, SKIP_EMOJI_ID),
+            (BUTTON_LOOP, LOOP_EMOJI_NAME, LOOP_EMOJI_ID),
+            (BUTTON_SHUFFLE, SHUFFLE_EMOJI_NAME, SHUFFLE_EMOJI_ID),
+            (BUTTON_AUTOMIX, AUTOMIX_EMOJI_NAME, AUTOMIX_EMOJI_ID),
+        ];
+        for (button, (custom_id, emoji_name, emoji_id)) in buttons.iter().take(4).zip(expected) {
+            assert_eq!(button["custom_id"], custom_id);
+            assert_eq!(button["emoji"]["name"], emoji_name);
+            assert_eq!(button["emoji"]["id"], emoji_id.to_string());
+        }
+        for button in buttons.iter().take(3) {
+            assert!(button.get("label").is_none());
+        }
+        assert_eq!(buttons[3]["label"], "AutoMix");
+        let invitation = &buttons[4];
+        assert_eq!(invitation["style"], 5);
+        assert_eq!(invitation["label"], INVITE_BUTTON_LABEL);
+        assert_eq!(
+            invitation["url"],
+            "https://discord.com/oauth2/authorize?client_id=1238488423208063107"
+        );
+        assert!(invitation.get("custom_id").is_none());
+        assert!(invitation.get("emoji").is_none());
+        assert!(matches!(
+            component_action(BUTTON_QUEUE),
+            Some(ComponentAction::Queue { .. })
+        ));
+    }
+
+    #[test]
+    fn player_panel_edit_keeps_components_v2_layout() {
+        let metadata = TrackMetadata::new("title", "artist", "https://example.com/a", None, None);
+        let components = player_panel_components(
+            &metadata,
+            "direct",
+            None,
+            Some(UserKey::new(123_456_789_012_345_678)),
+        );
+        let payload = serde_json::to_value(
+            EditMessage::new()
+                .allowed_mentions(CreateAllowedMentions::new())
+                .components_v2(components),
+        )
+        .expect("Components V2 message edit serializes");
+
+        assert!(payload.get("content").is_none());
+        assert!(payload.get("embeds").is_none());
+        assert!(
+            payload["allowed_mentions"]["parse"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+        assert_eq!(payload["components"][0]["type"], 17);
+        assert_eq!(payload["components"][0]["components"][0]["type"], 10);
+        assert_eq!(
+            payload["components"][0]["components"][2]["content"],
+            "Requested by <@123456789012345678>"
+        );
+        assert_eq!(payload["components"][0]["components"][3]["type"], 14);
+        assert_eq!(payload["components"][0]["components"][4]["type"], 1);
+    }
+
+    #[test]
+    fn player_panel_status_contains_only_the_requester() {
+        let metadata = TrackMetadata::new("title", "artist", "https://example.com/a", None, None);
+        let panel = serde_json::to_value(player_panel_components(
+            &metadata,
+            "direct",
+            Some(std::time::Duration::from_secs(4)),
+            Some(UserKey::new(123_456_789_012_345_678)),
+        ))
+        .expect("Components V2 player panel serializes");
+
+        assert_eq!(
+            panel[0]["components"][2]["content"],
+            "Requested by <@123456789012345678>"
+        );
+        assert!(!panel.to_string().contains("AutoMix **"));
+    }
+
+    #[test]
+    fn play_processing_uses_the_public_defer_from_the_previous_reply_flow() {
+        let payload = serde_json::to_value(deferred_play_response())
+            .expect("deferred interaction response serializes");
+        assert_eq!(payload["type"], 5);
+        assert!(payload["data"].get("flags").is_none());
+    }
+
+    #[test]
+    fn invitation_is_a_link_button_in_the_action_row_after_automix() {
+        let metadata = TrackMetadata::new("title", "artist", "https://example.com/a", None, None);
+        let payload = serde_json::to_value(player_panel_components(
+            &metadata,
+            "direct",
+            None,
+            Some(UserKey::new(123_456_789_012_345_678)),
+        ))
+        .expect("panel serializes");
+        let container = &payload[0]["components"];
+        let action_row = &container[4];
+        assert_eq!(action_row["type"], 1);
+        let invite = &action_row["components"][4];
+        assert_eq!(invite["type"], 2);
+        assert_eq!(invite["style"], 5);
+        assert_eq!(invite["label"], "招待");
+        assert_eq!(INVITE_BUTTON_LABEL, "招待");
         assert_eq!(
             invite["url"],
             "https://discord.com/oauth2/authorize?client_id=1238488423208063107"
         );
-        assert!(invite.get("emoji").is_none() || invite["emoji"].is_null());
+        assert!(invite.get("custom_id").is_none());
+        assert!(invite.get("emoji").is_none());
+        assert_eq!(
+            container[2]["content"],
+            "Requested by <@123456789012345678>"
+        );
+        assert!(matches!(
+            component_action(BUTTON_QUEUE),
+            Some(ComponentAction::Queue { .. })
+        ));
     }
 
     #[test]
-    fn mode_nickname_renders_all_active_indicators() {
+    fn progress_handles_unknown_live_and_long_durations() {
+        use std::time::Duration;
+
+        assert_eq!(format_player_progress(None, None), "再生時間不明");
+        assert_eq!(
+            format_player_progress(Some(Duration::from_secs(9)), None),
+            "`0:09` · 時間不明"
+        );
+        assert_eq!(
+            format_player_progress(
+                Some(Duration::from_secs(3661)),
+                Some(Duration::from_secs(7200))
+            ),
+            "`1:01:01` ━━━━━━━━━●───────── `2:00:00`"
+        );
+        assert_eq!(
+            format_player_progress(None, Some(Duration::from_secs(247))),
+            "`--:--` ─────────────────── `4:07`"
+        );
+        assert_eq!(
+            format_player_progress(
+                Some(Duration::from_secs(198)),
+                Some(Duration::from_secs(198))
+            ),
+            "`3:18` ━━━━━━━━━━━━━━━━━━● `3:18`"
+        );
+    }
+
+    #[test]
+    fn player_progress_clock_changes_every_second_and_bar_has_nineteen_glyphs() {
+        use std::time::Duration;
+
+        let first = format_player_progress(
+            Some(Duration::from_secs(55)),
+            Some(Duration::from_secs(247)),
+        );
+        let next = format_player_progress(
+            Some(Duration::from_secs(56)),
+            Some(Duration::from_secs(247)),
+        );
+        assert_ne!(first, next);
+        assert!(first.contains("`0:55`"));
+        assert!(next.contains("`0:56`"));
+        let bar = first.split(' ').nth(1).expect("progress bar");
+        assert_eq!(bar.chars().count(), PLAYER_PROGRESS_BAR_WIDTH);
+        assert_eq!(bar.chars().filter(|ch| *ch == '●').count(), 1);
+        assert!(bar.chars().all(|ch| matches!(ch, '━' | '●' | '─')));
+    }
+
+    #[test]
+    fn display_text_escapes_markdown_and_does_not_mutate_unknown_progress() {
+        assert_eq!(escape_markdown("*hello*"), "\\*hello\\*");
+        let metadata = TrackMetadata::new("live", "artist", "https://example.com/a", None, None);
+        let payload = serde_json::to_string(&player_panel_components(
+            &metadata,
+            "direct",
+            Some(std::time::Duration::from_secs(23)),
+            None,
+        ))
+        .expect("panel serializes");
+        assert!(payload.contains("`0:23` · 時間不明"));
+        assert!(payload.contains("Requested by 不明"));
+        assert!(!payload.contains("AutoMix **"));
+        assert!(!payload.contains("Now Playing"));
+        assert!(!payload.contains("Audio effects"));
+    }
+
+    #[test]
+    fn loop_and_shuffle_indicators_cannot_render_together() {
         let nickname = render_mode_nickname(
-            "音葉",
+            BOT_BASE_NICKNAME,
             ModeNicknameState {
                 looping: true,
+                shuffle: true,
+                automix: false,
+            },
+        );
+
+        assert_eq!(nickname, "音葉🔁");
+    }
+
+    #[test]
+    fn shuffle_and_automix_indicators_can_render_together() {
+        let nickname = render_mode_nickname(
+            BOT_BASE_NICKNAME,
+            ModeNicknameState {
+                looping: false,
                 shuffle: true,
                 automix: true,
             },
         );
 
-        assert_eq!(nickname, "音葉🔁🔀🎧");
+        assert_eq!(nickname, "音葉🔀🎧");
+    }
+
+    #[test]
+    fn disconnected_mode_uses_the_fixed_base_nickname() {
+        assert_eq!(
+            render_mode_nickname(BOT_BASE_NICKNAME, ModeNicknameState::default()),
+            "音葉"
+        );
+    }
+
+    #[test]
+    fn mode_nickname_states_render_independently_per_guild() {
+        let guild_a = ModeNicknameState {
+            looping: true,
+            ..ModeNicknameState::default()
+        };
+        let guild_b = ModeNicknameState {
+            shuffle: true,
+            ..ModeNicknameState::default()
+        };
+
+        assert_eq!(render_mode_nickname(BOT_BASE_NICKNAME, guild_a), "音葉🔁");
+        assert_eq!(render_mode_nickname(BOT_BASE_NICKNAME, guild_b), "音葉🔀");
     }
 
     #[test]

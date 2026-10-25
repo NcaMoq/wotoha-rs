@@ -18,10 +18,10 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, PlaybackFailureKind,
-    PlaybackId, PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink, RuntimeTrackHandle,
-    TrackStartOptions, TransitionArmResult, UserKey, VoiceActionAccess, VoiceGatewayEvent,
-    VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, NowPlayingSnapshot,
+    PlaybackFailureKind, PlaybackId, PlaybackRestartSnapshot, PlaybackService, RuntimeEventSink,
+    RuntimeTrackHandle, TrackStartOptions, TransitionArmResult, UserKey, VoiceActionAccess,
+    VoiceGatewayEvent, VoiceGatewayRuntime, VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
 };
 use wotoha_control::ControlService;
 use wotoha_core::{
@@ -730,6 +730,10 @@ where
         self.inner.queue_preview(guild_id, limit)
     }
 
+    async fn now_playing_snapshot(&self, guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+        self.inner.now_playing_snapshot(guild_id).await
+    }
+
     async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool> {
         self.inner.toggle_loop(guild_id).await
     }
@@ -742,8 +746,12 @@ where
         self.inner.has_current_track(guild_id)
     }
 
-    async fn shuffle(&self, guild_id: GuildKey) -> bool {
-        self.inner.shuffle(guild_id).await
+    async fn toggle_shuffle(&self, guild_id: GuildKey) -> Option<bool> {
+        self.inner.toggle_shuffle(guild_id).await
+    }
+
+    fn shuffle_enabled(&self, guild_id: GuildKey) -> bool {
+        self.inner.shuffle_enabled(guild_id)
     }
 
     fn automix_enabled(&self, guild_id: GuildKey) -> bool {
@@ -960,9 +968,9 @@ mod tests {
         time::Duration,
     };
     use wotoha_contracts::{
-        ChannelKey, EnqueueOutcome, GuildKey, PlaybackId, PlaybackService, RuntimeEventSink,
-        RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess, VoicePeerSnapshot,
-        VoiceRuntime, VoiceUpdateDecision,
+        ChannelKey, EnqueueOutcome, GuildKey, NowPlayingSnapshot, PlaybackId, PlaybackService,
+        RuntimeEventSink, RuntimeTrackHandle, TrackStartOptions, UserKey, VoiceActionAccess,
+        VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
     };
     use wotoha_core::{
         GuildPlayerState, PreparedSource, QueuePreview, TrackMetadata, TrackRequest,
@@ -973,6 +981,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct MockPlayback {
         queue_preview: Arc<Mutex<Option<QueuePreview>>>,
+        now_playing: Arc<Mutex<Option<NowPlayingSnapshot>>>,
         enqueue_calls: Arc<AtomicUsize>,
     }
 
@@ -1007,6 +1016,10 @@ mod tests {
             self.queue_preview.lock().unwrap().clone()
         }
 
+        async fn now_playing_snapshot(&self, _guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+            self.now_playing.lock().unwrap().clone()
+        }
+
         async fn toggle_loop(&self, _guild_id: GuildKey) -> Option<bool> {
             None
         }
@@ -1019,8 +1032,8 @@ mod tests {
             false
         }
 
-        async fn shuffle(&self, _guild_id: GuildKey) -> bool {
-            false
+        async fn toggle_shuffle(&self, _guild_id: GuildKey) -> Option<bool> {
+            None
         }
 
         async fn disconnect_guild(&self, _guild_id: GuildKey) {}
@@ -1191,6 +1204,25 @@ mod tests {
             Err(ConfiguredPlaybackError::QueueFull { .. })
         ));
         assert_eq!(inner.enqueue_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn configured_playback_forwards_now_playing_snapshot() {
+        let inner = MockPlayback::default();
+        let request = track_request("current");
+        let expected = NowPlayingSnapshot {
+            playback_id: PlaybackId::new(42),
+            request_id: request.request_id,
+            provider_id: Arc::from("youtube"),
+            metadata: request.metadata,
+            position: Some(Duration::from_secs(7)),
+        };
+        *inner.now_playing.lock().unwrap() = Some(expected.clone());
+        let playback = ConfiguredPlayback::new(inner, playback_config(8, 1));
+
+        let actual = playback.now_playing_snapshot(GuildKey::new(1)).await;
+
+        assert_eq!(actual, Some(expected));
     }
 
     #[test]

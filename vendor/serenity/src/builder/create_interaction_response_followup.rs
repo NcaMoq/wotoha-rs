@@ -5,8 +5,11 @@ use super::{
     CreateActionRow,
     CreateAllowedMentions,
     CreateAttachment,
+    CreateComponentV2,
     CreateEmbed,
+    CreateMessageComponent,
     CreatePoll,
+    CreateSelectMenu,
     EditAttachments,
 };
 #[cfg(feature = "http")]
@@ -27,11 +30,12 @@ pub struct CreateInteractionResponseFollowup {
     // [Omitting avatar_url: not supported in interaction followups]
     #[serde(skip_serializing_if = "Option::is_none")]
     tts: Option<bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     embeds: Vec<CreateEmbed>,
     #[serde(skip_serializing_if = "Option::is_none")]
     allowed_mentions: Option<CreateAllowedMentions>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    components: Option<Vec<CreateActionRow>>,
+    components: Option<Vec<CreateMessageComponent>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     flags: Option<MessageFlags>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,10 +172,55 @@ impl CreateInteractionResponseFollowup {
 
     /// Sets the components of this message.
     pub fn components(mut self, components: Vec<CreateActionRow>) -> Self {
-        self.components = Some(components);
+        self.components = Some(
+            components
+                .into_iter()
+                .map(CreateMessageComponent::ActionRow)
+                .collect(),
+        );
         self
     }
-    super::button_and_select_menu_convenience_methods!(self.components);
+
+    /// Sets Components V2 layout components on this message.
+    pub fn components_v2(mut self, components: Vec<CreateComponentV2>) -> Self {
+        self.components = Some(
+            components
+                .into_iter()
+                .map(CreateMessageComponent::V2)
+                .collect(),
+        );
+        self
+    }
+
+    /// Adds a clickable button, arranging it into a legacy action row.
+    pub fn button(mut self, button: super::CreateButton) -> Self {
+        let rows = self.components.get_or_insert_with(Vec::new);
+        let row = rows.last_mut().and_then(|component| match component {
+            CreateMessageComponent::ActionRow(CreateActionRow::Buttons(buttons))
+                if buttons.len() < 5 =>
+            {
+                Some(buttons)
+            },
+            _ => None,
+        });
+        match row {
+            Some(buttons) => buttons.push(button),
+            None => rows.push(CreateMessageComponent::ActionRow(CreateActionRow::Buttons(
+                vec![button],
+            ))),
+        }
+        self
+    }
+
+    /// Adds an interactive select menu in a legacy action row.
+    pub fn select_menu(mut self, select_menu: CreateSelectMenu) -> Self {
+        self.components
+            .get_or_insert_with(Vec::new)
+            .push(CreateMessageComponent::ActionRow(CreateActionRow::SelectMenu(
+                select_menu,
+            )));
+        self
+    }
 }
 
 #[cfg(feature = "http")]

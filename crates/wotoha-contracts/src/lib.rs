@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tracing::warn;
 use wotoha_core::{
-    QueuePreview, TrackRequest,
+    QueuePreview, TrackMetadata, TrackRequest, TrackRequestId,
     analysis::TrackAnalysisV2,
     automix::{EqTransition, TempoEnvelope, TrackAnalysis},
 };
@@ -46,6 +46,16 @@ runtime_key!(PlaybackId);
 pub struct EnqueueOutcome {
     pub now_playing: bool,
     pub request: TrackRequest,
+}
+
+/// Read-only state used to render the current player panel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NowPlayingSnapshot {
+    pub playback_id: PlaybackId,
+    pub request_id: TrackRequestId,
+    pub provider_id: Arc<str>,
+    pub metadata: TrackMetadata,
+    pub position: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -524,6 +534,7 @@ pub struct PlaybackRestartSnapshot {
     pub queued_source_urls: Vec<String>,
     pub position: Duration,
     pub looping: bool,
+    pub shuffle_enabled: bool,
     pub automix_enabled: bool,
 }
 
@@ -708,10 +719,16 @@ pub trait PlaybackService: Clone + Send + Sync + 'static {
     }
 
     fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview>;
+    async fn now_playing_snapshot(&self, _guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+        None
+    }
     async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool>;
     async fn skip(&self, guild_id: GuildKey) -> Option<bool>;
     fn has_current_track(&self, guild_id: GuildKey) -> bool;
-    async fn shuffle(&self, guild_id: GuildKey) -> bool;
+    async fn toggle_shuffle(&self, guild_id: GuildKey) -> Option<bool>;
+    fn shuffle_enabled(&self, _guild_id: GuildKey) -> bool {
+        false
+    }
     fn automix_enabled(&self, _guild_id: GuildKey) -> bool {
         false
     }

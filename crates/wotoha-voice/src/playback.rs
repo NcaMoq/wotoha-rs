@@ -19,10 +19,11 @@ use tokio::sync::{
 use tracing::{info, warn};
 use wotoha_contracts::{
     ChannelKey, EnqueueOutcome, FrameScheduledTransitionSupport, GuildKey, MediaBackend,
-    PlaybackFailureKind, PlaybackId, PlaybackRestartSnapshot, PlaybackRuntimeEvent,
-    PlaybackService, RuntimeEventReceiver, RuntimeEventSink, RuntimeTrackHandle, TrackEndReason,
-    TrackStartOptions, TransitionArmFailureKind, TransitionArmResult, UserKey, VoiceActionAccess,
-    VoicePeerSnapshot, VoiceRuntime, VoiceUpdateDecision,
+    NowPlayingSnapshot, PlaybackFailureKind, PlaybackId, PlaybackRestartSnapshot,
+    PlaybackRuntimeEvent, PlaybackService, RuntimeEventReceiver, RuntimeEventSink,
+    RuntimeTrackHandle, TrackEndReason, TrackStartOptions, TransitionArmFailureKind,
+    TransitionArmResult, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceRuntime,
+    VoiceUpdateDecision,
 };
 use wotoha_core::{
     GuildPlayerState, QueuePreview, TrackRequest,
@@ -735,9 +736,8 @@ where
                     .is_some_and(|current| track_analysis_key(current) == task_key);
                 let request_is_queued_candidate = playback
                     .logical
-                    .queue()
-                    .iter()
-                    .take(AUTOMIX_ANALYSIS_LOOKAHEAD)
+                    .upcoming_tracks(AUTOMIX_ANALYSIS_LOOKAHEAD)
+                    .into_iter()
                     .any(|queued| track_analysis_key(queued) == task_key);
                 if playback.automix_enabled
                     && (request_is_current || request_is_queued_candidate)
@@ -780,13 +780,7 @@ where
                 .logical
                 .current()
                 .into_iter()
-                .chain(
-                    playback
-                        .logical
-                        .queue()
-                        .iter()
-                        .take(AUTOMIX_ANALYSIS_LOOKAHEAD),
-                )
+                .chain(playback.logical.upcoming_tracks(AUTOMIX_ANALYSIS_LOOKAHEAD))
                 .cloned()
                 .collect::<Vec<_>>();
             let relevant_keys = requests
@@ -888,6 +882,7 @@ where
             .media
             .resolve(source_url)
             .await
+            .map(|request| request.with_fresh_request_id())
             .map_err(PlaybackError::Resolve);
         match &resolved {
             Ok(request) => append_debug_log(format!(
@@ -917,6 +912,36 @@ where
         let session = self.get_session(guild_id)?;
         let playback = session.playback.lock();
         Some(playback.logical.queue_preview(limit))
+    }
+
+    pub async fn now_playing_snapshot(&self, guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+        let session = self.get_session(guild_id)?;
+        let (playback_id, request, handle) = {
+            let playback = session.playback.lock();
+            (
+                playback.current_playback_id?,
+                playback.logical.current()?.clone(),
+                playback.active_handle.clone(),
+            )
+        };
+
+        let position = match handle {
+            Some(handle) => handle.position().await,
+            None => None,
+        };
+
+        let playback = session.playback.lock();
+        if playback.current_playback_id != Some(playback_id) {
+            return None;
+        }
+
+        Some(NowPlayingSnapshot {
+            playback_id,
+            request_id: request.request_id,
+            provider_id: request.provider_id,
+            metadata: request.metadata,
+            position,
+        })
     }
 
     pub async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool> {
@@ -978,27 +1003,26 @@ where
         playback.logical.current().is_some()
     }
 
-    pub async fn shuffle(&self, guild_id: GuildKey) -> bool {
-        let Some(session) = self.get_session(guild_id) else {
-            return false;
-        };
+    pub async fn toggle_shuffle(&self, guild_id: GuildKey) -> Option<bool> {
+        let session = self.get_session(guild_id)?;
 
         let _operation = session.operation.lock().await;
         let (shuffled, prepared) = {
             let mut playback = session.playback.lock();
-            let shuffled = playback.logical.shuffle();
-            let prepared = shuffled
-                .then(|| invalidate_prepared_transition(&mut playback))
-                .flatten();
+            let shuffled = playback.logical.toggle_shuffle();
+            let prepared = invalidate_prepared_transition(&mut playback);
             (shuffled, prepared)
         };
         if let Some(handle) = prepared {
             handle.stop();
         }
-        if shuffled {
-            self.spawn_relevant_analyses(guild_id, session.id);
-        }
-        shuffled
+        self.spawn_relevant_analyses(guild_id, session.id);
+        Some(shuffled)
+    }
+
+    pub fn shuffle_enabled(&self, guild_id: GuildKey) -> bool {
+        self.get_session(guild_id)
+            .is_some_and(|session| session.playback.lock().logical.is_shuffling())
     }
 
     pub async fn toggle_automix(&self, guild_id: GuildKey) -> Option<bool> {
@@ -1145,7 +1169,14 @@ where
 
     pub async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
         let session = self.get_session(guild_id)?;
-        let (handle, current_source_url, queued_source_urls, looping, automix_enabled) = {
+        let (
+            handle,
+            current_source_url,
+            queued_source_urls,
+            looping,
+            shuffle_enabled,
+            automix_enabled,
+        ) = {
             let playback = session.playback.lock();
             let current = playback.logical.current()?;
             (
@@ -1158,6 +1189,7 @@ where
                     .map(|track| track.source_url.to_string())
                     .collect(),
                 playback.logical.is_looping(),
+                playback.logical.is_shuffling(),
                 playback.automix_enabled,
             )
         };
@@ -1170,6 +1202,7 @@ where
                 .flatten()
                 .unwrap_or_default(),
             looping,
+            shuffle_enabled,
             automix_enabled,
         })
     }
@@ -1208,6 +1241,10 @@ where
                 playback.logical.disable_loop();
                 if snapshot.looping && !snapshot.automix_enabled {
                     playback.logical.toggle_loop();
+                } else {
+                    playback
+                        .logical
+                        .set_shuffle_enabled(snapshot.shuffle_enabled);
                 }
             }
             if snapshot.automix_enabled {
@@ -1714,7 +1751,7 @@ where
         };
 
         let mut prepared = match self.inner.media.prepare_playback(&next).await {
-            Ok(prepared) => prepared,
+            Ok(prepared) => prepared.with_request_id(next.request_id),
             Err(error) => {
                 warn!(guild_id = guild_id.get(), error = %error, "AutoMix failed to prefetch next track");
                 return;
@@ -2960,7 +2997,8 @@ where
             .media
             .prepare_playback(request)
             .await
-            .map_err(PlaybackError::Resolve)?;
+            .map_err(PlaybackError::Resolve)?
+            .with_request_id(request.request_id);
         operational_metrics().observe_media_resolve(media_started.elapsed());
         append_debug_log(format!(
             "voice: prepare_playback ok guild_id={} session_id={} provider={} key={} title={}",
@@ -3001,7 +3039,7 @@ where
                     );
                     match self.inner.media.prepare_playback_fresh(&prepared).await {
                         Ok(refreshed) if refreshed.prepared != prepared.prepared => {
-                            prepared = refreshed;
+                            prepared = refreshed.with_request_id(prepared.request_id);
                             continue;
                         }
                         Ok(_) => {
@@ -3184,7 +3222,9 @@ where
         *refresh_attempted = true;
 
         let refreshed = match self.inner.media.prepare_playback_fresh(prepared).await {
-            Ok(refreshed) if refreshed.prepared != prepared.prepared => refreshed,
+            Ok(refreshed) if refreshed.prepared != prepared.prepared => {
+                refreshed.with_request_id(prepared.request_id)
+            }
             Ok(_) => {
                 warn!(
                     guild_id = guild_id.get(),
@@ -3402,6 +3442,10 @@ where
         Self::queue_preview(self, guild_id, limit)
     }
 
+    async fn now_playing_snapshot(&self, guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+        Self::now_playing_snapshot(self, guild_id).await
+    }
+
     async fn toggle_loop(&self, guild_id: GuildKey) -> Option<bool> {
         Self::toggle_loop(self, guild_id).await
     }
@@ -3414,8 +3458,12 @@ where
         Self::has_current_track(self, guild_id)
     }
 
-    async fn shuffle(&self, guild_id: GuildKey) -> bool {
-        Self::shuffle(self, guild_id).await
+    async fn toggle_shuffle(&self, guild_id: GuildKey) -> Option<bool> {
+        Self::toggle_shuffle(self, guild_id).await
+    }
+
+    fn shuffle_enabled(&self, guild_id: GuildKey) -> bool {
+        Self::shuffle_enabled(self, guild_id)
     }
 
     fn automix_enabled(&self, guild_id: GuildKey) -> bool {
@@ -4563,6 +4611,26 @@ mod tests {
         assert!(playback.automix_enabled(GuildKey::new(1)));
         assert_eq!(playback.toggle_loop(GuildKey::new(1)).await, Some(true));
         assert!(!playback.automix_enabled(GuildKey::new(1)));
+    }
+
+    #[tokio::test]
+    async fn repeated_queue_entries_get_distinct_ids_and_snapshot_keeps_current_id() {
+        let guild_id = GuildKey::new(199);
+        let media = MockMedia::default();
+        let playback = PlaybackCoordinator::new(media.clone(), MockRuntime::default());
+        media.resolve_with("same-track", Ok(track_request("same-track")));
+
+        let first = playback.enqueue_impl(guild_id, "same-track").await.unwrap();
+        let second = playback.enqueue_impl(guild_id, "same-track").await.unwrap();
+        let snapshot = playback
+            .now_playing_snapshot(guild_id)
+            .await
+            .expect("first queue entry remains current");
+
+        assert!(first.now_playing);
+        assert!(!second.now_playing);
+        assert_ne!(first.request.request_id, second.request.request_id);
+        assert_eq!(snapshot.request_id, first.request.request_id);
     }
 
     #[tokio::test]
@@ -7466,5 +7534,61 @@ mod tests {
             "restored-second"
         );
         assert_eq!(restored.toggle_loop(guild_id).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn shuffle_state_is_per_guild_and_disconnect_clears_only_that_guild() {
+        let guild_a = GuildKey::new(201);
+        let guild_b = GuildKey::new(202);
+        let media = MockMedia::default();
+        media.resolve_with("guild-a", Ok(track_request("guild-a")));
+        media.resolve_with("guild-b", Ok(track_request("guild-b")));
+        let playback = PlaybackCoordinator::new(media, MockRuntime::default());
+
+        playback.enqueue_impl(guild_a, "guild-a").await.unwrap();
+        playback.enqueue_impl(guild_b, "guild-b").await.unwrap();
+        assert_eq!(playback.toggle_shuffle(guild_a).await, Some(true));
+
+        assert!(playback.shuffle_enabled(guild_a));
+        assert!(!playback.shuffle_enabled(guild_b));
+
+        playback.disconnect_guild(guild_a).await;
+
+        assert!(!playback.shuffle_enabled(guild_a));
+        assert!(!playback.shuffle_enabled(guild_b));
+        assert!(playback.has_current_track(guild_b));
+    }
+
+    #[tokio::test]
+    async fn restart_snapshot_preserves_shuffle_mode() {
+        let guild_id = GuildKey::new(203);
+        let media = MockMedia::default();
+        media.resolve_with("current", Ok(track_request("current")));
+        let playback = PlaybackCoordinator::new(media, MockRuntime::default());
+        playback.enqueue_impl(guild_id, "current").await.unwrap();
+        assert_eq!(playback.toggle_shuffle(guild_id).await, Some(true));
+
+        let snapshot = playback.restart_snapshot(guild_id).await.unwrap();
+
+        assert!(snapshot.shuffle_enabled);
+    }
+
+    #[tokio::test]
+    async fn loop_and_shuffle_mode_toggles_are_mutually_exclusive() {
+        let guild_id = GuildKey::new(204);
+        let media = MockMedia::default();
+        media.resolve_with("current", Ok(track_request("current")));
+        let playback = PlaybackCoordinator::new(media, MockRuntime::default());
+        playback.enqueue_impl(guild_id, "current").await.unwrap();
+
+        assert_eq!(playback.toggle_shuffle(guild_id).await, Some(true));
+        assert!(playback.shuffle_enabled(guild_id));
+        assert_eq!(playback.toggle_loop(guild_id).await, Some(true));
+        assert!(!playback.shuffle_enabled(guild_id));
+
+        assert_eq!(playback.toggle_shuffle(guild_id).await, Some(true));
+        assert!(playback.shuffle_enabled(guild_id));
+        assert_eq!(playback.toggle_loop(guild_id).await, Some(true));
+        assert!(!playback.shuffle_enabled(guild_id));
     }
 }

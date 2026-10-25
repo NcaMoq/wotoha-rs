@@ -31,6 +31,217 @@ impl serde::Serialize for CreateActionRow {
     }
 }
 
+/// A message component that can be either a legacy action row or a
+/// Components V2 layout component.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateMessageComponent {
+    ActionRow(CreateActionRow),
+    V2(CreateComponentV2),
+}
+
+impl Serialize for CreateMessageComponent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::ActionRow(row) => row.serialize(serializer),
+            Self::V2(component) => component.serialize(serializer),
+        }
+    }
+}
+
+/// A typed Components V2 message component.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateComponentV2 {
+    TextDisplay { content: String },
+    Section {
+        components: Vec<Self>,
+        accessory: CreateSectionAccessory,
+    },
+    Thumbnail(CreateThumbnail),
+    Separator { divider: bool, spacing: u8 },
+    Container {
+        components: Vec<Self>,
+        accent_color: Option<u32>,
+    },
+    ActionRow(CreateActionRow),
+}
+
+impl CreateComponentV2 {
+    /// Creates a markdown-capable text display component.
+    pub fn text_display(content: impl Into<String>) -> Self {
+        Self::TextDisplay {
+            content: content.into(),
+        }
+    }
+
+    /// Creates a section with text children and a button or thumbnail accessory.
+    pub fn section(
+        components: Vec<Self>,
+        accessory: impl Into<CreateSectionAccessory>,
+    ) -> Self {
+        Self::Section {
+            components,
+            accessory: accessory.into(),
+        }
+    }
+
+    /// Creates a thumbnail component, intended as a section accessory.
+    pub fn thumbnail(url: impl Into<String>, description: Option<String>) -> Self {
+        Self::Thumbnail(CreateThumbnail::new(url, description))
+    }
+
+    /// Creates a separator with the requested divider and spacing.
+    pub fn separator(divider: bool, spacing: u8) -> Self {
+        Self::Separator { divider, spacing }
+    }
+
+    /// Creates a visually grouped Components V2 container.
+    pub fn container(components: Vec<Self>) -> Self {
+        Self::Container {
+            components,
+            accent_color: None,
+        }
+    }
+
+    /// Creates a visually grouped Components V2 container with an accent color.
+    pub fn container_with_accent(components: Vec<Self>, accent_color: u32) -> Self {
+        Self::Container {
+            components,
+            accent_color: Some(accent_color),
+        }
+    }
+
+    /// Places an existing action row inside a Components V2 container.
+    pub fn action_row(row: CreateActionRow) -> Self {
+        Self::ActionRow(row)
+    }
+}
+
+impl Serialize for CreateComponentV2 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        if let Self::ActionRow(row) = self {
+            return row.serialize(serializer);
+        }
+
+        let mut map = serializer.serialize_map(None)?;
+        match self {
+            Self::TextDisplay { content } => {
+                map.serialize_entry("type", &10_u8)?;
+                map.serialize_entry("content", content)?;
+            },
+            Self::Section {
+                components,
+                accessory,
+            } => {
+                map.serialize_entry("type", &9_u8)?;
+                map.serialize_entry("components", components)?;
+                map.serialize_entry("accessory", accessory)?;
+            },
+            Self::Thumbnail(thumbnail) => thumbnail.serialize_map_entries(&mut map)?,
+            Self::Separator { divider, spacing } => {
+                map.serialize_entry("type", &14_u8)?;
+                map.serialize_entry("divider", divider)?;
+                map.serialize_entry("spacing", spacing)?;
+            },
+            Self::Container {
+                components,
+                accent_color,
+            } => {
+                map.serialize_entry("type", &17_u8)?;
+                map.serialize_entry("components", components)?;
+                if let Some(accent_color) = accent_color {
+                    map.serialize_entry("accent_color", accent_color)?;
+                }
+            },
+            Self::ActionRow(_) => {
+                return Err(<S::Error as serde::ser::Error>::custom(
+                    "legacy action rows must be serialized as message components",
+                ));
+            },
+        }
+        map.end()
+    }
+}
+
+/// A section accessory. Discord currently accepts link/action buttons and thumbnails.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CreateSectionAccessory {
+    Button(CreateButton),
+    Thumbnail(CreateThumbnail),
+}
+
+impl CreateSectionAccessory {
+    /// Uses a button as the section accessory.
+    pub fn button(button: CreateButton) -> Self {
+        Self::Button(button)
+    }
+
+    /// Uses a thumbnail as the section accessory.
+    pub fn thumbnail(url: impl Into<String>, description: Option<String>) -> Self {
+        Self::Thumbnail(CreateThumbnail::new(url, description))
+    }
+}
+
+impl From<CreateButton> for CreateSectionAccessory {
+    fn from(button: CreateButton) -> Self {
+        Self::Button(button)
+    }
+}
+
+impl Serialize for CreateSectionAccessory {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Button(button) => button.serialize(serializer),
+            Self::Thumbnail(thumbnail) => thumbnail.serialize(serializer),
+        }
+    }
+}
+
+/// A thumbnail used as a section accessory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateThumbnail {
+    url: String,
+    description: Option<String>,
+}
+
+impl CreateThumbnail {
+    /// Creates a thumbnail from an external media URL.
+    pub fn new(url: impl Into<String>, description: Option<String>) -> Self {
+        Self {
+            url: url.into(),
+            description,
+        }
+    }
+
+    fn serialize_map_entries<S: serde::ser::SerializeMap>(
+        &self,
+        map: &mut S,
+    ) -> Result<(), S::Error> {
+        map.serialize_entry("type", &11_u8)?;
+        map.serialize_entry("media", &ThumbnailMedia { url: &self.url })?;
+        if let Some(description) = &self.description {
+            map.serialize_entry("description", description)?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for CreateThumbnail {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+
+        let mut map = serializer.serialize_map(None)?;
+        self.serialize_map_entries(&mut map)?;
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+struct ThumbnailMedia<'a> {
+    url: &'a str,
+}
+
 /// A builder for creating a button component in a message
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[must_use]

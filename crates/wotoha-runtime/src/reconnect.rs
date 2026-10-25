@@ -35,6 +35,8 @@ struct StoredPlayback {
     queued_source_urls: Vec<String>,
     position_millis: u64,
     looping: bool,
+    #[serde(default)]
+    shuffle_enabled: bool,
     automix_enabled: bool,
 }
 
@@ -80,6 +82,7 @@ impl ReconnectStore {
                         queued_source_urls: snapshot.queued_source_urls.clone(),
                         position_millis: snapshot.position.as_millis().min(u64::MAX as u128) as u64,
                         looping: snapshot.looping,
+                        shuffle_enabled: snapshot.shuffle_enabled,
                         automix_enabled: snapshot.automix_enabled,
                     }),
                 })
@@ -133,6 +136,7 @@ impl ReconnectStore {
                     queued_source_urls: snapshot.queued_source_urls,
                     position: std::time::Duration::from_millis(snapshot.position_millis),
                     looping: snapshot.looping,
+                    shuffle_enabled: snapshot.shuffle_enabled,
                     automix_enabled: snapshot.automix_enabled,
                 });
                 (
@@ -157,7 +161,8 @@ pub fn reconnect_self_check_write() -> io::Result<()> {
             queued_source_urls: vec!["https://example.invalid/next".to_owned()],
             position: std::time::Duration::from_millis(12_345),
             looping: true,
-            automix_enabled: true,
+            shuffle_enabled: false,
+            automix_enabled: false,
         }),
     )])
 }
@@ -175,7 +180,8 @@ pub fn reconnect_self_check_read() -> io::Result<()> {
             queued_source_urls: vec!["https://example.invalid/next".to_owned()],
             position: std::time::Duration::from_millis(12_345),
             looping: true,
-            automix_enabled: true,
+            shuffle_enabled: false,
+            automix_enabled: false,
         }),
     )];
     if connections == expected {
@@ -234,6 +240,7 @@ mod tests {
                     queued_source_urls: vec!["https://example.com/next".to_owned()],
                     position: std::time::Duration::from_millis(12_345),
                     looping: false,
+                    shuffle_enabled: false,
                     automix_enabled: true,
                 }),
             ),
@@ -242,6 +249,28 @@ mod tests {
         store.save(&expected).unwrap();
         assert_eq!(store.take().unwrap(), expected);
         assert!(store.take().unwrap().is_empty());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn old_handoff_without_shuffle_mode_defaults_to_disabled() {
+        let path = test_path("without-shuffle-field");
+        fs::write(
+            &path,
+            br#"{"schema_version":2,"connections":[{"guild_id":30,"channel_id":40,"playback":{"current_source_url":"https://example.com/current","queued_source_urls":[],"position_millis":0,"looping":false,"automix_enabled":false}}]}"#,
+        )
+        .unwrap();
+        let store = ReconnectStore::new(path.clone());
+
+        let connections = store.take().unwrap();
+
+        assert_eq!(
+            connections[0]
+                .2
+                .as_ref()
+                .map(|snapshot| snapshot.shuffle_enabled),
+            Some(false)
+        );
         assert!(!path.exists());
     }
 

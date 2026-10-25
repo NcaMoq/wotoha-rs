@@ -245,7 +245,7 @@ impl MediaResolver {
         request: &TrackRequest,
     ) -> Result<TrackRequest, ResolveError> {
         if let Some(prepared) = self.lookup_prepared_request(request) {
-            return Ok(prepared);
+            return Ok(prepared.with_request_id(request.request_id));
         }
 
         if !should_refresh_on_prepare(request) {
@@ -259,20 +259,23 @@ impl MediaResolver {
             let _guard = lease.gate.lock.clone().lock_owned().await;
 
             if let Some(prepared) = self.lookup_prepared_request(request) {
-                return Ok(prepared);
+                return Ok(prepared.with_request_id(request.request_id));
             }
 
             let _permit = self.acquire_probe_slot().await?;
 
             match self.refresh_with_deadline(request).await {
-                Ok(refreshed) => match validate_prepared_request(&refreshed) {
-                    Ok(()) => {
-                        self.store_request(request.requested_url.as_ref(), &refreshed);
-                        self.store_prepared_request(&refreshed);
-                        Ok(refreshed)
+                Ok(refreshed) => {
+                    let refreshed = refreshed.with_request_id(request.request_id);
+                    match validate_prepared_request(&refreshed) {
+                        Ok(()) => {
+                            self.store_request(request.requested_url.as_ref(), &refreshed);
+                            self.store_prepared_request(&refreshed);
+                            Ok(refreshed)
+                        }
+                        Err(error) => Err(error),
                     }
-                    Err(error) => Err(error),
-                },
+                }
                 Err(error) => Err(error),
             }
         }
@@ -296,14 +299,17 @@ impl MediaResolver {
         let _permit = self.acquire_probe_slot().await?;
 
         match self.refresh_with_deadline(request).await {
-            Ok(refreshed) => match validate_prepared_request(&refreshed) {
-                Ok(()) => {
-                    self.store_request(request.requested_url.as_ref(), &refreshed);
-                    self.store_prepared_request(&refreshed);
-                    Ok(refreshed)
+            Ok(refreshed) => {
+                let refreshed = refreshed.with_request_id(request.request_id);
+                match validate_prepared_request(&refreshed) {
+                    Ok(()) => {
+                        self.store_request(request.requested_url.as_ref(), &refreshed);
+                        self.store_prepared_request(&refreshed);
+                        Ok(refreshed)
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             Err(error) => Err(error),
         }
     }

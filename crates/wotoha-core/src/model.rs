@@ -1,6 +1,26 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 const MAX_TRACK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+static NEXT_TRACK_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TrackRequestId(u64);
+
+impl TrackRequestId {
+    fn fresh() -> Self {
+        Self(NEXT_TRACK_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrackMetadata {
@@ -141,6 +161,7 @@ impl PreparedSource {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrackRequest {
+    pub request_id: TrackRequestId,
     pub provider_id: Arc<str>,
     pub canonical_key: Arc<str>,
     pub requested_url: Arc<str>,
@@ -161,6 +182,7 @@ impl TrackRequest {
         metadata: TrackMetadata,
     ) -> Self {
         Self {
+            request_id: TrackRequestId::fresh(),
             provider_id: provider_id.into(),
             canonical_key: canonical_key.into(),
             requested_url: requested_url.into(),
@@ -170,11 +192,23 @@ impl TrackRequest {
             metadata,
         }
     }
+
+    /// Assign a new identity for a separately queued instance of this source.
+    pub fn with_fresh_request_id(mut self) -> Self {
+        self.request_id = TrackRequestId::fresh();
+        self
+    }
+
+    /// Preserve queue-entry identity when refreshing only the prepared source.
+    pub fn with_request_id(mut self, request_id: TrackRequestId) -> Self {
+        self.request_id = request_id;
+        self
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TrackMetadata;
+    use super::{PreparedSource, TrackMetadata, TrackRequest};
     use std::time::Duration;
 
     #[test]
@@ -211,6 +245,27 @@ mod tests {
             )
             .duration,
             Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn track_request_identity_is_unique_per_queue_entry_and_stable_on_clone() {
+        let request = TrackRequest::new(
+            "test",
+            "same-track",
+            "https://example.com/request",
+            "https://example.com/canonical",
+            "https://example.com/source",
+            PreparedSource::http("https://example.com/stream", Vec::new(), None, None),
+            TrackMetadata::new("title", "artist", "https://example.com", None, None),
+        );
+        let requeued = request.clone().with_fresh_request_id();
+
+        assert_eq!(request.request_id, request.clone().request_id);
+        assert_ne!(request.request_id, requeued.request_id);
+        assert_eq!(
+            request.request_id,
+            requeued.with_request_id(request.request_id).request_id
         );
     }
 }

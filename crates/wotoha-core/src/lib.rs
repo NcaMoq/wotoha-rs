@@ -14,6 +14,8 @@ pub mod url;
 pub mod vocal_analysis;
 
 pub use config::{AutoMixPlannerMode, BeatmatchBlendConfig, BotConfig, ConfigError};
-pub use model::{PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest};
+pub use model::{
+    PreparedHeader, PreparedRangeMode, PreparedSource, TrackMetadata, TrackRequest, TrackRequestId,
+};
 pub use operational_metrics::{OperationalMetricsSnapshot, operational_metrics};
 pub use session::{GuildPlayerState, QueuePreview, TrackPreview};

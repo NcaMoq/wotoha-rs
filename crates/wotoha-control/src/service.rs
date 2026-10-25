@@ -1,6 +1,7 @@
 use wotoha_contracts::{
-    ChannelKey, EnqueueOutcome, GuildKey, PlaybackFailureKind, PlaybackRestartSnapshot,
-    PlaybackService, UserKey, VoiceActionAccess, VoicePeerSnapshot, VoiceUpdateDecision,
+    ChannelKey, EnqueueOutcome, GuildKey, NowPlayingSnapshot, PlaybackFailureKind,
+    PlaybackRestartSnapshot, PlaybackService, UserKey, VoiceActionAccess, VoicePeerSnapshot,
+    VoiceUpdateDecision,
 };
 use wotoha_core::QueuePreview;
 
@@ -22,8 +23,7 @@ pub enum ComponentAction {
 pub enum ComponentOutcome {
     Skip { was_looping: bool },
     Loop { enabled: bool },
-    Shuffle,
-    NothingToShuffle,
+    Shuffle { enabled: bool },
     AutoMix { enabled: bool },
     QueuePreview(Box<QueuePreview>),
     QueueEmpty,
@@ -78,13 +78,10 @@ impl<P: PlaybackService> ControlService<P> {
                 Some(enabled) => ComponentOutcome::Loop { enabled },
                 None => ComponentOutcome::NoTrackPlaying,
             },
-            ComponentAction::Shuffle => {
-                if self.playback.shuffle(guild_id).await {
-                    ComponentOutcome::Shuffle
-                } else {
-                    ComponentOutcome::NothingToShuffle
-                }
-            }
+            ComponentAction::Shuffle => match self.playback.toggle_shuffle(guild_id).await {
+                Some(enabled) => ComponentOutcome::Shuffle { enabled },
+                None => ComponentOutcome::NoTrackPlaying,
+            },
             ComponentAction::AutoMix => match self.playback.toggle_automix(guild_id).await {
                 Some(enabled) => ComponentOutcome::AutoMix { enabled },
                 None => ComponentOutcome::NoTrackPlaying,
@@ -104,8 +101,20 @@ impl<P: PlaybackService> ControlService<P> {
         self.playback.has_current_track(guild_id)
     }
 
+    pub fn queue_preview(&self, guild_id: GuildKey, limit: usize) -> Option<QueuePreview> {
+        self.playback.queue_preview(guild_id, limit)
+    }
+
+    pub async fn now_playing_snapshot(&self, guild_id: GuildKey) -> Option<NowPlayingSnapshot> {
+        self.playback.now_playing_snapshot(guild_id).await
+    }
+
     pub fn automix_enabled(&self, guild_id: GuildKey) -> bool {
         self.playback.automix_enabled(guild_id)
+    }
+
+    pub fn shuffle_enabled(&self, guild_id: GuildKey) -> bool {
+        self.playback.shuffle_enabled(guild_id)
     }
 
     pub async fn restart_snapshot(&self, guild_id: GuildKey) -> Option<PlaybackRestartSnapshot> {
@@ -189,7 +198,7 @@ mod tests {
         skip: Option<bool>,
         loop_result: Option<bool>,
         automix_enabled: bool,
-        shuffle: bool,
+        shuffle: Option<bool>,
         preview: Option<QueuePreview>,
         disconnected: usize,
     }
@@ -242,8 +251,16 @@ mod tests {
                 .is_some()
         }
 
-        async fn shuffle(&self, _guild_id: GuildKey) -> bool {
+        async fn toggle_shuffle(&self, _guild_id: GuildKey) -> Option<bool> {
             self.state.lock().expect("mock state").shuffle
+        }
+
+        fn shuffle_enabled(&self, _guild_id: GuildKey) -> bool {
+            self.state
+                .lock()
+                .expect("mock state")
+                .shuffle
+                .unwrap_or(false)
         }
 
         fn automix_enabled(&self, _guild_id: GuildKey) -> bool {
@@ -349,7 +366,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn component_shuffle_reports_empty_queue() {
+    async fn component_shuffle_reports_enabled_state_without_reordering() {
+        let playback = MockPlayback::default();
+        playback.state.lock().expect("mock state").shuffle = Some(true);
+        let service = ControlService::new(playback);
+
+        let outcome = service
+            .handle_component(GUILD, Some(CHANNEL), ComponentAction::Shuffle)
+            .await;
+
+        assert!(matches!(
+            outcome,
+            ComponentOutcome::Shuffle { enabled: true }
+        ));
+    }
+
+    #[tokio::test]
+    async fn component_shuffle_without_playback_reports_no_track() {
         let playback = MockPlayback::default();
         let service = ControlService::new(playback);
 
@@ -357,7 +390,7 @@ mod tests {
             .handle_component(GUILD, Some(CHANNEL), ComponentAction::Shuffle)
             .await;
 
-        assert!(matches!(outcome, ComponentOutcome::NothingToShuffle));
+        assert!(matches!(outcome, ComponentOutcome::NoTrackPlaying));
     }
 
     #[tokio::test]
